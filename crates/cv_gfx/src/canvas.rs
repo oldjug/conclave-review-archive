@@ -106,12 +106,19 @@ pub enum FillStyle {
         y1: f32,
         stops: Vec<GradientStop>,
     },
-    /// `createRadialGradient(cx0, cy0, r0, cx1, cy1, r1)` — simplified to
-    /// a gradient from the inner circle (cx1, cy1) outward to r1.
+    /// `createRadialGradient(x0, y0, r0, x1, y1, r1)` — the full two-circle
+    /// form. The gradient is the cone swept between the start circle
+    /// (x0, y0, r0) and the end circle (x1, y1, r1); each painted point's
+    /// offset is the largest ω such that the point lies on the interpolated
+    /// circle centered at ((1-ω)x0 + ω·x1, (1-ω)y0 + ω·y1) with radius
+    /// (1-ω)r0 + ω·r1 (WHATWG Canvas §4.12.5.1.10). Concentric and focal
+    /// (non-concentric) gradients are both handled exactly.
     Radial {
-        cx: f32,
-        cy: f32,
+        x0: f32,
+        y0: f32,
         r0: f32,
+        x1: f32,
+        y1: f32,
         r1: f32,
         stops: Vec<GradientStop>,
     },
@@ -144,14 +151,16 @@ impl FillStyle {
                 .clamp(0.0, 1.0);
                 sample_stops(stops, t, global_alpha)
             }
-            FillStyle::Radial { cx, cy, r0, r1, stops } => {
+            FillStyle::Radial { x0, y0, r0, x1, y1, r1, stops } => {
                 if stops.is_empty() {
                     return Color::TRANSPARENT;
                 }
-                let dist = ((px - cx) * (px - cx) + (py - cy) * (py - cy)).sqrt();
-                let span = (r1 - r0).abs().max(1e-6);
-                let t = ((dist - r0) / span).clamp(0.0, 1.0);
-                sample_stops(stops, t, global_alpha)
+                match radial_offset(*x0, *y0, *r0, *x1, *y1, *r1, px, py) {
+                    Some(omega) => sample_stops(stops, omega.clamp(0.0, 1.0), global_alpha),
+                    // No interpolated circle with non-negative radius contains
+                    // the point → the point is not painted (spec: transparent).
+                    None => Color::TRANSPARENT,
+                }
             }
             FillStyle::Pattern(p) => {
                 // Sample at the pixel the destination loop is filling.
@@ -200,6 +209,189 @@ fn sample_stops(stops: &[GradientStop], t: f32, global_alpha: f32) -> Color {
     let mut c = last.color;
     c.a = ((c.a as f32) * global_alpha) as u8;
     c
+}
+
+/// Compute the radial-gradient offset ω for a point (px, py) given the start
+/// circle (x0, y0, r0) and end circle (x1, y1, r1).
+///
+/// WHATWG Canvas §4.12.5.1.10 "If radial: for all values of ω where r(ω) > 0,
+/// starting with the value of ω nearest to positive infinity and ending with
+/// the value of ω nearest to negative infinity, draw the circumference of the
+/// circle with radius r(ω) at position (x(ω), y(ω)) [...]" — i.e. the painted
+/// offset at a pixel is the **largest** ω for which the pixel lies on the
+/// interpolated circle of non-negative radius. We solve the resulting quadratic
+/// in ω directly:
+///
+///   x(ω) = (1-ω)·x0 + ω·x1,  y(ω) = (1-ω)·y0 + ω·y1,  r(ω) = (1-ω)·r0 + ω·r1
+///
+/// Point on circle ⇔ |P - C(ω)|² = r(ω)². With d = P1-P0, dr = r1-r0, f = P-P0:
+///   a·ω² + b·ω + c = 0,
+///   a = d·d - dr²,  b = -2(f·d + r0·dr),  c = f·f - r0²
+///
+/// Returns the largest root with r(ω) ≥ 0, or `None` when no such root exists
+/// (the pixel is outside the painted cone and stays transparent). The returned
+/// value is NOT clamped — callers clamp into [0,1] before sampling stops.
+#[inline]
+fn radial_offset(
+    x0: f32,
+    y0: f32,
+    r0: f32,
+    x1: f32,
+    y1: f32,
+    r1: f32,
+    px: f32,
+    py: f32,
+) -> Option<f32> {
+    let dx = x1 - x0;
+    let dy = y1 - y0;
+    let dr = r1 - r0;
+    let fx = px - x0;
+    let fy = py - y0;
+    let a = dx * dx + dy * dy - dr * dr;
+    let b = -2.0 * (fx * dx + fy * dy + r0 * dr);
+    let c = fx * fx + fy * fy - r0 * r0;
+
+    // r(ω) ≥ 0 guard.
+    let radius_ok = |w: f32| r0 + w * dr >= 0.0;
+
+    if a.abs() < 1e-7 {
+        // Degenerate to linear in ω (the "spotlight" cone where |d| == |dr|, or
+        // concentric circles where d == 0).
+        if b.abs() < 1e-12 {
+            // a == b == 0: either no solution (c != 0) or the point is the cone
+            // apex / focal point (c == 0), satisfied by every ω. The apex is the
+            // zero-radius circle, i.e. ω where r(ω) = 0 → ω = -r0/dr (offset 0
+            // when r0 == 0). Falls back to 0 for fully concentric same-radius.
+            if c.abs() < 1e-6 {
+                if dr.abs() > 1e-9 {
+                    let w = -r0 / dr;
+                    return if radius_ok(w) { Some(w) } else { Some(0.0) };
+                }
+                return Some(0.0);
+            }
+            return None;
+        }
+        let w = -c / b;
+        return if radius_ok(w) { Some(w) } else { None };
+    }
+
+    let disc = b * b - 4.0 * a * c;
+    if disc < 0.0 {
+        return None;
+    }
+    let sqrt_disc = disc.sqrt();
+    let w1 = (-b + sqrt_disc) / (2.0 * a);
+    let w2 = (-b - sqrt_disc) / (2.0 * a);
+    // Prefer the larger ω (spec walks ω from +∞ downward; the first circle that
+    // contains the pixel — i.e. the largest valid ω — wins).
+    let (hi, lo) = if w1 >= w2 { (w1, w2) } else { (w2, w1) };
+    if radius_ok(hi) {
+        Some(hi)
+    } else if radius_ok(lo) {
+        Some(lo)
+    } else {
+        None
+    }
+}
+
+/// Approximate a Gaussian blur of standard deviation `sigma` over a single-
+/// channel coverage buffer (`buf`, row-major `w`×`h`, values in [0,1]) using
+/// three successive box blurs, per SVG 1.1 §15.17 "feGaussianBlur" (the same
+/// algorithm Skia's `SkBlurMask` fast path uses):
+///
+/// > "if d is odd, use three box-blurs of size 'd', centered on the output
+/// >  pixel. if d is even, use two box-blurs of size 'd' (the first one
+/// >  centered on the pixel boundary between the output pixel and the one to the
+/// >  left, the second one centered on the pixel boundary between the output
+/// >  pixel and the one to the right) and one box blur of size 'd+1' centered on
+/// >  the output pixel."
+/// >  with d = floor(s * 3 * sqrt(2*PI)/4 + 0.5)
+///
+/// The three passes are applied independently in the horizontal and vertical
+/// directions (the box blur is separable). No-ops for sigma below ~0.05.
+fn box_blur_gaussian(buf: &mut [f32], w: usize, h: usize, sigma: f32) {
+    if sigma < 0.05 || w == 0 || h == 0 {
+        return;
+    }
+    // d per the SVG spec.
+    let d = (sigma * 3.0 * (2.0 * std::f32::consts::PI).sqrt() / 4.0 + 0.5).floor() as i32;
+    if d < 1 {
+        return;
+    }
+    let mut tmp = vec![0.0f32; buf.len()];
+    // The three (left-radius, right-radius) box passes.
+    let passes: [(i32, i32); 3] = if d % 2 == 1 {
+        let r = d / 2;
+        [(r, r), (r, r), (r, r)]
+    } else {
+        let r = d / 2;
+        // size d centered on left boundary → radii (r, r-1);
+        // size d centered on right boundary → radii (r-1, r);
+        // size d+1 centered → radii (r, r).
+        [(r, r - 1), (r - 1, r), (r, r)]
+    };
+    for &(lr, rr) in &passes {
+        // Horizontal pass: buf → tmp.
+        box_blur_h(buf, &mut tmp, w, h, lr, rr);
+        // Vertical pass: tmp → buf.
+        box_blur_v(&tmp, buf, w, h, lr, rr);
+    }
+}
+
+/// One horizontal box-blur pass with the given left/right radii (averaging
+/// window width = lr + rr + 1), using a sliding-window running sum. Edges are
+/// clamped to zero outside the buffer (the buffer is padded by the caller so
+/// the shape never touches the border).
+fn box_blur_h(src: &[f32], dst: &mut [f32], w: usize, h: usize, lr: i32, rr: i32) {
+    let width = (lr + rr + 1) as f32;
+    let iw = w as i32;
+    for y in 0..h {
+        let row = y * w;
+        let mut sum = 0.0f32;
+        // Prime the window for x = 0: indices [-lr, rr].
+        for k in -lr..=rr {
+            if k >= 0 && k < iw {
+                sum += src[row + k as usize];
+            }
+        }
+        for x in 0..w as i32 {
+            dst[row + x as usize] = sum / width;
+            // Slide: drop (x - lr), add (x + rr + 1).
+            let out_idx = x - lr;
+            let in_idx = x + rr + 1;
+            if out_idx >= 0 && out_idx < iw {
+                sum -= src[row + out_idx as usize];
+            }
+            if in_idx >= 0 && in_idx < iw {
+                sum += src[row + in_idx as usize];
+            }
+        }
+    }
+}
+
+/// One vertical box-blur pass with the given top/bottom radii.
+fn box_blur_v(src: &[f32], dst: &mut [f32], w: usize, h: usize, lr: i32, rr: i32) {
+    let width = (lr + rr + 1) as f32;
+    let ih = h as i32;
+    for x in 0..w {
+        let mut sum = 0.0f32;
+        for k in -lr..=rr {
+            if k >= 0 && k < ih {
+                sum += src[(k as usize) * w + x];
+            }
+        }
+        for y in 0..h as i32 {
+            dst[(y as usize) * w + x] = sum / width;
+            let out_idx = y - lr;
+            let in_idx = y + rr + 1;
+            if out_idx >= 0 && out_idx < ih {
+                sum -= src[(out_idx as usize) * w + x];
+            }
+            if in_idx >= 0 && in_idx < ih {
+                sum += src[(in_idx as usize) * w + x];
+            }
+        }
+    }
 }
 
 /// An axis-aligned rectangle clip region stored on the state stack.
@@ -1297,16 +1489,22 @@ impl CanvasContext2D {
         self.state_mut().fill_style = Some(FillStyle::Linear { x0, y0, x1, y1, stops });
     }
 
-    /// Set the fill style to a radial gradient centered at (cx, cy) from radius r0 to r1.
+    /// Set the fill style to a radial gradient defined by the start circle
+    /// (x0, y0, r0) and the end circle (x1, y1, r1), with the given color stops
+    /// (sorted by offset). Mirrors `createRadialGradient(x0,y0,r0,x1,y1,r1)`.
+    #[allow(clippy::too_many_arguments)]
     pub fn set_fill_radial_gradient(
         &mut self,
-        cx: f32,
-        cy: f32,
+        x0: f32,
+        y0: f32,
         r0: f32,
+        x1: f32,
+        y1: f32,
         r1: f32,
         stops: Vec<GradientStop>,
     ) {
-        self.state_mut().fill_style = Some(FillStyle::Radial { cx, cy, r0, r1, stops });
+        self.state_mut().fill_style =
+            Some(FillStyle::Radial { x0, y0, r0, x1, y1, r1, stops });
     }
 
     /// Clear any gradient fill style, reverting to the solid color stored in `fill`.
@@ -1508,6 +1706,30 @@ impl CanvasContext2D {
 
         let global_alpha = self.state().global_alpha;
         let op = self.state().composite_op;
+
+        // ── shadowBlur / shadowColor pre-pass ─────────────────────────────────
+        // fillRect casts a shadow of the rectangle silhouette behind itself when
+        // a shadow is set (Canvas spec: shadows apply to fill/stroke/image ops).
+        // Use the DEVICE-space rect corners (axis-aligned here) as the polygon.
+        {
+            let sh = {
+                let s = self.state();
+                (s.shadow_color, s.shadow_blur, s.shadow_offset_x, s.shadow_offset_y, s.global_alpha)
+            };
+            let (scolor, blur, sox, soy, ga) = sh;
+            if scolor.a > 0 && (blur > 0.0 || sox != 0.0 || soy != 0.0) {
+                let rect = vec![vec![
+                    (x0, y0),
+                    (x1, y0),
+                    (x1, y1),
+                    (x0, y1),
+                    (x0, y0),
+                ]];
+                let clip = self.state().clip;
+                self.paint_shadow_glow(&rect, FillRule::Nonzero, scolor, blur, sox, soy, ga, clip);
+            }
+        }
+
         match &self.state().fill_style.clone() {
             Some(FillStyle::Pattern(p)) => {
                 // Pattern fill: tile sampled per destination pixel.
@@ -2161,13 +2383,21 @@ impl CanvasContext2D {
         self.fill_device_ops(&ops, rule);
     }
 
-    /// Paint a soft shadow glow for the given device-space polygons (used by the
-    /// fill path when shadowColor/shadowBlur are set). For each pixel in the
-    /// shape's bounding box expanded by `blur` (and displaced by the shadow
-    /// offset), alpha = shadow_alpha inside the shape, falling off linearly to 0
-    /// over `blur` px outside it — a cheap but faithful approximation of the
-    /// gaussian shadow for the small round shapes this is used on. Painted with
-    /// straight-alpha source-over so it layers under the subsequent fill.
+    /// Paint a real soft shadow for the given device-space polygons (used by the
+    /// fill/stroke paths when shadowColor/shadowBlur are set).
+    ///
+    /// This is the Chrome/Skia shadow model: the shape's *silhouette* (its alpha
+    /// coverage) is rendered in `shadowColor`, displaced by (shadowOffsetX,
+    /// shadowOffsetY), Gaussian-blurred, and composited **behind** the shape
+    /// (drawn here, before the fill itself paints over it).
+    ///
+    /// Blur amount: Blink converts `shadowBlur` → a Gaussian standard deviation
+    /// via `ShadowData::BlurRadiusToStdDev(radius) = radius * 0.5`
+    /// (`CanvasRenderingContext2DState::ShadowBlurAsSigma`), so
+    /// `sigma = shadowBlur / 2`. The Gaussian is approximated by three
+    /// successive box blurs per the SVG 1.1 §15.17 / CSS Filter Effects
+    /// `feGaussianBlur` algorithm (box size `d = floor(sigma*3*sqrt(2π)/4 + 0.5)`),
+    /// which is exactly Skia's `SkBlurMask` fast path.
     #[allow(clippy::too_many_arguments)]
     fn paint_shadow_glow(
         &mut self,
@@ -2180,40 +2410,46 @@ impl CanvasContext2D {
         global_alpha: f32,
         clip: Option<ClipRect>,
     ) {
-        // Offset polygons by the shadow displacement.
-        let off: Vec<Vec<(f32, f32)>> = polys
-            .iter()
-            .map(|p| p.iter().map(|&(x, y)| (x + sox, y + soy)).collect())
-            .collect();
+        // Shape bounds (unoffset shape space).
         let (mut min_x, mut min_y) = (f32::INFINITY, f32::INFINITY);
         let (mut max_x, mut max_y) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
-        for poly in &off {
+        for poly in polys {
             for &(x, y) in poly {
                 min_x = min_x.min(x); min_y = min_y.min(y);
                 max_x = max_x.max(x); max_y = max_y.max(y);
             }
         }
         if !min_x.is_finite() { return; }
-        let r = blur.max(0.0);
-        let bw = self.bitmap.width as i32;
-        let bh = self.bitmap.height as i32;
-        let y0 = ((min_y - r).floor() as i32).max(0);
-        let y1 = ((max_y + r).ceil() as i32).min(bh);
-        let x0 = ((min_x - r).floor() as i32).max(0);
-        let x1 = ((max_x + r).ceil() as i32).min(bw);
-        let (cy0, cy1, cx0, cx1) = match clip {
-            Some(c) => (y0.max(c.y0), y1.min(c.y1), x0.max(c.x0), x1.min(c.x1)),
-            None => (y0, y1, x0, x1),
-        };
-        if cy1 <= cy0 || cx1 <= cx0 { return; }
+
+        // sigma = shadowBlur / 2 (Blink BlurRadiusToStdDev).
+        let sigma = (blur * 0.5).max(0.0);
+        // The blur spreads ~3σ in each direction; pad the mask so the falloff
+        // tail is fully captured. +2 for the supersampled-edge antialias.
+        let pad = (sigma * 3.0).ceil() as i32 + 2;
+
+        // Local coverage-mask buffer covering the (padded) shape bbox.
+        let mlo_x = min_x.floor() as i32 - pad;
+        let mlo_y = min_y.floor() as i32 - pad;
+        let mhi_x = max_x.ceil() as i32 + pad;
+        let mhi_y = max_y.ceil() as i32 + pad;
+        let mw = (mhi_x - mlo_x).max(1) as usize;
+        let mh = (mhi_y - mlo_y).max(1) as usize;
+        // Guard against pathological allocation on huge shapes.
+        if mw.saturating_mul(mh) > 64 * 1024 * 1024 {
+            return;
+        }
+        let mut mask = vec![0.0f32; mw * mh];
+
         let inside = |w: i32| match rule {
             FillRule::Nonzero => w != 0,
             FillRule::EvenOdd => w % 2 != 0,
         };
-        // point-in-polygon (winding) for the offset polys.
+        // Antialiased coverage via 4×4 supersampling per pixel — gives the
+        // silhouette smooth edges (Chrome rasterizes the AA mask before blur).
+        const SS: i32 = 4;
         let point_inside = |px: f32, py: f32| -> bool {
             let mut wind = 0i32;
-            for poly in &off {
+            for poly in polys {
                 for w in poly.windows(2) {
                     let (ax, ay) = w[0]; let (bx, by) = w[1];
                     if (ay > py) != (by > py) {
@@ -2226,43 +2462,50 @@ impl CanvasContext2D {
             }
             inside(wind)
         };
-        // distance from a point to the nearest polygon edge (for the falloff).
-        let dist_to_edges = |px: f32, py: f32| -> f32 {
-            let mut best = f32::INFINITY;
-            for poly in &off {
-                for w in poly.windows(2) {
-                    let (ax, ay) = w[0]; let (bx, by) = w[1];
-                    let dx = bx - ax; let dy = by - ay;
-                    let len2 = dx * dx + dy * dy;
-                    let t = if len2 > 0.0 { (((px - ax) * dx + (py - ay) * dy) / len2).clamp(0.0, 1.0) } else { 0.0 };
-                    let qx = ax + t * dx; let qy = ay + t * dy;
-                    let d = ((px - qx).powi(2) + (py - qy).powi(2)).sqrt();
-                    if d < best { best = d; }
+        for my in 0..mh {
+            let base_y = mlo_y as f32 + my as f32;
+            for mx in 0..mw {
+                let base_x = mlo_x as f32 + mx as f32;
+                let mut hits = 0i32;
+                for sj in 0..SS {
+                    let py = base_y + (sj as f32 + 0.5) / SS as f32;
+                    for si in 0..SS {
+                        let px = base_x + (si as f32 + 0.5) / SS as f32;
+                        if point_inside(px, py) { hits += 1; }
+                    }
+                }
+                if hits != 0 {
+                    mask[my * mw + mx] = hits as f32 / (SS * SS) as f32;
                 }
             }
-            best
-        };
+        }
+
+        // Gaussian-blur the coverage mask in place (no-op when sigma≈0).
+        box_blur_gaussian(&mut mask, mw, mh, sigma);
+
+        // Composite the blurred coverage, tinted by shadowColor (× globalAlpha),
+        // BEHIND the shape — displaced by the shadow offset. Straight-alpha
+        // source-over so it layers under the subsequent fill.
+        let bw = self.bitmap.width as i32;
+        let bh = self.bitmap.height as i32;
         let base_a = (scolor.a as f32) * global_alpha;
-        for y in cy0..cy1 {
-            let py = y as f32 + 0.5;
-            let row = (y as usize) * (self.bitmap.width as usize);
-            for x in cx0..cx1 {
-                let px = x as f32 + 0.5;
-                let a = if point_inside(px, py) {
-                    base_a
-                } else if r > 0.0 {
-                    let d = dist_to_edges(px, py);
-                    if d >= r { continue; }
-                    // Smooth falloff (quadratic) — denser glow near the shape.
-                    let f = 1.0 - (d / r);
-                    base_a * f * f
-                } else {
-                    continue;
-                };
-                if a < 1.0 { continue; }
-                let sc = Color { r: scolor.r, g: scolor.g, b: scolor.b, a: a.min(255.0) as u8 };
-                self.bitmap.blend_pixel(x, y, sc);
-                let _ = row;
+        if base_a <= 0.0 { return; }
+        for my in 0..mh {
+            let cov_row = my * mw;
+            // Destination row = mask row + shape-space origin + shadow offset.
+            let dy = mlo_y + my as i32 + soy.round() as i32;
+            if dy < 0 || dy >= bh { continue; }
+            if let Some(c) = clip { if dy < c.y0 || dy >= c.y1 { continue; } }
+            for mx in 0..mw {
+                let cov = mask[cov_row + mx];
+                if cov <= 0.0 { continue; }
+                let dx = mlo_x + mx as i32 + sox.round() as i32;
+                if dx < 0 || dx >= bw { continue; }
+                if let Some(c) = clip { if dx < c.x0 || dx >= c.x1 { continue; } }
+                let a = (base_a * cov).min(255.0);
+                if a < 0.5 { continue; }
+                let sc = Color { r: scolor.r, g: scolor.g, b: scolor.b, a: a as u8 };
+                self.bitmap.blend_pixel(dx, dy, sc);
             }
         }
     }
@@ -4139,5 +4382,193 @@ mod tests {
         let snap = off.snapshot_pixels();
         assert_eq!(snap.len(), 16 * 16);
         assert_eq!(snap[1 * 16 + 1], inside);
+    }
+
+    // ---- Radial gradient: full two-circle (cone) sampling ----
+
+    /// Concentric radial gradient (r0=0 → r1=R) must sample a MID color partway
+    /// out, not flatten to first/last only. red center → blue edge: a pixel at
+    /// half the radius should be ~half-and-half (the real interpolation midpoint).
+    #[test]
+    fn radial_gradient_samples_mid_color() {
+        let mut ctx = CanvasContext2D::new(40, 40);
+        // Center (20,20), inner r0=0, outer r1=20; red→blue.
+        ctx.set_fill_radial_gradient(
+            20.0, 20.0, 0.0, 20.0, 20.0, 20.0,
+            vec![
+                GradientStop { offset: 0.0, color: Color { r: 255, g: 0, b: 0, a: 255 } },
+                GradientStop { offset: 1.0, color: Color { r: 0, g: 0, b: 255, a: 255 } },
+            ],
+        );
+        ctx.fill_rect(0.0, 0.0, 40.0, 40.0);
+        // Center is red.
+        let (rc, _gc, bc, _ac) = unpack(ctx.bitmap.pixels[20 * 40 + 20]);
+        assert!(rc > 200 && bc < 60, "center should be red, got r={rc} b={bc}");
+        // 10px right of center = halfway to the r=20 edge → ~50/50 red/blue.
+        let (rm, _gm, bm, am) = unpack(ctx.bitmap.pixels[20 * 40 + 30]);
+        assert!(am == 255, "midway pixel must be opaque, got a={am}");
+        assert!(rm > 90 && rm < 170, "midway red ~128, got {rm}");
+        assert!(bm > 90 && bm < 170, "midway blue ~128, got {bm}");
+        // Edge (at radius 20) is blue.
+        let (re, _ge, be, _ae) = unpack(ctx.bitmap.pixels[20 * 40 + 39]);
+        assert!(be > 180 && re < 80, "edge should be blue, got r={re} b={be}");
+    }
+
+    /// Multi-stop radial gradient honors INTERIOR stops (not just first+last).
+    /// red@0 → green@0.5 → blue@1: the pixel at half radius must be ~green.
+    #[test]
+    fn radial_gradient_honors_interior_stop() {
+        let mut ctx = CanvasContext2D::new(40, 40);
+        ctx.set_fill_radial_gradient(
+            20.0, 20.0, 0.0, 20.0, 20.0, 20.0,
+            vec![
+                GradientStop { offset: 0.0, color: Color { r: 255, g: 0, b: 0, a: 255 } },
+                GradientStop { offset: 0.5, color: Color { r: 0, g: 255, b: 0, a: 255 } },
+                GradientStop { offset: 1.0, color: Color { r: 0, g: 0, b: 255, a: 255 } },
+            ],
+        );
+        ctx.fill_rect(0.0, 0.0, 40.0, 40.0);
+        // 10px from center (offset≈0.5) must be green-dominant.
+        let (r, g, b, _a) = unpack(ctx.bitmap.pixels[20 * 40 + 30]);
+        assert!(g > 180, "half-radius must be green-dominant, got g={g}");
+        assert!(r < 80 && b < 80, "half-radius is not red/blue, got r={r} b={b}");
+    }
+
+    /// Pixels OUTSIDE the painted cone are transparent. With a NON-zero inner
+    /// radius (r0>0) and r0==r1 (a tube), the spec only paints the annulus; far
+    /// from both circle centers no valid ω exists → transparent.
+    #[test]
+    fn radial_gradient_outside_cone_is_transparent() {
+        // Start circle (10,20,2), end circle (30,20,2): two small equal circles.
+        // a = |d|^2 - dr^2 = 400 - 0 = 400 (well-posed). A point far above the
+        // axis lies on no interpolated circle of radius 2 → not painted.
+        let mut ctx = CanvasContext2D::new(40, 40);
+        ctx.set_fill_radial_gradient(
+            10.0, 20.0, 2.0, 30.0, 20.0, 2.0,
+            vec![
+                GradientStop { offset: 0.0, color: Color { r: 255, g: 0, b: 0, a: 255 } },
+                GradientStop { offset: 1.0, color: Color { r: 0, g: 0, b: 255, a: 255 } },
+            ],
+        );
+        ctx.fill_rect(0.0, 0.0, 40.0, 40.0);
+        // On the axis between the circles is painted.
+        let (_r, _g, _b, a_on) = unpack(ctx.bitmap.pixels[20 * 40 + 20]);
+        assert!(a_on > 0, "on-axis between circles must be painted, got a={a_on}");
+        // Far off-axis corner: no circle of radius 2 reaches it → transparent.
+        let (_r2, _g2, _b2, a_off) = unpack(ctx.bitmap.pixels[2 * 40 + 2]);
+        assert_eq!(a_off, 0, "far off-cone pixel must be transparent, got a={a_off}");
+    }
+
+    /// The raw cone solver returns the LARGEST ω with non-negative radius and
+    /// interpolates focal (non-concentric) gradients. A point on the end circle
+    /// (x1,y1,r1) maps to ω=1; on the start circle (x0,y0,r0) to ω=0.
+    #[test]
+    fn radial_offset_solver_endpoints() {
+        // start (0,0,0), end (10,0,10): classic "spotlight" cone.
+        // The end-circle rim point (20,0) lies on radius-10 circle at center
+        // (10,0) → ω=1. The center (0,0) is the degenerate r=0 start → ω=0.
+        let at = |px: f32, py: f32| super::radial_offset(0.0, 0.0, 0.0, 10.0, 0.0, 10.0, px, py);
+        let w_center = at(0.0, 0.0).unwrap();
+        assert!((w_center - 0.0).abs() < 1e-3, "start point ω≈0, got {w_center}");
+        let w_rim = at(20.0, 0.0).unwrap();
+        assert!((w_rim - 1.0).abs() < 1e-3, "end-circle rim ω≈1, got {w_rim}");
+        // The TOP of the ω=0.5 circle (center (5,0), radius 5) is (5,5); it lies
+        // on no larger-ω circle, so the solver must report ω=0.5 there. (The
+        // on-axis point (5,0) is ω=0.25 — circle center (2.5,0), radius 2.5 —
+        // which is the genuine cone geometry, not a bug.)
+        let w_half = at(5.0, 5.0).unwrap();
+        assert!((w_half - 0.5).abs() < 1e-3, "top-of-mid-circle ω≈0.5, got {w_half}");
+        let w_quarter = at(5.0, 0.0).unwrap();
+        assert!((w_quarter - 0.25).abs() < 1e-3, "on-axis (5,0) ω≈0.25, got {w_quarter}");
+    }
+
+    // ---- shadowBlur: real Gaussian blur of the silhouette ----
+
+    /// The box-blur Gaussian approximation CONSERVES total mass (a box average
+    /// neither creates nor destroys coverage, modulo the clamped border) and
+    /// SPREADS a single point into a smooth, monotonically decaying kernel.
+    #[test]
+    fn box_blur_gaussian_conserves_mass_and_spreads() {
+        let w = 41usize;
+        let h = 41usize;
+        let mut buf = vec![0.0f32; w * h];
+        buf[20 * w + 20] = 1.0; // unit impulse at center
+        let before: f32 = buf.iter().sum();
+        super::box_blur_gaussian(&mut buf, w, h, 3.0);
+        let after: f32 = buf.iter().sum();
+        // Mass conserved (buffer is large enough that the 3σ tail stays inside).
+        assert!((after - before).abs() < 0.02, "mass conserved: {before} -> {after}");
+        // The impulse spread: the exact center decreased, neighbors increased.
+        assert!(buf[20 * w + 20] < 1.0, "center spread out, got {}", buf[20 * w + 20]);
+        assert!(buf[20 * w + 21] > 0.0, "neighbor lit, got {}", buf[20 * w + 21]);
+        // Monotonic decay away from the center along a row.
+        let c = buf[20 * w + 20];
+        let n1 = buf[20 * w + 22];
+        let n2 = buf[20 * w + 26];
+        assert!(c > n1 && n1 > n2, "kernel decays: {c} > {n1} > {n2}");
+    }
+
+    /// A solid disc with shadowBlur paints a SMOOTH soft shadow OUTSIDE the disc
+    /// (Gaussian falloff) and leaves pixels well beyond ~3σ untouched. The
+    /// falloff must be gradual (monotonically decreasing), not a hard cutoff.
+    #[test]
+    fn shadow_blur_paints_gaussian_falloff() {
+        let mut ctx = CanvasContext2D::new(120, 120);
+        let gold = Color { r: 255, g: 215, b: 0, a: 255 };
+        ctx.set_fill_color(gold);
+        ctx.set_shadow_color(gold);
+        ctx.set_shadow_blur(20.0); // sigma = 10
+        ctx.begin_path();
+        ctx.arc(60.0, 60.0, 12.0, 0.0, std::f32::consts::PI * 2.0, false);
+        ctx.fill(FillRule::Nonzero);
+        let alpha = |x: usize, y: usize| ((ctx.bitmap.pixels[y * 120 + x] >> 24) & 0xFF) as u32;
+        // Disc interior fully filled.
+        assert!(alpha(60, 60) > 200, "disc centre filled, got {}", alpha(60, 60));
+        // The glow decays monotonically moving outward from the disc edge
+        // (edge ~12px above center is y=48; sample progressively farther up).
+        let a_near = alpha(60, 44); // ~4px past edge
+        let a_mid = alpha(60, 36);  // ~12px past edge
+        let a_far = alpha(60, 30);  // ~18px past edge (~near 3σ tail)
+        assert!(a_near > 0, "near glow lit, got {a_near}");
+        assert!(a_near > a_mid, "glow decays outward: near {a_near} > mid {a_mid}");
+        assert!(a_mid >= a_far, "glow keeps decaying: mid {a_mid} >= far {a_far}");
+        // Far corner (well beyond shape + 3σ) stays transparent.
+        assert_eq!(alpha(118, 118), 0, "corner beyond shape+blur stays transparent");
+    }
+
+    /// shadowOffsetX/Y displace the shadow: with a positive offset the glow
+    /// appears on the offset side and is ABSENT on the opposite side.
+    #[test]
+    fn shadow_offset_displaces_glow() {
+        let mut ctx = CanvasContext2D::new(120, 120);
+        let red = Color { r: 255, g: 0, b: 0, a: 255 };
+        ctx.set_fill_color(Color { r: 0, g: 0, b: 255, a: 255 });
+        ctx.set_shadow_color(red);
+        ctx.set_shadow_blur(6.0);
+        ctx.set_shadow_offset(20.0, 0.0); // shift shadow +20px in X
+        ctx.fill_rect(40.0, 50.0, 20.0, 20.0); // rect [40..60]x[50..70]
+        // The (blue) rect itself is at x=40..60. The red shadow is shifted to
+        // x≈60..80. A pixel at x=70,y=60 (right of the rect) should be reddish.
+        let (r_right, _g, b_right, a_right) = unpack(ctx.bitmap.pixels[60 * 120 + 70]);
+        assert!(a_right > 0, "shadow present on offset (right) side, a={a_right}");
+        assert!(r_right > b_right, "offset side is shadow-red, got r={r_right} b={b_right}");
+        // The opposite (left) side, x≈25, has neither rect nor shadow → clear.
+        let a_left = (ctx.bitmap.pixels[60 * 120 + 25] >> 24) & 0xFF;
+        assert_eq!(a_left, 0, "no shadow on the non-offset (left) side, a={a_left}");
+    }
+
+    /// A transparent shadowColor disables the shadow entirely (spec: shadows are
+    /// only drawn when shadowColor is non-transparent).
+    #[test]
+    fn transparent_shadow_color_disables_shadow() {
+        let mut ctx = CanvasContext2D::new(80, 80);
+        ctx.set_fill_color(Color { r: 0, g: 0, b: 255, a: 255 });
+        ctx.set_shadow_color(Color::TRANSPARENT);
+        ctx.set_shadow_blur(20.0);
+        ctx.set_shadow_offset(10.0, 10.0);
+        ctx.fill_rect(20.0, 20.0, 20.0, 20.0);
+        // Outside the rect (where a shadow would have fallen) must be clear.
+        let a_outside = (ctx.bitmap.pixels[55 * 80 + 55] >> 24) & 0xFF;
+        assert_eq!(a_outside, 0, "transparent shadowColor → no shadow, a={a_outside}");
     }
 }

@@ -10367,6 +10367,32 @@ fn opfs_opt_recursive(arg: Option<&cv_js::Value>) -> bool {
     }
 }
 
+/// Build a throwable `DOMException` value with the given legacy `name`, WebIDL
+/// `code`, and message — the shape the interpreter recognises as a real Error
+/// (so `instanceof DOMException` and `.name`/`.code` work). Used by spec'd
+/// synchronous-throw APIs like `createRadialGradient` (negative radius →
+/// IndexSizeError).
+fn make_dom_exception(name: &str, code: u32, msg: &str) -> cv_js::Value {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    let mut m: cv_js::OrderedMap<String, cv_js::Value> = cv_js::OrderedMap::new();
+    m.insert("name".into(), cv_js::Value::String(name.into()));
+    m.insert("message".into(), cv_js::Value::str(msg.to_string()));
+    m.insert("code".into(), cv_js::Value::Number(f64::from(code)));
+    m.insert(
+        "stack".into(),
+        cv_js::Value::str(format!("{name}: {msg}")),
+    );
+    m.insert("_isError".into(), cv_js::Value::Bool(true));
+    m.insert(
+        "_errorClasses".into(),
+        cv_js::Value::Array(Rc::new(RefCell::new(vec![cv_js::Value::String(
+            "DOMException".into(),
+        )]))),
+    );
+    cv_js::Value::Object(Rc::new(RefCell::new(m)))
+}
+
 /// A rejected promise carrying a `NotFoundError` DOMException — what the spec
 /// requires when `getFileHandle`/`getDirectoryHandle` is called without
 /// `{ create: true }` on a missing entry.
@@ -39203,8 +39229,9 @@ fn sync_canvas_fill_stroke(
                         let get_f = |k: &str| om.get(k)
                             .and_then(|v| if let cv_js::Value::Number(n) = v { Some(*n as f32) } else { None })
                             .unwrap_or(0.0);
-                        let (cx, cy, r0, r1) = (get_f("cx"), get_f("cy"), get_f("r0"), get_f("r1"));
-                        ctx.borrow_mut().set_fill_radial_gradient(cx, cy, r0, r1, stops);
+                        let (x0, y0, r0) = (get_f("x0"), get_f("y0"), get_f("r0"));
+                        let (x1, y1, r1) = (get_f("x1"), get_f("y1"), get_f("r1"));
+                        ctx.borrow_mut().set_fill_radial_gradient(x0, y0, r0, x1, y1, r1, stops);
                     }
                     _ => {}
                 }
@@ -40318,18 +40345,36 @@ fn build_canvas_2d_jsobj(
         install(
             "createRadialGradient",
             Box::new(move |args| {
-                // createRadialGradient(cx0, cy0, r0, cx1, cy1, r1)
-                // We use the outer circle (cx1, cy1, r1) as the gradient center/radius.
+                // createRadialGradient(x0, y0, r0, x1, y1, r1) — the full
+                // two-circle form (start circle x0,y0,r0 → end circle x1,y1,r1).
                 let get = |i: usize| -> f64 {
                     args.get(i)
                         .and_then(|v| if let cv_js::Value::Number(n) = v { Some(*n) } else { None })
                         .unwrap_or(0.0)
                 };
+                let (x0, y0, r0, x1, y1, r1) =
+                    (get(0), get(1), get(2), get(3), get(4), get(5));
+                // Spec: non-finite values → NotSupportedError; negative radius →
+                // IndexSizeError. (WHATWG Canvas §4.12.5.1.10.)
+                for v in [x0, y0, r0, x1, y1, r1] {
+                    if !v.is_finite() {
+                        return Err(cv_js::JsError::Throw(make_dom_exception(
+                            "NotSupportedError",
+                            9,
+                            "createRadialGradient: non-finite argument",
+                        )));
+                    }
+                }
+                if r0 < 0.0 || r1 < 0.0 {
+                    return Err(cv_js::JsError::Throw(make_dom_exception(
+                        "IndexSizeError",
+                        1,
+                        "createRadialGradient: negative radius",
+                    )));
+                }
                 Ok(build_canvas_radial_gradient_jsobj(
-                    get(3) as f32, // cx1
-                    get(4) as f32, // cy1
-                    get(2) as f32, // r0 (inner radius)
-                    get(5) as f32, // r1 (outer radius)
+                    x0 as f32, y0 as f32, r0 as f32,
+                    x1 as f32, y1 as f32, r1 as f32,
                 ))
             }),
             &obj,
@@ -40473,10 +40518,22 @@ fn build_canvas_linear_gradient_jsobj(x0: f32, y0: f32, x1: f32, y1: f32) -> cv_
     cv_js::Value::Object(Rc::new(RefCell::new(m)))
 }
 
-/// Build a JS CanvasGradient object for `createRadialGradient(...)`.
+/// Build a JS CanvasGradient object for `createRadialGradient(x0,y0,r0,x1,y1,r1)`.
 ///
-/// Stores `_isCanvasGradient: true`, `type: "radial"`, `cx, cy, r0, r1`, `stops: []`.
-fn build_canvas_radial_gradient_jsobj(cx: f32, cy: f32, r0: f32, r1: f32) -> cv_js::Value {
+/// Stores `_isCanvasGradient: true`, `type: "radial"`, the full two-circle form
+/// `x0, y0, r0, x1, y1, r1`, and an empty `stops: []`. The full start AND end
+/// circle centers are preserved so focal (non-concentric) gradients render
+/// correctly — previously cx0/cy0 were dropped and the gradient collapsed to a
+/// single concentric center.
+#[allow(clippy::too_many_arguments)]
+fn build_canvas_radial_gradient_jsobj(
+    x0: f32,
+    y0: f32,
+    r0: f32,
+    x1: f32,
+    y1: f32,
+    r1: f32,
+) -> cv_js::Value {
     use std::cell::RefCell;
     use std::rc::Rc;
     use cv_js::OrderedMap as HashMap;
@@ -40487,9 +40544,11 @@ fn build_canvas_radial_gradient_jsobj(cx: f32, cy: f32, r0: f32, r1: f32) -> cv_
     let mut m: HashMap<String, cv_js::Value> = HashMap::new();
     m.insert("_isCanvasGradient".into(), cv_js::Value::Bool(true));
     m.insert("type".into(), cv_js::Value::String("radial".into()));
-    m.insert("cx".into(), cv_js::Value::Number(f64::from(cx)));
-    m.insert("cy".into(), cv_js::Value::Number(f64::from(cy)));
+    m.insert("x0".into(), cv_js::Value::Number(f64::from(x0)));
+    m.insert("y0".into(), cv_js::Value::Number(f64::from(y0)));
     m.insert("r0".into(), cv_js::Value::Number(f64::from(r0)));
+    m.insert("x1".into(), cv_js::Value::Number(f64::from(x1)));
+    m.insert("y1".into(), cv_js::Value::Number(f64::from(y1)));
     m.insert("r1".into(), cv_js::Value::Number(f64::from(r1)));
     m.insert("stops".into(), cv_js::Value::Array(stops_arr));
     m.insert(
@@ -49613,6 +49672,117 @@ mod tests {
         assert_eq!(read(&runtime, "__pat_ok"), "true", "createPattern returns a pattern");
         assert_eq!(read(&runtime, "__pat_r"), "255", "pattern tiles red across fill");
         assert_eq!(read(&runtime, "__pat_a"), "255");
+    }
+
+    /// End-to-end (JS → render): createRadialGradient with the full two-circle
+    /// form samples a real MID color across all stops (not a 2-color flatten),
+    /// preserves focal (non-concentric) centers, casts a real shadowBlur glow,
+    /// and throws IndexSizeError on a negative radius — all via the JS bindings,
+    /// read back through getImageData.
+    #[test]
+    fn canvas2d_radial_gradient_and_shadow_wired_through_js() {
+        let doc = cv_html::parse("<!doctype html><html><body></body></html>");
+        let mut runtime = LiveInterp::new(&doc, "https://example.com/");
+        let read = |rt: &LiveInterp, k: &str| -> String {
+            rt.interp
+                .get_global("window")
+                .and_then(|w| match w {
+                    cv_js::Value::Object(o) => o.borrow().get(k).cloned(),
+                    _ => None,
+                })
+                .map(|v| v.to_display_string())
+                .unwrap_or_default()
+        };
+
+        // 1. Concentric radial gradient red→green(0.5)→blue. A pixel at half the
+        //    radius must be GREEN-dominant — proving interior stops sample, not a
+        //    first/last 2-color flatten.
+        runtime
+            .interp
+            .run(
+                "var c = document.createElement('canvas'); c.width=40; c.height=40;\
+                 var ctx = c.getContext('2d');\
+                 var g = ctx.createRadialGradient(20,20,0, 20,20,20);\
+                 g.addColorStop(0,'rgb(255,0,0)');\
+                 g.addColorStop(0.5,'rgb(0,255,0)');\
+                 g.addColorStop(1,'rgb(0,0,255)');\
+                 ctx.fillStyle = g; ctx.fillRect(0,0,40,40);\
+                 var ctr = ctx.getImageData(20,20,1,1).data;\
+                 window.__rg_cr = ctr[0]; window.__rg_cb = ctr[2];\
+                 var mid = ctx.getImageData(30,20,1,1).data;\
+                 window.__rg_mr = mid[0]; window.__rg_mg = mid[1]; window.__rg_mb = mid[2];\
+                 var edge = ctx.getImageData(39,20,1,1).data;\
+                 window.__rg_eb = edge[2];",
+            )
+            .expect("radial gradient renders");
+        let cr: i32 = read(&runtime, "__rg_cr").parse().unwrap_or(-1);
+        assert!(cr > 200, "center is red via JS, got r={cr}");
+        let mg: i32 = read(&runtime, "__rg_mg").parse().unwrap_or(-1);
+        let mr: i32 = read(&runtime, "__rg_mr").parse().unwrap_or(-1);
+        let mb: i32 = read(&runtime, "__rg_mb").parse().unwrap_or(-1);
+        assert!(mg > 180, "half-radius is green-dominant via JS, got g={mg}");
+        assert!(mr < 80 && mb < 80, "half-radius not red/blue, got r={mr} b={mb}");
+        let eb: i32 = read(&runtime, "__rg_eb").parse().unwrap_or(-1);
+        assert!(eb > 180, "edge is blue via JS, got b={eb}");
+
+        // 2. Focal (non-concentric) gradient: start circle offset from end. The
+        //    full two-circle form must be honored — the bright center follows the
+        //    start circle's location, NOT the end circle's center. Start at
+        //    (10,20,0) inside end (20,20,20): the red focal point is at x=10, so
+        //    x=10 is redder than the symmetric x=30.
+        runtime
+            .interp
+            .run(
+                "var c2 = document.createElement('canvas'); c2.width=40; c2.height=40;\
+                 var x = c2.getContext('2d');\
+                 var g2 = x.createRadialGradient(10,20,0, 20,20,20);\
+                 g2.addColorStop(0,'rgb(255,0,0)');\
+                 g2.addColorStop(1,'rgb(0,0,255)');\
+                 x.fillStyle = g2; x.fillRect(0,0,40,40);\
+                 var l = x.getImageData(10,20,1,1).data; window.__fg_lr = l[0];\
+                 var r = x.getImageData(30,20,1,1).data; window.__fg_rr = r[0];",
+            )
+            .expect("focal radial gradient renders");
+        let lr: i32 = read(&runtime, "__fg_lr").parse().unwrap_or(-1);
+        let rr: i32 = read(&runtime, "__fg_rr").parse().unwrap_or(-1);
+        assert!(
+            lr > rr + 40,
+            "focal point at x=10 is much redder than x=30 (focal honored), lr={lr} rr={rr}"
+        );
+
+        // 3. shadowBlur casts a soft glow behind a rect (read a pixel OUTSIDE the
+        //    rect, inside the blur radius).
+        runtime
+            .interp
+            .run(
+                "var c3 = document.createElement('canvas'); c3.width=80; c3.height=80;\
+                 var s = c3.getContext('2d');\
+                 s.shadowColor = 'rgb(255,0,0)'; s.shadowBlur = 12;\
+                 s.fillStyle = 'rgb(0,0,255)'; s.fillRect(30,30,20,20);\
+                 var glow = s.getImageData(55,40,1,1).data;\
+                 window.__sh_r = glow[0]; window.__sh_a = glow[3];",
+            )
+            .expect("shadowBlur renders");
+        let sh_a: i32 = read(&runtime, "__sh_a").parse().unwrap_or(-1);
+        let sh_r: i32 = read(&runtime, "__sh_r").parse().unwrap_or(-1);
+        assert!(sh_a > 0 && sh_a < 255, "soft shadow alpha partial via JS, got a={sh_a}");
+        assert!(sh_r > 100, "shadow is red via JS, got r={sh_r}");
+
+        // 4. Negative radius throws IndexSizeError (spec).
+        runtime
+            .interp
+            .run(
+                "var c4 = document.createElement('canvas');\
+                 var z = c4.getContext('2d');\
+                 try { z.createRadialGradient(0,0,-1, 0,0,5); window.__neg = 'no-throw'; }\
+                 catch (e) { window.__neg = (e && e.name) ? e.name : 'threw'; }",
+            )
+            .expect("negative radius path runs");
+        assert_eq!(
+            read(&runtime, "__neg"),
+            "IndexSizeError",
+            "negative radius throws IndexSizeError"
+        );
     }
 
     #[test]
