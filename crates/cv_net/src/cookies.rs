@@ -10,10 +10,12 @@
 //! any whose expiry is in the past at load time. Session cookies (no
 //! expiry) stay in-memory only, per spec.
 //!
+//! We enforce the `__Host-` / `__Secure-` cookie name prefixes
+//! (RFC 6265bis §5.7 steps 20-21; see [`parse_set_cookie`]).
+//!
 //! What we don't do yet:
 //!   * Public-suffix-list check (a malicious server could set a cookie
 //!     against `.co.uk`). Handled by `psl` for the common cases.
-//!   * `__Host-` / `__Secure-` prefix checks.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -525,6 +527,13 @@ fn default_path(request_path: &str) -> String {
     request_path[..last].to_string()
 }
 
+/// ASCII case-insensitive `starts_with`, used for cookie name-prefix
+/// matching (RFC 6265bis §5.7 specifies a "case-insensitive match", and
+/// Chrome's `GetCookiePrefix` uses `base::CompareCase::INSENSITIVE_ASCII`).
+fn starts_with_ascii_ci(s: &str, prefix: &str) -> bool {
+    s.len() >= prefix.len() && s.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
+}
+
 fn parse_set_cookie(
     value: &str,
     request_host: &str,
@@ -639,6 +648,44 @@ fn parse_set_cookie(
     }
 
     let path = path_attr.unwrap_or_else(|| default_path(request_path));
+
+    // Cookie name-prefix enforcement (RFC 6265bis §5.7 steps 20-21,
+    // Chrome net/cookies/cookie_util.cc `IsCookiePrefixValid` /
+    // `HasValidSecurePrefixAttributes` / `HasValidHostPrefixAttributes`).
+    //
+    // The prefix match is CASE-INSENSITIVE: the spec says "a case-insensitive
+    // match for the string", and current Chrome's `GetCookiePrefix` uses
+    // `base::CompareCase::INSENSITIVE_ASCII`. (We deliberately follow the
+    // spec + live Chrome source here.)
+    //
+    //   * `__Secure-` requires the Secure attribute (and, since Secure from a
+    //     non-https origin is already rejected above, a cryptographic origin —
+    //     mirroring `HasValidSecurePrefixAttributes`, which demands
+    //     `secure && ProvisionalAccessScheme(url) != kNonCryptographic`).
+    //   * `__Host-` additionally requires the cookie to be host-only (no Domain
+    //     attribute that broadens scope) and the resolved Path to be exactly
+    //     "/". Chrome's `HasValidHostPrefixAttributes` compares the *resolved*
+    //     path to "/" (`path != "/"`), not whether a Path attribute was given,
+    //     so we compare the resolved `path` here. Our `host_only` flag is the
+    //     analogue of Chrome's `domain.empty()` host-only requirement (a Domain
+    //     attribute that exactly equals a public-suffix host degraded to
+    //     host-only upstream, matching Chrome's IP-literal carve-out closely
+    //     enough for the host-only-flag check).
+    //
+    // On any violation the cookie is ignored entirely (not stored).
+    if starts_with_ascii_ci(name, "__Secure-") {
+        // Step 20: ignore unless secure-only-flag is true. (is_https is
+        // implied because `secure && !is_https` was already rejected.)
+        if !secure {
+            return None;
+        }
+    }
+    if starts_with_ascii_ci(name, "__Host-") {
+        // Step 21: ignore unless secure-only-flag && host-only-flag && path=="/".
+        if !secure || !host_only || path != "/" {
+            return None;
+        }
+    }
 
     // Expiry: Max-Age wins over Expires per spec. A negative or zero
     // Max-Age means "expire immediately". We compute the relative
@@ -1294,5 +1341,198 @@ mod tests {
         assert_eq!(jar.len(), 1);
         let h = jar.cookie_header("example.com", "/", true).unwrap();
         assert_eq!(h, "a=1");
+    }
+
+    // --- Cookie name-prefix enforcement (RFC 6265bis §5.7 steps 20-21;
+    //     Chrome net/cookies/cookie_util.cc IsCookiePrefixValid) ---
+
+    #[test]
+    fn starts_with_ascii_ci_helper() {
+        assert!(starts_with_ascii_ci("__Host-x", "__Host-"));
+        assert!(starts_with_ascii_ci("__HOST-x", "__Host-"));
+        assert!(starts_with_ascii_ci("__host-x", "__Host-"));
+        assert!(starts_with_ascii_ci("__SeCuRe-x", "__Secure-"));
+        assert!(!starts_with_ascii_ci("__Hos", "__Host-")); // shorter than prefix
+        assert!(!starts_with_ascii_ci("X__Host-", "__Host-")); // not a prefix
+    }
+
+    #[test]
+    fn host_prefix_with_domain_attr_rejected() {
+        // __Host- forbids any Domain attribute (host-only-flag must be true).
+        let c = parse_set_cookie(
+            "__Host-id=1; Secure; Path=/; Domain=example.com",
+            "example.com",
+            "/",
+            true,
+        );
+        assert!(c.is_none(), "__Host- with Domain must be rejected");
+        let jar = CookieJar::new();
+        jar.absorb(
+            &[(
+                "Set-Cookie".into(),
+                "__Host-id=1; Secure; Path=/; Domain=example.com".into(),
+            )],
+            "example.com",
+            "/",
+            true,
+        );
+        assert_eq!(jar.len(), 0);
+    }
+
+    #[test]
+    fn host_prefix_without_secure_rejected() {
+        // Even over https, no Secure attribute => reject.
+        let c = parse_set_cookie("__Host-id=1; Path=/", "example.com", "/", true);
+        assert!(c.is_none(), "__Host- without Secure must be rejected");
+    }
+
+    #[test]
+    fn host_prefix_with_non_root_path_rejected() {
+        // Resolved path must be exactly "/".
+        let c = parse_set_cookie(
+            "__Host-id=1; Secure; Path=/foo",
+            "example.com",
+            "/foo",
+            true,
+        );
+        assert!(c.is_none(), "__Host- with Path=/foo must be rejected");
+    }
+
+    #[test]
+    fn host_prefix_with_implicit_non_root_path_rejected() {
+        // No explicit Path attribute: the default-path is derived from the
+        // request path. Chrome compares the *resolved* path to "/", so a
+        // request like /foo/bar (default-path "/foo") must also be rejected.
+        let c = parse_set_cookie("__Host-id=1; Secure", "example.com", "/foo/bar", true);
+        assert!(
+            c.is_none(),
+            "__Host- whose resolved (default) path is not / must be rejected"
+        );
+    }
+
+    #[test]
+    fn valid_host_prefix_accepted_host_only() {
+        // Secure + no Domain + Path=/ over https => accepted, and host-only.
+        let c = parse_set_cookie("__Host-id=abc; Secure; Path=/", "example.com", "/", true)
+            .expect("valid __Host- cookie must be accepted");
+        assert_eq!(c.name, "__Host-id");
+        assert_eq!(c.value, "abc");
+        assert!(c.secure, "must carry Secure");
+        assert!(c.host_only, "__Host- cookie is host-only");
+        assert_eq!(c.path, "/");
+
+        // End-to-end via the jar: sent to the exact host, never to a subdomain.
+        let jar = CookieJar::new();
+        jar.absorb(
+            &[(
+                "Set-Cookie".into(),
+                "__Host-id=abc; Secure; Path=/".into(),
+            )],
+            "example.com",
+            "/",
+            true,
+        );
+        assert_eq!(jar.len(), 1);
+        assert!(
+            jar.cookie_header("www.example.com", "/", true).is_none(),
+            "host-only __Host- cookie must not leak to a subdomain"
+        );
+        let h = jar.cookie_header("example.com", "/page", true).unwrap();
+        assert_eq!(h, "__Host-id=abc");
+    }
+
+    #[test]
+    fn host_prefix_accepts_default_root_path_without_explicit_attr() {
+        // Chrome checks the resolved path, not whether a Path attribute was
+        // given. A request to "/" yields default-path "/", so a __Host-
+        // cookie with no explicit Path is valid.
+        let c = parse_set_cookie("__Host-id=abc; Secure", "example.com", "/", true)
+            .expect("__Host- with default root path must be accepted");
+        assert_eq!(c.path, "/");
+        assert!(c.host_only);
+    }
+
+    #[test]
+    fn secure_prefix_without_secure_rejected() {
+        // __Secure- requires the Secure attribute.
+        let c = parse_set_cookie("__Secure-id=1", "example.com", "/", true);
+        assert!(c.is_none(), "__Secure- without Secure must be rejected");
+        let jar = CookieJar::new();
+        jar.absorb(
+            &[("Set-Cookie".into(), "__Secure-id=1".into())],
+            "example.com",
+            "/",
+            true,
+        );
+        assert_eq!(jar.len(), 0);
+    }
+
+    #[test]
+    fn secure_prefix_with_secure_over_https_accepted() {
+        // __Secure- with Secure over https => accepted (may carry a Domain).
+        let c = parse_set_cookie(
+            "__Secure-id=v; Secure; Domain=example.com",
+            "example.com",
+            "/",
+            true,
+        )
+        .expect("valid __Secure- cookie must be accepted");
+        assert_eq!(c.name, "__Secure-id");
+        assert!(c.secure);
+        // Domain is allowed for __Secure- (only __Host- forbids it), so this
+        // cookie is NOT host-only.
+        assert!(!c.host_only, "__Secure- may scope a Domain");
+
+        let jar = CookieJar::new();
+        jar.absorb(
+            &[(
+                "Set-Cookie".into(),
+                "__Secure-id=v; Secure; Domain=example.com".into(),
+            )],
+            "example.com",
+            "/",
+            true,
+        );
+        // Domain-scoped => reaches subdomains.
+        assert!(jar.cookie_header("www.example.com", "/", true).is_some());
+    }
+
+    #[test]
+    fn secure_prefix_over_plain_http_rejected() {
+        // A __Secure- cookie can only be set with Secure, and Secure from a
+        // non-https origin is itself rejected, so it can never be set on http.
+        let c = parse_set_cookie("__Secure-id=1; Secure", "example.com", "/", false);
+        assert!(
+            c.is_none(),
+            "__Secure- (Secure) from plain http must be rejected"
+        );
+    }
+
+    #[test]
+    fn prefix_match_is_case_insensitive_like_chrome() {
+        // RFC 6265bis §5.7 + Chrome GetCookiePrefix: case-insensitive match.
+        // So "__host-" / "__SECURE-" are also enforced.
+        assert!(
+            parse_set_cookie("__host-id=1; Domain=example.com; Secure; Path=/", "example.com", "/", true).is_none(),
+            "lowercase __host- prefix must still be enforced (Domain rejected)"
+        );
+        assert!(
+            parse_set_cookie("__SECURE-id=1", "example.com", "/", true).is_none(),
+            "uppercase __SECURE- prefix must still be enforced (no Secure rejected)"
+        );
+        // And a valid lowercase variant is accepted.
+        assert!(
+            parse_set_cookie("__host-id=1; Secure; Path=/", "example.com", "/", true).is_some(),
+            "valid lowercase __host- cookie must be accepted"
+        );
+    }
+
+    #[test]
+    fn ordinary_cookie_unaffected_by_prefix_rules() {
+        // A cookie whose name merely contains, but does not start with, a
+        // prefix string is untouched.
+        let c = parse_set_cookie("x__Host-=1", "example.com", "/", true)
+            .expect("name not starting with __Host- is unaffected");
+        assert_eq!(c.name, "x__Host-");
     }
 }
