@@ -151,6 +151,134 @@ impl Request {
         self.method = method.into();
         self
     }
+
+    /// Request a single byte range `[first, last]` (inclusive), per
+    /// RFC 9110 §14.2 — emits `Range: bytes=first-last`. This is the form
+    /// Chrome's media stack uses for seeking (`net::HttpRequestHeaders`
+    /// with `kRange` = "bytes=" + start + "-" + end). `first`/`last` are
+    /// absolute byte offsets into the resource; `last` is INCLUSIVE, so a
+    /// 1024-byte first block is `range(0, 1023)`.
+    pub fn range(self, first: u64, last: u64) -> Self {
+        self.header("Range", &format!("bytes={first}-{last}"))
+    }
+
+    /// Request from `first` to the end of the resource, per RFC 9110
+    /// §14.1.1 (`int-range` with absent `last-pos`) — emits
+    /// `Range: bytes=first-`. Chrome uses this to resume an interrupted
+    /// download from the last byte already received
+    /// (`PartialData::PrepareCacheValidation` → "bytes=" + offset + "-").
+    pub fn range_from(self, first: u64) -> Self {
+        self.header("Range", &format!("bytes={first}-"))
+    }
+
+    /// Request the last `suffix_len` bytes of the resource, per RFC 9110
+    /// §14.1.2 (`suffix-range`) — emits `Range: bytes=-suffix_len`. Used to
+    /// read trailing metadata (e.g. a ZIP central directory, MP4 `moov`
+    /// atom at the tail) without knowing the total length.
+    pub fn range_suffix(self, suffix_len: u64) -> Self {
+        self.header("Range", &format!("bytes=-{suffix_len}"))
+    }
+
+    /// Make the attached `Range` conditional on the resource being
+    /// unchanged, per RFC 9110 §13.1.5. `validator` is either a strong
+    /// entity-tag (`"abc"` / `W/"abc"`) or an HTTP-date (Last-Modified).
+    /// If the validator still matches at the server the response is `206`
+    /// with just the requested slice; if it changed the server returns the
+    /// FULL `200` body so the client can re-fetch coherently. Chrome sets
+    /// this from the cached entry's validator when resuming a download
+    /// (`PartialData::PrepareCacheValidation`).
+    pub fn if_range(self, validator: &str) -> Self {
+        self.header("If-Range", validator)
+    }
+}
+
+/// A parsed `Content-Range` response header (RFC 9110 §14.4).
+///
+/// For a satisfied range (`bytes first-last/complete-length`) all three of
+/// `first`, `last`, `complete_len` are present. For an UNSATISFIED range
+/// (the 416 form `bytes */complete-length`) only `complete_len` is set and
+/// `first`/`last` are `None`. A `complete-length` of `*` (server doesn't
+/// know the total) leaves `complete_len` `None`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContentRange {
+    /// First byte position of the returned slice (inclusive), absolute.
+    pub first: Option<u64>,
+    /// Last byte position of the returned slice (inclusive), absolute.
+    pub last: Option<u64>,
+    /// Total length of the complete representation, if the server stated it.
+    pub complete_len: Option<u64>,
+}
+
+impl ContentRange {
+    /// Number of bytes in the returned slice (`last - first + 1`), if both
+    /// positions are known. This MUST equal the 206 body length.
+    pub fn slice_len(&self) -> Option<u64> {
+        match (self.first, self.last) {
+            (Some(f), Some(l)) if l >= f => Some(l - f + 1),
+            _ => None,
+        }
+    }
+}
+
+/// Parse a `Content-Range` field value per RFC 9110 §14.4:
+///   `bytes SP first-last/complete-length`  (satisfied)
+///   `bytes SP first-last/*`                (satisfied, unknown total)
+///   `bytes SP */complete-length`           (unsatisfied — 416 form)
+/// The unit MUST be the (case-insensitive) token `bytes`; any other unit
+/// or a malformed value returns `None` (callers treat that as "no usable
+/// range info" and fall back to the whole body). Numbers that overflow a
+/// `u64` are rejected rather than silently wrapped.
+pub fn parse_content_range(value: &str) -> Option<ContentRange> {
+    let v = value.trim();
+    // "bytes" unit (case-insensitive), separated from the range-resp by
+    // whitespace. Any other range-unit is unsupported → None.
+    if v.len() < 5 || !v[..5].eq_ignore_ascii_case("bytes") {
+        return None;
+    }
+    let rest = v[5..].trim_start();
+    // `range-resp = incl-range "/" ( complete-length / "*" )`
+    //            | `unsatisfied-range = "*" "/" complete-length`
+    let (range_part, len_part) = rest.split_once('/')?;
+    let range_part = range_part.trim();
+    let len_part = len_part.trim();
+
+    let complete_len = if len_part == "*" {
+        None
+    } else {
+        Some(len_part.parse::<u64>().ok()?)
+    };
+
+    if range_part == "*" {
+        // Unsatisfied-range form (the body the 416 carries). Both
+        // positions absent; complete-length MUST be present per grammar.
+        if complete_len.is_none() {
+            return None;
+        }
+        return Some(ContentRange {
+            first: None,
+            last: None,
+            complete_len,
+        });
+    }
+
+    let (first_s, last_s) = range_part.split_once('-')?;
+    let first = first_s.trim().parse::<u64>().ok()?;
+    let last = last_s.trim().parse::<u64>().ok()?;
+    // A satisfied range must have last >= first (RFC 9110 §14.4).
+    if last < first {
+        return None;
+    }
+    // If the server stated a complete-length, the range must fit inside it.
+    if let Some(total) = complete_len {
+        if last >= total {
+            return None;
+        }
+    }
+    Some(ContentRange {
+        first: Some(first),
+        last: Some(last),
+        complete_len,
+    })
 }
 
 #[derive(Debug)]
@@ -168,6 +296,45 @@ impl Response {
             .iter()
             .find(|(k, _)| k.to_ascii_lowercase() == name_lc)
             .map(|(_, v)| v.as_str())
+    }
+
+    /// `true` when this is a `206 Partial Content` response carrying just
+    /// the requested byte range (RFC 9110 §15.3.7).
+    pub fn is_partial(&self) -> bool {
+        self.status == 206
+    }
+
+    /// `true` when the server rejected the requested range as outside the
+    /// representation — `416 Range Not Satisfiable` (RFC 9110 §15.5.17).
+    /// The body (and `content_range()`) typically carries `bytes */total`.
+    pub fn is_range_not_satisfiable(&self) -> bool {
+        self.status == 416
+    }
+
+    /// The parsed `Content-Range` header, if present and well-formed
+    /// (RFC 9110 §14.4). On a `206` this gives the slice's `first`/`last`
+    /// byte positions and the `complete_len` total; on a `416` it gives the
+    /// `bytes */total` unsatisfied form (positions `None`, total `Some`).
+    pub fn content_range(&self) -> Option<ContentRange> {
+        parse_content_range(self.header("content-range")?)
+    }
+
+    /// The range units the origin advertises it can serve, from the
+    /// `Accept-Ranges` header (RFC 9110 §14.3) — e.g. `Some("bytes")`.
+    /// `Some("none")` means the server explicitly does NOT support ranges;
+    /// `None` means it said nothing (treat as unknown / no range support).
+    pub fn accept_ranges(&self) -> Option<&str> {
+        self.header("accept-ranges")
+    }
+
+    /// Convenience: does the origin advertise byte-range support?
+    /// True only for an explicit `Accept-Ranges: bytes` (case-insensitive),
+    /// matching how Chrome decides a media resource is seekable
+    /// (`media::ResourceMultiBuffer` checks for `Accept-Ranges: bytes`).
+    pub fn supports_byte_ranges(&self) -> bool {
+        self.accept_ranges()
+            .map(|v| v.split(',').any(|t| t.trim().eq_ignore_ascii_case("bytes")))
+            .unwrap_or(false)
     }
 }
 
@@ -1836,6 +2003,222 @@ mod tests {
         // Direct unit check too.
         let headers = vec![("Content-Encoding".to_string(), "gzip".to_string())];
         assert!(decode_content_encoding(&headers, Vec::new()).unwrap().is_empty());
+    }
+
+    // ==================================================================
+    // HTTP Range requests / 206 Partial Content (RFC 9110 §14).
+    // ==================================================================
+
+    /// The typed Range builders emit Chrome-shaped `Range:` headers:
+    /// `bytes=first-last`, `bytes=first-`, `bytes=-suffix`. The header
+    /// must survive onto the request unchanged (caller headers are passed
+    /// through verbatim by transact_with_deadline).
+    #[test]
+    fn range_request_builders_emit_correct_header() {
+        let url = Url::parse("https://example.com/video.mp4").unwrap();
+
+        let r = Request::get(url.clone()).range(0, 1023);
+        assert_eq!(
+            r.headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("range"))
+                .map(|(_, v)| v.as_str()),
+            Some("bytes=0-1023")
+        );
+
+        let r = Request::get(url.clone()).range_from(2048);
+        assert_eq!(
+            r.headers.iter().find(|(k, _)| k == "Range").unwrap().1,
+            "bytes=2048-"
+        );
+
+        let r = Request::get(url.clone()).range_suffix(500);
+        assert_eq!(
+            r.headers.iter().find(|(k, _)| k == "Range").unwrap().1,
+            "bytes=-500"
+        );
+
+        // If-Range pins the range to a validator.
+        let r = Request::get(url).range(0, 99).if_range("\"abc-etag\"");
+        assert_eq!(
+            r.headers.iter().find(|(k, _)| k == "If-Range").unwrap().1,
+            "\"abc-etag\""
+        );
+    }
+
+    /// The whole wire request for a Range GET must actually carry the
+    /// `Range:` header — proving transact's header pass-through does NOT
+    /// strip caller headers. We run a real loopback server that echoes the
+    /// raw request line + headers back as the 206 body and assert the
+    /// `Range:` line is present on the wire.
+    #[test]
+    fn range_header_reaches_the_wire() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut sock, _)) = listener.accept() {
+                let mut buf = [0u8; 2048];
+                let n = sock.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                let saw_range = req
+                    .lines()
+                    .any(|l| l.to_ascii_lowercase().starts_with("range:"));
+                let marker = if saw_range { "RANGE-SEEN" } else { "NO-RANGE" };
+                let body = marker.as_bytes();
+                let head = format!(
+                    "HTTP/1.1 206 Partial Content\r\nAccept-Ranges: bytes\r\n\
+                     Content-Range: bytes 0-{}/100\r\nContent-Length: {}\r\n\
+                     Connection: close\r\n\r\n",
+                    body.len() - 1,
+                    body.len()
+                );
+                let _ = sock.write_all(head.as_bytes());
+                let _ = sock.write_all(body);
+            }
+        });
+        let url = Url::parse(&format!("http://127.0.0.1:{port}/f")).unwrap();
+        let client = Client::with_timeout(5000);
+        let req = Request::get(url).range(0, 9);
+        let resp = client.send(req).expect("range fetch");
+        assert_eq!(resp.status, 206);
+        assert!(resp.is_partial());
+        assert_eq!(resp.body, b"RANGE-SEEN", "Range header was stripped!");
+    }
+
+    /// Parse a synthetic 206 response: status, Content-Range start/end/total,
+    /// Accept-Ranges, and that the body is exactly the slice.
+    #[test]
+    fn parses_206_partial_content() {
+        let raw = b"HTTP/1.1 206 Partial Content\r\n\
+                    Accept-Ranges: bytes\r\n\
+                    Content-Range: bytes 200-1023/146515\r\n\
+                    Content-Length: 824\r\n\
+                    Content-Type: video/mp4\r\n\r\n";
+        // Body of exactly 824 bytes (1023-200+1).
+        let mut buf = raw.to_vec();
+        buf.extend(std::iter::repeat(b'X').take(824));
+        let r = parse_response(&buf).unwrap();
+        assert_eq!(r.status, 206);
+        assert!(r.is_partial());
+        assert!(r.supports_byte_ranges());
+        assert_eq!(r.accept_ranges(), Some("bytes"));
+
+        let cr = r.content_range().expect("Content-Range must parse");
+        assert_eq!(cr.first, Some(200));
+        assert_eq!(cr.last, Some(1023));
+        assert_eq!(cr.complete_len, Some(146515));
+        assert_eq!(cr.slice_len(), Some(824));
+        // The body is exactly the slice — its length equals last-first+1.
+        assert_eq!(r.body.len() as u64, cr.slice_len().unwrap());
+    }
+
+    /// 416 Range Not Satisfiable: status flagged, and the unsatisfied-range
+    /// `bytes */total` Content-Range parses with no positions but a total.
+    #[test]
+    fn parses_416_range_not_satisfiable() {
+        let raw = b"HTTP/1.1 416 Range Not Satisfiable\r\n\
+                    Content-Range: bytes */146515\r\n\
+                    Content-Length: 0\r\n\r\n";
+        let r = parse_response(raw).unwrap();
+        assert_eq!(r.status, 416);
+        assert!(r.is_range_not_satisfiable());
+        let cr = r.content_range().expect("unsatisfied Content-Range parses");
+        assert_eq!(cr.first, None);
+        assert_eq!(cr.last, None);
+        assert_eq!(cr.complete_len, Some(146515));
+        assert_eq!(cr.slice_len(), None);
+    }
+
+    /// If-Range semantics at the response level: when the validator still
+    /// matches the server returns 206 (the slice); when it changed the
+    /// server returns the FULL 200 body. We assert the client surfaces both
+    /// faithfully (it does not itself decide — it reports what arrived).
+    #[test]
+    fn if_range_conditional_206_vs_200() {
+        // Unchanged validator → 206 slice.
+        let mut p = b"HTTP/1.1 206 Partial Content\r\n\
+                      Content-Range: bytes 0-3/12\r\nContent-Length: 4\r\n\r\n"
+            .to_vec();
+        p.extend_from_slice(b"abcd");
+        let r = parse_response(&p).unwrap();
+        assert!(r.is_partial());
+        assert_eq!(r.body, b"abcd");
+        assert_eq!(r.content_range().unwrap().complete_len, Some(12));
+
+        // Changed validator → server ignores the Range and sends 200 full.
+        let mut full = b"HTTP/1.1 200 OK\r\nContent-Length: 12\r\nAccept-Ranges: bytes\r\n\r\n"
+            .to_vec();
+        full.extend_from_slice(b"abcdefghijkl");
+        let r = parse_response(&full).unwrap();
+        assert!(!r.is_partial());
+        assert_eq!(r.status, 200);
+        assert_eq!(r.body, b"abcdefghijkl");
+        // No Content-Range on a 200 — the consumer must use the whole body.
+        assert!(r.content_range().is_none());
+    }
+
+    /// Direct unit coverage of the Content-Range grammar parser, including
+    /// the unknown-total `*` form, malformed/overflow rejection, and the
+    /// case-insensitive `bytes` unit.
+    #[test]
+    fn content_range_parser_grammar() {
+        // Satisfied with explicit total.
+        let cr = parse_content_range("bytes 0-499/1234").unwrap();
+        assert_eq!((cr.first, cr.last, cr.complete_len), (Some(0), Some(499), Some(1234)));
+        assert_eq!(cr.slice_len(), Some(500));
+
+        // Satisfied, unknown total (`*`).
+        let cr = parse_content_range("bytes 100-199/*").unwrap();
+        assert_eq!((cr.first, cr.last, cr.complete_len), (Some(100), Some(199), None));
+        assert_eq!(cr.slice_len(), Some(100));
+
+        // Unsatisfied-range form (the 416 body).
+        let cr = parse_content_range("bytes */777").unwrap();
+        assert_eq!((cr.first, cr.last, cr.complete_len), (None, None, Some(777)));
+
+        // Case-insensitive unit + extra whitespace tolerated.
+        let cr = parse_content_range("  BYTES   5-9 / 10 ").unwrap();
+        assert_eq!((cr.first, cr.last, cr.complete_len), (Some(5), Some(9), Some(10)));
+
+        // Rejections: wrong unit, last<first, range past total, both `*`,
+        // garbage, and integer overflow.
+        assert!(parse_content_range("items 0-9/10").is_none());
+        assert!(parse_content_range("bytes 9-0/10").is_none());
+        assert!(parse_content_range("bytes 0-10/10").is_none()); // last >= total
+        assert!(parse_content_range("bytes */*").is_none());
+        assert!(parse_content_range("bytes nonsense").is_none());
+        assert!(parse_content_range("bytes 0-99999999999999999999/x").is_none());
+    }
+
+    /// CACHE CORRECTNESS: a 206 partial response must NOT be stored as a
+    /// normal full-body cache entry (this cache has no sparse backing
+    /// store, so a later full-GET hit would return the slice as if it were
+    /// the whole resource — silent truncation). Chrome routes 206s through
+    /// partial_data.cc sparse entries instead; with no sparse store the
+    /// right behavior is "don't cache". A 200 with the same headers IS
+    /// cached, proving we only excluded the partial.
+    #[test]
+    fn cache_does_not_store_206_as_full_entry() {
+        let headers = vec![
+            ("Content-Range".to_string(), "bytes 0-3/12".to_string()),
+            ("Cache-Control".to_string(), "max-age=3600".to_string()),
+            ("Accept-Ranges".to_string(), "bytes".to_string()),
+        ];
+        // 206 → not cached even with an explicit cacheable Cache-Control.
+        assert!(
+            crate::cache::build_entry_if_cacheable(206, "Partial Content", &headers, b"abcd", &[])
+                .is_none(),
+            "206 partial content must never be stored as a full cache entry"
+        );
+        // 200 with the same Cache-Control IS cacheable (control case).
+        let h200 = vec![("Cache-Control".to_string(), "max-age=3600".to_string())];
+        assert!(
+            crate::cache::build_entry_if_cacheable(200, "OK", &h200, b"abcdefghijkl", &[])
+                .is_some(),
+            "200 full content should still cache normally"
+        );
     }
 
     // ==================================================================

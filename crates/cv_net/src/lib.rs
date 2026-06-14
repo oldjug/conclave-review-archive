@@ -40,7 +40,7 @@ pub mod websocket;
 
 pub use cache::{CacheControl, CachedEntry, HttpCache};
 pub use cookies::{CookieJar, SameSite};
-pub use http1::{Client, Request, Response};
+pub use http1::{Client, ContentRange, Request, Response, parse_content_range};
 pub use security::{
     CorsDecision, CspDirective, Origin, Policy, RequestMode, cors_decision, parse_csp,
     validate_cors_response,

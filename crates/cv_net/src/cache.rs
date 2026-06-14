@@ -291,12 +291,26 @@ pub fn build_entry_if_cacheable(
     request_headers: &[(String, String)],
 ) -> Option<CachedEntry> {
     // 2xx, 3xx (except 302/307 without explicit Cache-Control), and a
-    // few specific 4xxs are cacheable. We accept 200 / 203 / 204 / 206
-    // / 300 / 301 / 308 / 404 / 405 / 410 / 414 / 501 by default per
-    // RFC 9110 §4.2.2.
+    // few specific 4xxs are cacheable. We accept 200 / 203 / 204 / 300 /
+    // 301 / 308 / 404 / 405 / 410 / 414 / 501 by default per RFC 9110
+    // §4.2.2.
+    //
+    // 206 Partial Content is DELIBERATELY excluded. A 206 body is only a
+    // byte SLICE of the representation, framed by `Content-Range`. Storing
+    // it under the resource's normal cache key (this cache has no sparse /
+    // range-aware backing store) would make a later FULL `GET` cache-hit
+    // return only that slice as if it were the whole resource — silent
+    // truncation of every subsequently-revisited media file or download.
+    // Chrome keeps partial responses in dedicated *sparse* cache entries
+    // and reassembles them in `net/http/partial_data.cc`; it never feeds a
+    // 206 through the ordinary "store the whole response" path either. With
+    // no sparse store, the correct behavior is to NOT cache the 206 at all.
+    if status == 206 {
+        return None;
+    }
     let default_cacheable = matches!(
         status,
-        200 | 203 | 204 | 206 | 300 | 301 | 308 | 404 | 405 | 410 | 414 | 501
+        200 | 203 | 204 | 300 | 301 | 308 | 404 | 405 | 410 | 414 | 501
     );
     let mut etag: Option<String> = None;
     let mut last_modified: Option<String> = None;
