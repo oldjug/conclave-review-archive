@@ -29675,6 +29675,13 @@ fn set_event_prevented(ev: &cv_js::Value, v: bool) {
 /// (WebIDL legacy numeric code for NotFoundError). Used by `insertBefore`
 /// and `removeChild` when the reference/target node is not a child of the
 /// parent, per the DOM Living Standard §4.4.
+/// A `SyntaxError` DOMException (WebIDL legacy code 12). Thrown by
+/// `insertAdjacentHTML`/`insertAdjacentElement`/`insertAdjacentText` for an
+/// invalid position keyword, matching Chrome/Blink `Element::InsertAdjacent`.
+fn make_syntax_dom_exception(msg: &str) -> cv_js::Value {
+    make_dom_exception("SyntaxError", 12, msg)
+}
+
 fn make_not_found_dom_exception(msg: &str) -> cv_js::Value {
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -30654,6 +30661,17 @@ fn walk_for_table(
         }
         t.all.push(rec);
         drop(t);
+    }
+
+    // HTML Standard §4.13.3: a <template>'s children belong to its INERT content
+    // DocumentFragment — a separate tree scope. They must NOT enter the document
+    // element table, or `document.querySelector`/`getElementById` would (wrongly)
+    // match template content. Skip recursing into <template> children; the
+    // template's content fragment is built later from the parsed children.
+    if let cv_html::NodeKind::Element { name, .. } = &node.kind {
+        if name.eq_ignore_ascii_case("template") {
+            return;
+        }
     }
 
     for (i, c) in node.children.iter().enumerate() {
@@ -33316,6 +33334,47 @@ fn make_document_fragment_js(pending: &PendingDomMutations) -> cv_js::Value {
         .unwrap_or(cv_js::Value::Null))
     });
 
+    // DocumentFragment.querySelector / querySelectorAll (WHATWG DOM
+    // ParentNode mixin). Scoped to the fragment's OWN child list so a
+    // <template>.content query (`tpl.content.querySelector('.x')`) resolves a
+    // node inside the inert content scope — the standard template-cloning idiom.
+    let nested_for_qs = nested.clone();
+    let query_selector = cv_js::native_fn("querySelector", move |args| {
+        let sel_src = args.first().map(|v| v.to_display_string()).unwrap_or_default();
+        let toks: Vec<cv_css::CssToken> = cv_css::tokenize(&sel_src)
+            .into_iter()
+            .filter(|t| !matches!(t, cv_css::CssToken::Eof))
+            .collect();
+        let selectors = cv_css::selectors::parse_selector_list(&toks);
+        let roots = nested_for_qs.borrow().clone();
+        Ok(live_query_selector_from_roots(&roots, &selectors, true).unwrap_or(cv_js::Value::Null))
+    });
+    let nested_for_qsa = nested.clone();
+    let query_selector_all = cv_js::native_fn("querySelectorAll", move |args| {
+        let sel_src = args.first().map(|v| v.to_display_string()).unwrap_or_default();
+        let toks: Vec<cv_css::CssToken> = cv_css::tokenize(&sel_src)
+            .into_iter()
+            .filter(|t| !matches!(t, cv_css::CssToken::Eof))
+            .collect();
+        let selectors = cv_css::selectors::parse_selector_list(&toks);
+        let roots = nested_for_qsa.borrow().clone();
+        let out = live_query_selector_all_from_roots(&roots, &selectors, true);
+        Ok(cv_js::Value::Array(std::rc::Rc::new(std::cell::RefCell::new(out))))
+    });
+    let nested_for_gebi = nested.clone();
+    let get_element_by_id = cv_js::native_fn("getElementById", move |args| {
+        let id = args.first().map(|v| v.to_display_string()).unwrap_or_default();
+        if id.is_empty() {
+            return Ok(cv_js::Value::Null);
+        }
+        for kid in nested_for_gebi.borrow().iter() {
+            if let Some(found) = find_element_by_id_live(kid, &id) {
+                return Ok(found);
+            }
+        }
+        Ok(cv_js::Value::Null)
+    });
+
     {
         let mut map = obj.borrow_mut();
         map.insert("appendChild".into(), append_child);
@@ -33323,9 +33382,30 @@ fn make_document_fragment_js(pending: &PendingDomMutations) -> cv_js::Value {
         map.insert("prepend".into(), prepend);
         map.insert("replaceChildren".into(), replace_children);
         map.insert("cloneNode".into(), clone_node);
+        map.insert("querySelector".into(), query_selector);
+        map.insert("querySelectorAll".into(), query_selector_all);
+        map.insert("getElementById".into(), get_element_by_id);
     }
 
     cv_js::Value::Object(obj)
+}
+
+/// Invoke a `Pure` native-function Value directly with `args`, returning its
+/// result. Used to dispatch `insertAdjacentHTML`/`insertAdjacentElement`/
+/// `insertAdjacentText` (and the `outerHTML` setter) to the element's already
+/// built positional insert natives (`before`/`after`/`prepend`/`append`/
+/// `replaceWith`), so the adjacent-insert paths share the EXACT same snapshot
+/// mirror + `DomMutation` queueing as the corresponding spec primitives.
+fn call_pure_native_value(
+    func: &cv_js::Value,
+    args: Vec<cv_js::Value>,
+) -> Result<cv_js::Value, cv_js::JsError> {
+    if let cv_js::Value::NativeFunction(native) = func {
+        if let cv_js::NativeFnBody::Pure(f) = &native.func {
+            return f(args);
+        }
+    }
+    Ok(cv_js::Value::Undefined)
 }
 
 fn call_pure_native_method(target: &cv_js::Value, name: &str, args: Vec<cv_js::Value>) {
@@ -33707,6 +33787,140 @@ fn serialize_shadow_html_node(out: &mut String, node: &cv_html::Node) {
             out.push('>');
         }
     }
+}
+
+/// Serialize a LIVE JS DOM node (and its subtree) to HTML markup, INCLUDING the
+/// node's own tag — the `outerHTML` getter (HTML Standard §3.5: "the result of
+/// running the HTML fragment serialization algorithm on a fictional node whose
+/// only child is the context object"). `innerHTML`'s getter, by contrast,
+/// serializes only the children.
+///
+/// Walks the JS object graph directly (rather than via `js_value_to_nodes`,
+/// which only materializes `_isNewElement` created nodes) so it works for BOTH
+/// script-created elements AND parse-time table-backed elements. Attributes come
+/// from `_attrs` when present (created elements) and otherwise are reconstructed
+/// from the reflected `id`/`class` object props (table elements keep their attr
+/// store off-object). Engine-internal `\u{1}`-prefixed bookkeeping is never
+/// surfaced, matching Chrome's serializer.
+fn serialize_live_node_to_html(node: &cv_js::Value) -> String {
+    let mut out = String::new();
+    serialize_live_node_inner(node, &mut out);
+    out
+}
+
+fn serialize_live_node_inner(node: &cv_js::Value, out: &mut String) {
+    let cv_js::Value::Object(obj) = node else {
+        return;
+    };
+    let m = obj.borrow();
+    let node_type = match m.get("nodeType") {
+        Some(cv_js::Value::Number(n)) => *n as i64,
+        _ => 1,
+    };
+    match node_type {
+        3 => {
+            let text = m
+                .get("nodeValue")
+                .or_else(|| m.get("data"))
+                .or_else(|| m.get("textContent"))
+                .map(|v| v.to_display_string())
+                .unwrap_or_default();
+            out.push_str(&escape_html_text(&text));
+            return;
+        }
+        8 => {
+            let text = m
+                .get("nodeValue")
+                .or_else(|| m.get("data"))
+                .map(|v| v.to_display_string())
+                .unwrap_or_default();
+            out.push_str("<!--");
+            out.push_str(&text);
+            out.push_str("-->");
+            return;
+        }
+        _ => {}
+    }
+    let tag = m
+        .get("_tag")
+        .or_else(|| m.get("tagName"))
+        .map(|v| v.to_display_string().to_ascii_lowercase())
+        .filter(|s| !s.is_empty());
+    let Some(tag) = tag else {
+        return;
+    };
+    out.push('<');
+    out.push_str(&tag);
+    // Collect attributes: prefer the live `_attrs` object (created elements);
+    // fall back to reflected id/class props (table elements).
+    let mut emitted_class = false;
+    if let Some(cv_js::Value::Object(attrs_obj)) = m.get("_attrs") {
+        for (name, value) in attrs_obj.borrow().iter() {
+            if name.starts_with('\u{1}') || name == NODE_ID_ATTR {
+                continue;
+            }
+            if name == "class" {
+                emitted_class = true;
+            }
+            out.push(' ');
+            out.push_str(name);
+            out.push_str("=\"");
+            out.push_str(&escape_html_attr(&value.to_display_string()));
+            out.push('"');
+        }
+    } else {
+        if let Some(cv_js::Value::String(id)) = m.get("id") {
+            if !id.is_empty() {
+                out.push_str(" id=\"");
+                out.push_str(&escape_html_attr(id));
+                out.push('"');
+            }
+        }
+    }
+    if !emitted_class {
+        if let Some(cv_js::Value::String(cls)) = m.get("className") {
+            if !cls.is_empty() {
+                out.push_str(" class=\"");
+                out.push_str(&escape_html_attr(cls));
+                out.push('"');
+            }
+        }
+    }
+    const VOID: &[&str] = &[
+        "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param",
+        "source", "track", "wbr",
+    ];
+    if VOID.contains(&tag.as_str()) {
+        out.push('>');
+        return;
+    }
+    out.push('>');
+    // Children: serialize the live `_children`. If there are none but a
+    // textContent is set, emit it as a single text node (covers table elements
+    // whose only content is text, before any structural mutation).
+    let children: Vec<cv_js::Value> = match m.get("_children") {
+        Some(cv_js::Value::Array(arr)) => arr.borrow().clone(),
+        _ => Vec::new(),
+    };
+    if children.is_empty() {
+        if let Some(cv_js::Value::String(tc)) = m.get("textContent") {
+            if !tc.is_empty() {
+                out.push_str(&escape_html_text(tc));
+            }
+        }
+    } else {
+        drop(m);
+        for child in &children {
+            serialize_live_node_inner(child, out);
+        }
+        out.push_str("</");
+        out.push_str(&tag);
+        out.push('>');
+        return;
+    }
+    out.push_str("</");
+    out.push_str(&tag);
+    out.push('>');
 }
 
 /// WHATWG DOM §4.8 `Element.attachShadow(init)` + "attach a shadow root".
@@ -35184,12 +35398,230 @@ fn make_new_element_js_with_canvas_registry(
     class_list_map.insert("contains".into(), contains_class);
     class_list_map.insert("replace".into(), replace_class);
 
+    // insertAdjacentElement / insertAdjacentText / insertAdjacentHTML +
+    // outerHTML setter for CREATED elements (document.createElement /
+    // cloneNode / parsed-fragment nodes). These live only in the JS `_children`
+    // snapshot (they are not in the static element table), so they mutate it
+    // directly via `insert_element_snapshots` / `replace_child_snapshot` —
+    // exactly the same snapshot ops the table path queues. (HTML Standard §3.5.)
+    //   beforebegin/afterend → parent's _children adjacent to self
+    //   afterbegin           → self's _children, front
+    //   beforeend            → self's _children, back
+    let obj_for_adj = obj.clone();
+    let nested_for_adj = nested.clone();
+    let pending_for_adj = pending.clone();
+    let insert_adjacent_node = move |position: AdjacentPosition,
+                                     node: cv_js::Value|
+          -> Result<cv_js::Value, cv_js::JsError> {
+        let self_val = cv_js::Value::Object(obj_for_adj.clone());
+        // Stable id of this element — used to anchor render-path mutations so
+        // sibling inserts/outerHTML on a created element ALREADY attached to a
+        // table-backed ancestor reach the rendered document, not just the live
+        // snapshot. nid-anchored mutations are no-ops if self isn't yet in the
+        // doc tree (a still-detached created subtree serializes on its eventual
+        // append), so they never corrupt the orphan case.
+        let self_nid = obj_for_adj
+            .borrow()
+            .get(NODE_ID_ATTR)
+            .map(|v| v.to_display_string());
+        match position {
+            AdjacentPosition::AfterBegin => {
+                // prepend into self's children (self's Rc is referenced by the
+                // mutation that attached self, so this renders via re-serialize).
+                detach_element_snapshot_observed(&node);
+                set_parent_snapshot(&node, self_val.clone());
+                nested_for_adj.borrow_mut().insert(0, node);
+            }
+            AdjacentPosition::BeforeEnd => {
+                detach_element_snapshot_observed(&node);
+                set_parent_snapshot(&node, self_val.clone());
+                nested_for_adj.borrow_mut().push(node);
+            }
+            AdjacentPosition::BeforeBegin | AdjacentPosition::AfterEnd => {
+                // Insert into the parent's children adjacent to self. If self
+                // has no parent the spec returns null (no-op here).
+                let parent = obj_for_adj
+                    .borrow()
+                    .get("parentNode")
+                    .cloned()
+                    .unwrap_or(cv_js::Value::Null);
+                let Some(siblings) = get_children_snapshot(&parent) else {
+                    return Ok(cv_js::Value::Null);
+                };
+                let self_idx = siblings
+                    .borrow()
+                    .iter()
+                    .position(|c| cv_js::Value::strict_eq(c, &self_val));
+                let Some(self_idx) = self_idx else {
+                    return Ok(cv_js::Value::Null);
+                };
+                let at = if position == AdjacentPosition::BeforeBegin {
+                    self_idx
+                } else {
+                    self_idx + 1
+                };
+                // Render path: anchor before self (beforebegin) or before self's
+                // next sibling (afterend). A missing next sibling falls back to
+                // the snapshot-only path (still correct on eventual re-serialize).
+                let anchor_nid = match position {
+                    AdjacentPosition::BeforeBegin => self_nid.clone(),
+                    _ => siblings
+                        .borrow()
+                        .get(self_idx + 1)
+                        .and_then(|n| {
+                            if let cv_js::Value::Object(o) = n {
+                                o.borrow().get(NODE_ID_ATTR).map(|v| v.to_display_string())
+                            } else {
+                                None
+                            }
+                        }),
+                };
+                if let Some(anchor_nid) = anchor_nid {
+                    pending_for_adj.borrow_mut().push(DomMutation::InsertBefore {
+                        parent_path: Vec::new(),
+                        before_index: 0,
+                        nodes: vec![node.clone()],
+                        before_nid: Some(anchor_nid),
+                    });
+                }
+                // `insert_element_snapshots` filters out non-element nodes, so a
+                // text node from insertAdjacentText is inserted manually.
+                if is_element_js_value(&node) {
+                    insert_element_snapshots(&parent, at, std::slice::from_ref(&node));
+                } else {
+                    detach_element_snapshot_observed(&node);
+                    set_parent_snapshot(&node, parent.clone());
+                    siblings.borrow_mut().insert(at.min(siblings.borrow().len()), node);
+                }
+            }
+        }
+        Ok(cv_js::Value::Bool(true))
+    };
+
+    let insert_adjacent_node_elem = insert_adjacent_node.clone();
+    let insert_adjacent_element = cv_js::native_fn("insertAdjacentElement", move |args| {
+        let pos_raw = args.first().map(|v| v.to_display_string()).unwrap_or_default();
+        let Some(position) = parse_adjacent_position(&pos_raw) else {
+            return Err(cv_js::JsError::Throw(make_syntax_dom_exception(&format!(
+                "insertAdjacentElement: '{pos_raw}' is not a valid position"
+            ))));
+        };
+        let node = args.get(1).cloned().unwrap_or(cv_js::Value::Null);
+        if !is_element_js_value(&node) {
+            return Ok(cv_js::Value::Null);
+        }
+        if matches!(
+            insert_adjacent_node_elem(position, node.clone())?,
+            cv_js::Value::Null
+        ) {
+            return Ok(cv_js::Value::Null);
+        }
+        Ok(node)
+    });
+
+    let insert_adjacent_node_text = insert_adjacent_node.clone();
+    let insert_adjacent_text = cv_js::native_fn("insertAdjacentText", move |args| {
+        let pos_raw = args.first().map(|v| v.to_display_string()).unwrap_or_default();
+        let Some(position) = parse_adjacent_position(&pos_raw) else {
+            return Err(cv_js::JsError::Throw(make_syntax_dom_exception(&format!(
+                "insertAdjacentText: '{pos_raw}' is not a valid position"
+            ))));
+        };
+        let text = args.get(1).map(|v| v.to_display_string()).unwrap_or_default();
+        insert_adjacent_node_text(position, make_text_node_js(&text))?;
+        Ok(cv_js::Value::Undefined)
+    });
+
+    let insert_adjacent_node_html = insert_adjacent_node;
+    let pending_for_adj_html = pending.clone();
+    let insert_adjacent_html = cv_js::native_fn("insertAdjacentHTML", move |args| {
+        let pos_raw = args.first().map(|v| v.to_display_string()).unwrap_or_default();
+        let Some(position) = parse_adjacent_position(&pos_raw) else {
+            return Err(cv_js::JsError::Throw(make_syntax_dom_exception(&format!(
+                "insertAdjacentHTML: '{pos_raw}' is not a valid position"
+            ))));
+        };
+        let markup = args.get(1).map(|v| v.to_display_string()).unwrap_or_default();
+        let nodes = parse_html_markup_to_js_nodes(&markup, &pending_for_adj_html);
+        // afterbegin/afterend insert each node adjacent to the same anchor, so
+        // reverse to preserve document order; beforebegin/beforeend advance.
+        let ordered: Vec<cv_js::Value> = match position {
+            AdjacentPosition::AfterBegin | AdjacentPosition::AfterEnd => {
+                nodes.into_iter().rev().collect()
+            }
+            _ => nodes,
+        };
+        for node in ordered {
+            insert_adjacent_node_html(position, node)?;
+        }
+        Ok(cv_js::Value::Undefined)
+    });
+
+    // outerHTML accessor for created elements. Setter replaces self in the
+    // parent's child list with the parsed fragment; getter serializes self.
+    let obj_for_outer_set = obj.clone();
+    let pending_for_outer = pending.clone();
+    let outer_html_setter = cv_js::native_fn("set outerHTML", move |args| {
+        let self_val = cv_js::Value::Object(obj_for_outer_set.clone());
+        let parent = obj_for_outer_set
+            .borrow()
+            .get("parentNode")
+            .cloned()
+            .unwrap_or(cv_js::Value::Null);
+        if matches!(parent, cv_js::Value::Null | cv_js::Value::Undefined) {
+            return Err(cv_js::JsError::Throw(make_dom_exception(
+                "NoModificationAllowedError",
+                7,
+                "outerHTML: cannot set outerHTML on an element with no parent",
+            )));
+        }
+        let markup = args.first().map(|v| v.to_display_string()).unwrap_or_default();
+        let nodes = parse_html_markup_to_js_nodes(&markup, &pending_for_outer);
+        // Render path: insert the parsed fragment before self (anchored by
+        // self's stable id), then remove self by id. Both are nid-based so they
+        // resolve regardless of where self sits; they no-op if self isn't in the
+        // rendered tree yet (a detached created subtree serializes on append).
+        let self_nid = obj_for_outer_set
+            .borrow()
+            .get(NODE_ID_ATTR)
+            .map(|v| v.to_display_string());
+        if let Some(self_nid) = self_nid {
+            let mut p = pending_for_outer.borrow_mut();
+            p.push(DomMutation::InsertBefore {
+                parent_path: Vec::new(),
+                before_index: 0,
+                nodes: nodes.clone(),
+                before_nid: Some(self_nid.clone()),
+            });
+            p.push(DomMutation::Remove {
+                path: Vec::new(),
+                nid: Some(self_nid),
+            });
+        }
+        // Live snapshot: replace self with the parsed nodes in its parent.
+        replace_child_snapshot(&self_val, &nodes);
+        Ok(cv_js::Value::Undefined)
+    });
+    let obj_for_outer_get = obj.clone();
+    let outer_html_getter = cv_js::native_fn("get outerHTML", move |_args| {
+        Ok(cv_js::Value::str(serialize_live_node_to_html(&cv_js::Value::Object(
+            obj_for_outer_get.clone(),
+        ))))
+    });
+
     {
         let mut map = obj.borrow_mut();
         map.insert("appendChild".into(), append_inner);
         map.insert("append".into(), append_variadic);
         map.insert("prepend".into(), prepend_variadic);
         map.insert("replaceChildren".into(), replace_children);
+        map.insert("insertAdjacentElement".into(), insert_adjacent_element);
+        map.insert("insertAdjacentText".into(), insert_adjacent_text);
+        map.insert("insertAdjacentHTML".into(), insert_adjacent_html);
+        map.insert(
+            "outerHTML".into(),
+            tb_js_accessor(outer_html_getter, outer_html_setter),
+        );
         map.insert("setAttribute".into(), set_attribute);
         map.insert("getAttribute".into(), get_attribute);
         map.insert("hasAttribute".into(), has_attribute);
@@ -35543,6 +35975,52 @@ fn make_new_element_js_with_canvas_registry(
         map.insert("width".into(), cv_js::Value::Number(300.0));
         map.insert("height".into(), cv_js::Value::Number(150.0));
         map.insert("getContext".into(), get_context);
+    }
+    // <template>.content — a created template (document.createElement('template'))
+    // gets a real inert content DocumentFragment (HTML Standard §4.13.3). Per
+    // Blink, HTMLTemplateElement routes `innerHTML` to its content fragment, so
+    // `tpl.innerHTML = "<div>x</div>"; tpl.content.childNodes` resolves the parsed
+    // nodes — and they are NOT in the main document (content is a separate scope).
+    if tag_lc == "template" {
+        let content_fragment = make_document_fragment_js(pending);
+        let frag_children = if let cv_js::Value::Object(frag_obj) = &content_fragment {
+            match frag_obj.borrow().get("_children") {
+                Some(cv_js::Value::Array(arr)) => arr.clone(),
+                _ => std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
+            }
+        } else {
+            std::rc::Rc::new(std::cell::RefCell::new(Vec::new()))
+        };
+        // innerHTML accessor: setter parses into the content fragment; getter
+        // serializes it (matches HTMLTemplateElement's content-targeted IDL).
+        let frag_for_set = content_fragment.clone();
+        let children_for_set = frag_children.clone();
+        let pending_for_tpl = pending.clone();
+        let inner_html_setter = cv_js::native_fn("set innerHTML", move |args| {
+            let markup = args.first().map(|v| v.to_display_string()).unwrap_or_default();
+            let nodes = parse_html_markup_to_js_nodes(&markup, &pending_for_tpl);
+            for node in &nodes {
+                set_parent_snapshot(node, frag_for_set.clone());
+            }
+            *children_for_set.borrow_mut() = nodes;
+            Ok(cv_js::Value::Undefined)
+        });
+        let children_for_get = frag_children.clone();
+        let inner_html_getter = cv_js::native_fn("get innerHTML", move |_args| {
+            let mut out = String::new();
+            for child in children_for_get.borrow().iter() {
+                for node in js_value_to_nodes(child) {
+                    serialize_shadow_html_node(&mut out, &node);
+                }
+            }
+            Ok(cv_js::Value::str(out))
+        });
+        let mut map = obj.borrow_mut();
+        map.insert("content".into(), content_fragment);
+        map.insert(
+            "innerHTML".into(),
+            tb_js_accessor(inner_html_getter, inner_html_setter),
+        );
     }
     let value = cv_js::Value::Object(obj);
     if let Some(canvas_js) = canvas_js_cell {
@@ -36637,6 +37115,131 @@ fn install_dom_api(
                 Ok(cv_js::Value::Undefined)
             });
 
+            // insertAdjacentElement / insertAdjacentText / insertAdjacentHTML
+            // (HTML Standard §3.5 "insert adjacent" + the `Element` interface).
+            // All four positions reuse the element's already-built positional
+            // insert primitives so they share the SAME snapshot mirror + render
+            // `DomMutation` queue (Chrome routes them through one
+            // `Element::InsertAdjacent`):
+            //   beforebegin → before(node)   afterbegin → prepend(node)
+            //   beforeend   → append(node)   afterend   → after(node)
+            // Per spec, an invalid position keyword throws a SyntaxError; and
+            // beforebegin/afterend on a parentless element returns null (we
+            // surface that as a no-op `null`, matching the `before`/`after`
+            // empty-path guards above).
+            let bb_for_adj = before_self.clone();
+            let ab_for_adj = prepend_variadic.clone();
+            let be_for_adj = append_variadic.clone();
+            let ae_for_adj = after_self.clone();
+            let dispatch_adjacent = move |position: AdjacentPosition,
+                                          node: cv_js::Value|
+                  -> Result<cv_js::Value, cv_js::JsError> {
+                let target = match position {
+                    AdjacentPosition::BeforeBegin => &bb_for_adj,
+                    AdjacentPosition::AfterBegin => &ab_for_adj,
+                    AdjacentPosition::BeforeEnd => &be_for_adj,
+                    AdjacentPosition::AfterEnd => &ae_for_adj,
+                };
+                call_pure_native_value(target, vec![node])
+            };
+
+            let dispatch_adjacent_elem = dispatch_adjacent.clone();
+            let insert_adjacent_element =
+                cv_js::native_fn("insertAdjacentElement", move |args| {
+                    let pos_raw = args
+                        .first()
+                        .map(|v| v.to_display_string())
+                        .unwrap_or_default();
+                    let Some(position) = parse_adjacent_position(&pos_raw) else {
+                        return Err(cv_js::JsError::Throw(make_syntax_dom_exception(
+                            &format!("insertAdjacentElement: '{pos_raw}' is not a valid position"),
+                        )));
+                    };
+                    let node = args.get(1).cloned().unwrap_or(cv_js::Value::Null);
+                    if !is_element_js_value(&node) {
+                        return Ok(cv_js::Value::Null);
+                    }
+                    dispatch_adjacent_elem(position, node.clone())?;
+                    // insertAdjacentElement returns the inserted element (or null).
+                    Ok(node)
+                });
+
+            let dispatch_adjacent_text = dispatch_adjacent.clone();
+            let insert_adjacent_text = cv_js::native_fn("insertAdjacentText", move |args| {
+                let pos_raw = args
+                    .first()
+                    .map(|v| v.to_display_string())
+                    .unwrap_or_default();
+                let Some(position) = parse_adjacent_position(&pos_raw) else {
+                    return Err(cv_js::JsError::Throw(make_syntax_dom_exception(
+                        &format!("insertAdjacentText: '{pos_raw}' is not a valid position"),
+                    )));
+                };
+                let text = args.get(1).map(|v| v.to_display_string()).unwrap_or_default();
+                // A text node isn't an Element, so the positional primitives'
+                // `is_element_js_value` filters skip it — insert it directly.
+                dispatch_adjacent_text(position, make_text_node_js(&text))?;
+                Ok(cv_js::Value::Undefined)
+            });
+
+            let dispatch_adjacent_html = dispatch_adjacent;
+            let pending_for_adj_html = pending.clone();
+            let insert_adjacent_html = cv_js::native_fn("insertAdjacentHTML", move |args| {
+                let pos_raw = args
+                    .first()
+                    .map(|v| v.to_display_string())
+                    .unwrap_or_default();
+                let Some(position) = parse_adjacent_position(&pos_raw) else {
+                    return Err(cv_js::JsError::Throw(make_syntax_dom_exception(
+                        &format!("insertAdjacentHTML: '{pos_raw}' is not a valid position"),
+                    )));
+                };
+                let markup = args.get(1).map(|v| v.to_display_string()).unwrap_or_default();
+                let nodes = parse_html_markup_to_js_nodes(&markup, &pending_for_adj_html);
+                // Insert in document order. afterbegin dispatches to `prepend`,
+                // which front-inserts each node, so feed it in REVERSE to keep
+                // fragment order. beforebegin (`before`, NID-anchored), beforeend
+                // (`append`), and afterend (`after`, index-advancing) all preserve
+                // order with sequential forward inserts.
+                let ordered: Vec<cv_js::Value> = match position {
+                    AdjacentPosition::AfterBegin => nodes.into_iter().rev().collect(),
+                    _ => nodes,
+                };
+                for node in ordered {
+                    dispatch_adjacent_html(position, node)?;
+                }
+                Ok(cv_js::Value::Undefined)
+            });
+
+            // outerHTML setter (HTML Standard §3.5): parse the markup as a
+            // fragment and REPLACE this element with the result (Chrome routes
+            // it through `ReplaceWith`). Setting outerHTML on a parentless
+            // element throws NoModificationAllowedError. The getter serializes
+            // the element subtree (handled below via `serialize_live_node`).
+            let replace_with_for_outer = replace_with.clone();
+            let pending_for_outer = pending.clone();
+            let path_for_outer = rec.path.clone();
+            let outer_html_setter = cv_js::native_fn("set outerHTML", move |args| {
+                if path_for_outer.is_empty() {
+                    return Err(cv_js::JsError::Throw(make_dom_exception(
+                        "NoModificationAllowedError",
+                        7,
+                        "outerHTML: cannot set outerHTML on an element with no parent",
+                    )));
+                }
+                let markup = args.first().map(|v| v.to_display_string()).unwrap_or_default();
+                let nodes = parse_html_markup_to_js_nodes(&markup, &pending_for_outer);
+                call_pure_native_value(
+                    &replace_with_for_outer,
+                    nodes,
+                )?;
+                Ok(cv_js::Value::Undefined)
+            });
+            let self_for_outer_get = rec.js.clone();
+            let outer_html_getter = cv_js::native_fn("get outerHTML", move |_args| {
+                Ok(cv_js::Value::str(serialize_live_node_to_html(&self_for_outer_get)))
+            });
+
             let table_for_remove_child = table.clone();
             let pending_for_remove_child = pending.clone();
             let parent_path_for_remove_child = rec.path.clone();
@@ -37228,6 +37831,14 @@ fn install_dom_api(
                 m.insert("cloneNode".into(), clone_node);
                 m.insert("before".into(), before_self);
                 m.insert("after".into(), after_self);
+                m.insert("insertAdjacentElement".into(), insert_adjacent_element);
+                m.insert("insertAdjacentText".into(), insert_adjacent_text);
+                m.insert("insertAdjacentHTML".into(), insert_adjacent_html);
+                // outerHTML — a live get/set accessor (HTML Standard §3.5).
+                m.insert(
+                    "outerHTML".into(),
+                    tb_js_accessor(outer_html_getter, outer_html_setter),
+                );
                 m.insert("insertBefore".into(), insert_before);
                 m.insert("removeChild".into(), remove_child);
                 m.insert("replaceChild".into(), replace_child);
@@ -37515,6 +38126,49 @@ fn install_dom_api(
         m.insert("createTextNode".into(), create_text_node);
         m.insert("createDocumentFragment".into(), create_document_fragment);
 
+        // document.write / document.writeln — HTML Standard §3.2.5.2. For an
+        // OPEN document (during load), writes are inserted at the parser's
+        // insertion point, which for an inline-script call is inside the body at
+        // that point. Our scripts run after the initial parse, so the
+        // Chrome-faithful approximation is to PARSE the markup and append the
+        // resulting nodes to document.body (the deepest open element), reusing
+        // body's `append` machinery so the nodes are real, queryable, and
+        // rendered. (`writeln` appends a trailing newline before parsing.)
+        let pending_for_write = pending.clone();
+        let doc_for_write = document.clone();
+        let make_write = move |add_newline: bool| {
+            let pending_inner = pending_for_write.clone();
+            let doc_inner = doc_for_write.clone();
+            move |args: Vec<cv_js::Value>| -> Result<cv_js::Value, cv_js::JsError> {
+                let mut markup: String = args.iter().map(|v| v.to_display_string()).collect();
+                if add_newline {
+                    markup.push('\n');
+                }
+                if markup.is_empty() {
+                    return Ok(cv_js::Value::Undefined);
+                }
+                let nodes = parse_html_markup_to_js_nodes(&markup, &pending_inner);
+                // Resolve the current document.body (set just below at install
+                // time; present by the time any script runs).
+                let body = if let cv_js::Value::Object(d) = &doc_inner {
+                    d.borrow().get("body").cloned().unwrap_or(cv_js::Value::Null)
+                } else {
+                    cv_js::Value::Null
+                };
+                if let cv_js::Value::Object(b) = &body {
+                    let append = b.borrow().get("append").cloned();
+                    if let Some(append_fn) = append {
+                        call_pure_native_value(&append_fn, nodes)?;
+                    }
+                }
+                Ok(cv_js::Value::Undefined)
+            }
+        };
+        let write_impl = make_write(false);
+        m.insert("write".into(), cv_js::native_fn("write", write_impl));
+        let writeln_impl = make_write(true);
+        m.insert("writeln".into(), cv_js::native_fn("writeln", writeln_impl));
+
         // document.implementation.createHTMLDocument(title) — a REAL
         // detached HTML document (html > head + body) built from the same
         // element machinery as createElement, so jQuery's out-of-band HTML
@@ -37721,6 +38375,73 @@ fn install_dom_api(
                     cv_js::Value::Array(Rc::new(RefCell::new(child_vals))),
                 );
             }
+        }
+    }
+
+    // <template>.content — HTML Standard §4.13.3. A template element's parsed
+    // children belong to its INERT content DocumentFragment, a SEPARATE tree
+    // scope: they are NOT children of the template in the document, are not
+    // rendered, run no scripts, load no resources, and are NOT reachable via a
+    // document/body query. `walk_for_table` already declined to index template
+    // descendants, so they never enter the document element table. Here we build
+    // the real content fragment from the PARSED children (via `node_to_js_value`,
+    // the same materializer createElement uses) and clear the template's own
+    // child list. Blink: `HTMLTemplateElement::content()` returns the
+    // `TemplateContentDocumentFragment`. (Layout hides <template> via
+    // `template { display: none }`, so this only affects the scriptable DOM.)
+    {
+        fn node_at_path<'a>(root: &'a cv_html::Node, path: &[usize]) -> Option<&'a cv_html::Node> {
+            let mut cur = root;
+            for &i in path {
+                cur = cur.children.get(i)?;
+            }
+            Some(cur)
+        }
+        let pending_for_templates = table
+            .borrow()
+            .pending_dom_mutations
+            .clone()
+            .unwrap_or_else(|| std::rc::Rc::new(std::cell::RefCell::new(Vec::new())));
+        let template_recs: Vec<(Vec<usize>, cv_js::Value)> = {
+            let t = table.borrow();
+            t.all
+                .iter()
+                .filter(|r| r.tag == "template")
+                .map(|r| (r.path.clone(), r.js.clone()))
+                .collect()
+        };
+        for (path, js) in template_recs {
+            let cv_js::Value::Object(o) = &js else {
+                continue;
+            };
+            if o.borrow().contains_key("content") {
+                continue; // idempotent
+            }
+            // Materialize the parsed template children as live JS nodes.
+            let mut content_children: Vec<cv_js::Value> = Vec::new();
+            if let Some(parsed) = node_at_path(&doc.root, &path) {
+                for child in &parsed.children {
+                    content_children.push(node_to_js_value(child, &pending_for_templates));
+                }
+            }
+            let fragment = make_document_fragment_js(&pending_for_templates);
+            for child in &content_children {
+                set_parent_snapshot(child, fragment.clone());
+            }
+            if let cv_js::Value::Object(frag_obj) = &fragment {
+                if let Some(cv_js::Value::Array(frag_children)) =
+                    frag_obj.borrow().get("_children")
+                {
+                    *frag_children.borrow_mut() = content_children;
+                }
+            }
+            let mut m = o.borrow_mut();
+            // The template's own child list is empty (content lives in `.content`).
+            m.insert(
+                "_children".into(),
+                cv_js::Value::Array(std::rc::Rc::new(std::cell::RefCell::new(Vec::new()))),
+            );
+            m.insert("content".into(), fragment);
         }
     }
 }
@@ -38311,6 +39032,47 @@ fn parse_html_fragment_to_nodes(html_fragment: &str) -> Vec<cv_html::Node> {
         new_kids = fragment_doc.root.children.clone();
     }
     new_kids
+}
+
+/// Parse `markup` as an HTML fragment and convert each resulting node into a
+/// LIVE JS DOM node (the same kind `document.createElement` returns), ready to
+/// splice into a parent's `_children` snapshot and queue as a `DomMutation`.
+///
+/// This is the shared parse path behind `insertAdjacentHTML`, the `outerHTML`
+/// setter, `document.write` (open document), and `<template>.content`. It
+/// reuses the document tokenizer/tree-builder (`parse_html_fragment_to_nodes`)
+/// then materializes JS wrappers via `node_to_js_value` — exactly what
+/// `ShadowRoot.innerHTML`'s setter does (see `make_shadow_root_js`). Chrome
+/// implements all four via the same "fragment parsing algorithm" producing real
+/// nodes (HTML Standard §13.4 / §3.5 / §4.13.3).
+fn parse_html_markup_to_js_nodes(markup: &str, pending: &PendingDomMutations) -> Vec<cv_js::Value> {
+    parse_html_fragment_to_nodes(markup)
+        .iter()
+        .map(|node| node_to_js_value(node, pending))
+        .collect()
+}
+
+/// The four valid `insertAdjacentHTML`/`insertAdjacentElement`/
+/// `insertAdjacentText` positions (HTML Standard §3.5 / DOM `insertAdjacent*`).
+/// Case-insensitive per spec. Returns `None` for an unrecognized keyword so the
+/// caller can throw a `SyntaxError`, matching Chrome/Blink
+/// (`Element::InsertAdjacent` rejects with SyntaxError).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum AdjacentPosition {
+    BeforeBegin,
+    AfterBegin,
+    BeforeEnd,
+    AfterEnd,
+}
+
+fn parse_adjacent_position(raw: &str) -> Option<AdjacentPosition> {
+    match raw.to_ascii_lowercase().as_str() {
+        "beforebegin" => Some(AdjacentPosition::BeforeBegin),
+        "afterbegin" => Some(AdjacentPosition::AfterBegin),
+        "beforeend" => Some(AdjacentPosition::BeforeEnd),
+        "afterend" => Some(AdjacentPosition::AfterEnd),
+        _ => None,
+    }
 }
 
 fn apply_html_at_path(node: &mut cv_html::Node, path: &[usize], html_fragment: &str) {
@@ -53083,6 +53845,360 @@ mod tests {
             copy.children.is_empty(),
             "shallow clone should not copy children"
         );
+    }
+
+    // ── document.write / insertAdjacentHTML / outerHTML setter / <template>.content ──
+    // Real HTML fragment parse + node splicing (HTML Standard §3.5 + §4.13.3).
+
+    /// Walk the rendered doc tree for the element carrying id `wanted_id`.
+    fn dom_find_by_id<'a>(node: &'a cv_html::Node, wanted_id: &str) -> Option<&'a cv_html::Node> {
+        if let cv_html::NodeKind::Element { attrs, .. } = &node.kind {
+            if attrs.iter().any(|a| a.name == "id" && a.value == wanted_id) {
+                return Some(node);
+            }
+        }
+        for child in &node.children {
+            if let Some(found) = dom_find_by_id(child, wanted_id) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    fn dom_child_tags(node: &cv_html::Node) -> Vec<String> {
+        node.children
+            .iter()
+            .filter_map(|c| match &c.kind {
+                cv_html::NodeKind::Element { name, .. } => Some(name.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn dom_text(node: &cv_html::Node) -> String {
+        fn walk(n: &cv_html::Node, out: &mut String) {
+            match &n.kind {
+                cv_html::NodeKind::Text(t) => out.push_str(t),
+                _ => {
+                    for c in &n.children {
+                        walk(c, out);
+                    }
+                }
+            }
+        }
+        let mut out = String::new();
+        walk(node, &mut out);
+        out
+    }
+
+    #[test]
+    fn insert_adjacent_html_beforeend_adds_child() {
+        // insertAdjacentHTML("beforeend", "<b>x</b>") adds a <b> child whose
+        // textContent is "x" (HTML Standard §3.5).
+        let html = "<!doctype html><html><body><div id='r'></div>\
+            <script>document.getElementById('r').insertAdjacentHTML('beforeend','<b>x</b>');</script>\
+            </body></html>";
+        let cfg = cv_layout::LayoutConfig::default();
+        let (_rt, doc, _s, _p) =
+            build_runtime_and_first_paint(html, "https://example.com/", &cfg, "").expect("render");
+        let r = dom_find_by_id(&doc.root, "r").expect("#r");
+        assert_eq!(dom_child_tags(r), vec!["b".to_string()], "beforeend adds a <b>");
+        assert_eq!(dom_text(&r.children[0]), "x", "the <b>'s text is x");
+    }
+
+    #[test]
+    fn insert_adjacent_html_afterbegin_inserts_first() {
+        // "afterbegin" inserts before the element's existing first child.
+        let html = "<!doctype html><html><body><div id='r'><span id='old'>O</span></div>\
+            <script>document.getElementById('r').insertAdjacentHTML('afterbegin','<i>first</i>');</script>\
+            </body></html>";
+        let cfg = cv_layout::LayoutConfig::default();
+        let (_rt, doc, _s, _p) =
+            build_runtime_and_first_paint(html, "https://example.com/", &cfg, "").expect("render");
+        let r = dom_find_by_id(&doc.root, "r").expect("#r");
+        assert_eq!(
+            dom_child_tags(r),
+            vec!["i".to_string(), "span".to_string()],
+            "afterbegin lands the <i> before the existing <span>"
+        );
+        assert_eq!(dom_text(&r.children[0]), "first");
+    }
+
+    #[test]
+    fn insert_adjacent_html_beforebegin_and_afterend_insert_as_siblings() {
+        // "beforebegin"/"afterend" insert as siblings of the element.
+        let html = "<!doctype html><html><body><div id='p'><span id='mid'>M</span></div>\
+            <script>var m=document.getElementById('mid');\
+            m.insertAdjacentHTML('beforebegin','<a id=\"bb\">B</a>');\
+            m.insertAdjacentHTML('afterend','<a id=\"ae\">A</a>');</script>\
+            </body></html>";
+        let cfg = cv_layout::LayoutConfig::default();
+        let (_rt, doc, _s, _p) =
+            build_runtime_and_first_paint(html, "https://example.com/", &cfg, "").expect("render");
+        let p = dom_find_by_id(&doc.root, "p").expect("#p");
+        // Order inside #p must be: bb, mid, ae.
+        let ids: Vec<String> = p
+            .children
+            .iter()
+            .filter_map(|c| match &c.kind {
+                cv_html::NodeKind::Element { attrs, .. } => attrs
+                    .iter()
+                    .find(|a| a.name == "id")
+                    .map(|a| a.value.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["bb".to_string(), "mid".to_string(), "ae".to_string()],
+            "beforebegin/afterend insert as siblings in document order"
+        );
+    }
+
+    #[test]
+    fn insert_adjacent_html_preserves_multi_node_order() {
+        // A multi-node fragment keeps document order at every position.
+        let html = "<!doctype html><html><body><div id='r'><b id='anchor'>x</b></div>\
+            <script>var a=document.getElementById('anchor');\
+            a.insertAdjacentHTML('beforebegin','<i>1</i><i>2</i>');\
+            a.insertAdjacentHTML('afterend','<u>3</u><u>4</u>');</script>\
+            </body></html>";
+        let cfg = cv_layout::LayoutConfig::default();
+        let (_rt, doc, _s, _p) =
+            build_runtime_and_first_paint(html, "https://example.com/", &cfg, "").expect("render");
+        let r = dom_find_by_id(&doc.root, "r").expect("#r");
+        let tags = dom_child_tags(r);
+        assert_eq!(
+            tags,
+            vec![
+                "i".to_string(),
+                "i".to_string(),
+                "b".to_string(),
+                "u".to_string(),
+                "u".to_string()
+            ],
+            "fragment order preserved on both sides"
+        );
+        let texts: Vec<String> = r.children.iter().map(dom_text).collect();
+        assert_eq!(
+            texts,
+            vec!["1", "2", "x", "3", "4"]
+                .into_iter()
+                .map(String::from)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn insert_adjacent_html_invalid_position_throws_syntax_error() {
+        // An unknown position keyword throws a SyntaxError DOMException; the
+        // element is left unchanged (Chrome/Blink Element::InsertAdjacent).
+        let html = "<!doctype html><html><body><div id='r'></div>\
+            <script>try{document.getElementById('r').insertAdjacentHTML('nope','<b>x</b>');\
+            window.__thrown='no';}catch(e){window.__thrown=e.name;}</script>\
+            </body></html>";
+        let cfg = cv_layout::LayoutConfig::default();
+        let (mut rt, doc, _s, _p) =
+            build_runtime_and_first_paint(html, "https://example.com/", &cfg, "").expect("render");
+        let thrown = rt
+            .interp
+            .run_completion_value("window.__thrown")
+            .expect("read")
+            .to_display_string();
+        assert_eq!(thrown, "SyntaxError", "invalid position throws SyntaxError");
+        let r = dom_find_by_id(&doc.root, "r").expect("#r");
+        assert!(r.children.is_empty(), "element unchanged after the throw");
+    }
+
+    #[test]
+    fn outer_html_setter_replaces_element() {
+        // el.outerHTML = "<p>y</p>" replaces el; the parent now has a <p>.
+        let html = "<!doctype html><html><body><div id='wrap'><span id='gone'>old</span></div>\
+            <script>document.getElementById('gone').outerHTML='<p id=\"fresh\">y</p>';</script>\
+            </body></html>";
+        let cfg = cv_layout::LayoutConfig::default();
+        let (_rt, doc, _s, _p) =
+            build_runtime_and_first_paint(html, "https://example.com/", &cfg, "").expect("render");
+        let wrap = dom_find_by_id(&doc.root, "wrap").expect("#wrap");
+        assert_eq!(
+            dom_child_tags(wrap),
+            vec!["p".to_string()],
+            "the <span> is replaced by a <p>"
+        );
+        assert!(dom_find_by_id(&doc.root, "gone").is_none(), "old element removed");
+        let fresh = dom_find_by_id(&doc.root, "fresh").expect("#fresh present");
+        assert_eq!(dom_text(fresh), "y");
+    }
+
+    #[test]
+    fn outer_html_setter_on_created_element() {
+        // outerHTML on a created+appended element replaces it in its parent.
+        let html = "<!doctype html><html><body><div id='host'></div>\
+            <script>var d=document.createElement('div');d.setAttribute('id','victim');\
+            document.getElementById('host').appendChild(d);\
+            d.outerHTML='<section id=\"replacement\">R</section>';</script>\
+            </body></html>";
+        let cfg = cv_layout::LayoutConfig::default();
+        let (_rt, doc, _s, _p) =
+            build_runtime_and_first_paint(html, "https://example.com/", &cfg, "").expect("render");
+        let host = dom_find_by_id(&doc.root, "host").expect("#host");
+        assert_eq!(dom_child_tags(&host.clone()), vec!["section".to_string()]);
+        assert!(dom_find_by_id(&doc.root, "victim").is_none());
+        let rep = dom_find_by_id(&doc.root, "replacement").expect("#replacement");
+        assert_eq!(dom_text(rep), "R");
+    }
+
+    #[test]
+    fn outer_html_getter_serializes_element() {
+        // The outerHTML getter serializes the element + subtree (incl. its tag).
+        let html = "<!doctype html><html><body>\
+            <section id='s' class='card'><b>hi</b></section>\
+            <script>window.__oh=document.getElementById('s').outerHTML;</script>\
+            </body></html>";
+        let cfg = cv_layout::LayoutConfig::default();
+        let (mut rt, _doc, _s, _p) =
+            build_runtime_and_first_paint(html, "https://example.com/", &cfg, "").expect("render");
+        let oh = rt
+            .interp
+            .run_completion_value("window.__oh")
+            .expect("read")
+            .to_display_string();
+        assert!(oh.starts_with("<section"), "starts with the element's own tag: {oh}");
+        assert!(oh.contains("class=\"card\""), "carries the class attribute: {oh}");
+        assert!(oh.contains("<b>hi</b>"), "serializes the child subtree: {oh}");
+        assert!(oh.ends_with("</section>"), "closes the element: {oh}");
+        assert!(!oh.contains('\u{1}'), "no internal bookkeeping attributes leak: {oh}");
+    }
+
+    #[test]
+    fn insert_adjacent_html_visible_to_runtime_query() {
+        // After insertAdjacentHTML the new node is immediately reachable via a
+        // live DOM read (it lands in the `_children` snapshot, not just at
+        // render time).
+        let html = "<!doctype html><html><body><div id='r'></div>\
+            <script>var r=document.getElementById('r');\
+            r.insertAdjacentHTML('beforeend','<b id=\"kid\">x</b>');\
+            var k=document.getElementById('kid');\
+            window.__kidtag=k?k.tagName:'MISSING';\
+            window.__kidtext=k?k.textContent:'';</script>\
+            </body></html>";
+        let cfg = cv_layout::LayoutConfig::default();
+        let (mut rt, _doc, _s, _p) =
+            build_runtime_and_first_paint(html, "https://example.com/", &cfg, "").expect("render");
+        let tag = rt
+            .interp
+            .run_completion_value("window.__kidtag")
+            .expect("read")
+            .to_display_string();
+        let text = rt
+            .interp
+            .run_completion_value("window.__kidtext")
+            .expect("read")
+            .to_display_string();
+        assert_eq!(tag, "B", "new node reachable by getElementById at runtime");
+        assert_eq!(text, "x");
+    }
+
+    #[test]
+    fn template_content_is_inert_fragment_not_in_body() {
+        // A <template> with children has .content.childNodes.length > 0 and those
+        // nodes are NOT in document.body (HTML Standard §4.13.3 — template content
+        // is a separate, inert tree scope).
+        let html = "<!doctype html><html><body>\
+            <template id='t'><div class='tpl'>inside</div><span>two</span></template>\
+            <script>var t=document.getElementById('t');\
+            window.__cc=t.content?t.content.childNodes.length:-1;\
+            window.__inbody=document.querySelector('.tpl')?'YES':'NO';\
+            window.__viacontent=t.content&&t.content.querySelector?\
+              (t.content.querySelector('.tpl')?'YES':'NO'):'NOQS';</script>\
+            </body></html>";
+        let cfg = cv_layout::LayoutConfig::default();
+        let (mut rt, doc, _s, _p) =
+            build_runtime_and_first_paint(html, "https://example.com/", &cfg, "").expect("render");
+        let cc = rt
+            .interp
+            .run_completion_value("window.__cc")
+            .expect("read")
+            .to_display_string();
+        let in_body = rt
+            .interp
+            .run_completion_value("window.__inbody")
+            .expect("read")
+            .to_display_string();
+        let via_content = rt
+            .interp
+            .run_completion_value("window.__viacontent")
+            .expect("read")
+            .to_display_string();
+        assert_eq!(cc, "2", "template.content holds the 2 parsed children");
+        assert_eq!(
+            in_body, "NO",
+            "template content is NOT reachable via a document query"
+        );
+        assert_eq!(
+            via_content, "YES",
+            "template content IS reachable via content.querySelector (own scope)"
+        );
+        // The template element's own childNodes are empty — its parsed children
+        // live only in the content fragment (separate tree scope).
+        let own_children = rt
+            .interp
+            .run_completion_value(
+                "document.getElementById('t').childNodes ? \
+                 document.getElementById('t').childNodes.length : -1",
+            )
+            .expect("read")
+            .to_display_string();
+        assert_eq!(own_children, "0", "template's own child list is empty");
+        // The <template> element renders display:none, so its parsed content is
+        // not painted. (The cv_html doc node retains the markup but the UA sheet
+        // `template { display: none }` hides it.) Confirm the template element
+        // still exists in the document (it itself is a body child).
+        assert!(dom_find_by_id(&doc.root, "t").is_some(), "<template> present");
+    }
+
+    #[test]
+    fn created_template_innerhtml_populates_content() {
+        // document.createElement('template'); tpl.innerHTML = "<p>x</p>" routes
+        // into the template's content fragment (Blink HTMLTemplateElement).
+        let html = "<!doctype html><html><body>\
+            <script>var t=document.createElement('template');\
+            t.innerHTML='<p class=\"c\">x</p><p class=\"c\">y</p>';\
+            window.__n=t.content.childNodes.length;\
+            window.__rt=t.content.childNodes.length>0?t.content.childNodes[0].tagName:'NONE';\
+            </script></body></html>";
+        let cfg = cv_layout::LayoutConfig::default();
+        let (mut rt, _doc, _s, _p) =
+            build_runtime_and_first_paint(html, "https://example.com/", &cfg, "").expect("render");
+        let n = rt
+            .interp
+            .run_completion_value("window.__n")
+            .expect("read")
+            .to_display_string();
+        let first = rt
+            .interp
+            .run_completion_value("window.__rt")
+            .expect("read")
+            .to_display_string();
+        assert_eq!(n, "2", "innerHTML parsed 2 nodes into template content");
+        assert_eq!(first, "P", "content's first child is a <p>");
+    }
+
+    #[test]
+    fn document_write_appends_parsed_markup() {
+        // document.write(markup) on an open document parses + appends the markup.
+        let html = "<!doctype html><html><body><div id='r'>seed</div>\
+            <script>document.write('<p id=\"written\">hello</p>');</script>\
+            </body></html>";
+        let cfg = cv_layout::LayoutConfig::default();
+        let (_rt, doc, _s, _p) =
+            build_runtime_and_first_paint(html, "https://example.com/", &cfg, "").expect("render");
+        let written = dom_find_by_id(&doc.root, "written");
+        assert!(
+            written.is_some(),
+            "document.write appended a parsed <p> into the document"
+        );
+        assert_eq!(dom_text(written.unwrap()), "hello");
     }
 
     #[test]
