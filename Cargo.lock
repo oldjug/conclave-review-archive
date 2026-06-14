@@ -139,6 +139,7 @@ name = "cv_js"
 version = "0.0.1"
 dependencies = [
  "cv_asm",
+ "cv_compression",
  "cv_wasm",
 ]
 

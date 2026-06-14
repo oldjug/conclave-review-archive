@@ -10,8 +10,10 @@
 
 pub mod brotli;
 pub mod deflate;
+pub mod encode;
 pub mod gzip;
 
 pub use brotli::{BrotliError, decode_brotli};
 pub use deflate::{InflateError, inflate};
+pub use encode::{adler32, crc32, deflate as deflate_raw, encode_gzip, encode_zlib};
 pub use gzip::{GzipError, ZlibError, decode_gzip, decode_zlib};

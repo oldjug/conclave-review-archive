@@ -12,3 +12,4 @@ workspace = true
 [dependencies]
 cv_asm = { path = "../cv_asm" }
 cv_wasm = { path = "../cv_wasm" }
+cv_compression = { path = "../cv_compression" }

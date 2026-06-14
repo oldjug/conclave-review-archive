@@ -9848,6 +9848,11 @@ impl Interp {
         // cv_wasm; we plumb bytes in and Values out.
         install_webassembly(self);
 
+        // ===== Compression Streams =====
+        // CompressionStream / DecompressionStream (gzip/deflate/deflate-raw),
+        // backed by the real codecs in cv_compression.
+        install_compression_streams(self);
+
         let regex_ctor = native_fn_with_interp("RegExp", |_interp, args| {
             let mut pat = arg_str(&args, 0);
             let mut flg = arg_str(&args, 1);
@@ -21729,6 +21734,317 @@ fn install_webassembly(interp: &Interp) {
     interp.define_global("WebAssembly", Value::Object(Rc::new(RefCell::new(wa))));
 }
 
+// ============================================================
+// CompressionStream / DecompressionStream — the WHATWG Compression
+// Streams API (https://compression.spec.whatwg.org/, implemented by
+// Chrome blink `modules/compression/{compression,decompression}_stream.cc`).
+//
+// `new CompressionStream(format)` / `new DecompressionStream(format)` take
+// a format string in {"gzip","deflate","deflate-raw"} (TypeError otherwise,
+// per the spec's `CompressionFormat` IDL enum + the `Set up [De]compression
+// Stream` algorithm) and expose a TransformStream: the `writable` side takes
+// Uint8Array/ArrayBuffer chunks, the `readable` side emits the
+// compressed/decompressed Uint8Array.
+//
+//   "gzip"        -> gzip wrapper, RFC 1952
+//   "deflate"     -> zlib wrapper, RFC 1950
+//   "deflate-raw" -> raw DEFLATE,  RFC 1951
+//
+// The bytes are produced by the real codecs in `cv_compression`
+// (encode_gzip/encode_zlib/deflate_raw and decode_gzip/decode_zlib/inflate),
+// so output is correctly framed and round-trips against Chrome/zlib.
+//
+// HONEST SCOPE: our engine has no general ReadableStream/WritableStream/
+// TransformStream machinery yet, so this provides the
+// CompressionStream-shaped surface (`.readable`/`.writable` with
+// getWriter()/getReader(), write()/close(), read()) backed by a one-shot
+// codec that buffers all written chunks and runs the codec on close(). The
+// readable side then yields the full result as a single chunk followed by
+// `{done:true}`. This is observably equivalent for total bytes (a
+// TransformStream is free to coalesce), but it is NOT incremental streaming.
+
+/// Format accepted by the Compression Streams API. Returns the canonical
+/// kind, or `None` if the string is not one of the three IDL enum values.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CompressionFormat {
+    Gzip,
+    Deflate,
+    DeflateRaw,
+}
+
+fn parse_compression_format(s: &str) -> Option<CompressionFormat> {
+    match s {
+        "gzip" => Some(CompressionFormat::Gzip),
+        "deflate" => Some(CompressionFormat::Deflate),
+        "deflate-raw" => Some(CompressionFormat::DeflateRaw),
+        _ => None,
+    }
+}
+
+/// Build a JS `Uint8Array` value from raw bytes by invoking the real
+/// `Uint8Array` constructor (so the result has the proper prototype chain,
+/// `.buffer`, `.byteLength`, etc.).
+fn bytes_to_uint8array(interp: &mut Interp, bytes: &[u8]) -> Result<Value, JsError> {
+    let arr = Value::Array(Rc::new(RefCell::new(
+        bytes.iter().map(|b| Value::Number(f64::from(*b))).collect(),
+    )));
+    let ctor = interp
+        .get_global("Uint8Array")
+        .ok_or_else(|| JsError::Throw(err_str("TypeError: Uint8Array missing".into())))?;
+    interp.call_value(ctor, vec![arr])
+}
+
+/// Run the codec on the accumulated input. `compress` selects encode vs
+/// decode; `format` selects the framing. A decode failure surfaces as a
+/// `TypeError` (Chrome rejects the readable with a TypeError on malformed
+/// input — see `DecompressionStream` + the `Decode and enqueue a chunk`
+/// algorithm raising "junk found after end of compressed data" etc.).
+fn run_compression_codec(
+    input: &[u8],
+    compress: bool,
+    format: CompressionFormat,
+) -> Result<Vec<u8>, JsError> {
+    if compress {
+        Ok(match format {
+            CompressionFormat::Gzip => cv_compression::encode_gzip(input),
+            CompressionFormat::Deflate => cv_compression::encode_zlib(input),
+            CompressionFormat::DeflateRaw => cv_compression::deflate_raw(input),
+        })
+    } else {
+        let res = match format {
+            CompressionFormat::Gzip => {
+                cv_compression::decode_gzip(input).map_err(|e| format!("{e}"))
+            }
+            CompressionFormat::Deflate => {
+                cv_compression::decode_zlib(input).map_err(|e| format!("{e}"))
+            }
+            CompressionFormat::DeflateRaw => {
+                cv_compression::inflate(input).map_err(|e| format!("{e}"))
+            }
+        };
+        res.map_err(|e| JsError::Throw(err_str(format!("TypeError: {e}"))))
+    }
+}
+
+/// The shared backing state for one Compression/DecompressionStream. All of
+/// the writer/reader method closures hold an `Rc` to this so writes on the
+/// writable side flow to reads on the readable side.
+struct CompressionState {
+    compress: bool,
+    format: CompressionFormat,
+    /// Bytes accumulated from writes on the writable side.
+    input: RefCell<Vec<u8>>,
+    /// The codec output, produced on close(). `None` until close().
+    output: RefCell<Option<Result<Vec<u8>, JsError>>>,
+    /// Whether the writable side has been closed.
+    closed: std::cell::Cell<bool>,
+    /// Whether the single output chunk has already been read.
+    read_done: std::cell::Cell<bool>,
+}
+
+fn build_compression_stream(
+    compress: bool,
+    format: CompressionFormat,
+) -> Value {
+    let state = Rc::new(CompressionState {
+        compress,
+        format,
+        input: RefCell::new(Vec::new()),
+        output: RefCell::new(None),
+        closed: std::cell::Cell::new(false),
+        read_done: std::cell::Cell::new(false),
+    });
+
+    // --- writable side ------------------------------------------------------
+    // writer.write(chunk): coerce chunk to bytes and append.
+    let st = state.clone();
+    let write_fn = native_fn("write", move |args| {
+        if st.closed.get() {
+            return Ok(make_settled_promise(
+                false,
+                err_str("TypeError: Cannot write to a closed CompressionStream".into()),
+            ));
+        }
+        let chunk = args.first().cloned().unwrap_or(Value::Undefined);
+        let bytes = js_value_to_wasm_bytes(&chunk).ok_or(()).or_else(|()| {
+            // Per the spec the writable side's chunk must be a BufferSource;
+            // a non-BufferSource chunk rejects with a TypeError.
+            Err::<Vec<u8>, JsError>(JsError::Throw(err_str(
+                "TypeError: Chunk is not a BufferSource".into(),
+            )))
+        });
+        match bytes {
+            Ok(b) => {
+                st.input.borrow_mut().extend_from_slice(&b);
+                Ok(make_settled_promise(true, Value::Undefined))
+            }
+            Err(JsError::Throw(v)) => Ok(make_settled_promise(false, v)),
+            Err(_) => Ok(make_settled_promise(
+                false,
+                err_str("TypeError: write failed".into()),
+            )),
+        }
+    });
+
+    // writer.close(): run the codec over the accumulated input.
+    let st = state.clone();
+    let close_fn = native_fn("close", move |_args| {
+        if !st.closed.get() {
+            st.closed.set(true);
+            let input = st.input.borrow().clone();
+            let result = run_compression_codec(&input, st.compress, st.format);
+            *st.output.borrow_mut() = Some(result.clone());
+            if let Err(JsError::Throw(v)) = result {
+                return Ok(make_settled_promise(false, v));
+            }
+        }
+        Ok(make_settled_promise(true, Value::Undefined))
+    });
+
+    // writer.abort(): discard, mark closed with no output.
+    let st = state.clone();
+    let abort_fn = native_fn("abort", move |_args| {
+        st.closed.set(true);
+        *st.output.borrow_mut() = Some(Ok(Vec::new()));
+        st.read_done.set(true);
+        Ok(make_settled_promise(true, Value::Undefined))
+    });
+
+    // getWriter(): the WritableStreamDefaultWriter surface.
+    let writer_write = write_fn.clone();
+    let writer_close = close_fn.clone();
+    let writer_abort = abort_fn.clone();
+    let get_writer = native_fn("getWriter", move |_args| {
+        let mut w: HashMap<String, Value> = HashMap::new();
+        w.insert("write".into(), writer_write.clone());
+        w.insert("close".into(), writer_close.clone());
+        w.insert("abort".into(), writer_abort.clone());
+        w.insert(
+            "releaseLock".into(),
+            native_fn("releaseLock", |_| Ok(Value::Undefined)),
+        );
+        w.insert("ready".into(), make_settled_promise(true, Value::Undefined));
+        w.insert("closed".into(), make_settled_promise(true, Value::Undefined));
+        w.insert("desiredSize".into(), Value::Number(1.0));
+        Ok(Value::Object(Rc::new(RefCell::new(w))))
+    });
+
+    let mut writable: HashMap<String, Value> = HashMap::new();
+    writable.insert("_isWritableStream".into(), Value::Bool(true));
+    writable.insert("getWriter".into(), get_writer);
+    writable.insert("write".into(), write_fn);
+    writable.insert("close".into(), close_fn);
+    writable.insert("abort".into(), abort_fn);
+    writable.insert("locked".into(), Value::Bool(false));
+
+    // --- readable side ------------------------------------------------------
+    // reader.read(): yields {value, done}. If the writable side has been
+    // closed, returns the codec output once, then {done:true}. If not yet
+    // closed, this implementation cannot stream incrementally, so it eagerly
+    // finalizes (a no-write CompressionStream produces the empty-input frame).
+    let st = state.clone();
+    let read_fn = native_fn_with_interp("read", move |interp, _args| {
+        // Finalize lazily if the consumer reads before the producer closed.
+        if !st.closed.get() {
+            st.closed.set(true);
+            let input = st.input.borrow().clone();
+            *st.output.borrow_mut() = Some(run_compression_codec(&input, st.compress, st.format));
+        }
+        if st.read_done.get() {
+            let mut done: HashMap<String, Value> = HashMap::new();
+            done.insert("value".into(), Value::Undefined);
+            done.insert("done".into(), Value::Bool(true));
+            return Ok(make_settled_promise(true, Value::Object(Rc::new(RefCell::new(done)))));
+        }
+        st.read_done.set(true);
+        let out = st.output.borrow().clone();
+        match out {
+            Some(Ok(bytes)) => {
+                let ua = bytes_to_uint8array(interp, &bytes)?;
+                let mut res: HashMap<String, Value> = HashMap::new();
+                res.insert("value".into(), ua);
+                res.insert("done".into(), Value::Bool(false));
+                Ok(make_settled_promise(true, Value::Object(Rc::new(RefCell::new(res)))))
+            }
+            Some(Err(JsError::Throw(v))) => Ok(make_settled_promise(false, v)),
+            _ => Ok(make_settled_promise(
+                false,
+                err_str("TypeError: compression failed".into()),
+            )),
+        }
+    });
+
+    let reader_read = read_fn.clone();
+    let get_reader = native_fn("getReader", move |_args| {
+        let mut r: HashMap<String, Value> = HashMap::new();
+        r.insert("read".into(), reader_read.clone());
+        r.insert(
+            "cancel".into(),
+            native_fn("cancel", |_| Ok(make_settled_promise(true, Value::Undefined))),
+        );
+        r.insert(
+            "releaseLock".into(),
+            native_fn("releaseLock", |_| Ok(Value::Undefined)),
+        );
+        r.insert("closed".into(), make_settled_promise(true, Value::Undefined));
+        Ok(Value::Object(Rc::new(RefCell::new(r))))
+    });
+
+    let mut readable: HashMap<String, Value> = HashMap::new();
+    readable.insert("_isReadableStream".into(), Value::Bool(true));
+    readable.insert("getReader".into(), get_reader);
+    readable.insert("locked".into(), Value::Bool(false));
+
+    // --- the stream object: { readable, writable } --------------------------
+    let mut stream: HashMap<String, Value> = HashMap::new();
+    stream.insert("_isCompressionStream".into(), Value::Bool(true));
+    stream.insert(
+        "readable".into(),
+        Value::Object(Rc::new(RefCell::new(readable))),
+    );
+    stream.insert(
+        "writable".into(),
+        Value::Object(Rc::new(RefCell::new(writable))),
+    );
+    Value::Object(Rc::new(RefCell::new(stream)))
+}
+
+fn install_compression_streams(interp: &Interp) {
+    // new CompressionStream(format)
+    let cs_ctor = native_fn("CompressionStream", |args| {
+        let fmt = arg_str(&args, 0);
+        let format = parse_compression_format(&fmt).ok_or_else(|| {
+            JsError::Throw(err_str(format!(
+                "TypeError: Unsupported compression format: '{fmt}'"
+            )))
+        })?;
+        Ok(build_compression_stream(true, format))
+    });
+    let mut cs_obj: HashMap<String, Value> = HashMap::new();
+    cs_obj.insert("_construct".into(), cs_ctor);
+    interp.define_global(
+        "CompressionStream",
+        Value::Object(Rc::new(RefCell::new(cs_obj))),
+    );
+
+    // new DecompressionStream(format)
+    let ds_ctor = native_fn("DecompressionStream", |args| {
+        let fmt = arg_str(&args, 0);
+        let format = parse_compression_format(&fmt).ok_or_else(|| {
+            JsError::Throw(err_str(format!(
+                "TypeError: Unsupported compression format: '{fmt}'"
+            )))
+        })?;
+        Ok(build_compression_stream(false, format))
+    });
+    let mut ds_obj: HashMap<String, Value> = HashMap::new();
+    ds_obj.insert("_construct".into(), ds_ctor);
+    interp.define_global(
+        "DecompressionStream",
+        Value::Object(Rc::new(RefCell::new(ds_obj))),
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -26852,6 +27168,203 @@ log(probe());
         );
         let (_, out) = run(&src);
         assert_eq!(out, vec!["42"], "nested reentrant: got {out:?}");
+    }
+
+    // ── CompressionStream / DecompressionStream (WHATWG Compression Streams) ──
+
+    /// JS helper appended to a test program: compress `bytes` (an array of
+    /// numbers) with `format`, then read out the result as an array of bytes
+    /// printed via console.log. Uses the writer/reader surface.
+    const COMPRESS_HELPER: &str = "\
+        async function compress(format, bytes) {\
+          var cs = new CompressionStream(format);\
+          var w = cs.writable.getWriter();\
+          await w.write(new Uint8Array(bytes));\
+          await w.close();\
+          var r = cs.readable.getReader();\
+          var out = [];\
+          while (true) {\
+            var res = await r.read();\
+            if (res.done) break;\
+            for (var i = 0; i < res.value.length; i++) out.push(res.value[i]);\
+          }\
+          return out;\
+        }\
+        async function decompress(format, bytes) {\
+          var ds = new DecompressionStream(format);\
+          var w = ds.writable.getWriter();\
+          await w.write(new Uint8Array(bytes));\
+          await w.close();\
+          var r = ds.readable.getReader();\
+          var out = [];\
+          while (true) {\
+            var res = await r.read();\
+            if (res.done) break;\
+            for (var i = 0; i < res.value.length; i++) out.push(res.value[i]);\
+          }\
+          return out;\
+        }\
+        function asStr(bytes) {\
+          var s = '';\
+          for (var i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);\
+          return s;\
+        }\
+        function strBytes(s) {\
+          var b = [];\
+          for (var i = 0; i < s.length; i++) b.push(s.charCodeAt(i));\
+          return b;\
+        }";
+
+    #[test]
+    fn compression_stream_gzip_roundtrips_through_decompression_stream() {
+        let src = format!(
+            "{COMPRESS_HELPER}\
+             var input = '';\
+             for (var k = 0; k < 50; k++) input += 'hello world';\
+             compress('gzip', strBytes(input)).then(function(comp) {{\
+               return decompress('gzip', comp);\
+             }}).then(function(back) {{\
+               console.log(asStr(back) === input ? 'MATCH' : 'MISMATCH');\
+               console.log(asStr(back).length);\
+             }});"
+        );
+        let (_, out) = run(&src);
+        assert_eq!(out, vec!["MATCH", "550"], "gzip round-trip: {out:?}");
+    }
+
+    #[test]
+    fn compression_stream_gzip_output_has_magic_bytes() {
+        let src = format!(
+            "{COMPRESS_HELPER}\
+             compress('gzip', strBytes('hello world')).then(function(comp) {{\
+               console.log(comp[0]);\
+               console.log(comp[1]);\
+               console.log(comp[2]);\
+             }});"
+        );
+        let (_, out) = run(&src);
+        // gzip magic 0x1f 0x8b, CM=8 (RFC 1952).
+        assert_eq!(out, vec!["31", "139", "8"], "gzip magic: {out:?}");
+    }
+
+    #[test]
+    fn compression_stream_deflate_vs_deflate_raw_differ_by_zlib_wrapper() {
+        let src = format!(
+            "{COMPRESS_HELPER}\
+             (async function() {{\
+               var zlib = await compress('deflate', strBytes('hello world'));\
+               var raw = await compress('deflate-raw', strBytes('hello world'));\
+               console.log(zlib.length - raw.length);\
+               console.log(zlib[0]);\
+               console.log(zlib[1]);\
+               var bodyEqual = true;\
+               for (var i = 0; i < raw.length; i++) {{\
+                 if (zlib[i + 2] !== raw[i]) {{ bodyEqual = false; break; }}\
+               }}\
+               console.log(bodyEqual ? 'BODY_EQ' : 'BODY_NE');\
+             }})();"
+        );
+        let (_, out) = run(&src);
+        // zlib wrapper = 2-byte header + 4-byte Adler-32 trailer = 6 extra bytes.
+        // CMF = 0x78 = 120. The raw DEFLATE body is identical, just unwrapped.
+        assert_eq!(
+            out,
+            vec!["6", "120", "1", "BODY_EQ"],
+            "deflate vs deflate-raw: {out:?}"
+        );
+    }
+
+    #[test]
+    fn decompression_stream_deflate_raw_roundtrips() {
+        let src = format!(
+            "{COMPRESS_HELPER}\
+             var input = '';\
+             for (var k = 0; k < 20; k++) input += 'The quick brown fox. ';\
+             compress('deflate-raw', strBytes(input)).then(function(comp) {{\
+               return decompress('deflate-raw', comp);\
+             }}).then(function(back) {{\
+               console.log(asStr(back) === input ? 'MATCH' : 'MISMATCH');\
+             }});"
+        );
+        let (_, out) = run(&src);
+        assert_eq!(out, vec!["MATCH"], "deflate-raw round-trip: {out:?}");
+    }
+
+    #[test]
+    fn deflate_zlib_roundtrips_through_decompression_stream() {
+        let src = format!(
+            "{COMPRESS_HELPER}\
+             var input = '';\
+             for (var k = 0; k < 30; k++) input += 'abcdefghij';\
+             compress('deflate', strBytes(input)).then(function(comp) {{\
+               return decompress('deflate', comp);\
+             }}).then(function(back) {{\
+               console.log(asStr(back) === input ? 'MATCH' : 'MISMATCH');\
+             }});"
+        );
+        let (_, out) = run(&src);
+        assert_eq!(out, vec!["MATCH"], "deflate(zlib) round-trip: {out:?}");
+    }
+
+    #[test]
+    fn compression_stream_unknown_format_throws_type_error() {
+        // `new CompressionStream("br")` must throw a TypeError synchronously
+        // (the format is validated in the constructor per the IDL enum).
+        let (_, out) = run(
+            "try {\
+               new CompressionStream('br');\
+               console.log('NO_THROW');\
+             } catch (e) {\
+               console.log(e instanceof TypeError ? 'TypeError' : ('OTHER:' + e.name));\
+             }",
+        );
+        assert_eq!(out, vec!["TypeError"], "unknown format: {out:?}");
+    }
+
+    #[test]
+    fn decompression_stream_unknown_format_throws_type_error() {
+        let (_, out) = run(
+            "try {\
+               new DecompressionStream('lz4');\
+               console.log('NO_THROW');\
+             } catch (e) {\
+               console.log(e instanceof TypeError ? 'TypeError' : ('OTHER:' + e.name));\
+             }",
+        );
+        assert_eq!(out, vec!["TypeError"], "unknown decompress format: {out:?}");
+    }
+
+    #[test]
+    fn decompression_stream_rejects_garbage_input() {
+        // Feeding non-gzip bytes to a gzip DecompressionStream must reject the
+        // read with a TypeError (malformed input), not silently succeed.
+        let src = format!(
+            "{COMPRESS_HELPER}\
+             decompress('gzip', [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]).then(function(v) {{\
+               console.log('RESOLVED');\
+             }}, function(e) {{\
+               console.log(e instanceof TypeError ? 'REJECTED_TYPEERROR' : 'REJECTED_OTHER');\
+             }});"
+        );
+        let (_, out) = run(&src);
+        assert_eq!(out, vec!["REJECTED_TYPEERROR"], "garbage input: {out:?}");
+    }
+
+    #[test]
+    fn compression_stream_globals_are_constructors() {
+        // Sanity: the globals exist and are usable with `new`.
+        let (_, out) = run(
+            "console.log(typeof CompressionStream);\
+             console.log(typeof DecompressionStream);\
+             var cs = new CompressionStream('gzip');\
+             console.log(typeof cs.readable);\
+             console.log(typeof cs.writable);",
+        );
+        assert_eq!(
+            out,
+            vec!["function", "function", "object", "object"],
+            "globals: {out:?}"
+        );
     }
 }
 
