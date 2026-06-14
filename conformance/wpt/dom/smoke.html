@@ -1,0 +1,36 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>smoke: basic DOM</title>
+<script src="/resources/testharness.js"></script>
+<script src="/resources/testharnessreport.js"></script>
+</head>
+<body>
+<div id="host"></div>
+<script>
+test(function(){
+  var el = document.createElement('div');
+  el.id = 'made';
+  assert_equals(el.id, 'made', 'id reflects');
+  assert_equals(el.tagName, 'DIV', 'tagName uppercase');
+}, 'createElement basic');
+
+test(function(){
+  var host = document.getElementById('host');
+  assert_true(!!host, 'host exists');
+  var child = document.createElement('span');
+  host.appendChild(child);
+  assert_equals(host.children.length, 1, 'appendChild adds child');
+}, 'appendChild');
+
+test(function(){
+  assert_throws_js(TypeError, function(){ null.foo; }, 'property of null throws TypeError');
+}, 'assert_throws_js TypeError');
+
+test(function(){
+  assert_equals(1, 2, 'this should fail on purpose');
+}, 'intentional failure');
+</script>
+</body>
+</html>

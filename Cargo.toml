@@ -1,0 +1,106 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/cv_base",
+    "crates/cv_arena",
+    "crates/cv_sched",
+    "crates/cv_url",
+    "crates/cv_unicode",
+    "crates/cv_ipc",
+    "crates/cv_sandbox",
+    "crates/cv_crypto",
+    "crates/cv_compression",
+    "crates/cv_net",
+    "crates/cv_gfx",
+    "crates/cv_gpu",
+    "crates/cv_compositor",
+    "crates/cv_text",
+    "crates/cv_image",
+    "crates/cv_media",
+    "crates/cv_audio",
+    "crates/cv_html",
+    "crates/cv_css",
+    "crates/cv_dom",
+    "crates/cv_layout",
+    "crates/cv_paint",
+    "crates/cv_js",
+    "crates/cv_asm",
+    "crates/cv_wasm",
+    "crates/cv_spell",
+    "crates/cv_reader",
+    "crates/cv_session",
+    "crates/cv_ime",
+    "crates/cv_native_messaging",
+    "crates/cv_autofill",
+    "crates/cv_power",
+    "crates/cv_bindings",
+    "crates/cv_webapi",
+    "crates/cv_renderer",
+    "crates/cv_content",
+    "crates/cv_extensions",
+    "crates/cv_devtools",
+    "crates/cv_ui",
+    "crates/cv_profile",
+    "crates/cv_a11y",
+    "crates/cv_storage",
+    "crates/cv_pdf",
+    "crates/cv_dist",
+    "crates/cv_browser",
+    "tools/webidl_gen",
+    "tools/ucd_gen",
+    "tools/wpt_runner",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.95"
+authors = ["Conclave Authors"]
+license = "MPL-2.0"
+publish = false
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+unused_must_use = "deny"
+unreachable_pub = "warn"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# Browser code is hot — these clippy lints fight idiomatic Rust here.
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+cast_precision_loss = "allow"
+similar_names = "allow"
+
+# Strict third-party policy: no external crates allowed in any workspace member.
+# Anything we need we write ourselves or wrap OS syscalls.
+[profile.dev]
+opt-level = 1
+debug = "limited"
+incremental = true
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+debug = "limited"
+panic = "abort"
+strip = "debuginfo"
+
+# Like release but panic=unwind, so the in-process test262 runner's
+# catch_unwind can contain an engine panic on one test instead of aborting the
+# whole run. The SHIPPED binary stays panic=abort (profile.release); this
+# profile is ONLY for the conformance-measurement build:
+#   cargo build --profile release-unwind -p cv_browser
+[profile.release-unwind]
+inherits = "release"
+panic = "unwind"
+
+[profile.test]
+opt-level = 1

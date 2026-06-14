@@ -1,0 +1,20 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>CSS Box: computed width/margin/padding (direct)</title>
+<script src="/resources/testharness.js"></script>
+</head><body>
+<div id="target" style="width:100px;padding:10px;margin:5px;"></div>
+<script>
+test(function(){
+  var cs = getComputedStyle(document.getElementById('target'));
+  assert_equals(cs.width, '100px', 'width');
+}, 'computed width is 100px');
+test(function(){
+  var cs = getComputedStyle(document.getElementById('target'));
+  assert_equals(cs.paddingTop, '10px', 'paddingTop');
+}, 'computed paddingTop is 10px');
+test(function(){
+  var cs = getComputedStyle(document.getElementById('target'));
+  assert_equals(cs.marginTop, '5px', 'marginTop');
+}, 'computed marginTop is 5px');
+</script>
+</body></html>

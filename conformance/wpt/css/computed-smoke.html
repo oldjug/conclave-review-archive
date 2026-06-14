@@ -1,0 +1,21 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>computed style</title>
+<style>
+#a { color: rgb(255, 0, 0); display: block; }
+#b { width: 100px; }
+</style>
+</head><body>
+<div id="a">red</div>
+<div id="b">wide</div>
+<script>
+test(function(){
+  var a = document.getElementById('a');
+  var cs = getComputedStyle(a);
+  assert_equals(cs.color, 'rgb(255, 0, 0)', 'color computes to rgb()');
+}, 'getComputedStyle color');
+test(function(){
+  var a = document.getElementById('a');
+  assert_equals(getComputedStyle(a).display, 'block', 'display block');
+}, 'getComputedStyle display');
+</script>
+</body></html>

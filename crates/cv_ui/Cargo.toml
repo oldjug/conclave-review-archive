@@ -1,0 +1,17 @@
+[package]
+name = "cv_ui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+cv_gfx = { path = "../cv_gfx" }
+cv_gpu = { path = "../cv_gpu" }
+cv_layout = { path = "../cv_layout" }
+cv_paint = { path = "../cv_paint" }
+cv_compositor = { path = "../cv_compositor" }

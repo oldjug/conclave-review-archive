@@ -1,0 +1,36 @@
+[package]
+name = "cv_browser"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "conclave"
+path = "src/main.rs"
+
+[dependencies]
+cv_base = { path = "../cv_base" }
+cv_url = { path = "../cv_url" }
+cv_net = { path = "../cv_net" }
+cv_html = { path = "../cv_html" }
+cv_dom = { path = "../cv_dom" }
+cv_css = { path = "../cv_css" }
+cv_layout = { path = "../cv_layout" }
+cv_gfx = { path = "../cv_gfx" }
+cv_sched = { path = "../cv_sched" }
+cv_ui = { path = "../cv_ui" }
+cv_image = { path = "../cv_image" }
+cv_text = { path = "../cv_text" }
+cv_js = { path = "../cv_js" }
+cv_crypto = { path = "../cv_crypto" }
+cv_unicode = { path = "../cv_unicode" }
+cv_ipc = { path = "../cv_ipc" }
+cv_content = { path = "../cv_content" }
+cv_compositor = { path = "../cv_compositor" }
+cv_paint = { path = "../cv_paint" }
+cv_compression = { path = "../cv_compression" }

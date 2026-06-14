@@ -1,0 +1,27 @@
+<!doctype html>
+<!-- TB-LAYOUT-EXPECT
+{
+  "viewport": [1024, 768],
+  "checks": [
+    { "id": "frame", "rect_w": 200.0, "rect_h": 100.0, "tol": 1.0 }
+  ]
+}
+TB-LAYOUT-EXPECT-END -->
+<html><head><style>
+  body { margin: 0; padding: 0; }
+  #frame {
+    width: 200px;
+    height: 100px;
+    background: #eee;
+  }
+  #frame img {
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+  }
+</style></head>
+<body>
+  <div id="frame">
+    <img alt="logo" src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=">
+  </div>
+</body></html>

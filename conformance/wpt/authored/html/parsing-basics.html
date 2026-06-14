@@ -1,0 +1,38 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>HTML parsing basics</title>
+<script src="/resources/testharness.js"></script>
+</head><body>
+<div id="implicit-tbody"><table><tr><td>cell</td></tr></table></div>
+<p id="auto-close">one<p>two</p>
+<ul id="list"><li>a<li>b<li>c</ul>
+<div id="attrs" class="c1 c2" data-foo="bar" hidden></div>
+<div id="entities">a &amp; b &lt; c &gt; d &copy;</div>
+<script>
+test(function(){
+  var t = document.querySelector('#implicit-tbody table');
+  var tbody = t.querySelector('tbody');
+  assert_true(!!tbody, 'parser inserts implicit tbody');
+}, 'implicit tbody insertion');
+test(function(){
+  var ps = document.querySelectorAll('#auto-close, p');
+  // the first <p> auto-closes before the second <p>
+  var first = document.getElementById('auto-close');
+  assert_equals(first.tagName, 'P', 'first is P');
+  assert_equals(first.textContent.trim(), 'one', 'first p closed before second');
+}, 'p auto-close');
+test(function(){
+  var lis = document.querySelectorAll('#list li');
+  assert_equals(lis.length, 3, 'three auto-closed li');
+}, 'li auto-close');
+test(function(){
+  var d = document.getElementById('attrs');
+  assert_equals(d.className, 'c1 c2', 'class attr parsed');
+  assert_equals(d.getAttribute('data-foo'), 'bar', 'data attr parsed');
+  assert_true(d.hasAttribute('hidden'), 'boolean attr parsed');
+}, 'attribute parsing');
+test(function(){
+  var d = document.getElementById('entities');
+  assert_equals(d.textContent, 'a & b < c > d ©', 'entities decoded');
+}, 'character reference decoding');
+</script>
+</body></html>

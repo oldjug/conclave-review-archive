@@ -1,0 +1,60 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>DOM Node basics</title>
+<script src="/resources/testharness.js"></script>
+</head><body>
+<div id="parent"><span class="a">one</span><span class="b">two</span></div>
+<script>
+test(function(){
+  var p = document.getElementById('parent');
+  assert_equals(p.nodeType, 1, 'element nodeType is 1');
+  assert_equals(p.nodeName, 'DIV', 'nodeName uppercase');
+}, 'nodeType and nodeName');
+test(function(){
+  var p = document.getElementById('parent');
+  assert_equals(p.childNodes.length, 2, 'two child nodes');
+  assert_equals(p.firstChild.textContent, 'one', 'firstChild text');
+  assert_equals(p.lastChild.textContent, 'two', 'lastChild text');
+}, 'childNodes / firstChild / lastChild');
+test(function(){
+  var p = document.getElementById('parent');
+  var spans = p.getElementsByTagName('span');
+  assert_equals(spans.length, 2, 'two spans');
+}, 'getElementsByTagName');
+test(function(){
+  var p = document.getElementById('parent');
+  var c = document.createElement('em');
+  p.appendChild(c);
+  assert_equals(p.children.length, 3, 'appendChild grows children');
+  assert_equals(p.lastElementChild.tagName, 'EM', 'lastElementChild updated');
+}, 'appendChild updates children + lastElementChild');
+test(function(){
+  var p = document.getElementById('parent');
+  var first = p.firstElementChild;
+  p.removeChild(first);
+  assert_equals(p.firstElementChild.className, 'b', 'removeChild removed first');
+}, 'removeChild');
+test(function(){
+  var t = document.createTextNode('hello');
+  assert_equals(t.nodeType, 3, 'text nodeType is 3');
+  assert_equals(t.textContent, 'hello', 'text content');
+}, 'createTextNode');
+test(function(){
+  var d = document.createElement('div');
+  d.setAttribute('data-x', '42');
+  assert_equals(d.getAttribute('data-x'), '42', 'getAttribute reflects setAttribute');
+  assert_true(d.hasAttribute('data-x'), 'hasAttribute true');
+  d.removeAttribute('data-x');
+  assert_false(d.hasAttribute('data-x'), 'hasAttribute false after remove');
+}, 'attributes get/set/has/remove');
+test(function(){
+  var d = document.createElement('div');
+  d.className = 'foo bar';
+  assert_true(d.classList.contains('foo'), 'classList contains foo');
+  d.classList.add('baz');
+  assert_true(d.classList.contains('baz'), 'classList add');
+  d.classList.remove('foo');
+  assert_false(d.classList.contains('foo'), 'classList remove');
+  assert_equals(d.classList.length, 2, 'classList length');
+}, 'classList add/remove/contains');
+</script>
+</body></html>

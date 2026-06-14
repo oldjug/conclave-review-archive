@@ -1,0 +1,16 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>HTML template element</title>
+<script src="/resources/testharness.js"></script>
+</head><body>
+<template id="tpl"><div class="inside">content</div></template>
+<script>
+test(function(){
+  var tpl = document.getElementById('tpl');
+  assert_equals(tpl.tagName, 'TEMPLATE', 'is template');
+}, 'template tagName');
+test(function(){
+  var tpl = document.getElementById('tpl');
+  assert_true('content' in tpl, 'template has content property');
+}, 'template content property exists');
+</script>
+</body></html>

@@ -1,0 +1,12 @@
+<!doctype html>
+<html>
+<head><title>pf</title></head>
+<body>
+<script>
+var fb = (function () {}) instanceof Object;
+function hex(n, t) { return n.toString(16).padStart(2 * t, "0"); }
+function typ(n) { var s = n.toString(16); return typeof s; }
+console.log("HEXTEST [" + hex(255, 2) + "] [" + hex(10, 1) + "] typ=" + typ(255));
+</script>
+</body>
+</html>

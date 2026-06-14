@@ -1,0 +1,20 @@
+<!doctype html>
+<!-- TB-LAYOUT-EXPECT
+{
+  "viewport": [1024, 768],
+  "checks": [
+    { "id": "container", "rect_w": 760.0, "tol": 1.0 },
+    { "id": "inner",     "rect_w": 760.0, "tol": 1.0 }
+  ]
+}
+TB-LAYOUT-EXPECT-END -->
+<html><head><style>
+  body { margin: 0; padding: 0; }
+  #container { width: 800px; padding: 20px; box-sizing: border-box; }
+  #inner { width: 100%; }
+</style></head>
+<body>
+  <div id="container">
+    <div id="inner">hello</div>
+  </div>
+</body></html>

@@ -1,0 +1,16 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>async</title></head><body>
+<script>
+async_test(function(t){
+  setTimeout(t.step_func_done(function(){
+    assert_true(true, 'fired in timeout');
+  }), 0);
+}, 'setTimeout async_test');
+
+promise_test(function(t){
+  return Promise.resolve(42).then(function(v){
+    assert_equals(v, 42, 'promise resolves to 42');
+  });
+}, 'promise_test resolves');
+</script>
+</body></html>

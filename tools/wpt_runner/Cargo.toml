@@ -1,0 +1,20 @@
+[package]
+name = "wpt_runner"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+cv_base = { path = "../../crates/cv_base" }
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "wpt_runner"
+path = "src/main.rs"

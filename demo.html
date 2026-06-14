@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Conclave JS Demo</title>
+  <style>
+    body { background: #fffaf0; color: #222; font-family: system-ui; }
+    h1, h2 { color: #b35; text-align: center; }
+    .panel { background: #fff0e0; padding: 14px; margin: 12px 0; border: 2px solid #b35; text-align: center; }
+    .stat { color: #207; font-size: 16px; padding: 6px; border: 1px solid #aac; background: white; margin: 6px 0; }
+    .net { color: #035; font-size: 16px; padding: 8px; border: 2px solid #035; background: #eef4ff; margin: 8px 0; }
+    .highlighted { background: #ffe0a0; border: 2px solid #f80; }
+    #click_target { color: #c30; font-size: 22px; padding: 12px; border: 3px solid #c30; background: #ffeedd; text-align: center; }
+    li { color: #333; }
+    strong { color: #b35; }
+  </style>
+</head>
+<body>
+  <h1>Conclave: from-scratch browser</h1>
+  <p class="panel">Everything below — TLS 1.3, HTTP, parsing, layout, paint, JS, DOM, fetch — all from-scratch Rust.</p>
+
+  <p class="stat" id="counter_p">unset</p>
+  <p class="stat" id="visit_p">unset</p>
+
+  <p class="net" id="fetch_status">unset</p>
+  <p class="net" id="fetch_body">unset</p>
+
+  <p id="classlist_demo" class="stat">classList demo starts plain.</p>
+
+  <p class="panel">Click the box. ESC = close. Backspace = back.</p>
+  <p id="click_target" onclick="(function(){ const n = parseInt(localStorage.getItem('click_n') || '0') + 1; localStorage.setItem('click_n', '' + n); document.getElementById('click_target').textContent = 'clicked ' + n + ' time(s) — stored in localStorage'; })()">CLICK ME</p>
+
+  <script>
+    function makeCounter() { let n = 0; return function () { n = n + 1; return n; }; }
+    const tick = makeCounter();
+    let sum = 0;
+    for (let i = 1; i <= 5; i = i + 1) sum = sum + tick();
+    document.querySelector('#counter_p').textContent = 'closure counter sum 1..5 = ' + sum;
+
+    const visits = parseInt(localStorage.getItem('visits') || '0') + 1;
+    localStorage.setItem('visits', '' + visits);
+    document.getElementById('visit_p').textContent =
+      'page loaded ' + visits + ' time(s) (localStorage)';
+
+    // fetch() — synchronously pull example.com via our TLS 1.3 stack.
+    try {
+      const r = fetch('https://example.com');
+      document.getElementById('fetch_status').textContent =
+        'fetch("https://example.com") returned status=' + r.status + ' ' + r.statusText +
+        ', content-type=' + r.headers.get('content-type');
+      const body = r.text();
+      const preview = body.substring(0, 80);
+      document.getElementById('fetch_body').textContent =
+        'body length = ' + body.length + ' bytes. First 80 chars: ' + preview;
+    } catch (e) {
+      document.getElementById('fetch_status').textContent = 'fetch failed: ' + e;
+    }
+
+    const cls = document.getElementById('classlist_demo');
+    cls.classList.add('highlighted');
+    cls.textContent = 'classList.add("highlighted") added a class — orange border now applies';
+
+    document.title = 'JS ran (visit #' + visits + ')';
+    console.log('visits =', visits);
+  </script>
+</body>
+</html>

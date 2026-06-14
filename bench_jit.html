@@ -1,0 +1,8 @@
+<!doctype html><html><head><title>jit</title></head><body>
+<script>
+var fb = (function(){}) instanceof Object;
+function f(x){ return ((x*x*0.5 + x*3.0 - 1.0) * (x - 2.0) + x*x*x*0.25) / (x + 1.0) - x*0.5 + x*x*0.125 - x*7.0; }
+var s = 0;
+for (var i = 0; i < 1500000; i++) { s = s + f(i); }
+throw "BENCH s=" + s;
+</script></body></html>

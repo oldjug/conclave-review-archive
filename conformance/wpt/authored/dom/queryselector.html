@@ -1,0 +1,31 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>DOM querySelector</title>
+<script src="/resources/testharness.js"></script>
+</head><body>
+<div id="root">
+  <p class="x">a</p>
+  <p class="y" data-k="v">b</p>
+  <section><p class="x">c</p></section>
+</div>
+<script>
+var root = document.getElementById('root');
+test(function(){
+  assert_equals(root.querySelector('p').textContent, 'a', 'first p');
+}, 'querySelector returns first match');
+test(function(){
+  assert_equals(root.querySelectorAll('p').length, 3, 'three p');
+}, 'querySelectorAll counts all');
+test(function(){
+  assert_equals(root.querySelectorAll('.x').length, 2, 'two .x');
+}, 'class selector');
+test(function(){
+  assert_equals(root.querySelector('[data-k="v"]').textContent, 'b', 'attr selector');
+}, 'attribute selector');
+test(function(){
+  assert_equals(root.querySelectorAll('section p').length, 1, 'descendant');
+}, 'descendant combinator');
+test(function(){
+  assert_equals(root.querySelectorAll('div > p').length, 0, 'no direct div>p? actually root is div');
+}, 'child combinator (root>p direct children)');
+</script>
+</body></html>

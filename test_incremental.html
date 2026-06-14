@@ -1,0 +1,36 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Incremental render test</title>
+  <style>
+    body { font-family: sans-serif; margin: 24px; color: #222; }
+    h1 { color: #2a4; }
+    .box { padding: 10px; margin: 6px; background: #eef; border: 1px solid #99c; border-radius: 6px; }
+    #counter { font-size: 32px; font-weight: bold; color: #c33; }
+  </style>
+</head>
+<body>
+  <h1>Incremental render test</h1>
+  <p>Counter (updates every 3s — should RENDER): <span id="counter">0</span></p>
+  <div class="box">Static content block A — lorem ipsum dolor sit amet consectetur.</div>
+  <div class="box">Static content block B — the quick brown fox jumps over the lazy dog.</div>
+  <div class="box">Static content block C — pack my box with five dozen liquor jugs.</div>
+  <div class="box">Static content block D — sphinx of black quartz judge my vow.</div>
+  <div class="box">Static content block E — how vexingly quick daft zebras jump.</div>
+  <div class="box">Static content block F — the five boxing wizards jump quickly.</div>
+  <div class="box">Static content block G — jackdaws love my big sphinx of quartz.</div>
+  <div class="box">Static content block H — waltz bad nymph for quick jigs vex.</div>
+  <script>
+    // Frequent no-op timer: fires constantly but changes NOTHING.
+    // Every ticker tick that only saw this should SKIP the render.
+    setInterval(function () { var x = Math.sqrt(2) * 3; }, 25);
+    // Slow timer: updates the DOM every 3s. These ticks must RENDER.
+    var n = 0;
+    setInterval(function () {
+      n++;
+      document.getElementById('counter').textContent = String(n);
+    }, 3000);
+  </script>
+</body>
+</html>

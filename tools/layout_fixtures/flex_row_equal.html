@@ -1,0 +1,24 @@
+<!doctype html>
+<!-- TB-LAYOUT-EXPECT
+{
+  "viewport": [1024, 768],
+  "checks": [
+    { "id": "row", "rect_w": 600.0, "tol": 1.0 },
+    { "id": "a",   "rect_w": 200.0, "tol": 4.0 },
+    { "id": "b",   "rect_w": 200.0, "tol": 4.0 },
+    { "id": "c",   "rect_w": 200.0, "tol": 4.0 }
+  ]
+}
+TB-LAYOUT-EXPECT-END -->
+<html><head><style>
+  body { margin: 0; padding: 0; }
+  #row { display: flex; width: 600px; }
+  #row > div { flex: 1; }
+</style></head>
+<body>
+  <div id="row">
+    <div id="a">A</div>
+    <div id="b">B</div>
+    <div id="c">C</div>
+  </div>
+</body></html>

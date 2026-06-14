@@ -1,0 +1,21 @@
+<!doctype html>
+<!-- TB-LAYOUT-EXPECT
+{
+  "viewport": [1024, 768],
+  "checks": [
+    { "id": "stage",   "rect_w": 400.0, "rect_h": 300.0, "tol": 1.0 },
+    { "id": "overlay", "rect_x": 0.0,   "rect_y": 0.0,
+                       "rect_w": 400.0, "rect_h": 300.0, "tol": 2.0 }
+  ]
+}
+TB-LAYOUT-EXPECT-END -->
+<html><head><style>
+  body { margin: 0; padding: 0; }
+  #stage { position: relative; width: 400px; height: 300px; background: #eee; }
+  #overlay { position: absolute; inset: 0; background: rgba(0,0,0,0.5); }
+</style></head>
+<body>
+  <div id="stage">
+    <div id="overlay"></div>
+  </div>
+</body></html>

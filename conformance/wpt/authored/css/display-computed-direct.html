@@ -1,0 +1,21 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>CSS Display: getComputedStyle().display (direct)</title>
+<script src="/resources/testharness.js"></script>
+</head><body>
+<div id="target"></div>
+<script>
+function td(value, expected){
+  test(function(){
+    var t = document.getElementById('target');
+    t.style.display = '';
+    t.style.display = value;
+    assert_equals(getComputedStyle(t).display, expected, 'display ' + value);
+  }, 'display: ' + value + ' computes to ' + expected);
+}
+td('block', 'block');
+td('inline', 'inline');
+td('inline-block', 'inline-block');
+td('none', 'none');
+td('flex', 'flex');
+</script>
+</body></html>

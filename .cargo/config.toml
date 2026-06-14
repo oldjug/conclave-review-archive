@@ -1,0 +1,12 @@
+# Workspace cargo config. Pin to the MSVC toolchain on Windows.
+[build]
+target = "x86_64-pc-windows-msvc"
+
+[target.x86_64-pc-windows-msvc]
+rustflags = [
+    "-C", "target-feature=+crt-static",
+]
+
+# Allow `cargo run -p cv_browser` to work without typing the binary name.
+[alias]
+fetch-demo = ["run", "-p", "cv_browser", "--", "--type", "fetch"]

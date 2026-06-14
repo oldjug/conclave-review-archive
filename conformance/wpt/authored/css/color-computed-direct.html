@@ -1,0 +1,26 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>CSS Color: getComputedStyle().color (direct)</title>
+<script src="/resources/testharness.js"></script>
+<style>
+  #target { color: rgb(255, 0, 0); }
+</style>
+</head><body>
+<div id="target"></div>
+<script>
+function tc(value, expected, name){
+  test(function(){
+    var t = document.getElementById('target');
+    t.style.color = '';
+    t.style.color = value;
+    assert_equals(getComputedStyle(t).color, expected, name);
+  }, 'color: ' + value + ' computes to ' + expected);
+}
+tc('red', 'rgb(255, 0, 0)');
+tc('magenta', 'rgb(255, 0, 255)');
+tc('#234', 'rgb(34, 51, 68)');
+tc('#FEDCBA', 'rgb(254, 220, 186)');
+tc('rgb(2, 3, 4)', 'rgb(2, 3, 4)');
+tc('rgb(100%, 0%, 0%)', 'rgb(255, 0, 0)');
+tc('transparent', 'rgba(0, 0, 0, 0)');
+</script>
+</body></html>

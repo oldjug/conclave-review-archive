@@ -1,0 +1,13 @@
+[package]
+name = "cv_compositor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+cv_paint = { path = "../cv_paint" }
