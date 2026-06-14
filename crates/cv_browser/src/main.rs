@@ -12998,80 +12998,92 @@ fn install_fetch_inner(
     );
     // `document.createRange()` is added on document elsewhere; the
     // Range global stays for `new Range()`.
-    // ----- Custom Elements + Shadow DOM (#430) -----------------------
-    // `customElements.define(name, ctor, options?)` — store the
-    // constructor against the tag name for later upgrades when DOM
-    // building lands. `get` returns the stored ctor; `whenDefined`
-    // resolves immediately if already known, otherwise stays pending.
-    let registry: Rc<RefCell<HashMap<String, cv_js::Value>>> =
-        Rc::new(RefCell::new(HashMap::new()));
-    let registry_for_define = registry.clone();
-    let registry_for_get = registry.clone();
-    let registry_for_when = registry.clone();
+    // ----- Custom Elements (WHATWG HTML §4.13) -----------------------
+    // `customElements.define(name, ctor, options?)` records a real
+    // definition (ctor + observedAttributes), resolves any pending
+    // whenDefined promises for that name, and upgrades existing matching
+    // elements. Lifecycle reactions (connected/disconnected/attributeChanged/
+    // adoptedCallback) fire on real DOM changes via the reaction queue
+    // (`flush_custom_element_reactions`) wired to the microtask checkpoint.
+    // `get` returns the stored ctor; `whenDefined` returns a promise that
+    // resolves with the ctor ONLY once the name is defined (pending until
+    // then, immediate if already defined, SyntaxError-rejected for invalid
+    // names). The registry lives in the thread-local `CUSTOM_ELEMENTS`.
     let table_for_define = table_opt.clone();
     let custom_elements = obj_with(|m| {
         m.insert(
             "define".into(),
-            cv_js::native_fn("define", move |args| {
+            cv_js::native_fn_with_interp("define", move |interp, args| {
                 let name = args
                     .first()
                     .map(|v| v.to_display_string())
                     .unwrap_or_default();
                 let ctor = args.get(1).cloned().unwrap_or(cv_js::Value::Undefined);
-                registry_for_define
-                    .borrow_mut()
-                    .insert(name.clone(), ctor.clone());
-                // Upgrade reaction: per WHATWG Custom Elements spec,
-                // defining a tag triggers an immediate upgrade of every
-                // existing instance. Walk the live element table, find
-                // every element whose tag matches, and run the
-                // connectedCallback method on the existing JS wrapper
-                // if it exists on the ctor's prototype. We can't
-                // construct a fresh JS instance and swap it in (the
-                // wrapper is referenced by Rust-side rendering paths),
-                // so we copy ctor.prototype's methods onto the existing
-                // wrapper object — a pragmatic subset of the spec.
+                // §4.13.4 step 1: invalid name → SyntaxError. step 3: a
+                // non-constructor `ctor` → TypeError (we accept any callable
+                // here; feature code always passes a class).
+                if !is_valid_custom_element_name(&name) {
+                    return Err(cv_js::JsError::Throw(make_syntax_error_value(&format!(
+                        "'{name}' is not a valid custom element name"
+                    ))));
+                }
+                let name_lc = name.to_ascii_lowercase();
+                // §4.13.4: if attributeChangedCallback is non-null, read the
+                // ctor's static `observedAttributes` (an array or a static
+                // getter returning one) and snapshot the lowercased names.
+                let observed_attrs: Vec<String> =
+                    read_observed_attributes(interp, &ctor);
+                // Snapshot the ctor.prototype methods (resolves the lazily-built
+                // prototype of a class ctor regardless of value variant).
+                let proto_methods = read_ctor_proto_methods(interp, &ctor);
+                // Record the definition + resolve pending whenDefined promises.
+                let pending_inners = CUSTOM_ELEMENTS.with(|r| {
+                    let mut reg = r.borrow_mut();
+                    reg.defs.insert(
+                        name_lc.clone(),
+                        CustomElementDef {
+                            ctor: ctor.clone(),
+                            observed_attrs,
+                            proto_methods: proto_methods.clone(),
+                        },
+                    );
+                    reg.when_defined.remove(&name_lc).unwrap_or_default()
+                });
+                // §4.13.4 final step: resolve the when-defined promise(s) for
+                // this name with the constructor.
+                for inner in &pending_inners {
+                    cv_js::interp::resolve_promise(interp, inner, ctor.clone());
+                }
+                // §4.13: defining a name upgrades all existing matching
+                // elements. Copy the ctor.prototype's methods onto each live
+                // wrapper (so the lifecycle callbacks + author methods are
+                // callable), then — if the element is already CONNECTED — run
+                // the upgrade's connectedCallback reaction.
                 if let Some(table) = &table_for_define {
-                    let tag_lower = name.to_ascii_lowercase();
-                    let proto = if let cv_js::Value::Object(c) = &ctor {
-                        c.borrow()
-                            .get("prototype")
-                            .cloned()
-                            .unwrap_or(cv_js::Value::Undefined)
-                    } else {
-                        cv_js::Value::Undefined
+                    let wrappers: Vec<cv_js::Value> = {
+                        let t = table.borrow();
+                        t.all
+                            .iter()
+                            .filter(|rec| rec.tag.eq_ignore_ascii_case(&name_lc))
+                            .map(|rec| rec.js.clone())
+                            .collect()
                     };
-                    let proto_methods: Vec<(String, cv_js::Value)> =
-                        if let cv_js::Value::Object(p) = &proto {
-                            p.borrow()
-                                .iter()
-                                .map(|(k, v)| (k.clone(), v.clone()))
-                                .collect()
-                        } else {
-                            Vec::new()
-                        };
-                    let t = table.borrow();
-                    for rec in &t.all {
-                        if rec.tag.eq_ignore_ascii_case(&tag_lower) {
-                            if let cv_js::Value::Object(wrapper) = &rec.js {
-                                let mut w = wrapper.borrow_mut();
-                                // Copy each method onto the wrapper if
-                                // not already present (don't clobber
-                                // existing per-instance state).
-                                for (k, v) in &proto_methods {
-                                    if !w.contains_key(k) {
-                                        w.insert(k.clone(), v.clone());
-                                    }
-                                }
-                                // Mark as upgraded so author code can
-                                // feature-detect via the spec-private
-                                // [[CustomElementState]] slot.
-                                w.insert(
-                                    "__customElementState".into(),
-                                    cv_js::Value::String("custom".into()),
-                                );
-                            }
+                    for wrapper in &wrappers {
+                        apply_custom_element_proto(wrapper, &proto_methods);
+                        if value_is_connected(wrapper)
+                            && wrapper_has_callable(wrapper, "connectedCallback")
+                        {
+                            CUSTOM_ELEMENTS.with(|r| {
+                                r.borrow_mut()
+                                    .reactions
+                                    .push_back(CeReaction::Connected(wrapper.clone()))
+                            });
                         }
+                    }
+                    // Also upgrade live-DOM elements created by script that are
+                    // not in the static element table (createElement → append).
+                    for root in live_document_roots(&table.borrow()) {
+                        upgrade_live_subtree(&root, &name_lc, &proto_methods);
                     }
                 }
                 Ok(cv_js::Value::Undefined)
@@ -13083,12 +13095,15 @@ fn install_fetch_inner(
                 let name = args
                     .first()
                     .map(|v| v.to_display_string())
-                    .unwrap_or_default();
-                Ok(registry_for_get
-                    .borrow()
-                    .get(&name)
-                    .cloned()
-                    .unwrap_or(cv_js::Value::Undefined))
+                    .unwrap_or_default()
+                    .to_ascii_lowercase();
+                Ok(CUSTOM_ELEMENTS.with(|r| {
+                    r.borrow()
+                        .defs
+                        .get(&name)
+                        .map(|d| d.ctor.clone())
+                        .unwrap_or(cv_js::Value::Undefined)
+                }))
             }),
         );
         m.insert(
@@ -13098,16 +13113,75 @@ fn install_fetch_inner(
                     .first()
                     .map(|v| v.to_display_string())
                     .unwrap_or_default();
-                if registry_for_when.borrow().contains_key(&name) {
-                    Ok(resolved_promise(cv_js::Value::Undefined))
-                } else {
-                    Ok(resolved_promise(cv_js::Value::Undefined))
+                // §4.13.4 step 1: invalid name → promise rejected with SyntaxError.
+                if !is_valid_custom_element_name(&name) {
+                    return Ok(cv_js::interp::make_settled_promise(
+                        false,
+                        make_syntax_error_value(&format!(
+                            "'{name}' is not a valid custom element name"
+                        )),
+                    ));
                 }
+                let name_lc = name.to_ascii_lowercase();
+                // step 2: already defined → promise resolved with the ctor.
+                if let Some(ctor) =
+                    CUSTOM_ELEMENTS.with(|r| r.borrow().defs.get(&name_lc).map(|d| d.ctor.clone()))
+                {
+                    return Ok(cv_js::interp::make_settled_promise(true, ctor));
+                }
+                // steps 3-4: not defined → a PENDING promise stored in the
+                // when-defined map, resolved later by define(name).
+                let (promise, inner) = cv_js::interp::make_pending_promise();
+                CUSTOM_ELEMENTS.with(|r| {
+                    r.borrow_mut()
+                        .when_defined
+                        .entry(name_lc)
+                        .or_default()
+                        .push(inner)
+                });
+                Ok(promise)
             }),
         );
+        // §4.13.4 getName(constructor): reverse lookup name from ctor.
+        m.insert(
+            "getName".into(),
+            cv_js::native_fn("getName", move |args| {
+                let Some(ctor) = args.first() else {
+                    return Ok(cv_js::Value::Null);
+                };
+                Ok(CUSTOM_ELEMENTS.with(|r| {
+                    r.borrow()
+                        .defs
+                        .iter()
+                        .find(|(_, d)| cv_js::Value::strict_eq(&d.ctor, ctor))
+                        .map(|(n, _)| cv_js::Value::str(n.clone()))
+                        .unwrap_or(cv_js::Value::Null)
+                }))
+            }),
+        );
+        // `upgrade(root)` — §4.13.4: try to upgrade all custom-element-shaped
+        // descendants of `root` (+ root) that have a matching definition.
+        let table_for_upgrade = table_opt.clone();
         m.insert(
             "upgrade".into(),
-            cv_js::native_fn("upgrade", |_| Ok(cv_js::Value::Undefined)),
+            cv_js::native_fn("upgrade", move |args| {
+                let Some(root) = args.first() else {
+                    return Ok(cv_js::Value::Undefined);
+                };
+                // Snapshot defined names + their proto methods to upgrade against.
+                let defs: Vec<(String, Vec<(String, cv_js::Value)>)> = CUSTOM_ELEMENTS.with(|r| {
+                    r.borrow()
+                        .defs
+                        .iter()
+                        .map(|(n, d)| (n.clone(), d.proto_methods.clone()))
+                        .collect()
+                });
+                for (name_lc, proto_methods) in &defs {
+                    upgrade_live_subtree(root, name_lc, proto_methods);
+                }
+                let _ = &table_for_upgrade;
+                Ok(cv_js::Value::Undefined)
+            }),
         );
     });
     interp.define_global("customElements", custom_elements);
@@ -24067,7 +24141,16 @@ fn install_minimal_dom_with_url(interp: &cv_js::Interp, initial_title: String, p
     // before the next macrotask). Installing it as the interp's microtask-
     // checkpoint hook delivers queued MutationRecords at exactly that point.
     interp.set_microtask_checkpoint_hook(std::rc::Rc::new(
-        |interp: &mut cv_js::Interp| -> bool { deliver_mutation_records(interp) },
+        |interp: &mut cv_js::Interp| -> bool {
+            // WHATWG HTML "perform a microtask checkpoint": process the custom
+            // element reaction (backup element) queue first, then notify
+            // mutation observers. Either may report work → the host loops and
+            // re-drains, so a connectedCallback that mutates the DOM (queuing
+            // more reactions/records) is handled in the next round.
+            let ce = flush_custom_element_reactions(interp);
+            let mo = deliver_mutation_records(interp);
+            ce || mo
+        },
     ));
 
     // Event constructors that don't currently fire from the engine but
@@ -32776,8 +32859,21 @@ fn set_connected_snapshot(node: &cv_js::Value, connected: bool) {
     let cv_js::Value::Object(obj) = node else {
         return;
     };
+    // Detect the connectivity TRANSITION so we can fire the matching custom
+    // element lifecycle reaction (§4.13.6 connected/disconnectedCallback).
+    // The reaction is enqueued, not run synchronously — Chrome's
+    // CustomElementReactionStack defers to the microtask checkpoint.
+    let was_connected = matches!(
+        obj.borrow().get("isConnected"),
+        Some(cv_js::Value::Bool(true))
+    );
     obj.borrow_mut()
         .insert("isConnected".into(), cv_js::Value::Bool(connected));
+    if connected && !was_connected {
+        enqueue_connected_reaction(node);
+    } else if !connected && was_connected {
+        enqueue_disconnected_reaction(node);
+    }
     if let Some(children) = get_children_snapshot(node) {
         let child_nodes = children.borrow().clone();
         for child in child_nodes {
@@ -33429,6 +33525,407 @@ struct InjectedScript {
     element: Option<cv_js::Value>,
 }
 
+// ====================================================================
+// Custom Elements registry + reaction queue (WHATWG HTML §4.13)
+// --------------------------------------------------------------------
+// `customElements.define(name, ctor)` records a definition (the ctor +
+// its `observedAttributes` snapshot). Real DOM lifecycle reactions —
+// connectedCallback / disconnectedCallback / attributeChangedCallback /
+// adoptedCallback — are not run synchronously inside the mutating DOM
+// method; matching Chrome's CustomElementReactionStack, they are
+// ENQUEUED here and flushed at the microtask checkpoint (alongside
+// MutationObserver delivery). See `flush_custom_element_reactions`,
+// wired into the interp's microtask-checkpoint hook.
+// ====================================================================
+
+/// One custom-element definition. `observed_attrs` is the lowercased
+/// snapshot of the ctor's static `observedAttributes` (per
+/// §4.13.4 step "Get(constructor, observedAttributes)"), taken once at
+/// define() time — it gates attributeChangedCallback.
+#[derive(Clone)]
+struct CustomElementDef {
+    ctor: cv_js::Value,
+    observed_attrs: Vec<String>,
+    /// Own methods of `ctor.prototype` (connectedCallback / author methods),
+    /// snapshotted at define() time so upgrade can copy them onto live element
+    /// wrappers (which the Rust render path references — we can't swap in a
+    /// freshly-`new`-ed instance, so the wrapper IS the custom element).
+    proto_methods: Vec<(String, cv_js::Value)>,
+}
+
+/// A pending custom-element lifecycle reaction to be flushed at the next
+/// microtask checkpoint. `target` is the element's JS wrapper; the
+/// callback is read off the wrapper (the proto methods are copied onto it
+/// at define()/upgrade time, mirroring the existing pragmatic upgrade).
+enum CeReaction {
+    Connected(cv_js::Value),
+    Disconnected(cv_js::Value),
+    /// (target, name, oldValue, newValue, namespace)
+    AttributeChanged(
+        cv_js::Value,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    ),
+    // NOTE: adoptedCallback (cross-document move) is intentionally not modeled
+    // here — this runtime is single-document and exposes no adoptNode/importNode
+    // entry point, so there is no real trigger. Adding a reaction variant that
+    // is flushed but never enqueued would be dead infrastructure; wire it here
+    // alongside a real `document.adoptNode` when multi-document support lands.
+}
+
+struct CustomElementRegistry {
+    /// name (lowercase) -> definition.
+    defs: cv_js::OrderedMap<String, CustomElementDef>,
+    /// name (lowercase) -> pending whenDefined promise inners awaiting a
+    /// future define(name) (§4.13.4 "when-defined promise map").
+    when_defined: cv_js::OrderedMap<
+        String,
+        Vec<std::rc::Rc<std::cell::RefCell<cv_js::OrderedMap<String, cv_js::Value>>>>,
+    >,
+    /// FIFO reaction queue, flushed at the microtask checkpoint.
+    reactions: std::collections::VecDeque<CeReaction>,
+}
+
+thread_local! {
+    static CUSTOM_ELEMENTS: std::cell::RefCell<CustomElementRegistry> =
+        std::cell::RefCell::new(CustomElementRegistry {
+            defs: cv_js::OrderedMap::new(),
+            when_defined: cv_js::OrderedMap::new(),
+            reactions: std::collections::VecDeque::new(),
+        });
+}
+
+/// WHATWG HTML §4.13.3 "valid custom element name": ASCII-lowercase, no
+/// uppercase, MUST contain a hyphen, and not one of the reserved hyphenated
+/// SVG/MathML names. (We don't reproduce the full PotentialCustomElementName
+/// production grammar — the load-bearing rules in practice are the hyphen and
+/// the lowercase/reserved checks, which gate whenDefined's SyntaxError.)
+fn is_valid_custom_element_name(name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    // First code point must be an ASCII lower alpha.
+    let first = name.as_bytes()[0];
+    if !first.is_ascii_lowercase() {
+        return false;
+    }
+    // Must contain a hyphen; must not contain any ASCII uppercase; must
+    // not contain whitespace or other obviously-invalid chars.
+    if !name.contains('-') {
+        return false;
+    }
+    if name.chars().any(|c| c.is_ascii_uppercase()) {
+        return false;
+    }
+    if name.chars().any(|c| c.is_whitespace()) {
+        return false;
+    }
+    // Reserved hyphenated names (§4.13.3) are NOT valid custom element names.
+    !matches!(
+        name,
+        "annotation-xml"
+            | "color-profile"
+            | "font-face"
+            | "font-face-src"
+            | "font-face-uri"
+            | "font-face-format"
+            | "font-face-name"
+            | "missing-glyph"
+    )
+}
+
+/// Read the (lowercase) local name of an element JS wrapper.
+fn element_local_name(value: &cv_js::Value) -> Option<String> {
+    let cv_js::Value::Object(o) = value else {
+        return None;
+    };
+    let m = o.borrow();
+    m.get("localName")
+        .or_else(|| m.get("_tag"))
+        .or_else(|| m.get("tagName"))
+        .or_else(|| m.get("nodeName"))
+        .map(|v| v.to_display_string().to_ascii_lowercase())
+}
+
+/// True if `name` (lowercase local name) currently has a custom-element
+/// definition.
+fn custom_element_is_defined(name: &str) -> bool {
+    CUSTOM_ELEMENTS.with(|r| r.borrow().defs.contains_key(name))
+}
+
+/// The set of observed attributes for a defined custom element, or None if
+/// the local name is not a defined custom element.
+fn custom_element_observed_attrs(name: &str) -> Option<Vec<String>> {
+    CUSTOM_ELEMENTS.with(|r| {
+        r.borrow()
+            .defs
+            .get(name)
+            .map(|d| d.observed_attrs.clone())
+    })
+}
+
+/// Read the ctor's static `observedAttributes` as a lowercased Vec.
+/// §4.13.4: this is `Get(constructor, "observedAttributes")`. It may be a
+/// static data field (an array) OR a static getter; the tree-walk
+/// `read_property` returns the raw accessor descriptor object for a getter
+/// rather than invoking it, so we detect that and call the getter through the
+/// interp. Returns an empty Vec if absent/undefined.
+fn read_observed_attributes(interp: &mut cv_js::Interp, ctor: &cv_js::Value) -> Vec<String> {
+    let raw = interp.read_property(ctor, "observedAttributes");
+    // A static getter surfaces as an accessor descriptor `{ \u{1}__get__: fn }`.
+    let resolved = match &raw {
+        cv_js::Value::Object(o) => {
+            let getter = o.borrow().get(cv_js::ACCESSOR_GET).cloned();
+            match getter {
+                Some(
+                    g @ (cv_js::Value::Function(_)
+                    | cv_js::Value::NativeFunction(_)
+                    | cv_js::Value::BcClosure(_)),
+                ) => interp
+                    .call_value_with_this(g, ctor.clone(), vec![])
+                    .unwrap_or(cv_js::Value::Undefined),
+                _ => raw.clone(),
+            }
+        }
+        _ => raw.clone(),
+    };
+    match resolved {
+        cv_js::Value::Array(a) => a
+            .borrow()
+            .iter()
+            .map(|v| v.to_display_string().to_ascii_lowercase())
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Read the own methods of `ctor.prototype` (lifecycle callbacks + author
+/// methods). Uses `interp.read_property` so it resolves the lazily-built
+/// `.prototype` of a class ctor regardless of its value variant (Function /
+/// NativeFunction / BcClosure), not just plain objects. The `constructor`
+/// back-reference is excluded.
+fn read_ctor_proto_methods(
+    interp: &cv_js::Interp,
+    ctor: &cv_js::Value,
+) -> Vec<(String, cv_js::Value)> {
+    let proto = interp.read_property(ctor, "prototype");
+    let cv_js::Value::Object(p) = &proto else {
+        return Vec::new();
+    };
+    p.borrow()
+        .iter()
+        .filter(|(k, _)| k.as_str() != "constructor" && !k.starts_with('\u{1}'))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
+}
+
+/// Copy a custom element's prototype methods (lifecycle callbacks + author
+/// methods, snapshotted at define() time) onto the element wrapper, and stamp
+/// the [[CustomElementState]] = "custom" slot. The wrapper IS the live custom
+/// element (the Rust render path references it). Idempotent (won't clobber
+/// existing per-instance keys).
+fn apply_custom_element_proto(wrapper: &cv_js::Value, proto_methods: &[(String, cv_js::Value)]) {
+    let cv_js::Value::Object(w) = wrapper else {
+        return;
+    };
+    let mut wb = w.borrow_mut();
+    for (k, v) in proto_methods {
+        if !wb.contains_key(k) {
+            wb.insert(k.clone(), v.clone());
+        }
+    }
+    wb.insert(
+        "__customElementState".into(),
+        cv_js::Value::String("custom".into()),
+    );
+}
+
+/// Enqueue a connectedCallback reaction for `target` IFF it is a defined
+/// custom element whose wrapper carries a `connectedCallback`. Called from
+/// the connectivity tracker when a node transitions disconnected→connected.
+fn enqueue_connected_reaction(target: &cv_js::Value) {
+    let Some(name) = element_local_name(target) else { return };
+    if !custom_element_is_defined(&name) {
+        return;
+    }
+    if !wrapper_has_callable(target, "connectedCallback") {
+        return;
+    }
+    CUSTOM_ELEMENTS.with(|r| {
+        r.borrow_mut()
+            .reactions
+            .push_back(CeReaction::Connected(target.clone()))
+    });
+}
+
+/// Enqueue a disconnectedCallback reaction (see `enqueue_connected_reaction`).
+fn enqueue_disconnected_reaction(target: &cv_js::Value) {
+    let Some(name) = element_local_name(target) else { return };
+    if !custom_element_is_defined(&name) {
+        return;
+    }
+    if !wrapper_has_callable(target, "disconnectedCallback") {
+        return;
+    }
+    CUSTOM_ELEMENTS.with(|r| {
+        r.borrow_mut()
+            .reactions
+            .push_back(CeReaction::Disconnected(target.clone()))
+    });
+}
+
+/// Enqueue an attributeChangedCallback reaction IFF `target` is a defined
+/// custom element AND `attr` (case-insensitive) is in its observedAttributes
+/// (§4.13.6 "enqueue a custom element callback reaction" attribute gate).
+fn enqueue_attribute_changed_reaction(
+    target: &cv_js::Value,
+    attr: &str,
+    old_value: Option<&str>,
+    new_value: Option<&str>,
+    namespace: Option<&str>,
+) {
+    let Some(name) = element_local_name(target) else { return };
+    let Some(observed) = custom_element_observed_attrs(&name) else { return };
+    let attr_lc = attr.to_ascii_lowercase();
+    if !observed.iter().any(|o| o == &attr_lc) {
+        return;
+    }
+    if !wrapper_has_callable(target, "attributeChangedCallback") {
+        return;
+    }
+    CUSTOM_ELEMENTS.with(|r| {
+        r.borrow_mut().reactions.push_back(CeReaction::AttributeChanged(
+            target.clone(),
+            attr.to_string(),
+            old_value.map(|s| s.to_string()),
+            new_value.map(|s| s.to_string()),
+            namespace.map(|s| s.to_string()),
+        ))
+    });
+}
+
+/// True if the wrapper has an own callable property `key`.
+fn wrapper_has_callable(value: &cv_js::Value, key: &str) -> bool {
+    if let cv_js::Value::Object(o) = value {
+        matches!(
+            o.borrow().get(key),
+            Some(
+                cv_js::Value::Function(_)
+                    | cv_js::Value::NativeFunction(_)
+                    | cv_js::Value::BcClosure(_)
+            )
+        )
+    } else {
+        false
+    }
+}
+
+/// Flush all queued custom-element reactions, invoking each callback on its
+/// element wrapper. Mirrors `deliver_mutation_records`: invoked from the
+/// interp's microtask-checkpoint hook. Returns `true` if any callback ran
+/// (so the host re-drains microtasks the callbacks may have queued). A
+/// callback may enqueue further reactions (e.g. mutate the DOM) — we loop,
+/// draining the FIFO until empty, bounded against runaway re-entry.
+fn flush_custom_element_reactions(interp: &mut cv_js::Interp) -> bool {
+    let mut ran_any = false;
+    for _ in 0..10_000 {
+        let next = CUSTOM_ELEMENTS.with(|r| r.borrow_mut().reactions.pop_front());
+        let Some(reaction) = next else { break };
+        ran_any = true;
+        match reaction {
+            CeReaction::Connected(target) => {
+                let cb = read_wrapper_callable(&target, "connectedCallback");
+                if let Some(cb) = cb {
+                    let _ = interp.call_value_with_this(cb, target, vec![]);
+                }
+            }
+            CeReaction::Disconnected(target) => {
+                let cb = read_wrapper_callable(&target, "disconnectedCallback");
+                if let Some(cb) = cb {
+                    let _ = interp.call_value_with_this(cb, target, vec![]);
+                }
+            }
+            CeReaction::AttributeChanged(target, name, old, new, ns) => {
+                let cb = read_wrapper_callable(&target, "attributeChangedCallback");
+                if let Some(cb) = cb {
+                    let to_arg = |o: Option<String>| match o {
+                        Some(s) => cv_js::Value::str(s),
+                        None => cv_js::Value::Null,
+                    };
+                    let ns_arg = match ns {
+                        Some(s) => cv_js::Value::str(s),
+                        None => cv_js::Value::Null,
+                    };
+                    let _ = interp.call_value_with_this(
+                        cb,
+                        target,
+                        vec![cv_js::Value::str(name), to_arg(old), to_arg(new), ns_arg],
+                    );
+                }
+            }
+        }
+    }
+    ran_any
+}
+
+/// Walk the live JS DOM subtree rooted at `node` and upgrade every element
+/// whose local name == `name_lc` (apply the snapshotted prototype methods,
+/// then enqueue a connectedCallback reaction if connected + not already
+/// upgraded). Used by `define()` (for script-created nodes not in the static
+/// table) and `customElements.upgrade(root)`.
+fn upgrade_live_subtree(
+    node: &cv_js::Value,
+    name_lc: &str,
+    proto_methods: &[(String, cv_js::Value)],
+) {
+    if is_element_js_value(node) {
+        if let Some(local) = element_local_name(node) {
+            if local == name_lc {
+                let already = matches!(
+                    node,
+                    cv_js::Value::Object(o)
+                        if matches!(o.borrow().get("__customElementState"),
+                            Some(cv_js::Value::String(s)) if &**s == "custom")
+                );
+                if !already {
+                    apply_custom_element_proto(node, proto_methods);
+                    if value_is_connected(node) && wrapper_has_callable(node, "connectedCallback") {
+                        CUSTOM_ELEMENTS.with(|r| {
+                            r.borrow_mut()
+                                .reactions
+                                .push_back(CeReaction::Connected(node.clone()))
+                        });
+                    }
+                }
+            }
+        }
+    }
+    if let Some(children) = get_children_snapshot(node) {
+        let kids = children.borrow().clone();
+        for child in &kids {
+            upgrade_live_subtree(child, name_lc, proto_methods);
+        }
+    }
+}
+
+/// Read a callable own property off an element wrapper.
+fn read_wrapper_callable(value: &cv_js::Value, key: &str) -> Option<cv_js::Value> {
+    if let cv_js::Value::Object(o) = value {
+        match o.borrow().get(key) {
+            Some(
+                v @ (cv_js::Value::Function(_)
+                | cv_js::Value::NativeFunction(_)
+                | cv_js::Value::BcClosure(_)),
+            ) => Some(v.clone()),
+            _ => None,
+        }
+    } else {
+        None
+    }
+}
+
 thread_local! {
     /// Scripts injected into the DOM at runtime via `el.appendChild(script)`
     /// / `append` / `insertBefore`. Chrome FETCHES (if `src`) and EXECUTES
@@ -33950,6 +34447,14 @@ fn make_new_element_js_with_canvas_registry(
         let mo_target = cv_js::Value::Object(obj_for_set.clone());
         let mo_ns = svg_attr_namespace(&name, is_svg);
         emit_js_attribute_mutation(&mo_target, &name, mo_ns.as_deref(), mo_old.as_deref());
+        // Custom Elements §4.13.6: attributeChangedCallback for an observed attr.
+        enqueue_attribute_changed_reaction(
+            &mo_target,
+            &name,
+            mo_old.as_deref(),
+            Some(&value),
+            mo_ns.as_deref(),
+        );
         attrs_for_set
             .borrow_mut()
             .insert(lower.clone(), value.clone());
@@ -34064,6 +34569,15 @@ fn make_new_element_js_with_canvas_registry(
             let mo_target = cv_js::Value::Object(obj_for_remove.clone());
             let mo_ns = svg_attr_namespace(&name, false);
             emit_js_attribute_mutation(&mo_target, &name, mo_ns.as_deref(), mo_old.as_deref());
+            // Custom Elements §4.13.6: removing an observed attr fires
+            // attributeChangedCallback with newValue = null.
+            enqueue_attribute_changed_reaction(
+                &mo_target,
+                &name,
+                mo_old.as_deref(),
+                None,
+                mo_ns.as_deref(),
+            );
         }
         attrs_for_remove.borrow_mut().remove(&lower);
         attrs_obj_for_remove.borrow_mut().remove(&lower);
@@ -34882,6 +35396,17 @@ fn install_dom_api(
             o.borrow_mut()
                 .insert("ownerDocument".into(), document_for_create.clone());
         }
+        // WHATWG DOM "create an element": if `tag` names a defined custom
+        // element, the created element is upgraded synchronously (its
+        // prototype methods become callable, [[CustomElementState]]="custom").
+        // The connectedCallback fires later, when it's inserted into a
+        // connected tree (handled by the connectivity tracker).
+        let tag_lc = tag.to_ascii_lowercase();
+        if let Some(proto_methods) =
+            CUSTOM_ELEMENTS.with(|r| r.borrow().defs.get(&tag_lc).map(|d| d.proto_methods.clone()))
+        {
+            apply_custom_element_proto(&el, &proto_methods);
+        }
         Ok(el)
     });
 
@@ -35075,6 +35600,16 @@ fn install_dom_api(
                     .or_else(|| orig_attrs_set.get(&lc).cloned());
                 let mo_ns = svg_attr_namespace(&name, false);
                 emit_js_attribute_mutation(&js_for_set, &name, mo_ns.as_deref(), mo_old.as_deref());
+                // Custom Elements §4.13.6: attributeChangedCallback fires for an
+                // OBSERVED attribute being set/changed. oldValue is null when the
+                // attribute is being added (no prior value).
+                enqueue_attribute_changed_reaction(
+                    &js_for_set,
+                    &name,
+                    mo_old.as_deref(),
+                    Some(&value),
+                    mo_ns.as_deref(),
+                );
                 // Keep classList in sync when the class attribute is changed.
                 if name.eq_ignore_ascii_case("class") {
                     let parts: Vec<String> =
@@ -35162,6 +35697,15 @@ fn install_dom_api(
                 if let Some(old) = &mo_old {
                     let mo_ns = svg_attr_namespace(&name, false);
                     emit_js_attribute_mutation(&js_for_rm, &name, mo_ns.as_deref(), Some(old));
+                    // Custom Elements §4.13.6: removing an OBSERVED attribute
+                    // fires attributeChangedCallback with newValue = null.
+                    enqueue_attribute_changed_reaction(
+                        &js_for_rm,
+                        &name,
+                        Some(old),
+                        None,
+                        mo_ns.as_deref(),
+                    );
                 }
                 w.retain(|(p, n, _)| !(p == &path_for_rm_attr && n.eq_ignore_ascii_case(&name)));
                 // "\x01" = removed sentinel — getAttribute/hasAttribute treat this as absent
@@ -46180,6 +46724,217 @@ mod tests {
             out, "1|1",
             "a cross-parent move emits one removal (old parent) + one addition (new parent)"
         );
+    }
+
+    // ---- Custom Elements (WHATWG HTML §4.13) ---------------------------------
+
+    #[test]
+    fn custom_element_connected_callback_fires_on_append() {
+        // define a ctor with connectedCallback; create an instance; appendChild
+        // it into the connected document → connectedCallback runs (once).
+        let out = run_and_read(
+            "<html><body><div id=host></div></body></html>",
+            "globalThis.__connected = 0;\
+             class XFoo extends HTMLElement { connectedCallback(){ globalThis.__connected++; } }\
+             customElements.define('x-foo', XFoo);\
+             var host = document.getElementById('host');\
+             var el = document.createElement('x-foo');\
+             if (globalThis.__connected !== 0) throw 'must not fire before insertion';\
+             host.appendChild(el);",
+            "String(globalThis.__connected)",
+        );
+        assert_eq!(out, "1", "connectedCallback fires exactly once on insertion");
+    }
+
+    #[test]
+    fn custom_element_disconnected_callback_fires_on_remove() {
+        let out = run_and_read(
+            "<html><body><div id=host></div></body></html>",
+            "globalThis.__dis = 0;\
+             class XBar extends HTMLElement {\
+                 connectedCallback(){}\
+                 disconnectedCallback(){ globalThis.__dis++; }\
+             }\
+             customElements.define('x-bar', XBar);\
+             var host = document.getElementById('host');\
+             var el = document.createElement('x-bar');\
+             host.appendChild(el);\
+             host.removeChild(el);",
+            "String(globalThis.__dis)",
+        );
+        assert_eq!(out, "1", "disconnectedCallback fires on removal");
+    }
+
+    #[test]
+    fn custom_element_attribute_changed_callback_gets_name_old_new() {
+        // setAttribute of an OBSERVED attribute fires attributeChangedCallback
+        // with (name, oldValue, newValue, namespace). First set: oldValue=null.
+        let out = run_and_read(
+            "<html><body><div id=host></div></body></html>",
+            "globalThis.__log = [];\
+             class XAttr extends HTMLElement {\
+                 static get observedAttributes(){ return ['data-x']; }\
+                 attributeChangedCallback(name, oldV, newV, ns){\
+                     globalThis.__log.push(name + '|' + String(oldV) + '|' + String(newV) + '|' + String(ns));\
+                 }\
+             }\
+             customElements.define('x-attr', XAttr);\
+             var el = document.createElement('x-attr');\
+             document.body.appendChild(el);\
+             el.setAttribute('data-x', 'first');\
+             el.setAttribute('data-x', 'second');\
+             el.setAttribute('data-untracked', 'ignored');",
+            "globalThis.__log.join('#')",
+        );
+        assert_eq!(
+            out, "data-x|null|first|null#data-x|first|second|null",
+            "attributeChangedCallback fires only for observed attrs with (name, old, new, ns=null)"
+        );
+    }
+
+    #[test]
+    fn custom_element_attribute_changed_callback_fires_on_remove_attribute() {
+        let out = run_and_read(
+            "<html><body></body></html>",
+            "globalThis.__log = [];\
+             class XRm extends HTMLElement {\
+                 static get observedAttributes(){ return ['data-y']; }\
+                 attributeChangedCallback(name, oldV, newV){\
+                     globalThis.__log.push(name + '|' + String(oldV) + '|' + String(newV));\
+                 }\
+             }\
+             customElements.define('x-rm', XRm);\
+             var el = document.createElement('x-rm');\
+             document.body.appendChild(el);\
+             el.setAttribute('data-y', 'v');\
+             el.removeAttribute('data-y');",
+            "globalThis.__log.join('#')",
+        );
+        assert_eq!(
+            out, "data-y|null|v#data-y|v|null",
+            "removeAttribute of an observed attr fires attributeChangedCallback with newValue=null"
+        );
+    }
+
+    #[test]
+    fn custom_element_define_upgrades_existing_connected_element() {
+        // An element present in the SSR document (connected) is upgraded when
+        // its name is defined LATER → connectedCallback fires at define time.
+        let out = run_and_read(
+            "<html><body><x-up id=u></x-up></body></html>",
+            "globalThis.__connected = 0;\
+             class XUp extends HTMLElement { connectedCallback(){ globalThis.__connected++; } }\
+             customElements.define('x-up', XUp);",
+            "String(globalThis.__connected)",
+        );
+        assert_eq!(
+            out, "1",
+            "define upgrades an existing connected element and runs its connectedCallback"
+        );
+    }
+
+    #[test]
+    fn when_defined_stays_pending_until_define_then_resolves() {
+        // whenDefined('x-undefined') must NOT resolve until define is called.
+        let out = run_and_read(
+            "<html><body></body></html>",
+            "globalThis.__resolved = 'no';\
+             globalThis.__ctor = 'none';\
+             customElements.whenDefined('x-later').then(function(c){\
+                 globalThis.__resolved = 'yes';\
+                 globalThis.__ctor = (typeof c === 'function') ? 'fn' : typeof c;\
+             });",
+            "globalThis.__resolved",
+        );
+        assert_eq!(
+            out, "no",
+            "whenDefined of an undefined name stays pending (does NOT resolve)"
+        );
+    }
+
+    #[test]
+    fn when_defined_resolves_with_constructor_after_define() {
+        let out = run_and_read(
+            "<html><body></body></html>",
+            "globalThis.__resolved = 'no';\
+             globalThis.__isCtor = 'no';\
+             class XLater extends HTMLElement {}\
+             customElements.whenDefined('x-later2').then(function(c){\
+                 globalThis.__resolved = 'yes';\
+                 globalThis.__isCtor = (c === XLater) ? 'yes' : 'no';\
+             });\
+             customElements.define('x-later2', XLater);",
+            "[globalThis.__resolved, globalThis.__isCtor].join('|')",
+        );
+        assert_eq!(
+            out, "yes|yes",
+            "whenDefined resolves with the actual constructor once define() is called"
+        );
+    }
+
+    #[test]
+    fn when_defined_already_defined_resolves_immediately() {
+        let out = run_and_read(
+            "<html><body></body></html>",
+            "globalThis.__resolved = 'no';\
+             class XNow extends HTMLElement {}\
+             customElements.define('x-now', XNow);\
+             customElements.whenDefined('x-now').then(function(c){\
+                 globalThis.__resolved = (c === XNow) ? 'ctor' : 'other';\
+             });",
+            "globalThis.__resolved",
+        );
+        assert_eq!(
+            out, "ctor",
+            "whenDefined of an already-defined name resolves immediately with the ctor"
+        );
+    }
+
+    #[test]
+    fn when_defined_rejects_invalid_name_with_syntax_error() {
+        // A non-valid custom element name (no hyphen) → rejected SyntaxError.
+        let out = run_and_read(
+            "<html><body></body></html>",
+            "globalThis.__rejected = 'no';\
+             globalThis.__name = '';\
+             customElements.whenDefined('nothyphen').then(\
+                 function(){ globalThis.__rejected = 'resolved'; },\
+                 function(err){ globalThis.__rejected = 'yes'; globalThis.__name = err && err.name; }\
+             );",
+            "[globalThis.__rejected, globalThis.__name].join('|')",
+        );
+        assert_eq!(
+            out, "yes|SyntaxError",
+            "whenDefined rejects an invalid name with a SyntaxError"
+        );
+    }
+
+    #[test]
+    fn custom_element_get_and_getname_round_trip() {
+        let out = run_and_read(
+            "<html><body></body></html>",
+            "class XGet extends HTMLElement {}\
+             customElements.define('x-get', XGet);\
+             var byName = customElements.get('x-get');\
+             var name = customElements.getName(XGet);",
+            "[(customElements.get('x-get') === XGet) ? 'y':'n', customElements.getName(XGet), \
+              String(customElements.get('x-missing'))].join('|')",
+        );
+        assert_eq!(
+            out, "y|x-get|undefined",
+            "get returns the ctor; getName reverse-maps; get of an unknown name is undefined"
+        );
+    }
+
+    #[test]
+    fn is_valid_custom_element_name_rules() {
+        assert!(is_valid_custom_element_name("x-foo"));
+        assert!(is_valid_custom_element_name("my-element-2"));
+        assert!(!is_valid_custom_element_name("nohyphen"));
+        assert!(!is_valid_custom_element_name("X-Foo"), "uppercase invalid");
+        assert!(!is_valid_custom_element_name("-leadinghyphen"));
+        assert!(!is_valid_custom_element_name("annotation-xml"), "reserved");
+        assert!(!is_valid_custom_element_name(""), "empty invalid");
     }
 
     #[test]
