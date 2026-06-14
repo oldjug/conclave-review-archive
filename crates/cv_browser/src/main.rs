@@ -18329,6 +18329,22 @@ fn anim_scalar(s: &str) -> Option<f32> {
     n.parse::<f32>().ok()
 }
 
+/// Parse a sampled animation color string ("rgba(128, 0, 128, 1)", "#abc",
+/// "red") into a `cv_layout::Color`. Returns None for non-color values.
+fn anim_color(s: &str) -> Option<cv_layout::Color> {
+    let c = cv_css::cascade::parse_color_str(s)?;
+    if c.is_current_color() {
+        return None;
+    }
+    Some(cv_layout::Color { r: c.r, g: c.g, b: c.b, a: c.a })
+}
+
+/// True when a value token ends in `%` (after trimming) — used to skip applying
+/// a percent border-radius as a pixel value.
+fn s_ends_with_percent(s: &str) -> bool {
+    s.trim().ends_with('%')
+}
+
 /// Resolve a translate component ("12px", "-50%") to px — a percentage is
 /// relative to `basis` (the box's own size), matching CSS `transform: translate`.
 fn anim_len(s: &str, basis: f32) -> f32 {
@@ -18490,49 +18506,125 @@ fn has_active_animation(lb: &cv_layout::LayoutBox) -> bool {
 /// at the layout-box layer (`apply_css_transitions`) so it composes with the
 /// animation fast-path that re-bakes the cached layout WITHOUT re-running the
 /// cascade.
+/// Which animatable property a [`PropTransition`] tracks. The store is keyed by
+/// `(node_id, TransProp)` so an element can transition several properties at once
+/// (CSS Transitions L1 §3 — each property has its own running transition). Color
+/// properties carry all four RGBA channels; scalar (length/number) properties use
+/// channel 0 only.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+enum TransProp {
+    Opacity,
+    Color,           // CSS `color` → LayoutBox.text_color
+    BackgroundColor, // `background-color` → LayoutBox.background
+    BorderColor,     // `border-color` (uniform) → LayoutBox.border_color + per-side
+    BorderRadius,    // `border-radius` (px) → LayoutBox.border_radius_px
+}
+
+impl TransProp {
+    /// True when this property interpolates as a color (4 RGBA channels);
+    /// false = scalar (length/number, channel 0).
+    fn is_color(self) -> bool {
+        matches!(self, TransProp::Color | TransProp::BackgroundColor | TransProp::BorderColor)
+    }
+    /// Map a `transition-property` token / keyframe declaration name to the
+    /// tracked enum. `None` for properties this driver doesn't apply.
+    fn from_name(name: &str) -> Option<TransProp> {
+        match name {
+            "opacity" => Some(TransProp::Opacity),
+            "color" => Some(TransProp::Color),
+            "background-color" | "background" => Some(TransProp::BackgroundColor),
+            "border-color" => Some(TransProp::BorderColor),
+            "border-radius" => Some(TransProp::BorderRadius),
+            _ => None,
+        }
+    }
+    /// Whether `transition-property: <prop>` (or `all`) covers this property.
+    fn matches_transition_property(self, decl: Option<&str>) -> bool {
+        match decl {
+            None | Some("all") => true,
+            Some("none") => false,
+            Some(name) => TransProp::from_name(name) == Some(self),
+        }
+    }
+}
+
+/// One running CSS transition for a single (element, property). The displayed
+/// value is interpolated each frame between `from` and `target`. Unlike
+/// `@keyframes` (stateless timeline sampling), a transition needs persistent
+/// per-element state across renders, keyed by the stable layout `node_id`.
+/// The TARGET is captured at cascade time (`note_*_transition`, where the true
+/// computed value is known); the per-frame interpolation runs at the layout-box
+/// layer (`apply_css_transitions`) so it composes with the animation fast-path
+/// that re-bakes the cached layout WITHOUT re-running the cascade.
+///
+/// `from`/`target`/`displayed` are 4 f32 channels. Colors fill all four (RGBA,
+/// 0..=255); scalars use channel 0. Color interpolation is straight component-
+/// wise in sRGB (the legacy-color rule Blink applies for `color`/`background-
+/// color` transitions; CSS Color 4 §13 / CSS Transitions L1 — "by computed
+/// value, as color").
 #[derive(Clone, Copy)]
-struct OpacityTransition {
+struct PropTransition {
     dur_ms: f32,
     delay_ms: f32,
     timing: u8,
-    target: f32,
-    from: f32,
-    displayed: f32,
+    is_color: bool,
+    from: [f32; 4],
+    target: [f32; 4],
+    displayed: [f32; 4],
     start_ms: f64,
 }
-impl OpacityTransition {
-    /// Advance the interpolation to `now_ms`, updating `displayed`. Returns the
-    /// displayed opacity and whether the transition is still running (t < 1).
-    fn sample(&mut self, now_ms: f64) -> (f32, bool) {
+impl PropTransition {
+    /// Advance the interpolation to `now_ms`, updating `displayed`. Returns
+    /// `(displayed, still_running)`. `still` is false once t reaches 1.
+    fn sample(&mut self, now_ms: f64) -> ([f32; 4], bool) {
         if self.dur_ms <= 0.0 {
             return (self.displayed, false);
         }
         let elapsed = (now_ms - self.delay_ms as f64 - self.start_ms) as f32;
         let t = (elapsed / self.dur_ms).clamp(0.0, 1.0);
         let eased = anim_ease(t, self.timing);
-        self.displayed = self.from + (self.target - self.from) * eased;
-        (self.displayed.clamp(0.0, 1.0), t < 1.0)
+        for i in 0..4 {
+            self.displayed[i] = self.from[i] + (self.target[i] - self.from[i]) * eased;
+        }
+        (self.displayed, t < 1.0)
     }
 }
 thread_local! {
-    static TRANSITION_STATE: std::cell::RefCell<std::collections::HashMap<u64, OpacityTransition>> =
+    static TRANSITION_STATE: std::cell::RefCell<std::collections::HashMap<(u64, TransProp), PropTransition>> =
         std::cell::RefCell::new(std::collections::HashMap::new());
     /// True while any transition is starting or mid-flight, so the frame ticker's
     /// "keep repainting" gate stays alive until transitions settle.
     static TRANSITION_ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
-/// Record an element's transitioned opacity TARGET (called from the cascade with
-/// the true computed value). Starts a new transition when the target changes.
-fn note_opacity_transition(id: u64, dur_ms: f32, delay_ms: f32, timing: u8, target: f32, now_ms: f64) {
+
+/// Record an element's transitioned TARGET for one property (called from the
+/// cascade with the true computed value). Starts a new transition when the
+/// target changes by more than `eps` on any channel; otherwise just refreshes
+/// the timing parameters. First sighting only remembers the value (no animation
+/// from nothing — matches CSS Transitions L1 §3: a transition starts on a
+/// *change* of the after-change style).
+fn note_value_transition(
+    id: u64,
+    prop: TransProp,
+    dur_ms: f32,
+    delay_ms: f32,
+    timing: u8,
+    target: [f32; 4],
+    now_ms: f64,
+) {
+    let eps = if prop.is_color() { 0.5 } else { 0.0001 };
     TRANSITION_STATE.with(|s| {
         let mut s = s.borrow_mut();
-        match s.get_mut(&id) {
+        match s.get_mut(&(id, prop)) {
             Some(st) => {
                 st.dur_ms = dur_ms;
                 st.delay_ms = delay_ms;
                 st.timing = timing;
-                if (target - st.target).abs() > 0.0001 {
-                    // Target changed → animate from the currently-displayed value.
+                let changed = (0..4).any(|i| (target[i] - st.target[i]).abs() > eps);
+                if changed {
+                    // Target changed → animate from the currently-displayed value
+                    // (CSS Transitions L1 §4.2 "reversing" / interrupting from the
+                    // current state, not the original from).
                     st.from = st.displayed;
                     st.target = target;
                     st.start_ms = now_ms;
@@ -18540,15 +18632,15 @@ fn note_opacity_transition(id: u64, dur_ms: f32, delay_ms: f32, timing: u8, targ
                 }
             }
             None => {
-                // First sighting — no transition, just remember the value.
                 s.insert(
-                    id,
-                    OpacityTransition {
+                    (id, prop),
+                    PropTransition {
                         dur_ms,
                         delay_ms,
                         timing,
-                        target,
+                        is_color: prop.is_color(),
                         from: target,
+                        target,
                         displayed: target,
                         start_ms: now_ms,
                     },
@@ -18557,13 +18649,45 @@ fn note_opacity_transition(id: u64, dur_ms: f32, delay_ms: f32, timing: u8, targ
         }
     });
 }
+
+/// A `cv_layout` color → 4-channel f32 (RGBA, 0..=255) for interpolation.
+fn layout_color_channels(c: cv_layout::Color) -> [f32; 4] {
+    [c.r as f32, c.g as f32, c.b as f32, c.a as f32]
+}
+/// 4-channel f32 → `cv_layout::Color` (rounded, clamped 0..=255).
+fn channels_to_layout_color(ch: [f32; 4]) -> cv_layout::Color {
+    let q = |v: f32| v.round().clamp(0.0, 255.0) as u8;
+    cv_layout::Color { r: q(ch[0]), g: q(ch[1]), b: q(ch[2]), a: q(ch[3]) }
+}
+
+/// Back-compat shim for the existing opacity call site / tests.
+fn note_opacity_transition(id: u64, dur_ms: f32, delay_ms: f32, timing: u8, target: f32, now_ms: f64) {
+    note_value_transition(
+        id,
+        TransProp::Opacity,
+        dur_ms,
+        delay_ms,
+        timing,
+        [target, 0.0, 0.0, 0.0],
+        now_ms,
+    );
+}
 /// Whether any transition is mid-flight (gates the repaint ticker alongside
 /// `has_active_animation`).
 fn any_transition_active() -> bool {
     TRANSITION_ACTIVE.with(|a| a.get())
 }
-/// Per-frame: interpolate each box's transitioned opacity. Returns true while any
-/// transition is still running, and publishes that to `TRANSITION_ACTIVE`.
+/// Drop all running CSS transitions — called on navigation so a new document's
+/// freshly-allocated arena node ids never inherit a stale (FROM, target) pair
+/// from the previous page (which would flash a wrong interpolated color/opacity
+/// for one frame). Mirrors `clear_scroll_offsets` on document replacement.
+fn clear_transitions() {
+    TRANSITION_STATE.with(|s| s.borrow_mut().clear());
+    TRANSITION_ACTIVE.with(|a| a.set(false));
+}
+/// Per-frame: interpolate every box's running transitions and patch the matching
+/// LayoutBox paint field. Returns true while any transition is still running, and
+/// publishes that to `TRANSITION_ACTIVE`.
 fn apply_css_transitions(lb: &mut cv_layout::LayoutBox, now_ms: f64) -> bool {
     let running = apply_css_transitions_inner(lb, now_ms);
     TRANSITION_ACTIVE.with(|a| a.set(running));
@@ -18572,10 +18696,43 @@ fn apply_css_transitions(lb: &mut cv_layout::LayoutBox, now_ms: f64) -> bool {
 fn apply_css_transitions_inner(lb: &mut cv_layout::LayoutBox, now_ms: f64) -> bool {
     let mut running = false;
     if let Some(id) = lb.node_id {
-        let res = TRANSITION_STATE.with(|s| s.borrow_mut().get_mut(&id).map(|st| st.sample(now_ms)));
-        if let Some((op, still)) = res {
-            lb.opacity = op;
+        // Sample each property this element is transitioning. Collect first
+        // (the store borrow must end before we mutate `lb`).
+        let samples: Vec<(TransProp, [f32; 4], bool)> = TRANSITION_STATE.with(|s| {
+            let mut s = s.borrow_mut();
+            [
+                TransProp::Opacity,
+                TransProp::Color,
+                TransProp::BackgroundColor,
+                TransProp::BorderColor,
+                TransProp::BorderRadius,
+            ]
+            .into_iter()
+            .filter_map(|p| {
+                s.get_mut(&(id, p)).map(|st| {
+                    let (v, still) = st.sample(now_ms);
+                    (p, v, still)
+                })
+            })
+            .collect()
+        });
+        for (prop, v, still) in samples {
             running |= still;
+            match prop {
+                TransProp::Opacity => lb.opacity = v[0].clamp(0.0, 1.0),
+                TransProp::Color => lb.text_color = channels_to_layout_color(v),
+                TransProp::BackgroundColor => lb.background = Some(channels_to_layout_color(v)),
+                TransProp::BorderColor => {
+                    let c = channels_to_layout_color(v);
+                    lb.border_color = Some(c);
+                    for side in lb.border_colors_per_side.iter_mut() {
+                        if side.is_some() {
+                            *side = Some(c);
+                        }
+                    }
+                }
+                TransProp::BorderRadius => lb.border_radius_px = v[0].max(0.0),
+            }
         }
     }
     for child in &mut lb.children {
@@ -18587,23 +18744,27 @@ fn apply_css_transitions_inner(lb: &mut cv_layout::LayoutBox, now_ms: f64) -> bo
 #[cfg(test)]
 mod transition_tests {
     use super::*;
+    fn scalar(dur: f32, from: f32, target: f32) -> PropTransition {
+        PropTransition {
+            dur_ms: dur,
+            delay_ms: 0.0,
+            timing: 0,
+            is_color: false,
+            from: [from, 0.0, 0.0, 0.0],
+            target: [target, 0.0, 0.0, 0.0],
+            displayed: [from, 0.0, 0.0, 0.0],
+            start_ms: 0.0,
+        }
+    }
     #[test]
     fn opacity_transition_interpolates_linearly() {
         // 1.0 → 0.0 over 1000ms, linear (timing 0).
-        let mut st = OpacityTransition {
-            dur_ms: 1000.0,
-            delay_ms: 0.0,
-            timing: 0,
-            target: 0.0,
-            from: 1.0,
-            displayed: 1.0,
-            start_ms: 0.0,
-        };
+        let mut st = scalar(1000.0, 1.0, 0.0);
         let (mid, still_mid) = st.sample(500.0);
-        assert!((mid - 0.5).abs() < 0.02, "midpoint ~0.5, got {mid}");
+        assert!((mid[0] - 0.5).abs() < 0.02, "midpoint ~0.5, got {}", mid[0]);
         assert!(still_mid, "still running at the midpoint");
         let (end, still_end) = st.sample(1000.0);
-        assert!(end < 0.01, "settled to ~0, got {end}");
+        assert!(end[0] < 0.01, "settled to ~0, got {}", end[0]);
         assert!(!still_end, "finished at t=1");
     }
     #[test]
@@ -18616,10 +18777,163 @@ mod transition_tests {
         note_opacity_transition(id, 300.0, 0.0, 0, 0.0, 100.0);
         let ok = TRANSITION_STATE.with(|s| {
             let s = s.borrow();
-            let e = s.get(&id).expect("transition state");
-            (e.from - 1.0).abs() < 1e-6 && e.target.abs() < 1e-6 && (e.start_ms - 100.0).abs() < 1e-6
+            let e = s.get(&(id, TransProp::Opacity)).expect("transition state");
+            (e.from[0] - 1.0).abs() < 1e-6
+                && e.target[0].abs() < 1e-6
+                && (e.start_ms - 100.0).abs() < 1e-6
         });
         assert!(ok, "target change anchors from=1.0, target=0.0, start=100");
+    }
+    #[test]
+    fn border_radius_transition_interpolates() {
+        // 0px → 20px over 1000ms, linear.
+        let mut st = scalar(1000.0, 0.0, 20.0);
+        let (mid, _) = st.sample(500.0);
+        assert!((mid[0] - 10.0).abs() < 0.5, "midpoint ~10px, got {}", mid[0]);
+        let (end, still) = st.sample(1000.0);
+        assert!((end[0] - 20.0).abs() < 0.01, "settles to 20px, got {}", end[0]);
+        assert!(!still);
+    }
+    #[test]
+    fn color_transition_interpolates_componentwise() {
+        // black rgb(0,0,0) → white rgb(255,255,255) over 1000ms; midpoint is the
+        // component-wise sRGB average rgb(127.5,127.5,127.5) (CSS Color 4 §13 /
+        // CSS Transitions L1 "by computed value, as color"). Opaque on both ends
+        // so this is straight per-channel interpolation (no premultiply needed).
+        let mut st = PropTransition {
+            dur_ms: 1000.0,
+            delay_ms: 0.0,
+            timing: 0,
+            is_color: true,
+            from: [0.0, 0.0, 0.0, 255.0],
+            target: [255.0, 255.0, 255.0, 255.0],
+            displayed: [0.0, 0.0, 0.0, 255.0],
+            start_ms: 0.0,
+        };
+        let (mid, _) = st.sample(500.0);
+        let c = channels_to_layout_color(mid);
+        assert_eq!((c.r, c.g, c.b, c.a), (128, 128, 128, 255), "mid grey, got {c:?}");
+        let (end, still) = st.sample(1000.0);
+        let c1 = channels_to_layout_color(end);
+        assert_eq!((c1.r, c1.g, c1.b, c1.a), (255, 255, 255, 255), "ends white");
+        assert!(!still);
+    }
+    #[test]
+    fn color_transition_samples_red_to_blue_midpoint() {
+        // red rgb(255,0,0) → blue rgb(0,0,255): midpoint rgb(127.5,0,127.5),
+        // i.e. a desaturated purple — each channel moves independently.
+        let mut st = PropTransition {
+            dur_ms: 1000.0,
+            delay_ms: 0.0,
+            timing: 0,
+            is_color: true,
+            from: [255.0, 0.0, 0.0, 255.0],
+            target: [0.0, 0.0, 255.0, 255.0],
+            displayed: [255.0, 0.0, 0.0, 255.0],
+            start_ms: 0.0,
+        };
+        let (mid, _) = st.sample(500.0);
+        let c = channels_to_layout_color(mid);
+        assert_eq!((c.r, c.g, c.b), (128, 0, 128), "purple midpoint, got {c:?}");
+    }
+    #[test]
+    fn note_color_transition_anchors_from_displayed() {
+        let id = 0xC010_u64;
+        // First sighting: red, opaque.
+        note_value_transition(id, TransProp::BackgroundColor, 500.0, 0.0, 0, [255.0, 0.0, 0.0, 255.0], 0.0);
+        // Target → green: a transition anchors from the displayed (red) value.
+        note_value_transition(id, TransProp::BackgroundColor, 500.0, 0.0, 0, [0.0, 255.0, 0.0, 255.0], 100.0);
+        let ok = TRANSITION_STATE.with(|s| {
+            let s = s.borrow();
+            let e = s.get(&(id, TransProp::BackgroundColor)).expect("bg transition");
+            e.from == [255.0, 0.0, 0.0, 255.0]
+                && e.target == [0.0, 255.0, 0.0, 255.0]
+                && (e.start_ms - 100.0).abs() < 1e-6
+        });
+        assert!(ok, "bg color change anchors from=red target=green start=100");
+    }
+    #[test]
+    fn apply_css_transitions_patches_layoutbox_fields() {
+        use cv_layout::Color as LC;
+        // Build a minimal layout box with a node id and seed two transitions:
+        // background-color black→white and border-radius 0→20, both 1000ms.
+        let id = 0xBEEF_u64;
+        TRANSITION_STATE.with(|s| {
+            let mut s = s.borrow_mut();
+            s.insert(
+                (id, TransProp::BackgroundColor),
+                PropTransition {
+                    dur_ms: 1000.0, delay_ms: 0.0, timing: 0, is_color: true,
+                    from: [0.0, 0.0, 0.0, 255.0], target: [255.0, 255.0, 255.0, 255.0],
+                    displayed: [0.0, 0.0, 0.0, 255.0], start_ms: 0.0,
+                },
+            );
+            s.insert((id, TransProp::BorderRadius), scalar(1000.0, 0.0, 20.0));
+        });
+        // Build a real layout box via the normal pipeline (LayoutBox has no
+        // Default ctor), then attach the node id + a known starting background.
+        let doc = cv_html::parse("<!doctype html><html><body><div>x</div></body></html>");
+        let cfg = cv_layout::LayoutConfig {
+            viewport_w: 1000.0,
+            viewport_h: 800.0,
+            ..cv_layout::LayoutConfig::default()
+        };
+        let mut lb = build_layout_tree(&doc, &[], "file:///t", &cfg, &Default::default());
+        lb.children.clear();
+        lb.node_id = Some(id);
+        lb.background = Some(LC { r: 0, g: 0, b: 0, a: 255 });
+        let running = apply_css_transitions(&mut lb, 500.0);
+        assert!(running, "transitions still running at t=0.5");
+        assert_eq!(lb.background, Some(LC { r: 128, g: 128, b: 128, a: 255 }), "bg interpolated to mid-grey");
+        assert!((lb.border_radius_px - 10.0).abs() < 0.5, "radius ~10px, got {}", lb.border_radius_px);
+        // At the end the values settle and the transition reports finished.
+        let still = apply_css_transitions(&mut lb, 1000.0);
+        assert_eq!(lb.background, Some(LC { r: 255, g: 255, b: 255, a: 255 }), "bg settles white");
+        assert!((lb.border_radius_px - 20.0).abs() < 0.01);
+        assert!(!still, "transitions finished at t=1");
+        TRANSITION_STATE.with(|s| s.borrow_mut().clear());
+    }
+
+    #[test]
+    fn apply_css_animations_patches_color_and_radius_fields() {
+        use cv_layout::Color as LC;
+        // A @keyframes that animates background-color black→white, color
+        // white→black, and border-radius 0→40 across the timeline. Drive the box
+        // at the 50% mark and assert the LayoutBox paint fields interpolated.
+        let css = "@keyframes k { \
+            from { background-color: #000; color: #fff; border-radius: 0px; } \
+            to   { background-color: #fff; color: #000; border-radius: 40px; } }";
+        let ss = cv_css::parse_stylesheet(css);
+        let kf = cv_css::cascade::collect_keyframes(&[ss]);
+
+        let doc = cv_html::parse("<!doctype html><html><body><div>x</div></body></html>");
+        let cfg = cv_layout::LayoutConfig {
+            viewport_w: 1000.0,
+            viewport_h: 800.0,
+            ..cv_layout::LayoutConfig::default()
+        };
+        let mut lb = build_layout_tree(&doc, &[], "file:///t", &cfg, &Default::default());
+        lb.children.clear();
+        lb.animation_name = Some("k".to_string());
+        lb.animation_duration_ms = 1000.0;
+        lb.animation_delay_ms = 0.0;
+        lb.animation_iteration_count = 1.0;
+        lb.animation_timing = 0; // linear
+
+        // now_ms = 500 → progress 0.5 (linear).
+        let still = apply_css_animations(&mut lb, &kf, 500.0);
+        assert!(still, "animation still running mid-timeline");
+        assert_eq!(lb.background, Some(LC { r: 128, g: 128, b: 128, a: 255 }), "bg mid-grey");
+        assert_eq!(lb.text_color, LC { r: 128, g: 128, b: 128, a: 255 }, "color mid-grey");
+        assert!((lb.border_radius_px - 20.0).abs() < 1.0, "radius ~20px, got {}", lb.border_radius_px);
+
+        // At/after the end (progress clamps to 1.0) the box reaches the `to`
+        // frame and the animation reports finished (finite 1 iteration).
+        let still_end = apply_css_animations(&mut lb, &kf, 1000.0);
+        assert_eq!(lb.background, Some(LC { r: 255, g: 255, b: 255, a: 255 }), "bg ends white");
+        assert_eq!(lb.text_color, LC { r: 0, g: 0, b: 0, a: 255 }, "color ends black");
+        assert!((lb.border_radius_px - 40.0).abs() < 0.5, "radius ends 40px");
+        assert!(!still_end, "single-iteration animation finished");
     }
 }
 
@@ -18650,6 +18964,36 @@ fn apply_css_animations(
                     if let Some(op) = props.get("opacity") {
                         if let Some(v) = anim_scalar(op) {
                             lb.opacity = v.clamp(0.0, 1.0);
+                        }
+                    }
+                    // Color properties: the sampler interpolated them component-
+                    // wise in sRGB and emitted an `rgba(...)` string; parse it back
+                    // to a concrete LayoutBox color. `color` / `background-color` /
+                    // `border-color` are paint-time fields the painter reads
+                    // directly, so patching them post-layout is correct (no reflow).
+                    if let Some(c) = props.get("color").and_then(|s| anim_color(s)) {
+                        lb.text_color = c;
+                    }
+                    if let Some(c) = props
+                        .get("background-color")
+                        .or_else(|| props.get("background"))
+                        .and_then(|s| anim_color(s))
+                    {
+                        lb.background = Some(c);
+                    }
+                    if let Some(c) = props.get("border-color").and_then(|s| anim_color(s)) {
+                        lb.border_color = Some(c);
+                        for side in lb.border_colors_per_side.iter_mut() {
+                            if side.is_some() {
+                                *side = Some(c);
+                            }
+                        }
+                    }
+                    // border-radius (px). Percent radii aren't length-interpolated
+                    // here (need the box size); the px component is the common case.
+                    if let Some(r) = props.get("border-radius").and_then(|s| anim_scalar(s)) {
+                        if !s_ends_with_percent(props.get("border-radius").unwrap()) {
+                            lb.border_radius_px = r.max(0.0);
                         }
                     }
                     running |= still;
@@ -19110,6 +19454,9 @@ fn build_runtime_and_first_paint(
     // New document → drop any element scroll offsets carried from the
     // previous page (Chrome resets scroll positions on navigation).
     clear_scroll_offsets();
+    // Also drop running CSS transitions: the new arena reuses node ids, so a
+    // stale (from, target) would flash a wrong color/opacity for one frame.
+    clear_transitions();
     let mut doc = cv_html::parse(html);
     assign_node_ids(&mut doc.root);
     bmark!("parsed html ({} bytes)", html.len());
@@ -37683,26 +38030,48 @@ fn build_styled_tree_full_arena_inner(
             }
             style.element_path = Some(path.clone());
             style.node_id = Some(id.to_bits());
-            // CSS transition: record this element's transitioned opacity TARGET
-            // (the true computed value) so apply_css_transitions can interpolate
-            // toward it across frames. Only opacity is wired for now; `all` and
-            // `opacity` (and the bare `transition-duration` default) qualify.
+            // CSS transition: record this element's transitioned TARGETs (the true
+            // computed/used values, post-inheritance and post-currentColor) so
+            // `apply_css_transitions` can interpolate toward them across frames.
+            // Each property is recorded independently when `transition-property`
+            // (`all` / the specific name / the bare-duration default) covers it —
+            // matching CSS Transitions L1 §3 (a per-property transition list).
+            // The FROM is the element's previously-displayed value, captured by the
+            // store; first sighting only seeds (no animate-from-nothing).
             {
                 let tdur = cs.transition_duration_ms.unwrap_or(0.0);
-                if tdur > 0.0
-                    && matches!(
-                        cs.transition_property.as_deref(),
-                        None | Some("all") | Some("opacity")
-                    )
-                {
-                    note_opacity_transition(
-                        id.to_bits(),
-                        tdur,
-                        cs.transition_delay_ms.unwrap_or(0.0),
-                        cs.transition_timing.unwrap_or(0),
-                        cs.opacity.unwrap_or(1.0),
-                        raf_clock_now(),
-                    );
+                if tdur > 0.0 {
+                    let nid = id.to_bits();
+                    let tprop = cs.transition_property.as_deref();
+                    let tdelay = cs.transition_delay_ms.unwrap_or(0.0);
+                    let ttiming = cs.transition_timing.unwrap_or(0);
+                    let now = raf_clock_now();
+                    let mut note = |p: TransProp, target: [f32; 4]| {
+                        if p.matches_transition_property(tprop) {
+                            note_value_transition(nid, p, tdur, tdelay, ttiming, target, now);
+                        }
+                    };
+                    // opacity (number)
+                    note(TransProp::Opacity, [cs.opacity.unwrap_or(1.0), 0.0, 0.0, 0.0]);
+                    // color / background-color / border-color (as color, sRGB
+                    // component-wise). Use the lowered+resolved `style` values so
+                    // currentColor/inheritance are already applied (the same values
+                    // the painter reads), keeping FROM and TO in one space.
+                    if let Some(c) = style.text_color {
+                        note(TransProp::Color, layout_color_channels(c));
+                    }
+                    if let Some(c) = style.background {
+                        note(TransProp::BackgroundColor, layout_color_channels(c));
+                    }
+                    if let Some(c) = style.border_color {
+                        note(TransProp::BorderColor, layout_color_channels(c));
+                    }
+                    // border-radius (length, px). Percent radii are not yet
+                    // length-interpolated here (they need the box size); the px
+                    // component is the common case authors animate.
+                    if let Some(r) = style.border_radius_px {
+                        note(TransProp::BorderRadius, [r, 0.0, 0.0, 0.0]);
+                    }
                 }
             }
             // (c) recurse over ALL children by raw index (element + text), the

@@ -2335,13 +2335,73 @@ fn value_to_string(tokens: &[CssToken]) -> String {
     s
 }
 
-/// Interpolate between two CSS values at progress `t`. V1 handles:
+/// Parse a CSS color string (hex `#abc`/`#aabbcc`, `rgb()`/`rgba()`,
+/// `hsl()`/`hsla()`, or a named color) into a [`Color`]. Returns `None` for
+/// non-color values (lengths, numbers, keywords like `none`). Public so the
+/// animation/transition driver can interpolate colors in their own component
+/// space rather than via text. Reuses the production [`Color::from_tokens`]
+/// parser used by the cascade, so it covers every color form the cascade does.
+pub fn parse_color_str(s: &str) -> Option<Color> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let toks = crate::tokenizer::tokenize(s);
+    // Drop leading/trailing whitespace tokens so a value like " #fff " parses.
+    let toks: Vec<CssToken> = toks
+        .into_iter()
+        .filter(|t| !matches!(t, CssToken::Whitespace))
+        .collect();
+    if toks.is_empty() {
+        return None;
+    }
+    Color::from_tokens(&toks)
+}
+
+/// Format an interpolated color back to an `rgba(r, g, b, a)` string that
+/// `parse_color_str` (and downstream length/number parsers) round-trips. Alpha
+/// is 0..1 per CSS. Components are clamped+rounded into 0..255.
+fn color_to_rgba_string(c: Color) -> String {
+    format!(
+        "rgba({}, {}, {}, {})",
+        c.r,
+        c.g,
+        c.b,
+        (c.a as f32 / 255.0)
+    )
+}
+
+/// Interpolate between two CSS values at progress `t`. Handles:
+///   * colors (hex/named/rgb/hsl) — interpolated component-wise in sRGB
+///     (CSS Color 4 §13 / CSS Transitions L1 "by computed value, as color"),
+///     non-premultiplied (the common opaque case is plain per-channel lerp)
 ///   * plain numbers (`0` → `1`)
 ///   * length values (`0px` → `100px`)
 ///   * percentages (`0%` → `100%`)
-///   * `translate(Xpx)` shorthand
+///   * `translate(Xpx)` shorthand and other multi-number skeletons
 /// Anything else falls back to a step at t≥0.5.
 fn interpolate_value(a: &str, b: &str, t: f32) -> String {
+    // Color path FIRST: a hex/named color has no decimal-number runs the generic
+    // skeleton path could lerp (`#000`→`#fff` would step), and `rgb()` digits
+    // must move as a unit in color space (incl. alpha), not as arbitrary text
+    // numbers. When BOTH ends parse as colors, interpolate RGBA component-wise.
+    if let (Some(ca), Some(cb)) = (parse_color_str(a), parse_color_str(b)) {
+        // `currentColor` is a context-dependent sentinel, not a concrete color —
+        // don't interpolate it numerically (it would emit garbage). Step instead.
+        if ca.is_current_color() || cb.is_current_color() {
+            return if t >= 0.5 { b.to_string() } else { a.to_string() };
+        }
+        let lerp = |x: u8, y: u8| -> u8 {
+            (x as f32 + (y as f32 - x as f32) * t).round().clamp(0.0, 255.0) as u8
+        };
+        let out = Color {
+            r: lerp(ca.r, cb.r),
+            g: lerp(ca.g, cb.g),
+            b: lerp(ca.b, cb.b),
+            a: lerp(ca.a, cb.a),
+        };
+        return color_to_rgba_string(out);
+    }
     // Locate every numeric run (optional sign, digits, decimal) in a string.
     fn numbers(s: &str) -> Vec<(usize, usize, f32)> {
         let bytes = s.as_bytes();
@@ -6497,6 +6557,69 @@ fn parse_margin_shorthand(toks: &[CssToken]) -> Option<([Option<Length>; 4], [bo
 mod tests {
     use super::*;
     use crate::parser::parse_stylesheet;
+
+    #[test]
+    fn parse_color_str_handles_hex_named_and_rgb() {
+        assert_eq!(parse_color_str("#fff"), Some(Color { r: 255, g: 255, b: 255, a: 255 }));
+        assert_eq!(parse_color_str("#000000"), Some(Color { r: 0, g: 0, b: 0, a: 255 }));
+        assert_eq!(parse_color_str("red"), Some(Color { r: 255, g: 0, b: 0, a: 255 }));
+        assert_eq!(parse_color_str("rgb(0, 128, 255)"), Some(Color { r: 0, g: 128, b: 255, a: 255 }));
+        // Non-colors return None so lengths/numbers fall through to the numeric path.
+        assert_eq!(parse_color_str("12px"), None);
+        assert_eq!(parse_color_str("0.5"), None);
+        assert_eq!(parse_color_str("auto"), None);
+    }
+
+    #[test]
+    fn interpolate_value_lerps_colors_componentwise() {
+        // black → white midpoint: rgb(128,128,128). interpolate_value emits an
+        // rgba() string; round-trip it through the parser to compare components.
+        let mid = interpolate_value("#000", "#fff", 0.5);
+        let c = parse_color_str(&mid).expect("rgba output parses");
+        assert_eq!((c.r, c.g, c.b, c.a), (128, 128, 128, 255), "{mid}");
+        // red → blue midpoint: each channel moves independently → rgb(128,0,128).
+        let mid2 = interpolate_value("red", "blue", 0.5);
+        let c2 = parse_color_str(&mid2).expect("parses");
+        assert_eq!((c2.r, c2.g, c2.b), (128, 0, 128), "{mid2}");
+        // endpoints are exact.
+        let start = parse_color_str(&interpolate_value("red", "blue", 0.0)).unwrap();
+        assert_eq!((start.r, start.g, start.b), (255, 0, 0));
+        let end = parse_color_str(&interpolate_value("red", "blue", 1.0)).unwrap();
+        assert_eq!((end.r, end.g, end.b), (0, 0, 255));
+    }
+
+    #[test]
+    fn interpolate_value_lengths_still_numeric() {
+        // The color path must NOT swallow lengths/numbers.
+        let mid = interpolate_value("0px", "100px", 0.25);
+        // numeric skeleton path → "25px"
+        assert!(mid.starts_with("25"), "len lerp = {mid}");
+        let mid_n = interpolate_value("0", "10", 0.5);
+        assert!(mid_n.starts_with("5"), "num lerp = {mid_n}");
+    }
+
+    #[test]
+    fn interpolate_value_currentcolor_steps() {
+        // currentColor is a sentinel, not a concrete color → step, never numeric.
+        let v = interpolate_value("currentColor", "red", 0.6);
+        assert_eq!(v, "red", "t>=0.5 steps to b");
+        let v0 = interpolate_value("currentColor", "red", 0.4);
+        assert_eq!(v0, "currentColor", "t<0.5 steps to a");
+    }
+
+    #[test]
+    fn sample_animation_interpolates_background_color() {
+        // A @keyframes that fades background-color black → white; at t=0.5 the
+        // sampled value parses to mid-grey.
+        let css = "@keyframes fade { from { background-color: #000; } to { background-color: #fff; } }";
+        let ss = parse_stylesheet(css);
+        let kf = collect_keyframes(&[ss]);
+        let rule = kf.get("fade").expect("keyframe collected");
+        let props = sample_animation(rule, 0.5);
+        let bg = props.get("background-color").expect("bg sampled");
+        let c = parse_color_str(bg).expect("parses");
+        assert_eq!((c.r, c.g, c.b), (128, 128, 128), "mid grey, got {bg}");
+    }
 
     #[derive(Copy, Clone)]
     struct Fake<'a> {
