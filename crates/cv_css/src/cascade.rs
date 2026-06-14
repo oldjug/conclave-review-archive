@@ -5831,6 +5831,28 @@ fn supports_matches(prelude: &[CssToken]) -> bool {
     acc
 }
 
+/// Evaluate a media-query string (e.g. `"(min-width: 600px) and (orientation:
+/// portrait)"`) against a viewport of `vw`×`vh` CSS pixels, returning whether it
+/// matches the current environment. This is the public entry point used by
+/// `window.matchMedia` (CSSOM View §4.2) — it tokenises the query and runs the
+/// SAME evaluator the `@media` cascade uses, so a `matchMedia` verdict and the
+/// rules an `@media` block applies stay in lockstep. An empty query matches all
+/// media (per Media Queries 4 §2.1, an empty query list is equivalent to `all`).
+///
+/// Behaves as Blink's `MediaQueryEvaluator::Eval` over the parsed query:
+/// width/height (incl. `min-`/`max-`), orientation, prefers-color-scheme, and
+/// the other features implemented in `media_atom_matches`. Unknown / not-yet
+/// implemented features do not match (conservative, never false-positive).
+pub fn media_query_matches_str(query: &str, vw: f32, vh: f32) -> bool {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        // CSSOM View: matchMedia("") → media query list equivalent to `all`.
+        return true;
+    }
+    let toks = crate::tokenizer::tokenize(trimmed);
+    media_query_matches(&toks, vw, vh)
+}
+
 fn media_query_matches(prelude: &[CssToken], vw: f32, vh: f32) -> bool {
     // Split the prelude on top-level commas — a single query in the list
     // matching = the whole thing matches.
@@ -6031,7 +6053,18 @@ fn media_atom_matches(toks: &[CssToken], vw: f32, vh: f32) -> bool {
         "any-hover" => matches!(value_keyword.as_deref(), Some("hover") | None),
         "pointer" => matches!(value_keyword.as_deref(), Some("fine") | None),
         "any-pointer" => matches!(value_keyword.as_deref(), Some("fine") | None),
-        "orientation" => matches!(value_keyword.as_deref(), Some("landscape") | None),
+        // Orientation is derived from the viewport box per Media Queries 4
+        // §6.4: `portrait` when height >= width, `landscape` otherwise. A bare
+        // `(orientation)` with no value matches in both orientations (the
+        // feature is always "present"). Previously this hardcoded `landscape`
+        // regardless of the viewport, which made `matchMedia('(orientation:
+        // portrait)')` wrong on a tall window.
+        "orientation" => match value_keyword.as_deref() {
+            Some("portrait") => vh >= vw,
+            Some("landscape") => vw > vh,
+            None => true,
+            _ => false,
+        },
         "display-mode" => matches!(value_keyword.as_deref(), Some("browser") | None),
         "scripting" => matches!(value_keyword.as_deref(), Some("enabled") | None),
         "update" => matches!(value_keyword.as_deref(), Some("fast") | None),
@@ -7299,6 +7332,97 @@ mod tests {
                 media_type
             );
         }
+    }
+
+    /// The public `media_query_matches_str` entry point (used by
+    /// `window.matchMedia`) tokenises a bare query string and evaluates it
+    /// against an explicit viewport — no `@media` wrapper, no stylesheet.
+    #[test]
+    fn match_media_string_width_features() {
+        // Wide test viewport: 1024×768.
+        assert!(media_query_matches_str("(min-width: 1px)", 1024.0, 768.0));
+        assert!(!media_query_matches_str(
+            "(min-width: 999999px)",
+            1024.0,
+            768.0
+        ));
+        assert!(!media_query_matches_str("(max-width: 0px)", 1024.0, 768.0));
+        assert!(media_query_matches_str(
+            "(max-width: 2000px)",
+            1024.0,
+            768.0
+        ));
+        // Range crossing: a query that is true narrow and false wide.
+        assert!(media_query_matches_str("(max-width: 600px)", 500.0, 800.0));
+        assert!(!media_query_matches_str(
+            "(max-width: 600px)",
+            1000.0,
+            800.0
+        ));
+        // `and` compound + the leading `not`.
+        assert!(media_query_matches_str(
+            "(min-width: 300px) and (max-width: 1200px)",
+            800.0,
+            600.0
+        ));
+        assert!(media_query_matches_str(
+            "not (min-width: 2000px)",
+            800.0,
+            600.0
+        ));
+        // Empty query == `all` per CSSOM View / Media Queries 4 §2.1.
+        assert!(media_query_matches_str("", 800.0, 600.0));
+    }
+
+    /// `(orientation: portrait|landscape)` must be derived from the viewport
+    /// box (Media Queries 4 §6.4), not hardcoded. Regression: it used to always
+    /// report `landscape`.
+    #[test]
+    fn match_media_orientation_is_viewport_derived() {
+        // Tall viewport → portrait matches, landscape does not.
+        assert!(media_query_matches_str(
+            "(orientation: portrait)",
+            400.0,
+            900.0
+        ));
+        assert!(!media_query_matches_str(
+            "(orientation: landscape)",
+            400.0,
+            900.0
+        ));
+        // Wide viewport → landscape matches, portrait does not.
+        assert!(media_query_matches_str(
+            "(orientation: landscape)",
+            1200.0,
+            800.0
+        ));
+        assert!(!media_query_matches_str(
+            "(orientation: portrait)",
+            1200.0,
+            800.0
+        ));
+        // A square viewport is portrait per spec (height >= width).
+        assert!(media_query_matches_str(
+            "(orientation: portrait)",
+            500.0,
+            500.0
+        ));
+    }
+
+    /// `prefers-color-scheme` is honest: we are a light-theme browser, so
+    /// `light` matches and `dark` does not — independent of viewport.
+    #[test]
+    fn match_media_prefers_color_scheme() {
+        assert!(media_query_matches_str(
+            "(prefers-color-scheme: light)",
+            1024.0,
+            768.0
+        ));
+        assert!(!media_query_matches_str(
+            "(prefers-color-scheme: dark)",
+            1024.0,
+            768.0
+        ));
     }
 
     #[test]

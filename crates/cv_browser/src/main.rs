@@ -8922,6 +8922,15 @@ fn build_browser_session(target: &str) -> Result<BrowserParts, String> {
         let url = st.url.clone();
         let focus = st.focused_path.clone();
         set_caret_pos_for_render(st.caret_pos);
+        // Re-evaluate every live `window.matchMedia` MediaQueryList against the
+        // new viewport and fire `change` on the ones whose match state flipped
+        // (CSSOM View §4.2 — responsive sites toggle layout off this). The host
+        // hook only invokes JS callbacks when a query actually crosses a
+        // breakpoint, so a no-op drag stays cheap. Errors here must not abort
+        // the repaint, so the result is ignored.
+        let _ = st.runtime.interp.run(
+            "if (typeof window!=='undefined' && window.__cv_mql_reevaluate__) window.__cv_mql_reevaluate__();",
+        );
         // Re-render at the new size with the JS-created canvas contexts available
         // so a particles.js / animation canvas keeps compositing after a resize.
         // (Kept lightweight: WM_SIZE can fire rapidly during a drag.)
@@ -21504,6 +21513,283 @@ fn install_minimal_dom(interp: &cv_js::Interp, initial_title: String) {
     install_minimal_dom_with_url(interp, initial_title, "about:blank")
 }
 
+// ---- window.matchMedia (CSSOM View §4.2 — live MediaQueryList) ----
+
+/// One registered `MediaQueryList`. We keep a weak-ish registry of every MQL
+/// `matchMedia` hands out so a viewport / theme change can re-evaluate them all
+/// and fire `change` on the ones whose match state FLIPPED — mirroring Blink's
+/// `MediaQueryMatcher::MediaFeaturesChanged`, which walks its set of registered
+/// lists, re-evaluates each, and fires `change` only when the cached value
+/// differs from the freshly-evaluated one.
+struct MqlEntry {
+    /// The serialized media query string (the MQL's `.media`).
+    media: String,
+    /// The JS `MediaQueryList` object handed back to the page. Its `\u{1}matches`
+    /// backing field is updated in place when the match state flips so a later
+    /// read sees the new value even if the page cached the object.
+    obj: std::rc::Rc<std::cell::RefCell<cv_js::OrderedMap<String, cv_js::Value>>>,
+    /// "change" listeners registered via `addEventListener`/`addListener`.
+    listeners: std::rc::Rc<std::cell::RefCell<Vec<cv_js::Value>>>,
+    /// The match state at the last evaluation (the basis for flip detection).
+    last_matches: bool,
+}
+
+type MqlRegistry = std::rc::Rc<std::cell::RefCell<Vec<MqlEntry>>>;
+
+/// Re-evaluate every registered MQL against the CURRENT layout viewport and fire
+/// a `change` event (a `MediaQueryListEvent` with `matches`/`media`) on each one
+/// whose match state changed since the last evaluation. Called from the resize
+/// path and from the `__cv_mql_reevaluate__` host hook. Per CSSOM View §4.2,
+/// `change` fires only on a state transition, not on every evaluation.
+fn reevaluate_media_query_lists(interp: &mut cv_js::Interp, registry: &MqlRegistry) {
+    let (vw, vh) = layout_viewport_px();
+    // Snapshot the work to do without holding the registry borrow across the JS
+    // callbacks (a listener may itself call matchMedia and push a new entry).
+    struct Fire {
+        media: String,
+        matches: bool,
+        listeners: Vec<cv_js::Value>,
+        obj: std::rc::Rc<std::cell::RefCell<cv_js::OrderedMap<String, cv_js::Value>>>,
+    }
+    let mut to_fire: Vec<Fire> = Vec::new();
+    {
+        let mut reg = registry.borrow_mut();
+        // Drop entries that can never observe a `change` (no listeners and no
+        // `onchange`). A bare `matchMedia(q).matches` read creates an MQL that is
+        // immediately discarded by the page; without this prune the registry
+        // would grow unbounded on responsive libs that poll matchMedia. `.matches`
+        // is a live getter, so a pruned list still reads correctly if re-fetched.
+        reg.retain(|e| {
+            if !e.listeners.borrow().is_empty() {
+                return true;
+            }
+            matches!(
+                e.obj.borrow().get("onchange"),
+                Some(cv_js::Value::Function(_))
+                    | Some(cv_js::Value::NativeFunction(_))
+                    | Some(cv_js::Value::BcClosure(_))
+            )
+        });
+        for e in reg.iter_mut() {
+            let now = cv_css::media_query_matches_str(&e.media, vw, vh);
+            if now != e.last_matches {
+                e.last_matches = now;
+                // Keep the object's backing field current for cached reads.
+                e.obj
+                    .borrow_mut()
+                    .insert("\u{1}matches".into(), cv_js::Value::Bool(now));
+                to_fire.push(Fire {
+                    media: e.media.clone(),
+                    matches: now,
+                    listeners: e.listeners.borrow().clone(),
+                    obj: e.obj.clone(),
+                });
+            }
+        }
+    }
+    for f in to_fire {
+        let target = cv_js::Value::Object(f.obj.clone());
+        for cb in f.listeners {
+            if matches!(cb, cv_js::Value::Undefined | cv_js::Value::Null) {
+                continue;
+            }
+            let ev = make_media_query_list_event(&f.media, f.matches, target.clone());
+            let _ = interp.call_value_with_this(cb, target.clone(), vec![ev]);
+        }
+        // The legacy inline `onchange` handler fires after the listeners.
+        let inline = f.obj.borrow().get("onchange").cloned();
+        if let Some(cb) = inline {
+            if !matches!(cb, cv_js::Value::Undefined | cv_js::Value::Null) {
+                let ev = make_media_query_list_event(&f.media, f.matches, target.clone());
+                let _ = interp.call_value_with_this(cb, target.clone(), vec![ev]);
+            }
+        }
+    }
+}
+
+/// Build a `MediaQueryListEvent` object (CSSOM View §4.2 / Media Queries 4) with
+/// the fields a `change` listener reads: `type`, `media`, `matches`, `target`,
+/// `currentTarget`, `isTrusted`, and the no-op `Event` surface.
+fn make_media_query_list_event(
+    media: &str,
+    matches: bool,
+    target: cv_js::Value,
+) -> cv_js::Value {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    let mut m: cv_js::OrderedMap<String, cv_js::Value> = cv_js::OrderedMap::new();
+    m.insert("type".into(), cv_js::Value::str("change".to_string()));
+    m.insert("media".into(), cv_js::Value::str(media.to_string()));
+    m.insert("matches".into(), cv_js::Value::Bool(matches));
+    m.insert("isTrusted".into(), cv_js::Value::Bool(true));
+    m.insert("bubbles".into(), cv_js::Value::Bool(false));
+    m.insert("cancelable".into(), cv_js::Value::Bool(false));
+    m.insert("defaultPrevented".into(), cv_js::Value::Bool(false));
+    m.insert("target".into(), target.clone());
+    m.insert("currentTarget".into(), target);
+    m.insert("eventPhase".into(), cv_js::Value::Number(2.0)); // AT_TARGET
+    m.insert(
+        "preventDefault".into(),
+        cv_js::native_fn("preventDefault", |_| Ok(cv_js::Value::Undefined)),
+    );
+    m.insert(
+        "stopPropagation".into(),
+        cv_js::native_fn("stopPropagation", |_| Ok(cv_js::Value::Undefined)),
+    );
+    m.insert(
+        "stopImmediatePropagation".into(),
+        cv_js::native_fn("stopImmediatePropagation", |_| Ok(cv_js::Value::Undefined)),
+    );
+    cv_js::Value::Object(Rc::new(RefCell::new(m)))
+}
+
+/// Construct a live `MediaQueryList` for `query`, evaluate it against the current
+/// viewport, register it in `registry`, and return the object. Replaces the old
+/// constant-`false` stub. The returned object is a real EventTarget:
+/// `addEventListener("change", …)` / `addListener` store listeners that fire on
+/// a match-state flip; `.matches` is a live accessor that re-evaluates on read
+/// (so it is correct even between resize passes); `.media` is the serialized
+/// query (CSSOM View §4.2).
+fn make_media_query_list(query: &str, registry: &MqlRegistry) -> cv_js::Value {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    let media = query.trim().to_string();
+    let (vw, vh) = layout_viewport_px();
+    let initial = cv_css::media_query_matches_str(&media, vw, vh);
+
+    let listeners: Rc<RefCell<Vec<cv_js::Value>>> = Rc::new(RefCell::new(Vec::new()));
+
+    let mut m: cv_js::OrderedMap<String, cv_js::Value> = cv_js::OrderedMap::new();
+    m.insert("media".into(), cv_js::Value::str(media.clone()));
+    // Backing field for the live `matches` accessor + cross-resize cache.
+    m.insert("\u{1}matches".into(), cv_js::Value::Bool(initial));
+    m.insert("onchange".into(), cv_js::Value::Null);
+
+    // `.matches` — a live getter that re-evaluates against the CURRENT viewport,
+    // matching Blink's `MediaQueryList::matches()` (which evaluates the query
+    // each time the value is observed, not just at construction).
+    {
+        let media_for_get = media.clone();
+        let getter = cv_js::native_fn("get matches", move |_| {
+            let (vw, vh) = layout_viewport_px();
+            Ok(cv_js::Value::Bool(cv_css::media_query_matches_str(
+                &media_for_get,
+                vw,
+                vh,
+            )))
+        });
+        let mut acc: cv_js::OrderedMap<String, cv_js::Value> = cv_js::OrderedMap::new();
+        acc.insert(cv_js::ACCESSOR_GET.into(), getter);
+        m.insert("matches".into(), cv_js::Value::Object(Rc::new(RefCell::new(acc))));
+    }
+
+    let obj: Rc<RefCell<cv_js::OrderedMap<String, cv_js::Value>>> = Rc::new(RefCell::new(m));
+
+    // addEventListener("change", cb) — only the "change" type is meaningful on a
+    // MediaQueryList; other types are accepted but never fire (WHATWG EventTarget).
+    {
+        let l = listeners.clone();
+        let add = cv_js::native_fn("addEventListener", move |args| {
+            let ty = args
+                .first()
+                .map(|v| v.to_display_string())
+                .unwrap_or_default();
+            let cb = args.get(1).cloned().unwrap_or(cv_js::Value::Undefined);
+            if ty == "change" && !matches!(cb, cv_js::Value::Undefined | cv_js::Value::Null) {
+                l.borrow_mut().push(cb);
+            }
+            Ok(cv_js::Value::Undefined)
+        });
+        obj.borrow_mut().insert("addEventListener".into(), add);
+    }
+    // removeEventListener("change", cb).
+    {
+        let l = listeners.clone();
+        let rm = cv_js::native_fn("removeEventListener", move |args| {
+            let ty = args
+                .first()
+                .map(|v| v.to_display_string())
+                .unwrap_or_default();
+            let cb = args.get(1).cloned().unwrap_or(cv_js::Value::Undefined);
+            if ty == "change" {
+                l.borrow_mut()
+                    .retain(|c| !cv_js::Value::strict_eq(c, &cb));
+            }
+            Ok(cv_js::Value::Undefined)
+        });
+        obj.borrow_mut().insert("removeEventListener".into(), rm);
+    }
+    // Legacy addListener(cb) — equivalent to addEventListener("change", cb).
+    {
+        let l = listeners.clone();
+        let add = cv_js::native_fn("addListener", move |args| {
+            let cb = args.first().cloned().unwrap_or(cv_js::Value::Undefined);
+            if !matches!(cb, cv_js::Value::Undefined | cv_js::Value::Null) {
+                l.borrow_mut().push(cb);
+            }
+            Ok(cv_js::Value::Undefined)
+        });
+        obj.borrow_mut().insert("addListener".into(), add);
+    }
+    // Legacy removeListener(cb).
+    {
+        let l = listeners.clone();
+        let rm = cv_js::native_fn("removeListener", move |args| {
+            let cb = args.first().cloned().unwrap_or(cv_js::Value::Undefined);
+            l.borrow_mut()
+                .retain(|c| !cv_js::Value::strict_eq(c, &cb));
+            Ok(cv_js::Value::Undefined)
+        });
+        obj.borrow_mut().insert("removeListener".into(), rm);
+    }
+    // dispatchEvent — MediaQueryList is an EventTarget. A page-dispatched event
+    // synchronously invokes the registered "change" listeners (returns
+    // !defaultPrevented). Mirrors the window dispatchEvent above.
+    {
+        let l = listeners.clone();
+        let obj_for_disp = obj.clone();
+        let disp = cv_js::native_fn_with_interp("dispatchEvent", move |interp, args| {
+            let event = args.first().cloned().unwrap_or(cv_js::Value::Undefined);
+            let ty = if let cv_js::Value::Object(o) = &event {
+                o.borrow()
+                    .get("type")
+                    .map(|v| v.to_display_string())
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
+            let this_v = cv_js::Value::Object(obj_for_disp.clone());
+            if let cv_js::Value::Object(o) = &event {
+                let mut em = o.borrow_mut();
+                em.insert("target".into(), this_v.clone());
+                em.insert("currentTarget".into(), this_v.clone());
+            }
+            if ty == "change" {
+                let cbs: Vec<cv_js::Value> = l.borrow().clone();
+                for cb in cbs {
+                    let _ = interp.call_value_with_this(cb, this_v.clone(), vec![event.clone()]);
+                }
+            }
+            let prevented = if let cv_js::Value::Object(o) = &event {
+                matches!(o.borrow().get("defaultPrevented"), Some(cv_js::Value::Bool(true)))
+            } else {
+                false
+            };
+            Ok(cv_js::Value::Bool(!prevented))
+        });
+        obj.borrow_mut().insert("dispatchEvent".into(), disp);
+    }
+
+    registry.borrow_mut().push(MqlEntry {
+        media,
+        obj: obj.clone(),
+        listeners,
+        last_matches: initial,
+    });
+
+    cv_js::Value::Object(obj)
+}
+
 fn install_minimal_dom_with_url(interp: &cv_js::Interp, initial_title: String, page_url: &str) {
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -22623,26 +22909,35 @@ fn install_minimal_dom_with_url(interp: &cv_js::Interp, initial_title: String, p
             .unwrap_or_default();
         Ok(cv_js::Value::str(default))
     });
-    let match_media = cv_js::native_fn("matchMedia", move |_args| {
-        let mut m: HashMap<String, cv_js::Value> = HashMap::new();
-        m.insert("matches".into(), cv_js::Value::Bool(false));
-        m.insert(
-            "addEventListener".into(),
-            cv_js::native_fn("addEventListener", |_| Ok(cv_js::Value::Undefined)),
-        );
-        m.insert(
-            "removeEventListener".into(),
-            cv_js::native_fn("removeEventListener", |_| Ok(cv_js::Value::Undefined)),
-        );
-        m.insert(
-            "addListener".into(),
-            cv_js::native_fn("addListener", |_| Ok(cv_js::Value::Undefined)),
-        );
-        m.insert(
-            "removeListener".into(),
-            cv_js::native_fn("removeListener", |_| Ok(cv_js::Value::Undefined)),
-        );
-        Ok(cv_js::Value::Object(Rc::new(RefCell::new(m))))
+    // window.matchMedia — real, live MediaQueryList wired to the cv_css media
+    // evaluator (CSSOM View §4.2; Media Queries 4). Every list handed out is
+    // recorded in `mql_registry` so a viewport / theme change can re-evaluate
+    // them and fire `change` on a match-state flip (see
+    // `reevaluate_media_query_lists`, driven by the resize path and the
+    // `__cv_mql_reevaluate__` host hook). Replaces the old constant-`false` stub.
+    let mql_registry: MqlRegistry = Rc::new(RefCell::new(Vec::new()));
+    let mql_reg_for_match = mql_registry.clone();
+    let match_media = cv_js::native_fn_n("matchMedia", 1, move |args| {
+        let query = args
+            .first()
+            .map(|v| v.to_display_string())
+            .unwrap_or_default();
+        Ok(make_media_query_list(&query, &mql_reg_for_match))
+    });
+    // Host hook the resize path / tests call to re-evaluate every MediaQueryList
+    // against the current viewport and dispatch `change` on the flipped ones.
+    // Optional arg pair (w, h) lets a caller set the layout viewport first.
+    let mql_reg_for_reeval = mql_registry.clone();
+    let mql_reevaluate = cv_js::native_fn_with_interp("__cv_mql_reevaluate__", move |interp, args| {
+        if let (Some(w), Some(h)) = (args.first(), args.get(1)) {
+            let wf = w.to_number() as f32;
+            let hf = h.to_number() as f32;
+            if wf > 0.0 && hf > 0.0 {
+                set_layout_viewport_px(wf, hf);
+            }
+        }
+        reevaluate_media_query_lists(interp, &mql_reg_for_reeval);
+        Ok(cv_js::Value::Undefined)
     });
     let get_computed_style = cv_js::native_fn("getComputedStyle", move |args| {
         if let Some(cv_js::Value::Object(obj)) = args.first() {
@@ -22760,6 +23055,7 @@ fn install_minimal_dom_with_url(interp: &cv_js::Interp, initial_title: String, p
     window_map.insert("removeEventListener".into(), remove_event_listener);
     window_map.insert("dispatchEvent".into(), dispatch_event);
     window_map.insert("matchMedia".into(), match_media);
+    window_map.insert("__cv_mql_reevaluate__".into(), mql_reevaluate);
     window_map.insert("getComputedStyle".into(), get_computed_style);
 
     // history — pushState / replaceState / popstate. The stack is
@@ -49707,6 +50003,103 @@ mod tests {
                  if (!g || typeof g.addColorStop !== 'function') throw 'missing gradient object';",
             )
             .expect("created canvas behaves like DOM canvas");
+    }
+
+    /// window.matchMedia is a REAL live MediaQueryList wired to the cv_css media
+    /// evaluator (CSSOM View §4.2), NOT the old constant-`false` stub:
+    ///   - `.matches` reflects the real evaluation against the viewport,
+    ///   - `.media` echoes the (trimmed) query,
+    ///   - `addEventListener("change")` / legacy `addListener` fire a
+    ///     `MediaQueryListEvent{matches,media}` when the match state FLIPS on a
+    ///     simulated resize, and only then,
+    ///   - `removeEventListener` / `removeListener` unsubscribe.
+    #[test]
+    fn match_media_live_query_list_and_change_event() {
+        // Pin a known viewport BEFORE the runtime is built so the initial
+        // evaluation is deterministic (800×600).
+        set_layout_viewport_px(800.0, 600.0);
+        let doc = cv_html::parse("<!doctype html><html><body></body></html>");
+        let mut runtime = LiveInterp::new(&doc, "https://example.com/");
+
+        // .matches reflects the real evaluator at 800×600. The required cases:
+        // (min-width:1px) true, (min-width:999999px) false, (max-width:0px) false.
+        let v = runtime
+            .interp
+            .run_completion_value(
+                "[\
+                   window.matchMedia('(min-width: 1px)').matches, \
+                   window.matchMedia('(min-width: 999999px)').matches, \
+                   window.matchMedia('(max-width: 0px)').matches, \
+                   window.matchMedia('(max-width: 2000px)').matches, \
+                   window.matchMedia('(min-width: 600px)').media \
+                 ].join('|')",
+            )
+            .expect("matchMedia evaluates");
+        assert_eq!(
+            v.to_display_string(),
+            "true|false|false|true|(min-width: 600px)",
+            "matchMedia must reflect the real evaluator, not constant false"
+        );
+
+        // change event: a query true at 800px (max-width:700px → false now) must
+        // FLIP to true when the viewport shrinks below 700px, firing exactly one
+        // change with {matches:true, media}. Resizing back up flips it to false.
+        let result = runtime
+            .interp
+            .run_completion_value(
+                "(function(){ \
+                   var mq = window.matchMedia('(max-width: 700px)'); \
+                   if (mq.matches) return 'wrong-initial'; \
+                   var log = []; \
+                   var handler = function(e){ log.push(e.matches + ':' + e.media + ':' + (e.type||'')); }; \
+                   mq.addEventListener('change', handler); \
+                   /* simulate a resize that crosses the breakpoint (now 500px wide) */ \
+                   window.__cv_mql_reevaluate__(500, 600); \
+                   /* a no-op re-eval (same size) must NOT fire again */ \
+                   window.__cv_mql_reevaluate__(500, 600); \
+                   var afterShrink = mq.matches; \
+                   /* resize back up — flips false, fires once */ \
+                   window.__cv_mql_reevaluate__(1200, 600); \
+                   /* remove the listener, then a flip must NOT call it */ \
+                   mq.removeEventListener('change', handler); \
+                   window.__cv_mql_reevaluate__(500, 600); \
+                   return log.join('|') + ' || shrinkMatches=' + afterShrink; \
+                 })()",
+            )
+            .expect("matchMedia change listener fires on flip");
+        assert_eq!(
+            result.to_display_string(),
+            "true:(max-width: 700px):change|false:(max-width: 700px):change || shrinkMatches=true",
+            "change must fire once per flip with the right matches/media; removed listener must not fire"
+        );
+
+        // Legacy addListener / removeListener path (deprecated MQL API).
+        let legacy = runtime
+            .interp
+            .run_completion_value(
+                "(function(){ \
+                   window.__cv_mql_reevaluate__(1200, 600); \
+                   var mq = window.matchMedia('(min-width: 1000px)'); \
+                   if (!mq.matches) return 'wrong-initial-legacy'; \
+                   var n = 0; \
+                   var fn = function(e){ n += (e.matches===false?1:0); }; \
+                   mq.addListener(fn); \
+                   window.__cv_mql_reevaluate__(500, 600); /* drops below 1000 → false, fires */ \
+                   mq.removeListener(fn); \
+                   window.__cv_mql_reevaluate__(1200, 600); /* back up, but removed → no fire */ \
+                   return 'calls=' + n + ' final=' + mq.matches; \
+                 })()",
+            )
+            .expect("legacy addListener path");
+        assert_eq!(
+            legacy.to_display_string(),
+            "calls=1 final=true",
+            "legacy addListener/removeListener must work like addEventListener('change')"
+        );
+
+        // Restore the default test viewport so we don't perturb sibling tests
+        // that share the thread-local.
+        set_layout_viewport_px(1280.0, 800.0);
     }
 
     /// End-to-end: the new Canvas2D op groups are wired through the JS bindings

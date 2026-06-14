@@ -30,7 +30,8 @@ pub use cascade::{
     AncestorFilter, InvalidationSet, KeyframeRule, RuleFeatureSet, SelectorIndex,
     bloom_reset, bloom_stats, build_rule_feature_set, collect_keyframes, compute_pseudo,
     compute_pseudo_with_index, compute_with_index, compute_with_index_inheriting,
-    compute_with_index_inheriting_filtered, sample_animation, take_unknown_property_counts,
+    compute_with_index_inheriting_filtered, media_query_matches_str, sample_animation,
+    take_unknown_property_counts,
 };
 pub use parser::{Declaration, Rule, Stylesheet, parse_inline_style, parse_stylesheet};
 pub use selectors::{Selector, SimpleSelector};
