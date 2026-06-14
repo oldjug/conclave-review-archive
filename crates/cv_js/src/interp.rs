@@ -6218,6 +6218,17 @@ pub struct Interp {
     /// (dynamic `import()`, particles) complete instead of resolving to
     /// `undefined`. Returns `true` if it advanced any host work.
     pub host_pump: std::cell::RefCell<Option<std::rc::Rc<dyn Fn(&mut Interp) -> bool>>>,
+    /// Microtask-checkpoint hook — HTML "perform a microtask checkpoint" runs
+    /// "notify mutation observers" once the queue drains (WHATWG DOM §4.3). The
+    /// browser registers this so `MutationObserver` callbacks are delivered at
+    /// exactly the spec point: after the synchronous script (and every promise
+    /// reaction) settles, but before the next macrotask. The hook delivers any
+    /// queued `MutationRecord`s by invoking observer callbacks; those callbacks
+    /// may enqueue further microtasks (or mutate the DOM, queuing more records),
+    /// so `drain_microtasks` loops: drain → hook → (if it reported work) drain
+    /// again. Returns `true` if it delivered anything (so the loop re-drains).
+    pub microtask_checkpoint_hook:
+        std::cell::RefCell<Option<std::rc::Rc<dyn Fn(&mut Interp) -> bool>>>,
     /// CSP `unsafe-eval` gate (M9.1). The string-compiling sinks
     /// (`eval`, the `Function` constructor, and string-bodied
     /// `setTimeout`/`setInterval` in the host) consult this. `true` means
@@ -6234,6 +6245,13 @@ impl Interp {
     /// this so `await` can wait on chunk loads / timers.
     pub fn set_host_pump(&self, f: std::rc::Rc<dyn Fn(&mut Interp) -> bool>) {
         *self.host_pump.borrow_mut() = Some(f);
+    }
+
+    /// Install the microtask-checkpoint hook (see `microtask_checkpoint_hook`).
+    /// The browser sets this so MutationObserver records are delivered at the
+    /// end of every microtask checkpoint.
+    pub fn set_microtask_checkpoint_hook(&self, f: std::rc::Rc<dyn Fn(&mut Interp) -> bool>) {
+        *self.microtask_checkpoint_hook.borrow_mut() = Some(f);
     }
 
     /// CSP `unsafe-eval` gate setter (see `eval_allowed`). The host computes
@@ -6392,6 +6410,7 @@ impl Interp {
             output: Vec::new(),
             microtasks: std::cell::RefCell::new(std::collections::VecDeque::new()),
             host_pump: std::cell::RefCell::new(None),
+            microtask_checkpoint_hook: std::cell::RefCell::new(None),
             native_this_stack: std::cell::RefCell::new(Vec::new()),
             // CSP unsafe-eval gate: default permissive (no-CSP behavior).
             eval_allowed: std::cell::Cell::new(true),
@@ -6566,10 +6585,31 @@ impl Interp {
         // 100k tasks is roughly two orders of magnitude above any sane
         // page; cheaper than blowing the stack on infinite recursion.
         let mut budget = 100_000usize;
+        // Bound the outer drain↔checkpoint rounds too. Each round either drains
+        // the queue or the checkpoint hook delivers a finite batch of already-
+        // queued mutation records; a sane page settles in a handful of rounds.
+        let mut checkpoint_rounds = 1024usize;
         loop {
             let next = self.microtasks.borrow_mut().pop_front();
             match next {
-                None => return,
+                None => {
+                    // Queue is empty: perform the microtask checkpoint's
+                    // "notify mutation observers" step (WHATWG DOM §4.3). If the
+                    // hook delivered records (whose callbacks may have queued
+                    // more microtasks or mutated the DOM → more records), loop
+                    // and re-drain; otherwise we're done.
+                    let hook = self.microtask_checkpoint_hook.borrow().clone();
+                    if let Some(h) = hook {
+                        checkpoint_rounds = checkpoint_rounds.saturating_sub(1);
+                        if checkpoint_rounds == 0 {
+                            return;
+                        }
+                        if h(self) {
+                            continue;
+                        }
+                    }
+                    return;
+                }
                 Some((cb, args)) => {
                     budget = budget.saturating_sub(1);
                     if budget == 0 {

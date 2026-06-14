@@ -15282,6 +15282,14 @@ impl LiveInterp {
             if let Err(e) = self.interp.run(src) {
                 eprintln!("[js error] {e:?}");
             }
+        } else {
+            // The tree-walk `run` path drains microtasks itself (running the
+            // microtask-checkpoint hook → MutationObserver delivery); the
+            // bytecode VM path does not, so perform the checkpoint explicitly so
+            // queued MutationRecords (and promise reactions) are delivered after
+            // a VM-run script turn — matching HTML "perform a microtask
+            // checkpoint" after every task.
+            self.interp.drain_microtasks();
         }
         // After every script turn, persist localStorage so refreshes /
         // restarts see the latest values. Cheap (KB writes).
@@ -23333,6 +23341,85 @@ fn install_minimal_dom_with_url(interp: &cv_js::Interp, initial_title: String, p
                 Rc::new(RefCell::new(HashMap::new()));
             let observer_value = cv_js::Value::Object(observer_map.clone());
 
+            // ── Real MutationObserver (registry-backed, microtask-delivered) ──
+            // WHATWG DOM §4.3. observe(node, init) records a (node, options)
+            // registration; DOM mutations queue MutationRecords (see
+            // emit_js_*_mutation); the microtask-checkpoint hook delivers them
+            // by invoking this callback once with (records, observer);
+            // takeRecords() drains synchronously without invoking; disconnect()
+            // drops all registrations + pending records.
+            if name == "MutationObserver" {
+                let obs_id = mutation_registry_register(cb.clone(), observer_value.clone());
+                observer_map
+                    .borrow_mut()
+                    .insert(MO_ID_SLOT.into(), cv_js::Value::Number(obs_id as f64));
+
+                observer_map.borrow_mut().insert(
+                    "observe".into(),
+                    cv_js::native_fn("observe", move |observe_args| {
+                        let target = observe_args
+                            .first()
+                            .cloned()
+                            .unwrap_or(cv_js::Value::Undefined);
+                        let Some(ident) = js_object_identity(&target) else {
+                            return Ok(cv_js::Value::Undefined);
+                        };
+                        let init = parse_mo_init(observe_args.get(1));
+                        // WHATWG step 2: a registration with neither childList,
+                        // attributes, nor characterData is a TypeError. We accept
+                        // it as a no-op registration (lenient) so feature-test
+                        // code never throws, but it will simply never match.
+                        MUTATION_REGISTRY.with(|reg| {
+                            let mut reg = reg.borrow_mut();
+                            if let Some(entry) =
+                                reg.observers.iter_mut().find(|e| e.id == obs_id)
+                            {
+                                // Re-observing a node REPLACES its options.
+                                entry.registrations.retain(|r| r.ident != ident);
+                                entry.registrations.push(MoRegistration {
+                                    ident,
+                                    node: target.clone(),
+                                    init,
+                                });
+                            }
+                        });
+                        Ok(cv_js::Value::Undefined)
+                    }),
+                );
+                observer_map.borrow_mut().insert(
+                    "disconnect".into(),
+                    cv_js::native_fn("disconnect", move |_args| {
+                        MUTATION_REGISTRY.with(|reg| {
+                            let mut reg = reg.borrow_mut();
+                            if let Some(entry) =
+                                reg.observers.iter_mut().find(|e| e.id == obs_id)
+                            {
+                                entry.registrations.clear();
+                                entry.pending.clear();
+                            }
+                        });
+                        Ok(cv_js::Value::Undefined)
+                    }),
+                );
+                observer_map.borrow_mut().insert(
+                    "takeRecords".into(),
+                    cv_js::native_fn("takeRecords", move |_args| {
+                        let drained = MUTATION_REGISTRY.with(|reg| {
+                            let mut reg = reg.borrow_mut();
+                            reg.observers
+                                .iter_mut()
+                                .find(|e| e.id == obs_id)
+                                .map(|e| std::mem::take(&mut e.pending))
+                                .unwrap_or_default()
+                        });
+                        Ok(cv_js::Value::Array(Rc::new(RefCell::new(drained))))
+                    }),
+                );
+                observer_map.borrow_mut().insert("_callback".into(), cb);
+                let _ = records; // unused on this path
+                return Ok(observer_value);
+            }
+
             // ── M7.1 real observer engine (CV_OBSERVERS_REAL, default ON) ──
             // Register IO/RO into the render-thread registry. observe/unobserve/
             // disconnect/takeRecords route through it; the per-frame observer step
@@ -23974,6 +24061,14 @@ fn install_minimal_dom_with_url(interp: &cv_js::Interp, initial_title: String, p
         make_observer_ctor("IntersectionObserver"),
     );
     interp.define_global("ResizeObserver", make_observer_ctor("ResizeObserver"));
+
+    // WHATWG DOM §4.3 "notify mutation observers" runs at every microtask
+    // checkpoint (after the synchronous script + all promise reactions settle,
+    // before the next macrotask). Installing it as the interp's microtask-
+    // checkpoint hook delivers queued MutationRecords at exactly that point.
+    interp.set_microtask_checkpoint_hook(std::rc::Rc::new(
+        |interp: &mut cv_js::Interp| -> bool { deliver_mutation_records(interp) },
+    ));
 
     // Event constructors that don't currently fire from the engine but
     // whose names are widely feature-tested. Each returns an object
@@ -31608,6 +31703,460 @@ fn any_observer_registered() -> bool {
     OBSERVER_REGISTRY.with(|reg| !reg.borrow().observers.is_empty())
 }
 
+// ════════════════════════════════════════════════════════════════════════
+// Real MutationObserver — records from real DOM mutations, microtask-delivered.
+//
+// WHATWG DOM §4.3: every DOM mutation that an observer is interested in (the
+// observed node is the target, or — with `subtree` — an inclusive ancestor of
+// the target, and the relevant childList/attributes/characterData option +
+// attributeFilter admit it) "queues a mutation record" onto that observer; the
+// records are delivered at the next microtask checkpoint, invoking each pending
+// observer's callback once with `(records, observer)`. `takeRecords()` drains
+// synchronously without invoking.
+//
+// Unlike IO/RO (geometry, layout-driven, per-frame) this is DOM-topology-driven:
+// the JS DOM node graph (`parentNode`/`_parent` + `_children`) is the source of
+// truth for the ancestor walk. Target identity is `js_object_identity`
+// (Rc::as_ptr), exactly as IO/RO targets.
+// ════════════════════════════════════════════════════════════════════════
+
+/// Parsed `MutationObserverInit` for one `observe(node, init)` registration.
+#[derive(Clone, Debug, Default)]
+struct MoInit {
+    child_list: bool,
+    attributes: bool,
+    character_data: bool,
+    subtree: bool,
+    attribute_old_value: bool,
+    character_data_old_value: bool,
+    /// Lowercased attribute names; `None` = observe all attributes.
+    attribute_filter: Option<Vec<String>>,
+}
+
+/// One `(observed node, options)` registration inside a MutationObserver.
+#[derive(Clone)]
+struct MoRegistration {
+    /// `js_object_identity` of the observed node.
+    ident: usize,
+    /// The observed node's JS wrapper. Held so the registration keeps the
+    /// observed node alive (Chrome keeps a node alive while observed) and so the
+    /// ancestor walk could resolve it directly; matching is by `ident`.
+    #[allow(dead_code)]
+    node: cv_js::Value,
+    init: MoInit,
+}
+
+/// A registered MutationObserver.
+struct MoEntry {
+    id: u64,
+    callback: cv_js::Value,
+    /// The observer object — 2nd callback arg + `this`.
+    observer_obj: cv_js::Value,
+    registrations: Vec<MoRegistration>,
+    /// Queued records (JS `MutationRecord` objects), drained by `takeRecords()`
+    /// or the microtask checkpoint.
+    pending: Vec<cv_js::Value>,
+}
+
+#[derive(Default)]
+struct MutationRegistry {
+    observers: Vec<MoEntry>,
+    next_id: u64,
+}
+
+thread_local! {
+    static MUTATION_REGISTRY: std::cell::RefCell<MutationRegistry> =
+        std::cell::RefCell::new(MutationRegistry::default());
+}
+
+/// Hidden slot carrying a MutationObserver's registry id.
+const MO_ID_SLOT: &str = "\u{1}moid";
+
+/// `true` when any MutationObserver currently has a registration (cheap gate so
+/// the emit helpers do nothing on pages without observers).
+fn any_mutation_observer_active() -> bool {
+    MUTATION_REGISTRY.with(|reg| {
+        reg.borrow()
+            .observers
+            .iter()
+            .any(|e| !e.registrations.is_empty())
+    })
+}
+
+/// `true` when any observer has pending (undelivered) records.
+fn any_mutation_records_pending() -> bool {
+    MUTATION_REGISTRY.with(|reg| reg.borrow().observers.iter().any(|e| !e.pending.is_empty()))
+}
+
+/// Parse a JS `MutationObserverInit` object into [`MoInit`].
+fn parse_mo_init(opts: Option<&cv_js::Value>) -> MoInit {
+    let mut init = MoInit::default();
+    let cv_js::Value::Object(map) = (match opts {
+        Some(v) => v,
+        None => return init,
+    }) else {
+        return init;
+    };
+    let m = map.borrow();
+    let flag = |k: &str| matches!(m.get(k), Some(v) if v.to_bool());
+    init.child_list = flag("childList");
+    init.subtree = flag("subtree");
+    // `attributeOldValue`/`characterDataOldValue`/`attributeFilter` IMPLY the
+    // corresponding base flag per WHATWG step 3-5 ("if options's
+    // attributeOldValue ... is present and options's attributes is omitted, then
+    // set options's attributes to true").
+    let attr_present = m.get("attributes").is_some();
+    let cd_present = m.get("characterData").is_some();
+    init.attribute_old_value = flag("attributeOldValue");
+    init.character_data_old_value = flag("characterDataOldValue");
+    let filter = match m.get("attributeFilter") {
+        Some(cv_js::Value::Array(arr)) => Some(
+            arr.borrow()
+                .iter()
+                .map(|v| v.to_display_string().to_ascii_lowercase())
+                .collect::<Vec<_>>(),
+        ),
+        _ => None,
+    };
+    init.attributes = if attr_present {
+        flag("attributes")
+    } else {
+        init.attribute_old_value || filter.is_some()
+    };
+    init.character_data = if cd_present {
+        flag("characterData")
+    } else {
+        init.character_data_old_value
+    };
+    init.attribute_filter = filter;
+    init
+}
+
+/// Attribute-namespace URI for `MutationRecord.attributeNamespace`. HTML
+/// content attributes are in the null namespace (Chrome reports `null` for
+/// `class`/`id`/etc.); the `xmlns`/`xml:`/`xlink:` prefixes carry the
+/// WHATWG-defined namespaces. SVG attributes set via `setAttribute` (not
+/// `setAttributeNS`) are still in the null namespace, so `_is_svg` only matters
+/// for the prefix check being case-sensitive. Mirrors blink
+/// `Attribute::GetName().NamespaceURI()`.
+fn svg_attr_namespace(name: &str, _is_svg: bool) -> Option<String> {
+    let lower = name.to_ascii_lowercase();
+    if lower == "xmlns" || lower.starts_with("xmlns:") {
+        Some("http://www.w3.org/2000/xmlns/".to_string())
+    } else if lower.starts_with("xml:") {
+        Some("http://www.w3.org/XML/1998/namespace".to_string())
+    } else if lower.starts_with("xlink:") {
+        Some("http://www.w3.org/1999/xlink".to_string())
+    } else {
+        None
+    }
+}
+
+/// Read a JS node's parent (the `parentNode`/`_parent` snapshot the DOM
+/// mutation helpers keep in sync).
+fn js_node_parent(node: &cv_js::Value) -> Option<cv_js::Value> {
+    let cv_js::Value::Object(obj) = node else {
+        return None;
+    };
+    let m = obj.borrow();
+    let p = m
+        .get("_parent")
+        .or_else(|| m.get("parentNode"))
+        .cloned()?;
+    if matches!(p, cv_js::Value::Null | cv_js::Value::Undefined) {
+        None
+    } else {
+        Some(p)
+    }
+}
+
+/// The target's inclusive-ancestor chain as `(identity, distance)` pairs
+/// (distance 0 = the target itself). Bounded depth guards against a cyclic
+/// `_parent` snapshot.
+fn js_ancestor_chain(target: &cv_js::Value) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut cur = Some(target.clone());
+    let mut dist = 0usize;
+    let mut guard = 0usize;
+    while let Some(n) = cur {
+        if let Some(id) = js_object_identity(&n) {
+            out.push((id, dist));
+        }
+        guard += 1;
+        if guard > 4096 {
+            break;
+        }
+        cur = js_node_parent(&n);
+        dist += 1;
+    }
+    out
+}
+
+/// Register a fresh MutationObserver; returns its registry id.
+fn mutation_registry_register(callback: cv_js::Value, observer_obj: cv_js::Value) -> u64 {
+    MUTATION_REGISTRY.with(|reg| {
+        let mut reg = reg.borrow_mut();
+        reg.next_id += 1;
+        let id = reg.next_id;
+        reg.observers.push(MoEntry {
+            id,
+            callback,
+            observer_obj,
+            registrations: Vec::new(),
+            pending: Vec::new(),
+        });
+        id
+    })
+}
+
+/// Build a JS `MutationRecord` object with the WHATWG-shaped fields.
+fn make_mutation_record_js(
+    type_str: &str,
+    target: cv_js::Value,
+    added: Vec<cv_js::Value>,
+    removed: Vec<cv_js::Value>,
+    prev: cv_js::Value,
+    next: cv_js::Value,
+    attribute_name: cv_js::Value,
+    attribute_namespace: cv_js::Value,
+    old_value: cv_js::Value,
+) -> cv_js::Value {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    let mut m: cv_js::OrderedMap<String, cv_js::Value> = cv_js::OrderedMap::new();
+    m.insert("type".into(), cv_js::Value::str(type_str.to_string()));
+    m.insert("target".into(), target);
+    m.insert(
+        "addedNodes".into(),
+        cv_js::Value::Array(Rc::new(RefCell::new(added))),
+    );
+    m.insert(
+        "removedNodes".into(),
+        cv_js::Value::Array(Rc::new(RefCell::new(removed))),
+    );
+    m.insert("previousSibling".into(), prev);
+    m.insert("nextSibling".into(), next);
+    m.insert("attributeName".into(), attribute_name);
+    m.insert("attributeNamespace".into(), attribute_namespace);
+    m.insert("oldValue".into(), old_value);
+    cv_js::Value::Object(Rc::new(RefCell::new(m)))
+}
+
+/// Core "queue a mutation record" dispatch (WHATWG DOM §4.3.4): for every
+/// observer registration anchored on the target or an interested ancestor, the
+/// `build` closure produces the option-trimmed JS record (or `None` if this
+/// registration's options decline it), which is queued on that observer.
+///
+/// `build(init)` receives the registration's parsed options so it can honor
+/// attributeFilter / *OldValue. Each observer queues at most one record per
+/// mutation (the closest interested registration wins).
+fn queue_mutation_record(
+    target: &cv_js::Value,
+    mut build: impl FnMut(&MoInit, usize) -> Option<cv_js::Value>,
+) {
+    if !any_mutation_observer_active() {
+        return;
+    }
+    let chain = js_ancestor_chain(target);
+    if chain.is_empty() {
+        return;
+    }
+    MUTATION_REGISTRY.with(|reg| {
+        let mut reg = reg.borrow_mut();
+        for entry in reg.observers.iter_mut() {
+            // Closest interested registration on the ancestor chain wins.
+            let mut chosen: Option<cv_js::Value> = None;
+            'chain: for &(node_ident, dist) in &chain {
+                for r in &entry.registrations {
+                    if r.ident == node_ident {
+                        // subtree gate: a non-target anchor needs subtree:true.
+                        if dist > 0 && !r.init.subtree {
+                            continue;
+                        }
+                        if let Some(rec) = build(&r.init, dist) {
+                            chosen = Some(rec);
+                            break 'chain;
+                        }
+                    }
+                }
+            }
+            if let Some(rec) = chosen {
+                entry.pending.push(rec);
+            }
+        }
+    });
+}
+
+/// Emit a childList MutationRecord for an insertion/removal on `parent`.
+fn emit_js_childlist_mutation(
+    parent: &cv_js::Value,
+    added: &[cv_js::Value],
+    removed: &[cv_js::Value],
+    prev: cv_js::Value,
+    next: cv_js::Value,
+) {
+    if added.is_empty() && removed.is_empty() {
+        return;
+    }
+    let added = added.to_vec();
+    let removed = removed.to_vec();
+    let parent_clone = parent.clone();
+    queue_mutation_record(parent, |init, _dist| {
+        if !init.child_list {
+            return None;
+        }
+        Some(make_mutation_record_js(
+            "childList",
+            parent_clone.clone(),
+            added.clone(),
+            removed.clone(),
+            prev.clone(),
+            next.clone(),
+            cv_js::Value::Null,
+            cv_js::Value::Null,
+            cv_js::Value::Null,
+        ))
+    });
+}
+
+/// Emit an attributes MutationRecord for a set/remove of `name` on `target`.
+fn emit_js_attribute_mutation(
+    target: &cv_js::Value,
+    name: &str,
+    namespace: Option<&str>,
+    old_value: Option<&str>,
+) {
+    if !any_mutation_observer_active() {
+        return;
+    }
+    let name_lc = name.to_ascii_lowercase();
+    let name_val = cv_js::Value::str(name.to_string());
+    let ns_val = match namespace {
+        Some(ns) => cv_js::Value::str(ns.to_string()),
+        None => cv_js::Value::Null,
+    };
+    let old_owned = old_value.map(|s| s.to_string());
+    let target_clone = target.clone();
+    queue_mutation_record(target, |init, _dist| {
+        if !init.attributes {
+            return None;
+        }
+        if let Some(filter) = &init.attribute_filter {
+            if !filter.iter().any(|f| f == &name_lc) {
+                return None;
+            }
+        }
+        // oldValue ONLY when attributeOldValue was requested (else null).
+        let old = if init.attribute_old_value {
+            match &old_owned {
+                Some(s) => cv_js::Value::str(s.clone()),
+                None => cv_js::Value::Null,
+            }
+        } else {
+            cv_js::Value::Null
+        };
+        Some(make_mutation_record_js(
+            "attributes",
+            target_clone.clone(),
+            Vec::new(),
+            Vec::new(),
+            cv_js::Value::Null,
+            cv_js::Value::Null,
+            name_val.clone(),
+            ns_val.clone(),
+            old,
+        ))
+    });
+}
+
+/// Emit a characterData MutationRecord for a text/comment data change.
+fn emit_js_characterdata_mutation(target: &cv_js::Value, old_value: &str) {
+    if !any_mutation_observer_active() {
+        return;
+    }
+    let old_owned = old_value.to_string();
+    let target_clone = target.clone();
+    queue_mutation_record(target, |init, _dist| {
+        if !init.character_data {
+            return None;
+        }
+        let old = if init.character_data_old_value {
+            cv_js::Value::str(old_owned.clone())
+        } else {
+            cv_js::Value::Null
+        };
+        Some(make_mutation_record_js(
+            "characterData",
+            target_clone.clone(),
+            Vec::new(),
+            Vec::new(),
+            cv_js::Value::Null,
+            cv_js::Value::Null,
+            cv_js::Value::Null,
+            cv_js::Value::Null,
+            old,
+        ))
+    });
+}
+
+/// WHATWG DOM §4.3 "notify mutation observers": deliver every pending record
+/// batch. For each observer with queued records, drain its queue and invoke its
+/// callback ONCE with `(records, observer)`. Called at the microtask checkpoint.
+/// Returns `true` if it delivered anything (so the caller re-drains microtasks
+/// the callbacks may have queued).
+fn deliver_mutation_records(interp: &mut cv_js::Interp) -> bool {
+    if !any_mutation_records_pending() {
+        return false;
+    }
+    struct Fire {
+        callback: cv_js::Value,
+        observer_obj: cv_js::Value,
+        records: Vec<cv_js::Value>,
+    }
+    let fires: Vec<Fire> = MUTATION_REGISTRY.with(|reg| {
+        let mut reg = reg.borrow_mut();
+        let mut fires = Vec::new();
+        for entry in reg.observers.iter_mut() {
+            if entry.pending.is_empty() {
+                continue;
+            }
+            let records = std::mem::take(&mut entry.pending);
+            fires.push(Fire {
+                callback: entry.callback.clone(),
+                observer_obj: entry.observer_obj.clone(),
+                records,
+            });
+        }
+        fires
+    });
+    let mut delivered = false;
+    // Invoke callbacks OUTSIDE the registry borrow so a callback can re-enter
+    // observe()/disconnect()/takeRecords() or mutate the DOM.
+    for f in fires {
+        if matches!(
+            f.callback,
+            cv_js::Value::Function(_) | cv_js::Value::NativeFunction(_) | cv_js::Value::BcClosure(_)
+        ) {
+            use std::cell::RefCell;
+            use std::rc::Rc;
+            let records = cv_js::Value::Array(Rc::new(RefCell::new(f.records)));
+            let _ = interp.call_value_with_this(
+                f.callback,
+                f.observer_obj.clone(),
+                vec![records, f.observer_obj],
+            );
+            delivered = true;
+        }
+    }
+    delivered
+}
+
+/// Reset the MutationObserver registry — for test isolation.
+#[cfg(test)]
+fn reset_mutation_registry() {
+    MUTATION_REGISTRY.with(|reg| *reg.borrow_mut() = MutationRegistry::default());
+}
+
 /// Drive the per-frame observer step against a committed layout tree. Builds the
 /// identity→path and path→box indices, then runs the step. A no-op when the real
 /// observer engine is off or no observers are registered.
@@ -31923,10 +32472,26 @@ fn chardata_this_string() -> Option<(std::rc::Rc<std::cell::RefCell<cv_js::Order
 }
 
 /// Write `new_data` into all three CharacterData alias slots of a node object.
+/// Emits a `characterData` MutationRecord (WHATWG DOM §4.3.4 "replace data")
+/// for any observer watching this text/comment node (or, with subtree, an
+/// ancestor): the old value is captured before the overwrite.
 fn chardata_set_all(
     o: &std::rc::Rc<std::cell::RefCell<cv_js::OrderedMap<String, cv_js::Value>>>,
     new_data: String,
 ) {
+    if any_mutation_observer_active() {
+        let old = {
+            let b = o.borrow();
+            b.get("data")
+                .or_else(|| b.get("nodeValue"))
+                .or_else(|| b.get("textContent"))
+                .map(|v| v.to_display_string())
+                .unwrap_or_default()
+        };
+        if old != new_data {
+            emit_js_characterdata_mutation(&cv_js::Value::Object(o.clone()), &old);
+        }
+    }
     let mut b = o.borrow_mut();
     b.insert("data".into(), cv_js::Value::str(new_data.clone()));
     b.insert("nodeValue".into(), cv_js::Value::str(new_data.clone()));
@@ -32444,7 +33009,19 @@ fn sync_inserted_element_geometry(parent: &cv_js::Value, child: &cv_js::Value) {
     install_live_geometry_snapshot(child, x, y, w, h);
 }
 
+/// Remove `child` from its current parent's live snapshot. Per WHATWG "insert",
+/// inserting a node that already has a parent FIRST runs "remove" — which queues
+/// a childList removal record (with `removedNodes=[child]` and the old
+/// prev/next siblings) on the old parent — then the insert queues an add record
+/// on the new parent. So a move (and a same-parent reorder) correctly produces
+/// BOTH records; appending a brand-new node is a detach no-op (no parent → no
+/// removal record). A removal record is emitted ONLY when the node actually had
+/// a parent snapshot to leave.
 fn detach_element_snapshot(child: &cv_js::Value) {
+    detach_element_snapshot_observed(child)
+}
+
+fn detach_element_snapshot_observed(child: &cv_js::Value) {
     if !is_element_js_value(child) {
         return;
     }
@@ -32457,10 +33034,37 @@ fn detach_element_snapshot(child: &cv_js::Value) {
         cv_js::Value::Null
     };
     if let Some(children) = get_children_snapshot(&current_parent) {
+        // Capture prev/next siblings at the removal site BEFORE splicing it out
+        // (WHATWG childList record carries the removed node's old neighbors).
+        let (prev, next) = {
+            let kids = children.borrow();
+            match kids
+                .iter()
+                .position(|existing| cv_js::Value::strict_eq(existing, child))
+            {
+                Some(i) => {
+                    let prev = if i == 0 {
+                        cv_js::Value::Null
+                    } else {
+                        kids.get(i - 1).cloned().unwrap_or(cv_js::Value::Null)
+                    };
+                    let next = kids.get(i + 1).cloned().unwrap_or(cv_js::Value::Null);
+                    (prev, next)
+                }
+                None => (cv_js::Value::Null, cv_js::Value::Null),
+            }
+        };
         children
             .borrow_mut()
             .retain(|existing| !cv_js::Value::strict_eq(existing, child));
         refresh_parent_snapshot(&current_parent);
+        emit_js_childlist_mutation(
+            &current_parent,
+            &[],
+            std::slice::from_ref(child),
+            prev,
+            next,
+        );
     }
     set_parent_snapshot(child, cv_js::Value::Null);
 }
@@ -32477,19 +33081,30 @@ fn insert_element_snapshots(parent: &cv_js::Value, before_index: usize, nodes: &
     if element_nodes.is_empty() {
         return;
     }
+    // Move semantics: detach each node from its old parent WITHOUT a removal
+    // record (the single childList record below covers the move).
     for child in &element_nodes {
-        detach_element_snapshot(child);
+        detach_element_snapshot_observed(child);
     }
-    {
+    let insert_at;
+    let (prev, next) = {
         let mut current = children.borrow_mut();
-        let insert_at = before_index.min(current.len());
+        insert_at = before_index.min(current.len());
+        let prev = if insert_at == 0 {
+            cv_js::Value::Null
+        } else {
+            current.get(insert_at - 1).cloned().unwrap_or(cv_js::Value::Null)
+        };
+        let next = current.get(insert_at).cloned().unwrap_or(cv_js::Value::Null);
         current.splice(insert_at..insert_at, element_nodes.clone());
-    }
+        (prev, next)
+    };
     for child in &element_nodes {
         set_parent_snapshot(child, parent.clone());
         sync_inserted_element_geometry(parent, child);
     }
     refresh_parent_snapshot(parent);
+    emit_js_childlist_mutation(parent, &element_nodes, &[], prev, next);
 }
 
 fn replace_parent_children_snapshot(parent: &cv_js::Value, nodes: &[cv_js::Value]) {
@@ -33196,9 +33811,10 @@ fn make_new_element_js_with_canvas_registry(
             // DOM spec §4.4.2 "insert" step: if the node is already in the
             // DOM, remove it from its current parent first (move, not copy).
             // Without this, appendChild on an already-parented node creates a
-            // duplicate in the painted tree.
+            // duplicate in the painted tree. Detach WITHOUT a removal record —
+            // a move queues a single childList record on the destination.
             for node in &nodes {
-                detach_element_snapshot(node);
+                detach_element_snapshot_observed(node);
             }
             // Stamp parentNode on each appended child so
             //   parent.appendChild(child); child.parentNode === parent
@@ -33211,8 +33827,16 @@ fn make_new_element_js_with_canvas_registry(
             for node in &nodes {
                 set_parent_snapshot(node, parent_val.clone());
             }
-            nested_for_append_child_sync.borrow_mut().extend(nodes);
+            // WHATWG childList record: previousSibling = old last child,
+            // nextSibling = null (append goes to the end).
+            let prev = nested_for_append_child_sync
+                .borrow()
+                .last()
+                .cloned()
+                .unwrap_or(cv_js::Value::Null);
+            nested_for_append_child_sync.borrow_mut().extend(nodes.clone());
             sync_detached_child_state(&obj_for_append_child_sync, &nested_for_append_child_sync);
+            emit_js_childlist_mutation(&parent_val, &nodes, &[], prev, cv_js::Value::Null);
             Ok(child.clone())
         } else {
             Ok(cv_js::Value::Undefined)
@@ -33224,16 +33848,22 @@ fn make_new_element_js_with_canvas_registry(
         let nodes = normalize_dom_nodes(&args);
         queue_injected_scripts_in_nodes(&nodes);
         // DOM spec: detach nodes that already have a parent before
-        // inserting them here (move semantics, not copy).
+        // inserting them here (move semantics, not copy) — no removal record.
         for node in &nodes {
-            detach_element_snapshot(node);
+            detach_element_snapshot_observed(node);
         }
         let parent_val = cv_js::Value::Object(obj_for_append_sync.clone());
         for node in &nodes {
             set_parent_snapshot(node, parent_val.clone());
         }
-        nested_for_append_sync.borrow_mut().extend(nodes);
+        let prev = nested_for_append_sync
+            .borrow()
+            .last()
+            .cloned()
+            .unwrap_or(cv_js::Value::Null);
+        nested_for_append_sync.borrow_mut().extend(nodes.clone());
         sync_detached_child_state(&obj_for_append_sync, &nested_for_append_sync);
+        emit_js_childlist_mutation(&parent_val, &nodes, &[], prev, cv_js::Value::Null);
         Ok(cv_js::Value::Undefined)
     });
     let nested_for_prepend_sync = nested.clone();
@@ -33247,18 +33877,23 @@ fn make_new_element_js_with_canvas_registry(
         // of this same parent, detach_element_snapshot would try to borrow
         // `nested_for_prepend_sync` again and trigger a RefCell panic.
         for node in &nodes {
-            detach_element_snapshot(node);
+            detach_element_snapshot_observed(node);
         }
         let parent_val = cv_js::Value::Object(obj_for_prepend_sync.clone());
         for node in &nodes {
             set_parent_snapshot(node, parent_val.clone());
         }
-        {
+        let inserted = nodes.clone();
+        let next = {
             let mut children = nested_for_prepend_sync.borrow_mut();
+            // prepend → nextSibling = old first child.
+            let next = children.first().cloned().unwrap_or(cv_js::Value::Null);
             nodes.extend(children.drain(..));
             *children = nodes;
-        }
+            next
+        };
         sync_detached_child_state(&obj_for_prepend_sync, &nested_for_prepend_sync);
+        emit_js_childlist_mutation(&parent_val, &inserted, &[], cv_js::Value::Null, next);
         Ok(cv_js::Value::Undefined)
     });
     let nested_for_replace_children_sync = nested.clone();
@@ -33310,6 +33945,11 @@ fn make_new_element_js_with_canvas_registry(
         } else {
             name.to_ascii_lowercase()
         };
+        // Capture the prior value for a MutationRecord BEFORE overwriting.
+        let mo_old = attrs_for_set.borrow().get(&lower).cloned();
+        let mo_target = cv_js::Value::Object(obj_for_set.clone());
+        let mo_ns = svg_attr_namespace(&name, is_svg);
+        emit_js_attribute_mutation(&mo_target, &name, mo_ns.as_deref(), mo_old.as_deref());
         attrs_for_set
             .borrow_mut()
             .insert(lower.clone(), value.clone());
@@ -33417,6 +34057,14 @@ fn make_new_element_js_with_canvas_registry(
             .map(|v| v.to_display_string())
             .unwrap_or_default();
         let lower = name.to_ascii_lowercase();
+        // Only emit a record if the attribute was actually present (WHATWG
+        // "remove an attribute" no-ops when absent).
+        let mo_old = attrs_for_remove.borrow().get(&lower).cloned();
+        if mo_old.is_some() {
+            let mo_target = cv_js::Value::Object(obj_for_remove.clone());
+            let mo_ns = svg_attr_namespace(&name, false);
+            emit_js_attribute_mutation(&mo_target, &name, mo_ns.as_deref(), mo_old.as_deref());
+        }
         attrs_for_remove.borrow_mut().remove(&lower);
         attrs_obj_for_remove.borrow_mut().remove(&lower);
         if lower == "id" {
@@ -34403,6 +35051,8 @@ fn install_dom_api(
             let path_for_set = rec.path.clone();
             let attr_writes_set = attr_writes.clone();
             let cur_classes_set = cur_classes_for_set.clone();
+            let js_for_set = rec.js.clone();
+            let orig_attrs_set = rec.original_attrs.clone();
             let set_attribute = cv_js::native_fn("setAttribute", move |args| {
                 let name = args
                     .first()
@@ -34412,6 +35062,19 @@ fn install_dom_api(
                     .get(1)
                     .map(|v| v.to_display_string())
                     .unwrap_or_default();
+                // MutationRecord oldValue = most-recent prior write (non-removed)
+                // for this attr, else the parse-time original.
+                let lc = name.to_ascii_lowercase();
+                let mo_old = attr_writes_set
+                    .borrow()
+                    .iter()
+                    .rev()
+                    .find(|(p, n, _)| p == &path_for_set && n.eq_ignore_ascii_case(&name))
+                    .map(|(_, _, v)| v.clone())
+                    .filter(|v| v != "\x01")
+                    .or_else(|| orig_attrs_set.get(&lc).cloned());
+                let mo_ns = svg_attr_namespace(&name, false);
+                emit_js_attribute_mutation(&js_for_set, &name, mo_ns.as_deref(), mo_old.as_deref());
                 // Keep classList in sync when the class attribute is changed.
                 if name.eq_ignore_ascii_case("class") {
                     let parts: Vec<String> =
@@ -34479,12 +35142,27 @@ fn install_dom_api(
 
             let attr_writes_rm = attr_writes.clone();
             let path_for_rm_attr = rec.path.clone();
+            let js_for_rm = rec.js.clone();
+            let orig_attrs_rm = rec.original_attrs.clone();
             let remove_attribute = cv_js::native_fn("removeAttribute", move |args| {
                 let name = args
                     .first()
                     .map(|v| v.to_display_string())
                     .unwrap_or_default();
+                let lc = name.to_ascii_lowercase();
                 let mut w = attr_writes_rm.borrow_mut();
+                // oldValue + presence: prior non-removed write, else the original.
+                let mo_old = w
+                    .iter()
+                    .rev()
+                    .find(|(p, n, _)| p == &path_for_rm_attr && n.eq_ignore_ascii_case(&name))
+                    .map(|(_, _, v)| v.clone())
+                    .filter(|v| v != "\x01")
+                    .or_else(|| orig_attrs_rm.get(&lc).cloned());
+                if let Some(old) = &mo_old {
+                    let mo_ns = svg_attr_namespace(&name, false);
+                    emit_js_attribute_mutation(&js_for_rm, &name, mo_ns.as_deref(), Some(old));
+                }
                 w.retain(|(p, n, _)| !(p == &path_for_rm_attr && n.eq_ignore_ascii_case(&name)));
                 // "\x01" = removed sentinel — getAttribute/hasAttribute treat this as absent
                 w.push((path_for_rm_attr.clone(), name, "\x01".to_string()));
@@ -45268,6 +45946,258 @@ fn dump_styled_rec<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Run script in a LiveInterp against `html`, then read a JS expression back.
+    /// Both turns drain microtasks → run the checkpoint hook → deliver any queued
+    /// MutationRecords, so a `new MutationObserver(...).observe(...)` followed by a
+    /// DOM mutation in the SAME script has its callback fired before this returns.
+    fn run_and_read(html: &str, script: &str, read_expr: &str) -> String {
+        let doc = cv_html::parse(html);
+        let mut rt = LiveInterp::new(&doc, "https://mo.test/");
+        rt.run_script(script);
+        rt.interp
+            .run_completion_value(read_expr)
+            .map(|v| v.to_display_string())
+            .unwrap_or_else(|e| format!("<error: {e:?}>"))
+    }
+
+    #[test]
+    fn childlist_append_delivers_one_record_with_added_node() {
+        // observe parent for childList; appendChild a created child; the callback
+        // must fire ONCE with one record whose addedNodes contains the child.
+        let out = run_and_read(
+            "<html><body><div id=p></div></body></html>",
+            "globalThis.__calls = 0; globalThis.__added = -1; globalThis.__type='';\
+             var p = document.getElementById('p');\
+             var obs = new MutationObserver(function(records, observer){\
+                 globalThis.__calls++;\
+                 globalThis.__type = records[0].type;\
+                 globalThis.__added = records[0].addedNodes.length;\
+                 globalThis.__same = (observer === obs);\
+             });\
+             obs.observe(p, { childList: true });\
+             var c = document.createElement('span');\
+             p.appendChild(c);",
+            "[globalThis.__calls, globalThis.__type, globalThis.__added, globalThis.__same].join('|')",
+        );
+        assert_eq!(
+            out, "1|childList|1|true",
+            "exactly one childList callback with one addedNode and the observer as 2nd arg"
+        );
+    }
+
+    #[test]
+    fn attributes_record_carries_name_and_old_value() {
+        // attributeOldValue:true → oldValue is the prior attribute value.
+        let out = run_and_read(
+            "<html><body><div id=p data-x='first'></div></body></html>",
+            "globalThis.__name=''; globalThis.__old='SENTINEL'; globalThis.__type='';\
+             var p = document.getElementById('p');\
+             var obs = new MutationObserver(function(records){\
+                 globalThis.__type = records[0].type;\
+                 globalThis.__name = records[0].attributeName;\
+                 globalThis.__old = records[0].oldValue;\
+             });\
+             obs.observe(p, { attributes: true, attributeOldValue: true });\
+             p.setAttribute('data-x', 'second');",
+            "[globalThis.__type, globalThis.__name, globalThis.__old].join('|')",
+        );
+        assert_eq!(
+            out, "attributes|data-x|first",
+            "attributes record carries attributeName + oldValue (attributeOldValue:true)"
+        );
+    }
+
+    #[test]
+    fn attributes_without_old_value_flag_has_null_old_value() {
+        // attributes:true but NO attributeOldValue → oldValue is null.
+        let out = run_and_read(
+            "<html><body><div id=p data-x='first'></div></body></html>",
+            "globalThis.__old='SENTINEL';\
+             var p = document.getElementById('p');\
+             var obs = new MutationObserver(function(records){\
+                 globalThis.__old = records[0].oldValue;\
+             });\
+             obs.observe(p, { attributes: true });\
+             p.setAttribute('data-x', 'second');",
+            "String(globalThis.__old)",
+        );
+        assert_eq!(out, "null", "no oldValue without attributeOldValue (WHATWG)");
+    }
+
+    #[test]
+    fn attribute_filter_narrows_to_named_attributes() {
+        let out = run_and_read(
+            "<html><body><div id=p></div></body></html>",
+            "globalThis.__count = 0; globalThis.__last='';\
+             var p = document.getElementById('p');\
+             var obs = new MutationObserver(function(records){\
+                 for (var i=0;i<records.length;i++){ globalThis.__count++; globalThis.__last = records[i].attributeName; }\
+             });\
+             obs.observe(p, { attributes: true, attributeFilter: ['data-keep'] });\
+             p.setAttribute('data-drop', '1');\
+             p.setAttribute('data-keep', '2');",
+            "[globalThis.__count, globalThis.__last].join('|')",
+        );
+        assert_eq!(out, "1|data-keep", "attributeFilter admits only listed names");
+    }
+
+    #[test]
+    fn subtree_true_catches_grandchild_mutation() {
+        // subtree:true on the ancestor sees an appendChild on a descendant.
+        let out = run_and_read(
+            "<html><body><div id=p><section id=mid></section></div></body></html>",
+            "globalThis.__calls = 0;\
+             var p = document.getElementById('p');\
+             var mid = document.getElementById('mid');\
+             var obs = new MutationObserver(function(records){ globalThis.__calls += records.length; });\
+             obs.observe(p, { childList: true, subtree: true });\
+             mid.appendChild(document.createElement('span'));",
+            "String(globalThis.__calls)",
+        );
+        assert_eq!(out, "1", "subtree:true ancestor sees a grandchild childList mutation");
+    }
+
+    #[test]
+    fn subtree_false_ignores_grandchild_mutation() {
+        let out = run_and_read(
+            "<html><body><div id=p><section id=mid></section></div></body></html>",
+            "globalThis.__calls = 0;\
+             var p = document.getElementById('p');\
+             var mid = document.getElementById('mid');\
+             var obs = new MutationObserver(function(records){ globalThis.__calls += records.length; });\
+             obs.observe(p, { childList: true, subtree: false });\
+             mid.appendChild(document.createElement('span'));",
+            "String(globalThis.__calls)",
+        );
+        assert_eq!(out, "0", "subtree:false must NOT see a grandchild mutation");
+    }
+
+    #[test]
+    fn take_records_drains_synchronously_and_callback_not_called() {
+        // takeRecords() inside the SAME synchronous turn returns the pending
+        // record and empties the queue, so the microtask-checkpoint callback then
+        // has nothing to deliver (callback never runs).
+        let out = run_and_read(
+            "<html><body><div id=p></div></body></html>",
+            "globalThis.__calls = 0; globalThis.__taken = -1; globalThis.__taken_type='';\
+             var p = document.getElementById('p');\
+             var obs = new MutationObserver(function(records){ globalThis.__calls += records.length; });\
+             obs.observe(p, { childList: true });\
+             p.appendChild(document.createElement('i'));\
+             var taken = obs.takeRecords();\
+             globalThis.__taken = taken.length;\
+             globalThis.__taken_type = taken[0] ? taken[0].type : 'none';",
+            "[globalThis.__taken, globalThis.__taken_type, globalThis.__calls].join('|')",
+        );
+        assert_eq!(
+            out, "1|childList|0",
+            "takeRecords drains synchronously (1 record) → callback never fires (0 calls)"
+        );
+    }
+
+    #[test]
+    fn disconnect_stops_delivery_and_clears_pending() {
+        let out = run_and_read(
+            "<html><body><div id=p></div></body></html>",
+            "globalThis.__calls = 0;\
+             var p = document.getElementById('p');\
+             var obs = new MutationObserver(function(records){ globalThis.__calls += records.length; });\
+             obs.observe(p, { childList: true });\
+             p.appendChild(document.createElement('i'));\
+             obs.disconnect();\
+             p.appendChild(document.createElement('b'));",
+            "String(globalThis.__calls)",
+        );
+        assert_eq!(
+            out, "0",
+            "disconnect() clears pending (the first append) AND stops future records"
+        );
+    }
+
+    #[test]
+    fn two_mutations_batched_into_one_callback() {
+        // WHATWG: all records queued before the checkpoint are delivered in ONE
+        // callback invocation.
+        let out = run_and_read(
+            "<html><body><div id=p></div></body></html>",
+            "globalThis.__calls = 0; globalThis.__batch = -1;\
+             var p = document.getElementById('p');\
+             var obs = new MutationObserver(function(records){ globalThis.__calls++; globalThis.__batch = records.length; });\
+             obs.observe(p, { childList: true });\
+             p.appendChild(document.createElement('a'));\
+             p.appendChild(document.createElement('b'));",
+            "[globalThis.__calls, globalThis.__batch].join('|')",
+        );
+        assert_eq!(out, "1|2", "two appends → one callback with two records");
+    }
+
+    #[test]
+    fn childlist_remove_delivers_removed_node_record() {
+        // removeChild on the parent → a childList record with one removedNode.
+        let out = run_and_read(
+            "<html><body><div id=p><span id=c></span></div></body></html>",
+            "globalThis.__type=''; globalThis.__removed=-1; globalThis.__added=-1;\
+             var p = document.getElementById('p');\
+             var c = document.getElementById('c');\
+             var obs = new MutationObserver(function(records){\
+                 globalThis.__type = records[0].type;\
+                 globalThis.__removed = records[0].removedNodes.length;\
+                 globalThis.__added = records[0].addedNodes.length;\
+             });\
+             obs.observe(p, { childList: true });\
+             p.removeChild(c);",
+            "[globalThis.__type, globalThis.__removed, globalThis.__added].join('|')",
+        );
+        assert_eq!(
+            out, "childList|1|0",
+            "removeChild → childList record with one removedNode, no addedNodes"
+        );
+    }
+
+    #[test]
+    fn move_between_parents_emits_removal_then_addition() {
+        // WHATWG "insert" of an already-parented node runs remove (record on old
+        // parent) then insert (record on new parent). A single observer with
+        // subtree on a common ancestor sees BOTH (removal + addition).
+        let out = run_and_read(
+            "<html><body><div id=root><div id=a><span id=x></span></div><div id=b></div></div></body></html>",
+            "globalThis.__removed=0; globalThis.__added=0;\
+             var root = document.getElementById('root');\
+             var b = document.getElementById('b');\
+             var x = document.getElementById('x');\
+             var obs = new MutationObserver(function(records){\
+                 for (var i=0;i<records.length;i++){\
+                     globalThis.__removed += records[i].removedNodes.length;\
+                     globalThis.__added += records[i].addedNodes.length;\
+                 }\
+             });\
+             obs.observe(root, { childList: true, subtree: true });\
+             b.appendChild(x);",
+            "[globalThis.__removed, globalThis.__added].join('|')",
+        );
+        assert_eq!(
+            out, "1|1",
+            "a cross-parent move emits one removal (old parent) + one addition (new parent)"
+        );
+    }
+
+    #[test]
+    fn parse_mo_init_implies_base_flags() {
+        // attributeOldValue / characterDataOldValue / attributeFilter imply the
+        // base flag (WHATWG step 3-5).
+        let mut a = MoInit::default();
+        a.attribute_old_value = true;
+        let parsed = parse_mo_init(Some(&{
+            use std::cell::RefCell;
+            use std::rc::Rc;
+            let mut m: cv_js::OrderedMap<String, cv_js::Value> = cv_js::OrderedMap::new();
+            m.insert("attributeOldValue".into(), cv_js::Value::Bool(true));
+            cv_js::Value::Object(Rc::new(RefCell::new(m)))
+        }));
+        assert!(parsed.attributes, "attributeOldValue implies attributes");
+        assert!(parsed.attribute_old_value);
+    }
 
     // ---- WPT runner helper tests --------------------------------------------
     #[test]

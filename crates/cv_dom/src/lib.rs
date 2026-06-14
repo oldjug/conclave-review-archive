@@ -429,7 +429,7 @@ impl Document {
         self.maybe_register_id(child);
         self.emit_mutation(MutationRecord {
             target: parent,
-            kind: MutationType::ChildListAdded {
+            kind: MutationType::ChildList {
                 added: vec![child],
                 removed: Vec::new(),
                 previous_sibling: prev,
@@ -470,7 +470,7 @@ impl Document {
         self.maybe_register_id(new_node);
         self.emit_mutation(MutationRecord {
             target: parent,
-            kind: MutationType::ChildListAdded {
+            kind: MutationType::ChildList {
                 added: vec![new_node],
                 removed: Vec::new(),
                 previous_sibling: prev,
@@ -500,7 +500,7 @@ impl Document {
         self.unregister_id(child);
         self.emit_mutation(MutationRecord {
             target: parent,
-            kind: MutationType::ChildListAdded {
+            kind: MutationType::ChildList {
                 added: Vec::new(),
                 removed: vec![child],
                 previous_sibling: prev,
@@ -536,7 +536,7 @@ impl Document {
         self.maybe_register_id(new_child);
         self.emit_mutation(MutationRecord {
             target: parent,
-            kind: MutationType::ChildListAdded {
+            kind: MutationType::ChildList {
                 added: vec![new_child],
                 removed: vec![old_child],
                 previous_sibling: prev,
@@ -649,14 +649,33 @@ impl Document {
                 r.element_id_cache = Some(value.to_string());
             }
         }
+        let namespace = self.attr_namespace(name);
         self.emit_mutation(MutationRecord {
             target: id,
             kind: MutationType::Attributes {
                 name: name.to_string(),
+                namespace,
                 old_value: old,
                 new_value: Some(value.to_string()),
             },
         });
+    }
+    /// Best-effort attribute-namespace URI for an HTML attribute name. HTML
+    /// content attributes are in the null namespace (Chrome reports
+    /// `attributeNamespace === null` for `class`, `id`, etc.); the `xml:` /
+    /// `xmlns` / `xlink:` prefixes carry the WHATWG-defined namespaces. Mirrors
+    /// blink `Attribute::GetName().NamespaceURI()`.
+    fn attr_namespace(&self, name: &str) -> Option<String> {
+        let lower = name.to_ascii_lowercase();
+        if lower == "xmlns" || lower.starts_with("xmlns:") {
+            Some("http://www.w3.org/2000/xmlns/".to_string())
+        } else if lower.starts_with("xml:") {
+            Some("http://www.w3.org/XML/1998/namespace".to_string())
+        } else if lower.starts_with("xlink:") {
+            Some("http://www.w3.org/1999/xlink".to_string())
+        } else {
+            None
+        }
     }
     pub fn remove_attribute(&mut self, id: NodeId, name: &str) {
         let old = self.rec_mut(id).and_then(|r| r.attrs.remove(name));
@@ -670,10 +689,12 @@ impl Document {
                 r.element_id_cache = None;
             }
         }
+        let namespace = self.attr_namespace(name);
         self.emit_mutation(MutationRecord {
             target: id,
             kind: MutationType::Attributes {
                 name: name.to_string(),
+                namespace,
                 old_value: old,
                 new_value: None,
             },
@@ -793,13 +814,73 @@ impl Document {
         }
     }
 
+    /// WHATWG DOM §4.3.4 "queue a mutation record": for every observer, walk the
+    /// target's inclusive-ancestor chain; if an observed root sits at distance
+    /// `d` (0 = the target itself) and that registration's options admit the
+    /// record (subtree gate for d>0, attribute/childList/characterData kind
+    /// gate, attributeFilter, and oldValue trimming — all in
+    /// `MutationObserver::record_for`), the trimmed record is queued on that
+    /// observer. One mutation can queue at most one record per observer here
+    /// (the closest interested registration wins, mirroring Blink's
+    /// per-observer registration map collapsing duplicates).
     fn emit_mutation(&mut self, rec: MutationRecord) {
+        // Precompute the target's inclusive-ancestor chain with distances so we
+        // don't re-walk per observer.
+        let mut chain: Vec<(NodeId, usize)> = Vec::new();
+        let mut cur = Some(rec.target);
+        let mut dist = 0usize;
+        while let Some(n) = cur {
+            chain.push((n, dist));
+            cur = self.parent(n);
+            dist += 1;
+        }
         for obs in &self.observers {
-            obs.borrow_mut().push(rec.clone());
+            // Find the closest observed root on the chain that admits this
+            // record. Closest first → matches Blink "transient registration"
+            // distance ordering (the nearest interested registration delivers).
+            let chosen = {
+                let o = obs.borrow();
+                let roots = o.roots();
+                let mut best: Option<MutationRecord> = None;
+                for &(node, d) in &chain {
+                    if roots.contains(&node) {
+                        if let Some(trimmed) = o.record_for(node, d, &rec) {
+                            best = Some(trimmed);
+                            break;
+                        }
+                    }
+                }
+                best
+            };
+            if let Some(trimmed) = chosen {
+                obs.borrow_mut().enqueue(trimmed);
+            }
         }
     }
     pub fn add_observer(&mut self, obs: Rc<RefCell<MutationObserver>>) {
         self.observers.push(obs);
+    }
+
+    /// WHATWG DOM §4.3 "notify mutation observers" (the microtask-checkpoint
+    /// step): for each registered observer that has queued records, drain its
+    /// queue and invoke `callback(records)` ONCE. Blink invokes the JS callback
+    /// with `(records, observer)`; here the host passes the per-observer `cb`
+    /// that already knows its observer. Observers with no pending records are
+    /// skipped (no spurious empty callbacks).
+    pub fn notify_mutation_observers<F: FnMut(Vec<MutationRecord>)>(&mut self, mut callback: F) {
+        for obs in &self.observers {
+            let records = {
+                let mut o = obs.borrow_mut();
+                if o.has_pending() {
+                    o.take_records()
+                } else {
+                    Vec::new()
+                }
+            };
+            if !records.is_empty() {
+                callback(records);
+            }
+        }
     }
     pub fn live_node_count(&self) -> usize {
         self.slab.len()
