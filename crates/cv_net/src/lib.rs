@@ -21,6 +21,7 @@ pub mod cookies;
 pub mod dns;
 pub mod doh;
 pub mod fetch_enforce;
+pub mod fetchmeta;
 pub mod hsts;
 pub mod http1;
 pub mod http2;
@@ -40,6 +41,7 @@ pub mod websocket;
 
 pub use cache::{CacheControl, CachedEntry, HttpCache};
 pub use cookies::{CookieJar, SameSite};
+pub use fetchmeta::{Destination, FetchMetadata, FetchMode, ReferrerPolicy};
 pub use http1::{Client, ContentRange, Request, Response, parse_content_range};
 pub use security::{
     CorsDecision, CspDirective, Origin, Policy, RequestMode, cors_decision, parse_csp,

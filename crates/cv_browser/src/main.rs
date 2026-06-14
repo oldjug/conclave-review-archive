@@ -5558,13 +5558,18 @@ fn fetch_external_stylesheets(doc: &cv_html::Document, base_url: &str) -> Vec<cv
     // aggressive 2s here used to spuriously drop news.css and render HN
     // unstyled.
     let client = session_client(8_000); // shared keep-alive pool + cache
+    // Compute the stylesheet Fetch Metadata ON THIS THREAD (the worker
+    // threads spawned below don't inherit the document thread-locals).
+    // Stylesheets fetch in no-cors mode with a `style` destination.
+    let css_meta = subresource_meta(cv_net::Destination::Style, cv_net::FetchMode::NoCors);
     let fetched: Vec<Option<(String, String)>> = std::thread::scope(|s| {
         let handles: Vec<_> = urls
             .iter()
             .map(|abs| {
                 let client = client.clone();
+                let css_meta = css_meta.clone();
                 s.spawn(move || {
-                    let resp = match client.fetch(abs) {
+                    let resp = match client.fetch_with_meta(abs, Some(css_meta)) {
                         Ok(r) => r,
                         Err(e) => {
                             eprintln!("stylesheet: failed to fetch {}: {}", abs.to_string(), e);
@@ -6143,7 +6148,16 @@ fn fetch_url_text(url: &Url) -> Option<String> {
             read_data_url_bytes(url).map(|b| String::from_utf8_lossy(&b).into_owned())
         }
         cv_url::Scheme::File => read_file_url_text(url),
-        cv_url::Scheme::Http | cv_url::Scheme::Https => match session_client(5_000).fetch(url) {
+        cv_url::Scheme::Http | cv_url::Scheme::Https => match session_client(5_000)
+            .fetch_with_meta(
+                url,
+                // Module scripts fetch in CORS mode with a `script`
+                // destination (Fetch: "fetch a single module script").
+                Some(subresource_meta(
+                    cv_net::Destination::Script,
+                    cv_net::FetchMode::Cors,
+                )),
+            ) {
             Ok(resp) => {
                 if !is_http_success(resp.status) {
                     eprintln!(
@@ -6259,7 +6273,10 @@ fn fetch_script_source(src: &str, base_url: Option<&Url>) -> Option<String> {
             // empty cache (so re-launch re-downloads), and sends no cookies (so
             // cookie-gated scripts fail). Sharing the pool is the real-page win.
             let client = session_client(5_000);
-            match client.fetch(&resolved) {
+            // Classic external <script src> fetches in no-cors mode with a
+            // `script` destination (Fetch: "fetch a classic script").
+            let meta = subresource_meta(cv_net::Destination::Script, cv_net::FetchMode::NoCors);
+            match client.fetch_with_meta(&resolved, Some(meta)) {
                 Ok(resp) => Some(String::from_utf8_lossy(&resp.body).into_owned()),
                 Err(e) => {
                     eprintln!(
@@ -9107,11 +9124,38 @@ fn fetch_body_for_url(url: &Url, timeout_ms: u32) -> Result<Vec<u8>, String> {
         DOCUMENT_ORIGIN_STR.with(|o| *o.borrow_mut() = url.to_string());
         DOCUMENT_IS_HTTPS.with(|c| c.set(false));
         DOCUMENT_CROSS_ORIGIN_ISOLATED.with(|c| c.set(default_cross_origin_isolated()));
+        // file:// is a local scheme: it produces no Referer for its
+        // subresources (Referrer Policy §8.4) and resets the policy to
+        // the default. Record the document URL for same-document logic.
+        DOCUMENT_URL.with(|u| *u.borrow_mut() = Some(url.clone()));
+        DOCUMENT_REFERRER_POLICY.with(|p| p.set(cv_net::ReferrerPolicy::default()));
         std::fs::read(&decoded).map_err(|e| format!("file read {decoded}: {e}"))
     } else {
+        // Build the navigation Fetch Metadata from the OUTGOING (previous)
+        // document so the request carries Sec-Fetch-* + a policy-trimmed
+        // Referer. A top-level navigation is treated as user-activated
+        // (typed URL / clicked link / Enter) → Sec-Fetch-User: ?1. The
+        // referrer is the page we are leaving, run through ITS Referrer
+        // Policy; a first/cold navigation has no previous page → Site: none,
+        // no Referer.
+        let nav_meta = navigation_meta(true);
         let resp = session_client(timeout_ms)
-            .fetch(url)
+            .fetch_with_meta(url, Some(nav_meta))
             .map_err(|e| format!("net: {e}"))?;
+        // Referrer Policy for THIS newly-loaded document: from its
+        // `Referrer-Policy` response header, else the Chrome default
+        // (strict-origin-when-cross-origin). Governs subresource + onward
+        // navigation Referer. (`<meta name=referrer>` can refine this later.)
+        let ref_policy = resp
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("referrer-policy"))
+            .and_then(|(_, v)| cv_net::ReferrerPolicy::parse(v))
+            .unwrap_or_default();
+        DOCUMENT_REFERRER_POLICY.with(|p| p.set(ref_policy));
+        // This document's URL becomes the referrer for its subresources +
+        // any onward navigation it initiates.
+        DOCUMENT_URL.with(|u| *u.borrow_mut() = Some(url.clone()));
         // Capture the page's Content-Security-Policy header so that
         // subsequent JS fetch() and XHR calls can enforce connect-src
         // against it.  This is the only place we have the full HTTP
@@ -9767,6 +9811,51 @@ thread_local! {
     /// flips the default to false for a future Chrome-strict mode.
     static DOCUMENT_CROSS_ORIGIN_ISOLATED: std::cell::Cell<bool> =
         const { std::cell::Cell::new(true) };
+    /// Full URL of the most recently loaded top-level page. Used as the
+    /// *referrer* for subresource fetches (CSS/JS/img) and same-page
+    /// navigations, fed through the Referrer Policy by `subresource_meta`.
+    /// `None` until the first navigation. Stored as a parsed `Url` so the
+    /// referrer computation can strip fragment/credentials + downgrade.
+    static DOCUMENT_URL: std::cell::RefCell<Option<Url>> =
+        std::cell::RefCell::new(None);
+    /// The Referrer Policy in effect for the current document, taken from
+    /// the top-level response's `Referrer-Policy` header (later refinable by
+    /// `<meta name=referrer>`). Defaults to the Chrome default
+    /// `strict-origin-when-cross-origin` on every navigation.
+    static DOCUMENT_REFERRER_POLICY: std::cell::Cell<cv_net::ReferrerPolicy> =
+        const { std::cell::Cell::new(cv_net::ReferrerPolicy::StrictOriginWhenCrossOrigin) };
+}
+
+/// Build the [`cv_net::FetchMetadata`] for a SUBRESOURCE fetch issued by the
+/// current document (CSS, JS, image, font, …). Reads the document URL +
+/// Referrer Policy from the per-renderer thread-locals so the wire builder
+/// can emit `Sec-Fetch-Site/Mode/Dest` (no `Sec-Fetch-User` — subresources
+/// are never navigations) and a policy-trimmed `Referer`. The initiator
+/// origin is the document's origin (or `None` before the first nav, which
+/// yields `Sec-Fetch-Site: none`).
+fn subresource_meta(
+    destination: cv_net::Destination,
+    mode: cv_net::FetchMode,
+) -> cv_net::FetchMetadata {
+    let referrer = DOCUMENT_URL.with(|u| u.borrow().clone());
+    let policy = DOCUMENT_REFERRER_POLICY.with(|p| p.get());
+    let initiator = referrer.as_ref().map(cv_net::fetchmeta::Origin::of);
+    cv_net::FetchMetadata::subresource(destination, mode, initiator)
+        .with_referrer(referrer, policy)
+}
+
+/// Build the [`cv_net::FetchMetadata`] for a top-level document NAVIGATION
+/// to `target`. The referrer is the PREVIOUS document URL (the page we are
+/// leaving), run through that page's Referrer Policy. `user_activated`
+/// drives `Sec-Fetch-User: ?1`. The initiator origin is the previous
+/// document's origin; a browser-initiated nav (no previous page) leaves it
+/// `None` → `Sec-Fetch-Site: none`.
+fn navigation_meta(user_activated: bool) -> cv_net::FetchMetadata {
+    let referrer = DOCUMENT_URL.with(|u| u.borrow().clone());
+    let policy = DOCUMENT_REFERRER_POLICY.with(|p| p.get());
+    let initiator = referrer.as_ref().map(cv_net::fetchmeta::Origin::of);
+    cv_net::FetchMetadata::navigation(initiator, user_activated)
+        .with_referrer(referrer, policy)
 }
 
 /// Master kill-switch for all M9.1 web-platform security enforcement (CSP
@@ -11752,6 +11841,30 @@ fn install_fetch_inner(
         let cors_for_bg = cors.clone();
         let request_origin_for_bg = request_origin.clone();
         let target_origin_for_bg = target_origin.clone();
+        // Fetch Metadata for the `fetch()` request, computed on THIS
+        // (renderer) thread — the background thread below doesn't inherit
+        // the document thread-locals. `fetch()` has an `empty` destination;
+        // the mode mirrors the JS `mode:` option. Preflight + real request
+        // both carry this (Sec-Fetch-Site recomputed per URL by the wire).
+        let fetch_mode = match req_mode {
+            cv_net::security::RequestMode::SameOrigin => cv_net::FetchMode::SameOrigin,
+            cv_net::security::RequestMode::NoCors => cv_net::FetchMode::NoCors,
+            cv_net::security::RequestMode::Navigate => cv_net::FetchMode::Navigate,
+            cv_net::security::RequestMode::Cors => cv_net::FetchMode::Cors,
+        };
+        let fetch_meta_for_bg =
+            subresource_meta(cv_net::Destination::Empty, fetch_mode);
+        // CORS-preflight metadata: always mode=cors, dest=empty, and no
+        // referrer (preflights don't carry Referer in Chrome).
+        let preflight_meta = {
+            let referrer = DOCUMENT_URL.with(|u| u.borrow().clone());
+            let initiator = referrer.as_ref().map(cv_net::fetchmeta::Origin::of);
+            cv_net::FetchMetadata::subresource(
+                cv_net::Destination::Empty,
+                cv_net::FetchMode::Cors,
+                initiator,
+            )
+        };
         let (promise, inner) = cv_js::interp::make_pending_promise();
         let fetch_id = next_fetch_id();
         PENDING_FETCHES.with(|m| m.borrow_mut().insert(fetch_id, inner));
@@ -11779,6 +11892,11 @@ fn install_fetch_inner(
                         headers: pf_headers,
                         body: vec![],
                         accept_brotli: false,
+                        // CORS-preflight carries Sec-Fetch-* (Mode: cors,
+                        // Dest: empty, Site computed) but NO Referer — it is
+                        // not the actual request (Chrome omits Referer on
+                        // preflights).
+                        fetch_meta: Some(preflight_meta.clone()),
                     };
                     let pf_resp = client.send(pf).map_err(|e| format!("CORS preflight failed: {e}"))?;
                     cv_net::security::validate_cors_response(
@@ -11802,6 +11920,7 @@ fn install_fetch_inner(
                     headers: extra_headers.clone(),
                     body: body_bytes,
                     accept_brotli: true,
+                    fetch_meta: Some(fetch_meta_for_bg.clone()),
                 };
                 // Attach Origin header for CORS requests.
                 if cors_needs_validation {
@@ -12057,6 +12176,11 @@ fn install_fetch_inner(
                 &method,
                 &header_pairs,
             );
+            // Fetch Metadata for the XHR: `empty` destination, `cors` mode,
+            // policy-trimmed Referer from the document. (Runs on the
+            // renderer thread, so the thread-locals are live.)
+            let xhr_meta =
+                subresource_meta(cv_net::Destination::Empty, cv_net::FetchMode::Cors);
             if cors == cv_net::security::CorsDecision::Forbidden {
                 return fire_xhr_error(
                     interp,
@@ -12095,6 +12219,12 @@ fn install_fetch_inner(
                     headers: pf_headers,
                     body: vec![],
                     accept_brotli: false,
+                    // Preflight: Sec-Fetch-Mode: cors, Dest: empty, no Referer.
+                    fetch_meta: Some(cv_net::FetchMetadata::subresource(
+                        cv_net::Destination::Empty,
+                        cv_net::FetchMode::Cors,
+                        xhr_meta.initiator.clone(),
+                    )),
                 };
                 match pf_client.send(pf_req) {
                     Ok(pf_resp) => {
@@ -12156,10 +12286,11 @@ fn install_fetch_inner(
             let is_get_like =
                 matches!(method.to_ascii_uppercase().as_str(), "GET" | "HEAD") && body.is_empty();
             let result = if is_get_like {
-                // Cache-friendly GET fast path (unchanged).
-                client.fetch(&url)
+                // Cache-friendly GET fast path (now carries Fetch Metadata).
+                client.fetch_with_meta(&url, Some(xhr_meta.clone()))
             } else {
-                let req = build_xhr_request(&method, url.clone(), header_pairs, body);
+                let mut req = build_xhr_request(&method, url.clone(), header_pairs, body);
+                req.fetch_meta = Some(xhr_meta.clone());
                 client.send_with_redirects(req, 5)
             };
             let resp = match result {
@@ -42075,12 +42206,16 @@ fn spawn_image_fetch(url: Url) {
     if !pending_images().lock().unwrap().insert(key.clone()) {
         return; // already in flight
     }
+    // Build the image Fetch Metadata ON THIS (renderer) thread — the pool
+    // worker below doesn't inherit the document thread-locals. Images fetch
+    // in no-cors mode with an `image` destination (Fetch: "the img element").
+    let img_meta = subresource_meta(cv_net::Destination::Image, cv_net::FetchMode::NoCors);
     // Background decode on the shared pool (Priority::Low) — no per-image thread.
     compute_pool().submit(cv_sched::Priority::Low, move || {
         // Shared session Client → reuses the keep-alive pool, same cookies.
         let client = session_client(5_000);
         let decoded = (|| -> Option<cv_image::RgbaImage> {
-            let resp = client.fetch(&url).ok()?;
+            let resp = client.fetch_with_meta(&url, Some(img_meta)).ok()?;
             if !is_http_success(resp.status) {
                 return None;
             }

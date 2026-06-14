@@ -115,6 +115,13 @@ pub struct Request {
     /// When false we drop `br` — used when an earlier attempt failed
     /// on a brotli static-dictionary reference and we're retrying.
     pub accept_brotli: bool,
+    /// Fetch Metadata (`Sec-Fetch-*`) + `Referer`/Referrer-Policy context.
+    /// When present and the target is potentially-trustworthy, the wire
+    /// builder emits `Sec-Fetch-Site/Mode/Dest`, `Sec-Fetch-User` (nav +
+    /// user-activated only), and a policy-trimmed `Referer`. `None` (the
+    /// default for internal fetches like DoH) emits none of these, keeping
+    /// today's bytes byte-for-byte.
+    pub fetch_meta: Option<crate::fetchmeta::FetchMetadata>,
 }
 
 impl Request {
@@ -125,6 +132,7 @@ impl Request {
             headers: Vec::new(),
             body: Vec::new(),
             accept_brotli: true,
+            fetch_meta: None,
         }
     }
 
@@ -189,6 +197,15 @@ impl Request {
     /// (`PartialData::PrepareCacheValidation`).
     pub fn if_range(self, validator: &str) -> Self {
         self.header("If-Range", validator)
+    }
+
+    /// Attach Fetch Metadata + Referrer-Policy context so the wire builder
+    /// emits `Sec-Fetch-*` and a policy-trimmed `Referer`. Chrome-shaped:
+    /// `services/network/sec_header_helpers.cc` for the Sec-Fetch family,
+    /// W3C Referrer Policy §8.3 for the Referer.
+    pub fn with_fetch_meta(mut self, meta: crate::fetchmeta::FetchMetadata) -> Self {
+        self.fetch_meta = Some(meta);
+        self
     }
 }
 
@@ -554,6 +571,19 @@ impl Client {
     }
 
     pub fn fetch(&self, url: &Url) -> Result<Response, NetError> {
+        self.fetch_with_meta(url, None)
+    }
+
+    /// `fetch`, but attach Fetch Metadata + Referrer-Policy context so the
+    /// wire requests carry `Sec-Fetch-*` and a policy-trimmed `Referer`.
+    /// The metadata is cloned onto BOTH the conditional-revalidation request
+    /// and the fresh GET (and is preserved across redirects since
+    /// `Sec-Fetch-Site` is recomputed per request URL by the wire builder).
+    pub fn fetch_with_meta(
+        &self,
+        url: &Url,
+        meta: Option<crate::fetchmeta::FetchMetadata>,
+    ) -> Result<Response, NetError> {
         // Cache fast-path: a fresh entry skips the network entirely.
         // A stale or no-cache entry triggers a conditional revalidation;
         // a 304 refreshes the stored entry and returns the cached body.
@@ -562,6 +592,10 @@ impl Client {
         // headers that end up on the wire (Accept-Encoding, User-Agent, etc.)
         // are added by transact_with_deadline.  We record those same headers
         // when building a new entry so Vary validation works.
+        let attach = |req: Request| match &meta {
+            Some(m) => req.with_fetch_meta(m.clone()),
+            None => req,
+        };
         let url_str = url.to_string();
         // The static headers we always send — used for Vary capture.
         let sent_request_headers: Vec<(String, String)> = vec![
@@ -594,7 +628,7 @@ impl Client {
                 });
             } else {
                 // Stale (or no-cache): revalidate with conditional headers.
-                let mut req = Request::get(url.clone());
+                let mut req = attach(Request::get(url.clone()));
                 if let Some(et) = &entry.etag {
                     req = req.header("If-None-Match", et);
                 }
@@ -619,7 +653,7 @@ impl Client {
                 return Ok(resp);
             }
         }
-        let resp = self.send_with_redirects(Request::get(url.clone()), 5)?;
+        let resp = self.send_with_redirects(attach(Request::get(url.clone())), 5)?;
         if let Some(entry) = build_entry_if_cacheable(
             resp.status,
             &resp.reason,
@@ -656,7 +690,13 @@ impl Client {
                     // Preserve method, headers, and body; only the URL changes.
                     req.url = next;
                 } else {
+                    // 301/302/303 → bodyless GET, but carry the Fetch Metadata
+                    // forward (Chrome keeps dest/mode/referrer-policy across
+                    // redirects and recomputes Sec-Fetch-Site per request URL,
+                    // which the wire builder does from `fetch_meta`).
+                    let meta = req.fetch_meta.take();
                     req = Request::get(next);
+                    req.fetch_meta = meta;
                 }
                 continue;
             }
@@ -890,6 +930,14 @@ impl Client {
             wire.push_str("Accept-Encoding: gzip, deflate\r\n");
         }
         wire.push_str("Connection: keep-alive\r\n");
+        // Fetch Metadata (`Sec-Fetch-*`) + `Referer`. These are
+        // browser-controlled "forbidden" headers Chrome attaches on
+        // (almost) every request. We emit them from the request's
+        // `fetch_meta` context; `None` (internal fetches) emits nothing,
+        // preserving today's bytes exactly.
+        for (k, v) in build_fetch_metadata_headers(req) {
+            wire.push_str(&format!("{k}: {v}\r\n"));
+        }
         // Attach session cookies for this URL, if any apply. We don't
         // forward a Cookie header the caller added themselves separately;
         // those are pass-through "raw header" inputs and merging would
@@ -1376,6 +1424,49 @@ fn is_retriable_conn_error(e: &NetError) -> bool {
 /// see the M6.3 follow-up note — not something to slip into this perf
 /// change, since it would alter both the bytes on the wire and the
 /// observable behaviour.
+/// Build the `Sec-Fetch-*` + `Referer` request headers for `req` from its
+/// attached [`crate::fetchmeta::FetchMetadata`]. Returns an empty vec when
+/// no metadata is attached, or when the target URL is not
+/// potentially-trustworthy (Chrome only attaches `Sec-Fetch-*` to such
+/// URLs — `services/network/sec_header_helpers.cc`).
+///
+/// Header order mirrors Chrome's: Sec-Fetch-Dest, -Mode, -Site, -User,
+/// then Referer. Order is not semantically significant but keeping it
+/// stable makes the wire bytes assertable in tests.
+fn build_fetch_metadata_headers(req: &Request) -> Vec<(String, String)> {
+    let Some(meta) = &req.fetch_meta else {
+        return Vec::new();
+    };
+    let mut out: Vec<(String, String)> = Vec::new();
+
+    // Sec-Fetch-* go on potentially-trustworthy request URLs only.
+    if crate::fetchmeta::is_potentially_trustworthy(&req.url) {
+        out.push(("Sec-Fetch-Dest".into(), meta.destination.token().into()));
+        out.push(("Sec-Fetch-Mode".into(), meta.mode.token().into()));
+        out.push((
+            "Sec-Fetch-Site".into(),
+            crate::fetchmeta::sec_fetch_site(meta.initiator.as_ref(), &req.url).into(),
+        ));
+        // Sec-Fetch-User: `?1` only for user-activated navigation requests.
+        if meta.user_activated && meta.mode == crate::fetchmeta::FetchMode::Navigate {
+            out.push(("Sec-Fetch-User".into(), "?1".into()));
+        }
+    }
+
+    // Referer per the document's Referrer Policy (independent of the
+    // Sec-Fetch trustworthiness gate — Referer rides on http too, the
+    // policy's downgrade rule is what suppresses it).
+    if let Some(referrer) = &meta.referrer {
+        if let Some(value) =
+            crate::fetchmeta::compute_referer(meta.policy, referrer, &req.url)
+        {
+            out.push(("Referer".into(), value));
+        }
+    }
+
+    out
+}
+
 fn chrome131_h2_headers<'a>(
     method: &'a str,
     authority: &'a str,
@@ -1961,6 +2052,150 @@ mod tests {
             "304 should return immediately, took {:?}",
             started.elapsed()
         );
+    }
+
+    /// Capture the raw request bytes a real `fetch()` writes over a loopback
+    /// socket, so we can assert the EXACT `Sec-Fetch-*` + `Referer` header
+    /// lines the wire builder emits. Returns the request head as a String.
+    fn capture_request_head(req: Request) -> String {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        std::thread::spawn(move || {
+            if let Ok((mut sock, _)) = listener.accept() {
+                // Read until the blank line that ends the request head.
+                let mut acc: Vec<u8> = Vec::new();
+                let mut buf = [0u8; 1024];
+                loop {
+                    match sock.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            acc.extend_from_slice(&buf[..n]);
+                            if acc.windows(4).any(|w| w == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                let _ = tx.send(String::from_utf8_lossy(&acc).into_owned());
+                // Reply so the client doesn't error/retry.
+                let _ = sock.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nhi",
+                );
+            }
+        });
+        // Point the request at our loopback listener port; keep its
+        // fetch_meta intact (which carries the ORIGINAL referrer/target).
+        let mut req = req;
+        req.url.host = "127.0.0.1".into();
+        req.url.port = Some(port);
+        let client = Client::with_timeout(5000);
+        let _ = client.send(req);
+        rx.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("server must capture the request head")
+    }
+
+    #[test]
+    fn wire_emits_sec_fetch_for_trustworthy_loopback_nav() {
+        // http://localhost is potentially-trustworthy → Sec-Fetch-* present.
+        // A browser-initiated, user-activated navigation.
+        let url = Url::parse("http://localhost/page").unwrap();
+        let meta = crate::fetchmeta::FetchMetadata::navigation(None, true);
+        let head = capture_request_head(Request::get(url).with_fetch_meta(meta));
+        assert!(head.contains("\r\nSec-Fetch-Dest: document\r\n"), "head: {head}");
+        assert!(head.contains("\r\nSec-Fetch-Mode: navigate\r\n"), "head: {head}");
+        assert!(head.contains("\r\nSec-Fetch-Site: none\r\n"), "head: {head}");
+        assert!(head.contains("\r\nSec-Fetch-User: ?1\r\n"), "head: {head}");
+    }
+
+    #[test]
+    fn wire_omits_sec_fetch_on_plain_http_public_host() {
+        // Plain http:// to a non-loopback host is NOT trustworthy → no
+        // Sec-Fetch-*. (We can't actually dial a public host in a unit test,
+        // so assert the builder directly with a public-host target.)
+        let url = Url::parse("http://example.com/page").unwrap();
+        let meta = crate::fetchmeta::FetchMetadata::navigation(None, true);
+        let req = Request::get(url).with_fetch_meta(meta);
+        let headers = build_fetch_metadata_headers(&req);
+        assert!(
+            headers.iter().all(|(k, _)| !k.starts_with("Sec-Fetch")),
+            "plain-http public host must not carry Sec-Fetch-*: {headers:?}"
+        );
+    }
+
+    #[test]
+    fn wire_sec_fetch_site_same_origin_vs_cross_site() {
+        // Subresource from https://a.com to https://a.com  → same-origin.
+        let init = crate::fetchmeta::Origin::of(&Url::parse("https://a.com/").unwrap());
+        let same = build_fetch_metadata_headers(
+            &Request::get(Url::parse("https://a.com/x.js").unwrap()).with_fetch_meta(
+                crate::fetchmeta::FetchMetadata::subresource(
+                    crate::fetchmeta::Destination::Script,
+                    crate::fetchmeta::FetchMode::NoCors,
+                    Some(init.clone()),
+                ),
+            ),
+        );
+        assert!(same.contains(&("Sec-Fetch-Site".to_string(), "same-origin".to_string())));
+        assert!(same.contains(&("Sec-Fetch-Dest".to_string(), "script".to_string())));
+        // No Sec-Fetch-User on a subresource (not a nav).
+        assert!(same.iter().all(|(k, _)| k != "Sec-Fetch-User"));
+
+        // Subresource from https://a.com to https://b.com → cross-site.
+        let cross = build_fetch_metadata_headers(
+            &Request::get(Url::parse("https://b.com/track").unwrap()).with_fetch_meta(
+                crate::fetchmeta::FetchMetadata::subresource(
+                    crate::fetchmeta::Destination::Image,
+                    crate::fetchmeta::FetchMode::NoCors,
+                    Some(init),
+                ),
+            ),
+        );
+        assert!(cross.contains(&("Sec-Fetch-Site".to_string(), "cross-site".to_string())));
+        assert!(cross.contains(&("Sec-Fetch-Dest".to_string(), "image".to_string())));
+    }
+
+    #[test]
+    fn wire_referer_default_policy_same_vs_cross_vs_downgrade() {
+        use crate::fetchmeta::{Destination, FetchMetadata, FetchMode, Origin, ReferrerPolicy};
+        let referrer = Url::parse("https://example.com/page?s=1#frag").unwrap();
+        let init = Origin::of(&referrer);
+        let make = |target: &str| {
+            let meta = FetchMetadata::subresource(
+                Destination::Image,
+                FetchMode::NoCors,
+                Some(init.clone()),
+            )
+            .with_referrer(Some(referrer.clone()), ReferrerPolicy::StrictOriginWhenCrossOrigin);
+            build_fetch_metadata_headers(
+                &Request::get(Url::parse(target).unwrap()).with_fetch_meta(meta),
+            )
+        };
+        // Same-origin → full URL (fragment stripped).
+        let same = make("https://example.com/a.png");
+        assert!(
+            same.contains(&("Referer".to_string(), "https://example.com/page?s=1".to_string())),
+            "{same:?}"
+        );
+        // Cross-origin → origin only.
+        let cross = make("https://cdn.other.com/a.png");
+        assert!(
+            cross.contains(&("Referer".to_string(), "https://example.com/".to_string())),
+            "{cross:?}"
+        );
+        // https→http downgrade → no Referer at all.
+        let down = make("http://example.com/a.png");
+        assert!(down.iter().all(|(k, _)| k != "Referer"), "{down:?}");
+    }
+
+    #[test]
+    fn wire_no_fetch_meta_emits_nothing() {
+        // The default Request (internal fetch) carries no Sec-Fetch/Referer.
+        let req = Request::get(Url::parse("https://example.com/").unwrap());
+        assert!(build_fetch_metadata_headers(&req).is_empty());
     }
 
     #[test]

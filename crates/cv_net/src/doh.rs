@@ -115,6 +115,7 @@ pub fn resolve(endpoint: &Url, host: &str, client: &Client) -> Result<Vec<IpAddr
             ],
             body,
             accept_brotli: true,
+            fetch_meta: None,
         };
         let resp = client.send(req).map_err(|e| e.to_string())?;
         if resp.status != 200 {
