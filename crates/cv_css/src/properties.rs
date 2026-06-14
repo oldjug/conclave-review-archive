@@ -1987,6 +1987,58 @@ fn split_top_level_commas(toks: &[CssToken]) -> Vec<&[CssToken]> {
     out
 }
 
+/// CSS `overflow` (and the `-x`/`-y` longhands) — CSS Overflow 3 §3.1.
+/// `Visible` is the initial value: content is not clipped and may render
+/// outside the box. `Hidden`/`Clip` clip to the padding box (no UA scroll
+/// mechanism). `Scroll`/`Auto` establish a *scroll container*: content
+/// that overflows the padding box is clipped AND the box gets an
+/// independent scroll offset the user (or `element.scrollTop`) can drive.
+/// We don't paint a UA scrollbar gutter, so `Scroll` and `Auto` behave
+/// identically for layout/paint purposes (both are scrollable).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+pub enum Overflow {
+    #[default]
+    Visible,
+    Hidden,
+    Clip,
+    Scroll,
+    Auto,
+}
+
+impl Overflow {
+    pub fn from_tokens(toks: &[CssToken]) -> Option<Self> {
+        for t in toks {
+            if let CssToken::Ident(s) = t {
+                return Some(match s.to_ascii_lowercase().as_str() {
+                    "visible" => Self::Visible,
+                    "hidden" => Self::Hidden,
+                    "clip" => Self::Clip,
+                    "scroll" => Self::Scroll,
+                    "auto" => Self::Auto,
+                    _ => return None,
+                });
+            }
+        }
+        None
+    }
+
+    /// True when this value clips overflow to the padding box.
+    /// Per CSS Overflow 3, anything other than `visible` clips.
+    pub fn clips(self) -> bool {
+        !matches!(self, Self::Visible)
+    }
+
+    /// True when this value establishes a *scroll container* (an
+    /// independently scrollable region). `scroll` and `auto` do;
+    /// `hidden`/`clip`/`visible` do not (hidden can still be scrolled
+    /// programmatically in Chrome, but it offers no user scroll
+    /// mechanism — we treat `hidden` as non-user-scrollable here, which
+    /// matches the common case and keeps wheel routing correct).
+    pub fn is_scrollable(self) -> bool {
+        matches!(self, Self::Scroll | Self::Auto)
+    }
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
 pub enum Position {
     #[default]

@@ -370,6 +370,16 @@ pub struct ComputedStyle {
     /// `row-gap` — when set distinct from `gap`. Falls back to `gap`.
     pub row_gap: Option<Length>,
     pub overflow_hidden: bool,
+    /// Resolved `overflow-x` / `overflow-y` (CSS Overflow 3). `None` =
+    /// the initial `visible`. These supersede the legacy single
+    /// `overflow_hidden` boolean: `Scroll`/`Auto` make the box an
+    /// independently scrollable region (a scroll container), while
+    /// `Hidden`/`Clip` clip without a scroll mechanism. Kept per-axis so
+    /// `overflow-x: hidden; overflow-y: auto` (the canonical vertical
+    /// scroller) resolves correctly. `overflow_hidden` stays set whenever
+    /// EITHER axis clips so existing clip paths keep working unchanged.
+    pub overflow_x: Option<crate::properties::Overflow>,
+    pub overflow_y: Option<crate::properties::Overflow>,
     /// CSS `list-style-type: none` (or `list-style: none`). When true,
     /// the UA marker (• for ul, "1. 2. 3." for ol) is suppressed. Lots
     /// of real pages reset `<nav><ul>` with `list-style: none` and the
@@ -4383,23 +4393,47 @@ fn apply_declaration(style: &mut ComputedStyle, d: &Declaration) {
         // to trigger clipping on that axis. We set the single boolean flag
         // `overflow_hidden` which the paint path uses to scissor children.
         "overflow" | "overflow-x" | "overflow-y" => {
+            use crate::properties::Overflow;
+            // Collect the (up to two) ident values present, in order.
+            let mut vals: Vec<Overflow> = Vec::new();
             for t in toks {
-                if let CssToken::Ident(s) = t {
-                    match s.to_ascii_lowercase().as_str() {
-                        "hidden" | "clip" => {
-                            style.overflow_hidden = true;
-                        }
-                        // `overflow: visible` resets to non-clipping.
-                        // overflow-x/y `visible` is more nuanced (only
-                        // clears one axis) but we model one flag, so only
-                        // respond to the shorthand for the clear path.
-                        "visible" if d.name.as_str() == "overflow" => {
-                            style.overflow_hidden = false;
-                        }
-                        _ => {}
+                if matches!(t, CssToken::Ident(_)) {
+                    if let Some(v) = Overflow::from_tokens(std::slice::from_ref(t)) {
+                        vals.push(v);
                     }
                 }
             }
+            match d.name.as_str() {
+                "overflow-x" => {
+                    if let Some(v) = vals.first().copied() {
+                        style.overflow_x = Some(v);
+                    }
+                }
+                "overflow-y" => {
+                    if let Some(v) = vals.first().copied() {
+                        style.overflow_y = Some(v);
+                    }
+                }
+                // Shorthand `overflow: <x> [<y>]`. One value sets both axes;
+                // two values are `overflow-x overflow-y` (CSS Overflow 3 §3.1).
+                _ => {
+                    let x = vals.first().copied();
+                    let y = vals.get(1).copied().or(x);
+                    if let Some(x) = x {
+                        style.overflow_x = Some(x);
+                    }
+                    if let Some(y) = y {
+                        style.overflow_y = Some(y);
+                    }
+                }
+            }
+            // Keep the legacy `overflow_hidden` flag in sync: it means
+            // "this box clips its overflow" (any non-visible value on
+            // either axis). Existing clip-rect paint paths read it; the
+            // new scroll path reads the per-axis enums.
+            let clips = style.overflow_x.map(|o| o.clips()).unwrap_or(false)
+                || style.overflow_y.map(|o| o.clips()).unwrap_or(false);
+            style.overflow_hidden = clips;
         }
         // ── transform-origin ──────────────────────────────────────────────
         // The pivot point around which 2D transforms (rotate, scale, matrix)

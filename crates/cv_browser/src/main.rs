@@ -7771,6 +7771,66 @@ fn build_browser_session(target: &str) -> Result<BrowserParts, String> {
             tab.paint = paint.clone();
             return Some(paint);
         }
+        // Element-level wheel/keyboard scroll routed from the UI layer.
+        // Encoding (set by cv_ui): `tb-scroll:<node_id>:<delta_x>:<delta_y>`
+        // where node_id is the scroll container's stable arena id (from the
+        // layout snapshot's hit-test) and the deltas are CSS px to ADD to the
+        // current offset. The store is the source of truth; we apply the delta
+        // (clamped by `apply_persisted_scroll_offsets` on the rebuild) and
+        // re-render so the scrolled content composites this frame. JS gets a
+        // matching `scroll` event so listeners (infinite scroll, sticky
+        // headers) fire — Blink dispatches `scroll` to the scrolled element.
+        if let Some(rest) = url.strip_prefix("tb-scroll:") {
+            let parts: Vec<&str> = rest.split(':').collect();
+            let node_id: u64 = match parts.first().and_then(|s| s.parse().ok()) {
+                Some(v) => v,
+                None => return None,
+            };
+            let dx: f32 = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0.0);
+            let dy: f32 = parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(0.0);
+            let (cur_l, cur_t) = get_scroll_offset(node_id);
+            // Store the raw target offset; the per-axis clamp to
+            // [0, scroll-client] happens on the rebuild in
+            // apply_persisted_scroll_offsets (the true range needs a layout).
+            set_scroll_offset(node_id, (cur_l + dx).max(0.0), (cur_t + dy).max(0.0));
+            let tab = session_guard.active_mut()?;
+            // Find the scrolled element's path (for the `scroll` event) from
+            // the current layout snapshot, which carries node_id + element_path.
+            let target_path: Option<Vec<usize>> = tab
+                .paint
+                .layout_root
+                .as_ref()
+                .and_then(|root| cv_layout::find_box_by_node_id(root, node_id))
+                .and_then(|b| b.element_path.clone());
+            let st = tab.page.as_mut()?;
+            // Dispatch a `scroll` event to the element (Blink fires `scroll`
+            // on the scrolled node; it does NOT bubble for elements, but does
+            // for document — we dispatch to the element path either way).
+            let style_overrides = if let Some(path) = &target_path {
+                let _ = st.runtime.dispatch_event_with_bubble_status(path, "scroll");
+                st.runtime.flush_console();
+                let muts = st.runtime.extract_mutations();
+                muts.apply_to_doc(&mut st.doc)
+            } else {
+                Default::default()
+            };
+            let url_s = st.url.clone();
+            let focus = st.focused_path.clone();
+            set_caret_pos_for_render(st.caret_pos);
+            let paint = render_paint_only_focused(
+                &st.doc,
+                &st.sheets,
+                &url_s,
+                &cfg_for_nav,
+                &style_overrides,
+                st.runtime.title_override(),
+                focus.as_deref(),
+                None,
+            );
+            tab.title = paint.title.clone();
+            tab.paint = paint.clone();
+            return Some(paint);
+        }
         // SPA link-click: fire JS click first, navigate only if not prevented.
         // Encoding: `tb-link-click:<path>|||<href>`
         // The UI layer emits this when a layout box has BOTH an element_path
@@ -17638,6 +17698,16 @@ thread_local! {
     /// `None` = no interest rect → raster everything (the legacy full-doc bake,
     /// the default until `CV_INTEREST_RECT` flips it on).
     static INTEREST_BAND_Y: std::cell::Cell<Option<(f32, f32)>> = const { std::cell::Cell::new(None) };
+
+    /// Nesting depth inside a scroll container whose offset is non-zero. The
+    /// interest-band cull compares a box's DOCUMENT-space `subtree_bounds`
+    /// against the doc-space band, which is only valid when the box paints at
+    /// its document position. A scroll offset remaps descendants by
+    /// `-scroll_offset`, so a child at doc-y 900 can be on-screen while its
+    /// doc bounds sit far below the band — culling it would erase scrolled
+    /// content. While this depth is > 0 the band cull is suppressed (the
+    /// scroll container's own padding-box clip still bounds the work).
+    static SCROLL_PAINT_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
 /// Whether interest-rect (viewport-bounded) rastering is enabled. Default OFF
@@ -18631,6 +18701,176 @@ thread_local! {
     /// persistent arena only when this advances past the arena's built version,
     /// so idle / animation-only frames reuse the arena instead of rebuilding it.
     static DOC_REVISION: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+
+    /// Element-level scroll offsets, keyed by the stable arena `node_id` of
+    /// the scroll container. Persisted across re-layouts so that a user
+    /// wheel-scroll / `element.scrollTop = n` survives the next render (which
+    /// rebuilds the layout tree from scratch). Applied by
+    /// `apply_persisted_scroll_offsets` to every freshly-built tree, then
+    /// re-clamped to the post-layout scroll range. This mirrors Blink, where
+    /// the scroll offset lives on the persistent `PaintLayerScrollableArea`,
+    /// not on the throwaway layout fragments.
+    static SCROLL_OFFSETS: std::cell::RefCell<std::collections::HashMap<u64, (f32, f32)>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Set the stored scroll offset for a scroll container by node id. Values are
+/// not clamped here (the layout box's true scroll range isn't known until the
+/// next layout); `apply_persisted_scroll_offsets` clamps on apply.
+fn set_scroll_offset(node_id: u64, left: f32, top: f32) {
+    SCROLL_OFFSETS.with(|c| {
+        c.borrow_mut().insert(node_id, (left.max(0.0), top.max(0.0)));
+    });
+}
+
+/// Read the stored scroll offset for a node id, or `(0, 0)` if none.
+fn get_scroll_offset(node_id: u64) -> (f32, f32) {
+    SCROLL_OFFSETS.with(|c| c.borrow().get(&node_id).copied().unwrap_or((0.0, 0.0)))
+}
+
+/// Clear all persisted scroll offsets — called on navigation so a new page
+/// starts unscrolled (Chrome resets element scroll on document replacement).
+fn clear_scroll_offsets() {
+    SCROLL_OFFSETS.with(|c| c.borrow_mut().clear());
+}
+
+/// CSSOM scroll geometry per element path: the padding-box (`client*`) and
+/// scrollable-overflow (`scroll*`) sizes, the current scroll offset, plus the
+/// stable arena id so JS `scrollTop`/`scrollLeft` writes can address the live
+/// scroll container's offset.
+#[derive(Clone, Copy)]
+struct ScrollGeom {
+    client_w: f32,
+    client_h: f32,
+    scroll_w: f32,
+    scroll_h: f32,
+    scroll_left: f32,
+    scroll_top: f32,
+    node_id: Option<u64>,
+    is_scroll_container: bool,
+}
+
+/// Collect per-element-path scroll geometry from a built layout tree. First
+/// fragment for a path wins (a wrapped inline can split into several boxes; the
+/// principal box carries the scroll state).
+fn collect_scroll_geom(
+    node: &cv_layout::LayoutBox,
+    out: &mut cv_js::OrderedMap<Vec<usize>, ScrollGeom>,
+) {
+    if let Some(path) = &node.element_path {
+        out.entry(path.clone()).or_insert(ScrollGeom {
+            client_w: node.client_width(),
+            client_h: node.client_height(),
+            scroll_w: node.scroll_width(),
+            scroll_h: node.scroll_height(),
+            scroll_left: node.scroll_offset_x,
+            scroll_top: node.scroll_offset_y,
+            node_id: node.node_id,
+            is_scroll_container: node.is_scroll_container(),
+        });
+    }
+    for child in &node.children {
+        collect_scroll_geom(child, out);
+    }
+}
+
+/// Parse the arguments of `Element.scrollTo`/`scrollBy`: either two positional
+/// numbers `(x, y)` or a single options object `{left, top, behavior}`. Returns
+/// `(Some(x)?, Some(y)?)` — `None` for an axis the caller omitted (so scrollBy
+/// can leave the other axis untouched). The `behavior` key is accepted but
+/// ignored (we jump to the end state, no smooth tween).
+fn parse_scroll_xy(args: &[cv_js::Value]) -> (Option<f32>, Option<f32>) {
+    if let Some(cv_js::Value::Object(o)) = args.first() {
+        let m = o.borrow();
+        let num = |k: &str| -> Option<f32> {
+            match m.get(k) {
+                Some(cv_js::Value::Number(n)) => Some(*n as f32),
+                _ => None,
+            }
+        };
+        return (num("left"), num("top"));
+    }
+    let x = args.first().map(|v| v.to_number() as f32);
+    let y = args.get(1).map(|v| v.to_number() as f32);
+    (x, y)
+}
+
+/// Read each scroll container's `scrollTop`/`scrollLeft` back out of its live
+/// JS element object and reconcile any JS-written value into the persistent
+/// scroll store, clamped to `[0, scroll - client]`. A value is treated as a JS
+/// write when it differs from the store-seeded value by more than ~0.5px.
+/// This is how `element.scrollTop = n` (and `scrollTo`/`scrollBy`, which write
+/// the same fields) drive real scrolling without needing native accessor
+/// properties (the descriptor model is gated off by default).
+fn sync_scroll_offsets_from_js(
+    runtime: &LiveInterp,
+    scroll_by_path: &cv_js::OrderedMap<Vec<usize>, ScrollGeom>,
+) {
+    let table = runtime.table.borrow();
+    for rec in &table.all {
+        let Some(sg) = scroll_by_path.get(&rec.path).copied() else {
+            continue;
+        };
+        if !sg.is_scroll_container {
+            continue;
+        }
+        let Some(id) = sg.node_id else { continue };
+        let cv_js::Value::Object(o) = &rec.js else {
+            continue;
+        };
+        let map = o.borrow();
+        let read = |k: &str| -> Option<f32> {
+            match map.get(k) {
+                Some(cv_js::Value::Number(n)) => Some(*n as f32),
+                _ => None,
+            }
+        };
+        let max_left = (sg.scroll_w - sg.client_w).max(0.0);
+        let max_top = (sg.scroll_h - sg.client_h).max(0.0);
+        let (cur_l, cur_t) = get_scroll_offset(id);
+        let mut new_l = cur_l;
+        let mut new_t = cur_t;
+        if let Some(js_l) = read("scrollLeft") {
+            if (js_l - sg.scroll_left).abs() > 0.5 {
+                new_l = js_l.clamp(0.0, max_left);
+            }
+        }
+        if let Some(js_t) = read("scrollTop") {
+            if (js_t - sg.scroll_top).abs() > 0.5 {
+                new_t = js_t.clamp(0.0, max_top);
+            }
+        }
+        if (new_l - cur_l).abs() > 0.01 || (new_t - cur_t).abs() > 0.01 {
+            set_scroll_offset(id, new_l, new_t);
+        }
+    }
+}
+
+/// Apply persisted scroll offsets into a freshly-built layout tree and clamp
+/// each to its current scroll range. Walks every box; for scroll containers
+/// with a node id and a stored offset, writes the offset then clamps. Keeps
+/// the store in sync with the clamped value so a now-shorter container doesn't
+/// keep an out-of-range offset forever.
+fn apply_persisted_scroll_offsets(root: &mut cv_layout::LayoutBox) {
+    fn walk(b: &mut cv_layout::LayoutBox) {
+        if b.is_scroll_container() {
+            if let Some(id) = b.node_id {
+                let (l, t) = get_scroll_offset(id);
+                if l != 0.0 || t != 0.0 {
+                    b.scroll_offset_x = l;
+                    b.scroll_offset_y = t;
+                    let (cl, ct) = b.clamp_scroll();
+                    if (cl - l).abs() > 0.01 || (ct - t).abs() > 0.01 {
+                        set_scroll_offset(id, cl, ct);
+                    }
+                }
+            }
+        }
+        for c in &mut b.children {
+            walk(c);
+        }
+    }
+    walk(root);
 }
 
 fn build_layout_tree(
@@ -18680,7 +18920,9 @@ fn build_layout_tree(
     }
     prune_ignorable_whitespace(&mut styled);
     flatten_inline_runs(&mut styled);
-    cv_layout::layout(&styled, cfg)
+    let mut lb = cv_layout::layout(&styled, cfg);
+    apply_persisted_scroll_offsets(&mut lb);
+    lb
 }
 
 /// Arena (`cv_dom`) counterpart of [`build_layout_tree`] — Phase-0 Brick 2b
@@ -18715,7 +18957,8 @@ fn build_layout_tree_arena(
     }
     prune_ignorable_whitespace(&mut styled);
     flatten_inline_runs(&mut styled);
-    let lb = cv_layout::layout(&styled, cfg);
+    let mut lb = cv_layout::layout(&styled, cfg);
+    apply_persisted_scroll_offsets(&mut lb);
     report_layout_stats();
     lb
 }
@@ -18864,6 +19107,9 @@ fn build_runtime_and_first_paint(
             }
         };
     }
+    // New document → drop any element scroll offsets carried from the
+    // previous page (Chrome resets scroll positions on navigation).
+    clear_scroll_offsets();
     let mut doc = cv_html::parse(html);
     assign_node_ids(&mut doc.root);
     bmark!("parsed html ({} bytes)", html.len());
@@ -19932,6 +20178,23 @@ fn populate_runtime_layout_metrics(
     let layout = build_layout_tree(doc, sheets, label, cfg, style_overrides);
     let mut metrics_by_path: HashMap<Vec<usize>, cv_layout::Rect> = HashMap::new();
     collect_metrics(&layout, &mut metrics_by_path);
+    let mut scroll_by_path: HashMap<Vec<usize>, ScrollGeom> = HashMap::new();
+    collect_scroll_geom(&layout, &mut scroll_by_path);
+    // Reconcile JS writes to `element.scrollTop`/`scrollLeft` made since the
+    // last render into the persistent scroll store, clamped to each box's
+    // current scroll range. The store is the single source of truth the paint
+    // build re-reads, so a programmatic scroll survives into the next frame.
+    sync_scroll_offsets_from_js(runtime, &scroll_by_path);
+    // Refresh the per-path scroll geometry's seeded offset from the store
+    // (a JS write above may have changed it) so the values we hand JS below
+    // reflect the clamped result.
+    for sg in scroll_by_path.values_mut() {
+        if let Some(id) = sg.node_id {
+            let (l, t) = get_scroll_offset(id);
+            sg.scroll_left = l;
+            sg.scroll_top = t;
+        }
+    }
     let mut cs_by_path: HashMap<Vec<usize>, Vec<(&'static str, String)>> = HashMap::new();
     collect_cs(&layout, &mut cs_by_path);
     // `documentElement.scrollHeight` / `.scrollWidth` are the size of the
@@ -19976,12 +20239,89 @@ fn populate_runtime_layout_metrics(
             let mut map = o.borrow_mut();
             map.insert("offsetTop".into(), cv_js::Value::Number(rect.y.into()));
             map.insert("offsetLeft".into(), cv_js::Value::Number(rect.x.into()));
+            // offsetWidth/offsetHeight = BORDER box (Chrome). clientWidth/
+            // clientHeight = PADDING box; scrollWidth/scrollHeight = the
+            // scrollable-overflow size. When we have real scroll geometry for
+            // this box (a scroll-aware layout box), use it; otherwise fall
+            // back to the border rect (a non-scroller's client≈border for our
+            // borderless V1 boxes, and scroll==client when nothing overflows).
             map.insert("offsetWidth".into(), cv_js::Value::Number(rect.w.into()));
             map.insert("offsetHeight".into(), cv_js::Value::Number(rect.h.into()));
-            map.insert("clientWidth".into(), cv_js::Value::Number(rect.w.into()));
-            map.insert("clientHeight".into(), cv_js::Value::Number(rect.h.into()));
-            map.insert("scrollWidth".into(), cv_js::Value::Number(rect.w.into()));
-            map.insert("scrollHeight".into(), cv_js::Value::Number(rect.h.into()));
+            if let Some(sg) = scroll_by_path.get(&rec.path).copied() {
+                map.insert("clientWidth".into(), cv_js::Value::Number(sg.client_w.into()));
+                map.insert("clientHeight".into(), cv_js::Value::Number(sg.client_h.into()));
+                map.insert("scrollWidth".into(), cv_js::Value::Number(sg.scroll_w.into()));
+                map.insert("scrollHeight".into(), cv_js::Value::Number(sg.scroll_h.into()));
+                // scrollLeft/scrollTop are READ/WRITE (CSSOM View §6.1). We
+                // seed them from the persistent scroll store (already clamped
+                // into range by apply_persisted_scroll_offsets) so a re-render
+                // reflects the live scroll, and JS can write them — the write
+                // is read back by sync_scroll_offsets_from_js before the next
+                // paint.
+                map.insert("scrollLeft".into(), cv_js::Value::Number(sg.scroll_left.into()));
+                map.insert("scrollTop".into(), cv_js::Value::Number(sg.scroll_top.into()));
+                // Element.scrollTo(x, y) / scrollTo({left, top}) and
+                // scrollBy(dx, dy) (CSSOM View §6.1). These write the same
+                // scrollLeft/scrollTop fields the reconcile reads, so they
+                // drive real element scrolling. `behavior:'smooth'` is honored
+                // as an instant jump (we don't animate yet — Chrome-correct end
+                // state, no tween).
+                let o_to = o.clone();
+                map.insert(
+                    "scrollTo".into(),
+                    cv_js::native_fn("scrollTo", move |args| {
+                        let (x, y) = parse_scroll_xy(&args);
+                        let mut mm = o_to.borrow_mut();
+                        if let Some(x) = x {
+                            mm.insert("scrollLeft".into(), cv_js::Value::Number(x.into()));
+                        }
+                        if let Some(y) = y {
+                            mm.insert("scrollTop".into(), cv_js::Value::Number(y.into()));
+                        }
+                        Ok(cv_js::Value::Undefined)
+                    }),
+                );
+                let o_by = o.clone();
+                map.insert(
+                    "scrollBy".into(),
+                    cv_js::native_fn("scrollBy", move |args| {
+                        let (dx, dy) = parse_scroll_xy(&args);
+                        let mut mm = o_by.borrow_mut();
+                        if let Some(dx) = dx {
+                            let cur = match mm.get("scrollLeft") {
+                                Some(cv_js::Value::Number(n)) => *n,
+                                _ => 0.0,
+                            };
+                            mm.insert(
+                                "scrollLeft".into(),
+                                cv_js::Value::Number((cur + dx as f64).into()),
+                            );
+                        }
+                        if let Some(dy) = dy {
+                            let cur = match mm.get("scrollTop") {
+                                Some(cv_js::Value::Number(n)) => *n,
+                                _ => 0.0,
+                            };
+                            mm.insert(
+                                "scrollTop".into(),
+                                cv_js::Value::Number((cur + dy as f64).into()),
+                            );
+                        }
+                        Ok(cv_js::Value::Undefined)
+                    }),
+                );
+            } else {
+                map.insert("clientWidth".into(), cv_js::Value::Number(rect.w.into()));
+                map.insert("clientHeight".into(), cv_js::Value::Number(rect.h.into()));
+                map.insert("scrollWidth".into(), cv_js::Value::Number(rect.w.into()));
+                map.insert("scrollHeight".into(), cv_js::Value::Number(rect.h.into()));
+                // Non-scroll-containers report scrollLeft/scrollTop of 0
+                // (Chrome: a non-scrollable element's scrollTop is always 0).
+                map.entry("scrollLeft".into())
+                    .or_insert(cv_js::Value::Number(0.0));
+                map.entry("scrollTop".into())
+                    .or_insert(cv_js::Value::Number(0.0));
+            }
             map.insert("getBoundingClientRect".into(), bcr);
 
             // Element.animate(keyframes, options) — returns an
@@ -37852,6 +38192,18 @@ fn lower_style(
     let column_gap_px = cs.column_gap.and_then(|l| l.resolve_px(em_px, rem_px, 0.0));
     let row_gap_px = cs.row_gap.and_then(|l| l.resolve_px(em_px, rem_px, 0.0));
     let overflow_hidden = cs.overflow_hidden;
+    // Map the per-axis cv_css overflow into the layout/paint enum. `None`
+    // (initial) → Visible. Scroll/Auto make the box an independently
+    // scrollable region; Hidden/Clip clip without a scroll mechanism.
+    let map_overflow = |o: Option<cv_css::properties::Overflow>| match o {
+        Some(cv_css::properties::Overflow::Hidden) => cv_layout::Overflow::Hidden,
+        Some(cv_css::properties::Overflow::Clip) => cv_layout::Overflow::Clip,
+        Some(cv_css::properties::Overflow::Scroll) => cv_layout::Overflow::Scroll,
+        Some(cv_css::properties::Overflow::Auto) => cv_layout::Overflow::Auto,
+        Some(cv_css::properties::Overflow::Visible) | None => cv_layout::Overflow::Visible,
+    };
+    let overflow_x = map_overflow(cs.overflow_x);
+    let overflow_y = map_overflow(cs.overflow_y);
     let visibility_hidden = cs.visibility.map(|v| {
         matches!(
             v,
@@ -38232,6 +38584,8 @@ fn lower_style(
         table_row_span: cs.table_row_span,
         opacity: effective_opacity,
         overflow_hidden,
+        overflow_x,
+        overflow_y,
         visibility_hidden,
         border_radius_px,
         border_radius_percent,
@@ -42441,7 +42795,7 @@ fn paint_box_offset_t(
     // is also document space, so compare directly (do NOT add the band paint
     // offset `off_y`, which maps doc→band-bitmap rows). Suppressed for affine
     // layer roots (they raster into a local layer, not the page band).
-    if !suppress_self_transform {
+    if !suppress_self_transform && SCROLL_PAINT_DEPTH.with(|c| c.get()) == 0 {
         if let Some((band_top, band_bottom)) = INTEREST_BAND_Y.with(|c| c.get()) {
             let sb = b.subtree_bounds();
             if sb.y + sb.h < band_top || sb.y > band_bottom {
@@ -43707,6 +44061,20 @@ fn paint_box_offset_t(
     } else {
         clip_rect
     };
+    // ── Element-level scroll offset (CSS Overflow 3 / Blink
+    // PaintLayerScrollableArea) ─────────────────────────────────────────────
+    // A scroll container translates its painted CONTENT by `-scrollOffset`
+    // (the box chrome — background/border, painted above — stays put; only
+    // the children shift). The clip above already pinned children to the
+    // padding box, so content scrolled out of view is correctly clipped.
+    // Non-scroll containers contribute zero, so this is a no-op for them.
+    let (child_off_x, child_off_y) = if b.is_scroll_container() {
+        (off_x - b.scroll_offset_x, off_y - b.scroll_offset_y)
+    } else {
+        (off_x, off_y)
+    };
+    let off_x = child_off_x;
+    let off_y = child_off_y;
     // CSS 2.1 Appendix E §E.2 — paint order within a stacking context.
     // Chrome's reference: `third_party/blink/renderer/core/paint/
     // paint_layer_painter.cc` (PaintLayerPainter::PaintChildren).
@@ -43758,6 +44126,14 @@ fn paint_box_offset_t(
             None // static non-flex/grid item: z-index ignored per spec
         }
     };
+    // When this box is a scroll container with a live offset, its children
+    // paint at remapped positions — suppress the doc-space interest-band cull
+    // for the whole subtree (see SCROLL_PAINT_DEPTH).
+    let scroll_active = b.is_scroll_container()
+        && (b.scroll_offset_x.abs() > 0.01 || b.scroll_offset_y.abs() > 0.01);
+    if scroll_active {
+        SCROLL_PAINT_DEPTH.with(|c| c.set(c.get() + 1));
+    }
     let needs_sort =
         b.children.iter().any(|c| effective_z(c).is_some()) || b.children.iter().any(is_positioned);
     if needs_sort {
@@ -43806,6 +44182,9 @@ fn paint_box_offset_t(
         for c in &b.children {
             paint_box_offset(c, bmp, texts, off_x, off_y, next_clip);
         }
+    }
+    if scroll_active {
+        SCROLL_PAINT_DEPTH.with(|c| c.set(c.get().saturating_sub(1)));
     }
     // CSS `clip-path:` — pixel mask everything outside the shape.
     // Applied after children but before filter so the mask survives
@@ -47614,6 +47993,10 @@ mod tests {
             table_row_span: None,
             grid_area_name: None,
             overflow_hidden: false,
+            overflow_x: cv_layout::Overflow::Visible,
+            overflow_y: cv_layout::Overflow::Visible,
+            scroll_offset_x: 0.0,
+            scroll_offset_y: 0.0,
             visibility_hidden: false,
             opacity: 1.0,
             border_radius_px: 0.0,
@@ -48133,6 +48516,10 @@ mod tests {
             table_col_span: None,
             table_row_span: None,
             overflow_hidden: false,
+            overflow_x: cv_layout::Overflow::Visible,
+            overflow_y: cv_layout::Overflow::Visible,
+            scroll_offset_x: 0.0,
+            scroll_offset_y: 0.0,
             opacity: 1.0,
             border_radius_px: 0.0,
             border_radius_percent: None,
@@ -48265,6 +48652,10 @@ mod tests {
             table_col_span: None,
             table_row_span: None,
             overflow_hidden: false,
+            overflow_x: cv_layout::Overflow::Visible,
+            overflow_y: cv_layout::Overflow::Visible,
+            scroll_offset_x: 0.0,
+            scroll_offset_y: 0.0,
             opacity: 1.0,
             border_radius_px: 0.0,
             border_radius_percent: None,
@@ -48422,6 +48813,10 @@ mod tests {
             table_col_span: None,
             table_row_span: None,
             overflow_hidden: false,
+            overflow_x: cv_layout::Overflow::Visible,
+            overflow_y: cv_layout::Overflow::Visible,
+            scroll_offset_x: 0.0,
+            scroll_offset_y: 0.0,
             opacity: 1.0,
             border_radius_px: 0.0,
             border_radius_percent: None,
@@ -48561,6 +48956,10 @@ mod tests {
             table_col_span: None,
             table_row_span: None,
             overflow_hidden: true,
+            overflow_x: cv_layout::Overflow::Hidden,
+            overflow_y: cv_layout::Overflow::Hidden,
+            scroll_offset_x: 0.0,
+            scroll_offset_y: 0.0,
             opacity: 1.0,
             border_radius_px: 0.0,
             border_radius_percent: None,
@@ -55180,6 +55579,285 @@ var el = document.getElementById('el');
             .run_completion_value("eval('40+2')")
             .expect("eval runs");
         assert_eq!(v.to_number(), 42.0);
+    }
+
+    // ── Element-level scrolling (overflow:auto/scroll) end-to-end ───────────
+
+    /// Build a runtime + populate layout metrics for a page with a fixed-size
+    /// `overflow:auto` scroller (id=s) wrapping a much taller child. Returns
+    /// the runtime, the built layout tree, and the scroll-geom map so tests can
+    /// both read the JS-exposed metrics and drive the scroll store.
+    fn scroll_test_page() -> (LiveInterp, cv_layout::LayoutBox) {
+        clear_scroll_offsets();
+        let html = "<!doctype html><html><head><style>\
+            #s{overflow:auto;width:200px;height:200px;padding:0}\
+            #tall{height:1000px;width:80px}\
+            </style></head><body>\
+            <div id=s><div id=tall></div></div></body></html>";
+        let mut doc = cv_html::parse(html);
+        assign_node_ids(&mut doc.root);
+        let mut sheets = vec![parse_user_agent_stylesheet()];
+        sheets.extend(collect_stylesheets(&doc));
+        let cfg = cv_layout::LayoutConfig {
+            viewport_w: 800.0,
+            viewport_h: 600.0,
+            ..cv_layout::LayoutConfig::default()
+        };
+        let mut runtime = LiveInterp::new(&doc, "https://scroll.test/");
+        populate_runtime_layout_metrics(
+            &mut runtime,
+            &doc,
+            &sheets,
+            "https://scroll.test/",
+            &cfg,
+            &cv_js::OrderedMap::new(),
+        );
+        let layout = build_layout_tree(&doc, &sheets, "https://scroll.test/", &cfg, &Default::default());
+        (runtime, layout)
+    }
+
+    #[test]
+    fn js_scroll_geometry_reflects_chrome_box_model() {
+        let (mut runtime, _layout) = scroll_test_page();
+        // clientHeight = padding box (200, no padding). scrollHeight = full
+        // content (1000) since #tall is the only child and there's no padding.
+        let v = runtime
+            .interp
+            .run_completion_value(
+                "var s=document.getElementById('s');\
+                 [s.clientHeight, s.scrollHeight, s.scrollTop].join(',')",
+            )
+            .expect("read scroll metrics");
+        let s = v.to_display_string();
+        let parts: Vec<f64> = s.split(',').map(|x| x.parse().unwrap_or(-1.0)).collect();
+        assert!(
+            (parts[0] - 200.0).abs() < 1.0,
+            "clientHeight should be padding box (200), got {}",
+            parts[0]
+        );
+        assert!(
+            parts[1] >= 1000.0,
+            "scrollHeight should span the 1000px child, got {}",
+            parts[1]
+        );
+        assert_eq!(parts[2], 0.0, "initial scrollTop is 0");
+    }
+
+    #[test]
+    fn js_scrolltop_write_drives_the_store_clamped() {
+        let (mut runtime, layout) = scroll_test_page();
+        // JS over-scrolls past the bottom; the value must clamp to
+        // scrollHeight - clientHeight on reconcile.
+        runtime
+            .run_script("document.getElementById('s').scrollTop = 99999;");
+        let mut scroll_by_path: cv_js::OrderedMap<Vec<usize>, ScrollGeom> = cv_js::OrderedMap::new();
+        collect_scroll_geom(&layout, &mut scroll_by_path);
+        // Find the scroller's node id + expected max.
+        let (node_id, max_top) = scroll_by_path
+            .values()
+            .find(|g| g.is_scroll_container)
+            .map(|g| (g.node_id.unwrap(), (g.scroll_h - g.client_h).max(0.0)))
+            .expect("a scroll container exists");
+        assert!(max_top > 0.0, "the scroller has vertical overflow");
+        sync_scroll_offsets_from_js(&runtime, &scroll_by_path);
+        let (_l, t) = get_scroll_offset(node_id);
+        assert!(
+            (t - max_top).abs() < 1.0,
+            "over-scroll via JS clamps to max ({max_top}), got {t}"
+        );
+        clear_scroll_offsets();
+    }
+
+    #[test]
+    fn js_scrolltop_midrange_write_is_preserved() {
+        let (mut runtime, layout) = scroll_test_page();
+        runtime.run_script("document.getElementById('s').scrollTop = 300;");
+        let mut scroll_by_path: cv_js::OrderedMap<Vec<usize>, ScrollGeom> = cv_js::OrderedMap::new();
+        collect_scroll_geom(&layout, &mut scroll_by_path);
+        let node_id = scroll_by_path
+            .values()
+            .find(|g| g.is_scroll_container)
+            .and_then(|g| g.node_id)
+            .expect("scroll container id");
+        sync_scroll_offsets_from_js(&runtime, &scroll_by_path);
+        let (_l, t) = get_scroll_offset(node_id);
+        assert!(
+            (t - 300.0).abs() < 1.0,
+            "in-range scrollTop=300 preserved, got {t}"
+        );
+        // And the offset persists into a fresh layout build (paint reflects it).
+        let html = "<!doctype html><html><head><style>\
+            #s{overflow:auto;width:200px;height:200px}#tall{height:1000px}\
+            </style></head><body><div id=s><div id=tall></div></div></body></html>";
+        let mut doc2 = cv_html::parse(html);
+        assign_node_ids(&mut doc2.root);
+        let mut sheets = vec![parse_user_agent_stylesheet()];
+        sheets.extend(collect_stylesheets(&doc2));
+        let cfg = cv_layout::LayoutConfig::default();
+        // Re-tag the same node id via build (node ids are deterministic from the
+        // arena for an identical doc); assert the scroller box picked up offset.
+        let rebuilt = build_layout_tree(&doc2, &sheets, "https://scroll.test/", &cfg, &Default::default());
+        let mut found_offset = false;
+        fn walk(b: &cv_layout::LayoutBox, found: &mut bool) {
+            if b.is_scroll_container() && b.scroll_offset_y > 1.0 {
+                *found = true;
+            }
+            for c in &b.children {
+                walk(c, found);
+            }
+        }
+        walk(&rebuilt, &mut found_offset);
+        assert!(
+            found_offset,
+            "the persisted scroll offset is applied to the freshly built tree"
+        );
+        clear_scroll_offsets();
+    }
+
+    #[test]
+    fn paint_translates_and_clips_scrolled_content() {
+        // A scroll container paints its content translated UP by the scroll
+        // offset and clipped to the padding box. We build a scroller whose
+        // child is a tall column split into a RED top band and a BLUE bottom
+        // band. At scroll 0 a fixed sample row near the top is RED; after
+        // scrolling past the red band, that same row shows BLUE — proving the
+        // content moved by exactly the offset (and the clip kept it in box).
+        let (_runtime, layout) = scroll_test_page();
+        // Find the scroller and rebuild its child as two colored bands.
+        fn scroller_mut(b: &mut cv_layout::LayoutBox) -> Option<&mut cv_layout::LayoutBox> {
+            if b.is_scroll_container() {
+                return Some(b);
+            }
+            for c in &mut b.children {
+                if let Some(s) = scroller_mut(c) {
+                    return Some(s);
+                }
+            }
+            None
+        }
+        let mut layout = layout;
+        let scroller = scroller_mut(&mut layout).expect("scroller present");
+        let pad = scroller.padding_rect();
+        let red = cv_layout::Color { r: 220, g: 10, b: 10, a: 255 };
+        let blue = cv_layout::Color { r: 10, g: 10, b: 220, a: 255 };
+        // Replace the child with a 100px red band followed by a tall blue band,
+        // anchored at the scroller's content origin.
+        let cx = scroller.content.x;
+        let cy = scroller.content.y;
+        let cw = scroller.content.w;
+        let make_band = |y: f32, h: f32, color: cv_layout::Color| {
+            let mut band = scroller.children[0].clone();
+            band.children = Vec::new();
+            band.content = cv_layout::Rect { x: cx, y, w: cw, h };
+            band.padding = cv_layout::EdgeSizes::default();
+            band.border_width_px = 0.0;
+            band.background = Some(color);
+            band.overflow_x = cv_layout::Overflow::Visible;
+            band.overflow_y = cv_layout::Overflow::Visible;
+            band
+        };
+        scroller.children = vec![
+            make_band(cy, 100.0, red),
+            make_band(cy + 100.0, 900.0, blue),
+        ];
+        // Sample a row 20px below the padding-box top, inside the child column.
+        let sample_x = (pad.x + 10.0) as usize;
+        let sample_y = (pad.y + 20.0) as usize;
+        fn paint_to_bitmap(lb: &cv_layout::LayoutBox) -> cv_gfx::Bitmap {
+            let mut bmp = cv_gfx::Bitmap::new(400, 1400);
+            let mut texts = Vec::new();
+            paint_box(lb, &mut bmp, &mut texts);
+            bmp
+        }
+        let is_red = |bmp: &cv_gfx::Bitmap| {
+            let px = bmp.pixels[sample_y * bmp.width as usize + sample_x];
+            let r8 = ((px >> 16) & 0xFF) as u8;
+            let b8 = (px & 0xFF) as u8;
+            r8 > 150 && b8 < 90
+        };
+        let is_blue = |bmp: &cv_gfx::Bitmap| {
+            let px = bmp.pixels[sample_y * bmp.width as usize + sample_x];
+            let r8 = ((px >> 16) & 0xFF) as u8;
+            let b8 = (px & 0xFF) as u8;
+            b8 > 150 && r8 < 90
+        };
+        // Before scroll: the sample row is in the red band.
+        assert!(is_red(&paint_to_bitmap(&layout)), "top band is red at scroll 0");
+        // Scroll down 200px (past the 100px red band). clamp to legal range.
+        let scroller = scroller_mut(&mut layout).unwrap();
+        scroller.scroll_offset_y = 200.0;
+        scroller.clamp_scroll();
+        let bmp = paint_to_bitmap(&layout);
+        assert!(
+            is_blue(&bmp),
+            "after scrolling 200px, the sample row shows the blue band (content translated up)"
+        );
+        assert!(!is_red(&bmp), "the red band scrolled off the top");
+        clear_scroll_offsets();
+    }
+
+    #[test]
+    fn js_scrollto_and_scrollby_drive_the_store() {
+        let (mut runtime, layout) = scroll_test_page();
+        // scrollTo(0, 250) sets scrollTop=250; scrollBy(0, 50) → 300.
+        runtime.run_script(
+            "var s=document.getElementById('s'); s.scrollTo(0, 250); s.scrollBy(0, 50);",
+        );
+        let mut scroll_by_path: cv_js::OrderedMap<Vec<usize>, ScrollGeom> = cv_js::OrderedMap::new();
+        collect_scroll_geom(&layout, &mut scroll_by_path);
+        let node_id = scroll_by_path
+            .values()
+            .find(|g| g.is_scroll_container)
+            .and_then(|g| g.node_id)
+            .expect("scroll container id");
+        sync_scroll_offsets_from_js(&runtime, &scroll_by_path);
+        let (_l, t) = get_scroll_offset(node_id);
+        assert!(
+            (t - 300.0).abs() < 1.0,
+            "scrollTo(250)+scrollBy(50) → scrollTop 300, got {t}"
+        );
+        // Options-object form: scrollTo({top: 100}).
+        runtime.run_script("document.getElementById('s').scrollTo({top: 100});");
+        sync_scroll_offsets_from_js(&runtime, &scroll_by_path);
+        let (_l2, t2) = get_scroll_offset(node_id);
+        assert!(
+            (t2 - 100.0).abs() < 1.0,
+            "scrollTo({{top:100}}) → scrollTop 100, got {t2}"
+        );
+        clear_scroll_offsets();
+    }
+
+    #[test]
+    fn overflow_shorthand_maps_to_scroll_enum() {
+        // overflow:auto → both axes Auto → scroll container. overflow:hidden →
+        // clip but not scrollable. Verified through the cv_css→cv_layout lower.
+        for (css, want_scroll) in [
+            ("overflow:auto", true),
+            ("overflow:scroll", true),
+            ("overflow:hidden", false),
+            ("overflow-y:auto;overflow-x:hidden", true),
+        ] {
+            let html = format!(
+                "<!doctype html><html><head><style>#s{{{css};width:100px;height:50px}}\
+                 #t{{height:500px}}</style></head><body>\
+                 <div id=s><div id=t></div></div></body></html>"
+            );
+            let mut doc = cv_html::parse(&html);
+            assign_node_ids(&mut doc.root);
+            let mut sheets = vec![parse_user_agent_stylesheet()];
+            sheets.extend(collect_stylesheets(&doc));
+            let cfg = cv_layout::LayoutConfig::default();
+            let layout = build_layout_tree(&doc, &sheets, "https://t/", &cfg, &Default::default());
+            fn any_scroller(b: &cv_layout::LayoutBox) -> bool {
+                b.is_scroll_container() || b.children.iter().any(any_scroller)
+            }
+            assert_eq!(
+                any_scroller(&layout),
+                want_scroll,
+                "`{css}` scroll-container expectation"
+            );
+            clear_scroll_offsets();
+        }
     }
 }
 

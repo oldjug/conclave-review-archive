@@ -304,6 +304,22 @@ pub struct LayoutBox {
     /// any explicit numeric `grid_*_start`/`_span` on this box.
     pub grid_area_name: Option<String>,
     pub overflow_hidden: bool,
+    /// Resolved per-axis overflow. `overflow_hidden` stays as the legacy
+    /// "this box clips" flag (true whenever either axis clips); these two
+    /// carry the full value so paint can tell `hidden` (clip only) from
+    /// `scroll`/`auto` (clip + independent scroll offset).
+    pub overflow_x: Overflow,
+    pub overflow_y: Overflow,
+    /// The box's current scroll position (CSSOM `scrollLeft`/`scrollTop`),
+    /// in CSS px. Content paints translated by `-scroll_offset`. Only
+    /// meaningful when the corresponding axis `is_scrollable()` and there
+    /// is scrollable overflow; clamped to `[0, scroll_size - client_size]`.
+    /// Applied at paint time, NOT during box placement (children keep
+    /// their layout coordinates; only the paint offset shifts) — matching
+    /// Blink's `PaintLayerScrollableArea`, where the scroll offset is a
+    /// paint-property-tree translation, not a re-layout.
+    pub scroll_offset_x: f32,
+    pub scroll_offset_y: f32,
     /// CSS `visibility: hidden` — box keeps its layout slot but the
     /// paint pass skips it (and inherits to descendants unless they
     /// explicitly set `visibility: visible`).  Critical for honoring
@@ -636,6 +652,131 @@ impl LayoutBox {
             h: b.h + self.margin.top + self.margin.bottom,
         }
     }
+
+    // ── Scrolling (CSSOM View §6 + CSS Overflow 3) ──────────────────────────
+    // Chrome reference: a box whose computed overflow is `scroll`/`auto`
+    // (and that has overflowing content) gets a `PaintLayerScrollableArea`
+    // (blink/renderer/core/paint/paint_layer_scrollable_area.cc). Its scroll
+    // offset translates the painted content and clips it to the padding box.
+
+    /// True when EITHER axis establishes an independently scrollable region.
+    pub fn is_scroll_container(&self) -> bool {
+        self.overflow_x.is_scrollable() || self.overflow_y.is_scrollable()
+    }
+
+    /// `Element.clientWidth` (CSSOM View §6.1): width of the *padding box*,
+    /// i.e. content width + left/right padding. (We don't render a UA
+    /// scrollbar gutter, so nothing is subtracted for it.)
+    pub fn client_width(&self) -> f32 {
+        (self.content.w + self.padding.left + self.padding.right).max(0.0)
+    }
+
+    /// `Element.clientHeight`: height of the padding box.
+    pub fn client_height(&self) -> f32 {
+        (self.content.h + self.padding.top + self.padding.bottom).max(0.0)
+    }
+
+    /// The scrollable-overflow extent (right, bottom) of this box's
+    /// content in the box's own padding-box coordinate space, where the
+    /// padding-box top-left is the origin. This unions the border-box of
+    /// every in-flow/positioned descendant (recursively, since a child's
+    /// own overflow can escape it unless the child clips) and adds the
+    /// box's end-side padding — matching how Chrome's scrolling area
+    /// reaches one padding past the last child.
+    fn scrollable_overflow_extent(&self) -> (f32, f32) {
+        // The CONTENT box's top-left in document coordinates is the origin
+        // for measuring children (the scrolling area starts at padding-top,
+        // and content begins one padding-top below the padding-box origin —
+        // so measuring children from the content origin and then adding back
+        // BOTH paddings reproduces "padding-top .. last child .. padding-
+        // bottom", matching Chrome/MDN: scrollHeight runs from padding-top to
+        // padding-bottom and includes the end padding even past overflow).
+        let origin_x = self.content.x;
+        let origin_y = self.content.y;
+        // Furthest child border-box edge relative to the content origin.
+        // Floor at 0 (no children → 0) so the padding-only fallback wins.
+        let mut child_right = 0.0f32;
+        let mut child_bottom = 0.0f32;
+        fn accumulate(
+            b: &LayoutBox,
+            origin_x: f32,
+            origin_y: f32,
+            right: &mut f32,
+            bottom: &mut f32,
+        ) {
+            let br = b.border_rect();
+            let r = (br.x + br.w) - origin_x;
+            let bo = (br.y + br.h) - origin_y;
+            if r > *right {
+                *right = r;
+            }
+            if bo > *bottom {
+                *bottom = bo;
+            }
+            // A child that itself clips/scrolls confines its own
+            // descendants — they don't contribute to THIS box's
+            // scrollable overflow beyond the child's border box.
+            if b.overflow_x.clips() && b.overflow_y.clips() {
+                return;
+            }
+            for c in &b.children {
+                accumulate(c, origin_x, origin_y, right, bottom);
+            }
+        }
+        for c in &self.children {
+            accumulate(c, origin_x, origin_y, &mut child_right, &mut child_bottom);
+        }
+        // Add the start+end padding around the content-relative extent so the
+        // scrolling area spans the full padding box (and one padding past the
+        // last child). An empty scroller falls back to its own padding box.
+        let right = (child_right + self.padding.left + self.padding.right)
+            .max(self.content.w + self.padding.left + self.padding.right);
+        let bottom = (child_bottom + self.padding.top + self.padding.bottom)
+            .max(self.content.h + self.padding.top + self.padding.bottom);
+        (right.max(0.0), bottom.max(0.0))
+    }
+
+    /// `Element.scrollWidth`: `max(clientWidth, scrollable overflow width)`.
+    pub fn scroll_width(&self) -> f32 {
+        let (right, _) = self.scrollable_overflow_extent();
+        right.max(self.client_width())
+    }
+
+    /// `Element.scrollHeight`: `max(clientHeight, scrollable overflow height)`.
+    pub fn scroll_height(&self) -> f32 {
+        let (_, bottom) = self.scrollable_overflow_extent();
+        bottom.max(self.client_height())
+    }
+
+    /// Largest legal `scrollLeft` for this box: `scrollWidth - clientWidth`,
+    /// floored at 0. 0 when there's nothing to scroll horizontally.
+    pub fn max_scroll_left(&self) -> f32 {
+        (self.scroll_width() - self.client_width()).max(0.0)
+    }
+
+    /// Largest legal `scrollTop`: `scrollHeight - clientHeight`, floored at 0.
+    pub fn max_scroll_top(&self) -> f32 {
+        (self.scroll_height() - self.client_height()).max(0.0)
+    }
+
+    /// Clamp the current scroll offset into the legal range. Returns the
+    /// clamped offset (also written back into the box). Honors per-axis
+    /// scrollability: a non-scrollable axis is pinned to 0.
+    pub fn clamp_scroll(&mut self) -> (f32, f32) {
+        let max_x = if self.overflow_x.is_scrollable() {
+            self.max_scroll_left()
+        } else {
+            0.0
+        };
+        let max_y = if self.overflow_y.is_scrollable() {
+            self.max_scroll_top()
+        } else {
+            0.0
+        };
+        self.scroll_offset_x = self.scroll_offset_x.clamp(0.0, max_x);
+        self.scroll_offset_y = self.scroll_offset_y.clamp(0.0, max_y);
+        (self.scroll_offset_x, self.scroll_offset_y)
+    }
 }
 
 impl fmt::Display for LayoutBox {
@@ -756,6 +897,9 @@ pub struct Style {
     /// `row-gap` distinct from the column axis. None → fall back to `gap`.
     pub row_gap_px: Option<f32>,
     pub overflow_hidden: bool,
+    /// Per-axis overflow lowered from `cv_css`. Default `Visible`.
+    pub overflow_x: Overflow,
+    pub overflow_y: Overflow,
     /// CSS `visibility: hidden` flag — propagates through `build_box`
     /// onto every layout box that carries it.  Painters skip such
     /// boxes (and inherit "hidden" to descendants unless they
@@ -945,6 +1089,32 @@ pub enum Position {
     Absolute,
     Fixed,
     Sticky,
+}
+
+/// CSS `overflow` per axis — see `cv_css::properties::Overflow`. Mirrored
+/// into the layout/paint layer so the painter (which has no cv_css
+/// dependency) can decide between "clip to padding box" (`Hidden`/`Clip`)
+/// and "clip + translate by an independent scroll offset"
+/// (`Scroll`/`Auto`). `Visible` does neither.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+pub enum Overflow {
+    #[default]
+    Visible,
+    Hidden,
+    Clip,
+    Scroll,
+    Auto,
+}
+
+impl Overflow {
+    /// True when this value clips overflow to the padding box.
+    pub fn clips(self) -> bool {
+        !matches!(self, Self::Visible)
+    }
+    /// True when this value establishes an independently scrollable region.
+    pub fn is_scrollable(self) -> bool {
+        matches!(self, Self::Scroll | Self::Auto)
+    }
 }
 
 /// CSS `background-repeat`. `Repeat` is the spec default and tiles the
@@ -2781,6 +2951,10 @@ fn build_box_inner(node: &StyledNode, cfg: &LayoutConfig) -> LayoutBox {
                 table_col_span: node.style.table_col_span,
                 table_row_span: node.style.table_row_span,
                 overflow_hidden: node.style.overflow_hidden,
+                overflow_x: node.style.overflow_x,
+                overflow_y: node.style.overflow_y,
+                scroll_offset_x: 0.0,
+                scroll_offset_y: 0.0,
                 visibility_hidden: node.style.visibility_hidden.unwrap_or(false),
                 opacity: node.style.opacity.unwrap_or(1.0),
                 border_radius_px: node.style.border_radius_px.unwrap_or(0.0),
@@ -2909,6 +3083,10 @@ fn build_box_inner(node: &StyledNode, cfg: &LayoutConfig) -> LayoutBox {
             table_col_span: None,
             table_row_span: None,
             overflow_hidden: false,
+            overflow_x: Overflow::Visible,
+            overflow_y: Overflow::Visible,
+            scroll_offset_x: 0.0,
+            scroll_offset_y: 0.0,
             visibility_hidden: false,
             opacity: 1.0,
             border_radius_px: 0.0,
@@ -3029,6 +3207,108 @@ pub fn hit_test_element_path(root: &LayoutBox, x: f32, y: f32) -> Option<Vec<usi
     }
     walk(root, x, y, &mut best);
     best.and_then(|b| b.element_path.clone())
+}
+
+/// Hit-test for the chain of scroll containers under document point
+/// `(x, y)`, innermost first. Each entry is `(node_id, max_scroll_left,
+/// max_scroll_top)`. Wheel routing scrolls the innermost container that
+/// can still move in the wheel's direction, then chains outward to the
+/// next ancestor at the edge — matching Blink's scroll-chaining
+/// (`scroll_manager.cc` / `RecursiveScrollMethod`). Boxes without a stable
+/// `node_id` are skipped (we can't address their offset across frames).
+///
+/// IMPORTANT: the hit-test uses each box's PADDING box, and the point
+/// must already have any ancestor scroll offsets applied by the caller —
+/// here we walk in document/layout coordinates, which is what the
+/// snapshot tree holds, and adjust for scroll as we descend.
+pub fn scroll_chain_at(root: &LayoutBox, x: f32, y: f32) -> Vec<ScrollTarget> {
+    let mut chain: Vec<ScrollTarget> = Vec::new();
+    // `(sx, sy)` is the accumulated scroll offset of ancestors, which
+    // shifts where descendants actually appear on screen.
+    fn walk(b: &LayoutBox, x: f32, y: f32, sx: f32, sy: f32, chain: &mut Vec<ScrollTarget>) {
+        // The padding box, shifted by ancestor scroll, is where this box's
+        // children currently appear. The box itself is positioned in flow
+        // (already shifted by ancestor scroll via sx/sy).
+        let pad = b.padding_rect();
+        let bx = pad.x - sx;
+        let by = pad.y - sy;
+        let inside = x >= bx && x < bx + pad.w && y >= by && y < by + pad.h;
+        if !inside {
+            return;
+        }
+        // This box's own children are further shifted by THIS box's scroll.
+        let (csx, csy) = if b.is_scroll_container() {
+            (sx + b.scroll_offset_x, sy + b.scroll_offset_y)
+        } else {
+            (sx, sy)
+        };
+        for c in &b.children {
+            walk(c, x, y, csx, csy, chain);
+        }
+        // Push AFTER children so the innermost container ends up first.
+        if b.is_scroll_container() {
+            if let Some(id) = b.node_id {
+                chain.push(ScrollTarget {
+                    node_id: id,
+                    cur_left: b.scroll_offset_x,
+                    cur_top: b.scroll_offset_y,
+                    max_left: if b.overflow_x.is_scrollable() {
+                        b.max_scroll_left()
+                    } else {
+                        0.0
+                    },
+                    max_top: if b.overflow_y.is_scrollable() {
+                        b.max_scroll_top()
+                    } else {
+                        0.0
+                    },
+                });
+            }
+        }
+    }
+    walk(root, x, y, 0.0, 0.0, &mut chain);
+    chain
+}
+
+/// One link in a scroll chain (see [`scroll_chain_at`]): the scroll
+/// container's stable id, its current offset, and the legal max offset on
+/// each axis. Wheel routing scrolls the innermost target that can still move
+/// in the wheel direction, then chains outward.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct ScrollTarget {
+    pub node_id: u64,
+    pub cur_left: f32,
+    pub cur_top: f32,
+    pub max_left: f32,
+    pub max_top: f32,
+}
+
+/// Find the box with the given stable `node_id` (mutable). Used to apply a
+/// scroll-offset delta produced by wheel/keyboard input back into the
+/// layout snapshot so the next paint reflects it.
+pub fn find_box_by_node_id_mut(root: &mut LayoutBox, id: u64) -> Option<&mut LayoutBox> {
+    if root.node_id == Some(id) {
+        return Some(root);
+    }
+    for c in &mut root.children {
+        if let Some(found) = find_box_by_node_id_mut(c, id) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// Find the box with the given stable `node_id` (shared).
+pub fn find_box_by_node_id(root: &LayoutBox, id: u64) -> Option<&LayoutBox> {
+    if root.node_id == Some(id) {
+        return Some(root);
+    }
+    for c in &root.children {
+        if let Some(found) = find_box_by_node_id(c, id) {
+            return Some(found);
+        }
+    }
+    None
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -8657,5 +8937,211 @@ mod tests {
             y0,
             y1
         );
+    }
+
+    // ── Element-level scrolling (overflow:auto/scroll) ──────────────────────
+
+    /// A fixed-height `overflow:auto` div with a much taller child is a
+    /// scroll container; scrollHeight reflects the full content, clientHeight
+    /// the padding box, and the two yield a non-zero max scrollTop.
+    fn scroller_with_tall_child() -> LayoutBox {
+        // 200px-tall viewport with 20px padding all round, holding a
+        // 1000px-tall child. box-sizing content-box.
+        let child = block(
+            "div",
+            Style {
+                display: Some(Display::Block),
+                width: Some(LengthSpec::Px(100.0)),
+                height: Some(LengthSpec::Px(1000.0)),
+                ..Style::default()
+            },
+            vec![],
+        );
+        let scroller = block(
+            "div",
+            Style {
+                display: Some(Display::Block),
+                width: Some(LengthSpec::Px(160.0)),
+                height: Some(LengthSpec::Px(160.0)),
+                padding: EdgeSizes {
+                    top: 20.0,
+                    right: 20.0,
+                    bottom: 20.0,
+                    left: 20.0,
+                },
+                overflow_y: Overflow::Auto,
+                overflow_x: Overflow::Auto,
+                ..Style::default()
+            },
+            vec![child],
+        );
+        let root = layout(&scroller, &LayoutConfig::default());
+        // The root wraps the page; descend to our scroller box.
+        find_scroller(&root).expect("scroller present").clone()
+    }
+
+    fn find_scroller(b: &LayoutBox) -> Option<&LayoutBox> {
+        if b.is_scroll_container() {
+            return Some(b);
+        }
+        for c in &b.children {
+            if let Some(s) = find_scroller(c) {
+                return Some(s);
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn scroll_container_geometry_matches_chrome_box_model() {
+        let s = scroller_with_tall_child();
+        assert!(s.is_scroll_container(), "overflow:auto box scrolls");
+        // content-box sizing: height:160px sets the CONTENT height to 160.
+        // clientHeight = padding box = content (160) + top+bottom padding
+        // (40) = 200.
+        assert!(
+            (s.client_height() - 200.0).abs() < 0.5,
+            "clientHeight should be the padding box (200), got {}",
+            s.client_height()
+        );
+        // scrollHeight = padding-top + full content + padding-bottom. The
+        // 1000px child plus 20px top + 20px bottom padding = 1040.
+        assert!(
+            (s.scroll_height() - 1040.0).abs() < 1.0,
+            "scrollHeight should span the full content + padding (~1040), got {}",
+            s.scroll_height()
+        );
+        // max scrollTop = scrollHeight - clientHeight = 1040 - 200 = 840.
+        assert!(
+            (s.max_scroll_top() - 840.0).abs() < 1.0,
+            "max scrollTop should be 840, got {}",
+            s.max_scroll_top()
+        );
+    }
+
+    #[test]
+    fn scroll_offset_clamps_to_legal_range() {
+        let mut s = scroller_with_tall_child();
+        let max_y = s.max_scroll_top();
+        // Over-scroll past the bottom clamps to max.
+        s.scroll_offset_y = 99999.0;
+        s.clamp_scroll();
+        assert!(
+            (s.scroll_offset_y - max_y).abs() < 0.5,
+            "over-scroll clamps to max ({}), got {}",
+            max_y,
+            s.scroll_offset_y
+        );
+        // Negative scroll clamps to 0.
+        s.scroll_offset_y = -50.0;
+        s.clamp_scroll();
+        assert_eq!(s.scroll_offset_y, 0.0, "negative scroll clamps to 0");
+        // A mid value is preserved.
+        s.scroll_offset_y = 300.0;
+        s.clamp_scroll();
+        assert!(
+            (s.scroll_offset_y - 300.0).abs() < 0.5,
+            "in-range scroll preserved, got {}",
+            s.scroll_offset_y
+        );
+    }
+
+    #[test]
+    fn non_scrollable_axis_pins_offset_to_zero() {
+        let mut s = scroller_with_tall_child();
+        // Make the horizontal axis non-scrollable; a horizontal offset must
+        // be pinned even though there'd be room (child is narrower, so no
+        // overflow anyway, but the pin must hold regardless).
+        s.overflow_x = Overflow::Visible;
+        s.scroll_offset_x = 40.0;
+        s.clamp_scroll();
+        assert_eq!(
+            s.scroll_offset_x, 0.0,
+            "overflow-x:visible pins scrollLeft to 0"
+        );
+    }
+
+    #[test]
+    fn visible_overflow_is_not_a_scroll_container() {
+        let plain = block(
+            "div",
+            Style {
+                display: Some(Display::Block),
+                width: Some(LengthSpec::Px(100.0)),
+                height: Some(LengthSpec::Px(50.0)),
+                ..Style::default()
+            },
+            vec![text("hi")],
+        );
+        let root = layout(&plain, &LayoutConfig::default());
+        assert!(
+            find_scroller(&root).is_none(),
+            "a plain overflow:visible box never scrolls"
+        );
+    }
+
+    #[test]
+    fn scroll_chain_finds_innermost_then_ancestor() {
+        // Outer scroller (node_id 1) holds an inner scroller (node_id 2)
+        // holding a tall child. A point inside the inner scroller's padding
+        // box must return [inner, outer] — innermost first.
+        let inner_child = block(
+            "div",
+            Style {
+                display: Some(Display::Block),
+                width: Some(LengthSpec::Px(80.0)),
+                height: Some(LengthSpec::Px(2000.0)),
+                ..Style::default()
+            },
+            vec![],
+        );
+        let inner = block(
+            "div",
+            Style {
+                display: Some(Display::Block),
+                width: Some(LengthSpec::Px(150.0)),
+                height: Some(LengthSpec::Px(120.0)),
+                overflow_y: Overflow::Scroll,
+                ..Style::default()
+            },
+            vec![inner_child],
+        );
+        let outer = block(
+            "div",
+            Style {
+                display: Some(Display::Block),
+                width: Some(LengthSpec::Px(200.0)),
+                height: Some(LengthSpec::Px(160.0)),
+                overflow_y: Overflow::Scroll,
+                ..Style::default()
+            },
+            vec![inner],
+        );
+        let mut root = layout(&outer, &LayoutConfig::default());
+        // Tag the two scroll containers with stable node ids (the test
+        // layout pipeline doesn't thread arena ids).
+        fn tag(b: &mut LayoutBox, next: &mut u64) {
+            if b.is_scroll_container() {
+                *next += 1;
+                b.node_id = Some(*next);
+            }
+            for c in &mut b.children {
+                tag(c, next);
+            }
+        }
+        let mut n = 0u64;
+        tag(&mut root, &mut n);
+        // node 1 = outer (visited first top-down), node 2 = inner.
+        let outer_box = find_box_by_node_id(&root, 1).unwrap();
+        let inner_box = find_box_by_node_id(&root, 2).unwrap();
+        let p = inner_box.padding_rect();
+        let (px, py) = (p.x + 5.0, p.y + 5.0);
+        let chain = scroll_chain_at(&root, px, py);
+        assert_eq!(chain.len(), 2, "point is inside both scrollers: {:?}", chain);
+        assert_eq!(chain[0].node_id, 2, "innermost (inner) first");
+        assert_eq!(chain[1].node_id, 1, "outer ancestor second");
+        // Both report a positive max scrollTop.
+        assert!(chain[0].max_top > 0.0 && chain[1].max_top > 0.0);
+        let _ = outer_box;
     }
 }

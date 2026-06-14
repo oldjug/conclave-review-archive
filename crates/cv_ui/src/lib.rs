@@ -2525,6 +2525,72 @@ fn draw_scrollbar_into_frame(
 /// Centralised paint swap: install `new_paint` and update the window
 /// title + URL bar text. Used everywhere a navigator/ticker delivers
 /// fresh paint data.
+/// Route a mouse-wheel delta to the innermost element-level scroll container
+/// under the cursor (Blink scroll chaining). Returns `true` if an element
+/// absorbed the scroll (so the page must NOT also scroll), `false` to fall
+/// through to page scrolling.
+///
+/// `dy` is the CSS-px delta to ADD to the chosen container's vertical scroll
+/// offset (already sign-corrected: wheel-down → positive `dy` → scroll down).
+/// We pick the innermost scroll container that still has headroom in the
+/// wheel's direction; if the innermost is pinned at its edge, we chain outward
+/// to the next ancestor (exactly Chrome's overscroll/scroll-chaining model).
+/// When no container can move, we return `false` and the page scrolls.
+fn route_wheel_to_element(
+    hwnd: sys::HWND,
+    state_ptr: *mut std::cell::RefCell<WindowState>,
+    dy: f32,
+) -> bool {
+    if dy == 0.0 {
+        return false;
+    }
+    // Cursor → client → content coordinates (mirror dispatch_mouse_url).
+    let mut pt = sys::POINT { x: 0, y: 0 };
+    unsafe {
+        if sys::GetCursorPos(&mut pt) == 0 {
+            return false;
+        }
+        sys::ScreenToClient(hwnd, &mut pt);
+    }
+    let mut guard = unsafe { (*state_ptr).borrow_mut() };
+    let chrome_h = guard.paint.chrome_h as i32;
+    // Wheel over the chrome strip never scrolls page content.
+    if pt.y < chrome_h {
+        return false;
+    }
+    let content_x = pt.x as f32;
+    let content_y = (pt.y - chrome_h) as f32 + guard.scroll_y as f32;
+    let Some(root) = guard.paint.layout_root.as_ref() else {
+        return false;
+    };
+    let chain = cv_layout::scroll_chain_at(root, content_x, content_y);
+    if chain.is_empty() {
+        return false;
+    }
+    // Innermost-first: pick the first target with headroom in the wheel's
+    // direction. Vertical only here (horizontal-wheel/shift-wheel is a
+    // follow-up); a container with max_top == 0 (no vertical overflow) is
+    // skipped so the scroll chains past it.
+    let target = chain.iter().find(|t| {
+        if dy > 0.0 {
+            t.cur_top < t.max_top - 0.5 // room to scroll down
+        } else {
+            t.cur_top > 0.5 // room to scroll up
+        }
+    });
+    let Some(t) = target else {
+        // Every container is pinned at the edge in this direction → let the
+        // page scroll (outermost overscroll).
+        return false;
+    };
+    let node_id = t.node_id;
+    drop(guard);
+    let cmd = format!("tb-scroll:{node_id}:0:{dy}");
+    let mut guard = unsafe { (*state_ptr).borrow_mut() };
+    pump_input_command(&mut guard, hwnd, &cmd);
+    true
+}
+
 /// Dispatch a content INPUT command (`tb-mouse:` / `tb-key:` / `tb-typed:` /
 /// `tb-backspace:` / `tb-enter:` / `tb-element:` / `tb-link-click:`) — an event
 /// on the CURRENT page, NOT a navigation. OFF-MAIN: send it to the renderer
@@ -4562,19 +4628,26 @@ unsafe extern "system" fn wnd_proc(
             let delta = ((wparam >> 16) & 0xFFFF) as i16;
             let state_ptr = OWNER_PTR.load(Ordering::SeqCst);
             if !state_ptr.is_null() {
-                let mut guard = unsafe { (*state_ptr).borrow_mut() };
                 let lines = (delta as i32) / 120;
                 // Win32 convention: wheel-DOWN (toward user) = NEGATIVE delta,
                 // and scrolling down means advancing INTO the document (content
                 // slides up, scroll_y INCREASES). So scroll_y must move OPPOSITE
-                // the delta sign: scroll_y -= lines*step. The old `+= lines*60`
-                // inverted this — wheel-down produced negative lines and DECREASED
-                // scroll_y, which clamped to 0, so the page never scrolled down
-                // (the exact bug: hyvechain wouldn't scroll). 60px per line ≈ 3
+                // the delta sign: scroll_y -= lines*step. 60px per line ≈ 3
                 // lines/notch like Chrome's default.
-                guard.scroll_y -= lines * 60;
-                clamp_scroll(&mut guard, hwnd);
-                publish_scroll(&guard, hwnd);
+                let dy = -(lines * 60) as f32; // px to ADD to a scroll offset
+                // ── Element-level scroll routing (Blink scroll chaining) ──────
+                // Map the wheel position to the innermost scroll container under
+                // the cursor that can still move in the wheel's direction; if
+                // found, scroll IT (route a tb-scroll command to the renderer)
+                // instead of the page. At the edge, chain outward to the next
+                // ancestor; if nothing can absorb it, fall through to page scroll.
+                let routed = route_wheel_to_element(hwnd, state_ptr, dy);
+                if !routed {
+                    let mut guard = unsafe { (*state_ptr).borrow_mut() };
+                    guard.scroll_y -= lines * 60;
+                    clamp_scroll(&mut guard, hwnd);
+                    publish_scroll(&guard, hwnd);
+                }
             }
             0
         }
