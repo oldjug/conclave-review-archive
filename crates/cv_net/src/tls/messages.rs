@@ -215,6 +215,43 @@ fn grease_value_b() -> u16 {
     0xBABA
 }
 
+/// Whether to offer `h2` (then `http/1.1`) in the ClientHello ALPN
+/// extension. **Default OFF** — read once from the `CV_HTTP2` env var.
+///
+/// h1.1-only is the production default because Cloudflare/Google
+/// fingerprint the full h2 byte sequence (Akamai h2 fingerprint +
+/// PRIORITY_UPDATE framing) and RST an h2 stream that doesn't match,
+/// which would break sites that work over h1.1. The downstream h2
+/// client (http2.rs) is Chrome-shaped and READY; this flag is the one
+/// gate that lets a server select h2. `CV_HTTP2=1`/`true` turns it on;
+/// unset or any other value keeps it off. Cached per-process so the
+/// offer can never drift mid-session.
+pub fn http2_alpn_enabled() -> bool {
+    use std::sync::OnceLock;
+    static F: OnceLock<bool> = OnceLock::new();
+    *F.get_or_init(|| {
+        std::env::var("CV_HTTP2")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
+}
+
+/// Encode the ALPN `ProtocolNameList` body (RFC 7301 §3.1) into `w`,
+/// which is positioned inside the extension_data's outer u16-length
+/// vector. Each protocol is a 1-byte-length-prefixed name. When
+/// `offer_h2` is set, `h2` is offered FIRST (Chrome's preference order),
+/// then `http/1.1`; otherwise only `http/1.1`. Pulled out as a pure
+/// helper so the byte output of both branches is unit-testable without
+/// toggling the process-cached `CV_HTTP2` env flag.
+fn encode_alpn_protocol_list(w: &mut Encoder, offer_h2: bool) {
+    w.vec_u16(|w| {
+        if offer_h2 {
+            w.vec_u8(|w| w.bytes(b"h2"));
+        }
+        w.vec_u8(|w| w.bytes(b"http/1.1"));
+    });
+}
+
 /// no `HandshakeType` byte — caller wraps).
 ///
 /// `client_random`: 32 random bytes.
@@ -320,8 +357,8 @@ pub fn build_client_hello_body(
         w.u16(ExtensionType::SessionTicket as u16);
         w.vec_u16(|_| {});
 
-        // 8. ALPN — http/1.1 only. Tried "h2,http/1.1" with a full
-        // Chrome-shaped h2 client (SETTINGS values, WINDOW_UPDATE,
+        // 8. ALPN. DEFAULT: http/1.1 only. Tried "h2,http/1.1" with a
+        // full Chrome-shaped h2 client (SETTINGS values, WINDOW_UPDATE,
         // alphabetical headers, Huffman HPACK, priority header).
         // Cloudflare's bot manager (thehindu) and Google's frontend
         // BOTH still reject the h2 stream — they fingerprint deeper
@@ -330,12 +367,19 @@ pub fn build_client_hello_body(
         // Advertising h2 forces those servers onto an h2 channel
         // they then close, breaking sites that worked over h1.1.
         // h1.1-only is the strictly-better net until the h2 path
-        // can clear those checks (separate slice — needs Wireshark).
+        // can clear those checks (separate live-soak slice).
+        //
+        // FLAG: `CV_HTTP2=1` flips the offer to Chrome's exact
+        // "h2","http/1.1" list (RFC 7301 §3.1, in preference order).
+        // When the server then selects h2, the downstream pipeline
+        // (http1.rs `alpn=="h2"` branch → http2.rs `Connection::
+        // new_client`) sends the Chrome-exact preface + SETTINGS +
+        // stream-0 WINDOW_UPDATE + m/a/s/p HEADERS. Default-OFF until
+        // that sequence clears the live fingerprint check; turning it
+        // on must NOT regress h1.1 sites, so it stays opt-in.
         w.u16(ExtensionType::ApplicationLayerProtocolNegotiation as u16);
         w.vec_u16(|w| {
-            w.vec_u16(|w| {
-                w.vec_u8(|w| w.bytes(b"http/1.1"));
-            });
+            encode_alpn_protocol_list(w, http2_alpn_enabled());
         });
 
         // 9. status_request — OCSP.
@@ -802,5 +846,119 @@ mod tests {
         assert_eq!(&rec[1..3], &[0x03, 0x03]);
         let rec_len = u16::from_be_bytes([rec[3], rec[4]]) as usize;
         assert_eq!(rec_len, hs.len());
+    }
+
+    // ==================================================================
+    // CV_HTTP2 ALPN offer — byte-level (offline, no env toggle needed).
+    //
+    // The `CV_HTTP2` flag itself is process-cached via OnceLock, so we
+    // assert the load-bearing pure helper `encode_alpn_protocol_list`
+    // for BOTH branches, and confirm it is genuinely wired into the
+    // ClientHello by scanning a real body for the ALPN extension.
+    // ==================================================================
+
+    /// Build just the ALPN ProtocolNameList body (RFC 7301 §3.1) for the
+    /// given flag value.
+    fn alpn_list_bytes(offer_h2: bool) -> Vec<u8> {
+        let mut e = Encoder::new();
+        encode_alpn_protocol_list(&mut e, offer_h2);
+        e.buf
+    }
+
+    /// Split an ALPN ProtocolNameList body into its protocol strings.
+    fn parse_alpn_list(body: &[u8]) -> Vec<String> {
+        // body = u16 list_length || (u8 name_len || name)*
+        let mut out = Vec::new();
+        let list_len = u16::from_be_bytes([body[0], body[1]]) as usize;
+        let mut i = 2;
+        let end = 2 + list_len;
+        while i < end {
+            let n = body[i] as usize;
+            i += 1;
+            out.push(String::from_utf8(body[i..i + n].to_vec()).unwrap());
+            i += n;
+        }
+        out
+    }
+
+    #[test]
+    fn alpn_offer_excludes_h2_when_flag_off() {
+        let body = alpn_list_bytes(false);
+        let protos = parse_alpn_list(&body);
+        assert_eq!(protos, vec!["http/1.1".to_string()]);
+        // Exact wire: u16 list_len=9, u8 len=8, "http/1.1".
+        assert_eq!(body, vec![0x00, 0x09, 0x08, b'h', b't', b't', b'p', b'/', b'1', b'.', b'1']);
+    }
+
+    #[test]
+    fn alpn_offer_includes_h2_first_when_flag_on() {
+        let body = alpn_list_bytes(true);
+        let protos = parse_alpn_list(&body);
+        // Chrome's preference order: h2 FIRST, then http/1.1.
+        assert_eq!(protos, vec!["h2".to_string(), "http/1.1".to_string()]);
+        // Exact wire: u16 list_len=12, [u8 2,"h2"], [u8 8,"http/1.1"].
+        assert_eq!(
+            body,
+            vec![0x00, 0x0c, 0x02, b'h', b'2', 0x08, b'h', b't', b't', b'p', b'/', b'1', b'.', b'1']
+        );
+    }
+
+    /// Find the ALPN extension's ProtocolNameList body inside a full
+    /// ClientHello body. Returns None if the extension is absent.
+    fn find_alpn_in_client_hello(body: &[u8]) -> Option<Vec<u8>> {
+        // Walk to the extensions block: legacy_version(2) random(32)
+        // session_id(1+len) cipher_suites(2+len) compression(1+len)
+        // extensions(2+len).
+        let mut i = 2 + 32;
+        let sid_len = body[i] as usize;
+        i += 1 + sid_len;
+        let cs_len = u16::from_be_bytes([body[i], body[i + 1]]) as usize;
+        i += 2 + cs_len;
+        let comp_len = body[i] as usize;
+        i += 1 + comp_len;
+        let ext_total = u16::from_be_bytes([body[i], body[i + 1]]) as usize;
+        i += 2;
+        let ext_end = i + ext_total;
+        while i + 4 <= ext_end {
+            let ext_type = u16::from_be_bytes([body[i], body[i + 1]]);
+            let ext_len = u16::from_be_bytes([body[i + 2], body[i + 3]]) as usize;
+            let data = &body[i + 4..i + 4 + ext_len];
+            if ext_type == ExtensionType::ApplicationLayerProtocolNegotiation as u16 {
+                return Some(data.to_vec());
+            }
+            i += 4 + ext_len;
+        }
+        None
+    }
+
+    #[test]
+    fn client_hello_carries_alpn_extension_matching_flag() {
+        // Confirms the helper is actually WIRED into the ClientHello (not
+        // just unit-tested in isolation). The flag is process-cached, so
+        // we assert the live offer is one of the two valid shapes AND
+        // that it equals what the helper produces for the live flag.
+        let cr = [0x42u8; 32];
+        let sid = [0x88u8; 32];
+        let ks_pub = [0x11u8; 32];
+        let mut ks_p256 = [0u8; 65];
+        ks_p256[0] = 0x04;
+        let mut ks_p384 = [0u8; 97];
+        ks_p384[0] = 0x04;
+        let body = build_client_hello_body(&cr, &sid, &ks_pub, &ks_p256, &ks_p384, "example.com");
+        let alpn = find_alpn_in_client_hello(&body).expect("ALPN extension present");
+        let protos = parse_alpn_list(&alpn);
+        // http/1.1 is ALWAYS offered, regardless of the flag.
+        assert!(protos.contains(&"http/1.1".to_string()));
+        // The live extension equals the helper output for the live flag.
+        assert_eq!(alpn, alpn_list_bytes(http2_alpn_enabled()));
+        // And the two valid shapes are the only possibilities.
+        assert!(
+            protos == vec!["http/1.1".to_string()]
+                || protos == vec!["h2".to_string(), "http/1.1".to_string()]
+        );
+        // When h2 is offered it MUST be first (Chrome preference order).
+        if protos.len() == 2 {
+            assert_eq!(protos[0], "h2");
+        }
     }
 }

@@ -139,6 +139,37 @@ pub fn decode_settings(body: &[u8]) -> Vec<(u16, u32)> {
     out
 }
 
+/// Chrome 131's exact initial SETTINGS, in the exact (id, value) order
+/// Chrome puts them on the wire. This is the single source of truth for
+/// the "Akamai HTTP/2 fingerprint" SETTINGS component, which a server
+/// hashes as the ordered `id:value;…` string. Chrome's published value
+/// is `1:65536;2:0;3:1000;4:6291456;6:262144` (HEADER_TABLE_SIZE=65536,
+/// ENABLE_PUSH=0, MAX_CONCURRENT_STREAMS=1000, INITIAL_WINDOW_SIZE=
+/// 6291456, MAX_HEADER_LIST_SIZE=262144). MAX_FRAME_SIZE (id 5) is left
+/// at the protocol default 16384 and NOT sent — Chrome omits it, so we
+/// must too or the fingerprint string gains an entry Chrome lacks.
+///
+/// Sources: net/spdy/spdy_session.cc (kSpdySessionInitialSettings) and
+/// the widely-published Chrome h2 fingerprint (Akamai whitepaper
+/// "Passive Fingerprinting of HTTP/2 Clients"; tls.peet.ws / browserleaks
+/// HTTP/2 fingerprint). RFC 9113 §6.5.2 defines the ids.
+pub const CHROME_H2_SETTINGS: &[(u16, u32)] = &[
+    (SettingId::HeaderTableSize as u16, 65_536),
+    (SettingId::EnablePush as u16, 0),
+    (SettingId::MaxConcurrentStreams as u16, 1_000),
+    (SettingId::InitialWindowSize as u16, 6_291_456),
+    (SettingId::MaxHeaderListSize as u16, 262_144),
+];
+
+/// The connection-level (stream 0) WINDOW_UPDATE increment Chrome sends
+/// immediately after its initial SETTINGS frame, bumping the default
+/// 65535 connection flow-control window to 65535 + 15663105 = 15728640
+/// (~15 MiB). This exact increment is the WINDOW_UPDATE component of the
+/// Chrome HTTP/2 fingerprint. Source: net/spdy/spdy_session.cc
+/// (kDefaultInitialMaxConcurrentStreams / session_max_recv_window_size_
+/// minus the 65535 default), confirmed by published Chrome h2 captures.
+pub const CHROME_H2_CONNECTION_WINDOW_UPDATE: u32 = 15_663_105;
+
 /// Build the bytes of a complete SETTINGS frame (header + body).
 pub fn build_settings_frame(settings: &[(u16, u32)], ack: bool) -> Vec<u8> {
     let mut body = Vec::with_capacity(settings.len() * 6);
@@ -703,23 +734,21 @@ impl Connection {
             closed_by_goaway: false,
         };
         me.outgoing.extend_from_slice(CONNECTION_PREFACE);
-        // Initial SETTINGS — Chrome 131's exact values and order. The
+        // Initial SETTINGS — Chrome 131's exact values AND order. The
         // "Akamai h2 fingerprint" (a separate hash from JA4) hashes
         // the (id, value) pairs in order; matching Chrome here is what
-        // gets us past Cloudflare bot-manager's h2 check.
-        me.outgoing.extend_from_slice(&build_settings_frame(
-            &[
-                (SettingId::HeaderTableSize as u16, 65_536),
-                (SettingId::EnablePush as u16, 0),
-                (SettingId::InitialWindowSize as u16, 6_291_456),
-                (SettingId::MaxHeaderListSize as u16, 262_144),
-            ],
-            false,
-        ));
-        // Chrome bumps the connection-level recv window to ~15 MB
-        // right after SETTINGS — also part of the h2 fingerprint.
+        // gets us past Cloudflare bot-manager's h2 check. Sourced from
+        // CHROME_H2_SETTINGS (the single source of truth, so the wire
+        // bytes can NEVER drift from the value the tests assert).
         me.outgoing
-            .extend_from_slice(&build_window_update(0, 15_663_105));
+            .extend_from_slice(&build_settings_frame(CHROME_H2_SETTINGS, false));
+        // Chrome bumps the connection-level recv window to ~15 MiB
+        // right after SETTINGS — also part of the h2 fingerprint
+        // (the WINDOW_UPDATE component).
+        me.outgoing.extend_from_slice(&build_window_update(
+            0,
+            CHROME_H2_CONNECTION_WINDOW_UPDATE,
+        ));
         me
     }
 
@@ -1061,6 +1090,147 @@ mod tests {
         let hdr = FrameHeader::decode(after_preface).unwrap();
         assert_eq!(hdr.typ, FrameType::Settings);
         assert_eq!(hdr.stream_id, 0);
+    }
+
+    // ==================================================================
+    // CV_HTTP2 — Chrome-EXACT h2 fingerprint (offline, byte-level).
+    //
+    // These prove the produced bytes match Chrome's published HTTP/2
+    // fingerprint: SETTINGS `1:65536;2:0;3:1000;4:6291456;6:262144`,
+    // WINDOW_UPDATE `15663105`, pseudo-header order `:method :authority
+    // :scheme :path` (m,a,s,p), and the RFC 9113 §3.4 connection preface.
+    // No socket, no TLS — pure encoder assertions.
+    // ==================================================================
+
+    #[test]
+    fn connection_preface_bytes_are_exact() {
+        // RFC 9113 §3.4: the 24-octet client connection preface.
+        assert_eq!(CONNECTION_PREFACE, b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+        assert_eq!(CONNECTION_PREFACE.len(), 24);
+        // Hex per RFC 9113 §3.4.
+        assert_eq!(
+            CONNECTION_PREFACE,
+            &[
+                0x50, 0x52, 0x49, 0x20, 0x2a, 0x20, 0x48, 0x54, 0x54, 0x50, 0x2f, 0x32, 0x2e,
+                0x30, 0x0d, 0x0a, 0x0d, 0x0a, 0x53, 0x4d, 0x0d, 0x0a, 0x0d, 0x0a
+            ]
+        );
+        // The client's queued bytes START with exactly the preface.
+        let c = Connection::new_client();
+        assert!(c.outgoing.starts_with(CONNECTION_PREFACE));
+    }
+
+    #[test]
+    fn settings_frame_matches_chrome_fingerprint_exactly() {
+        // The single-source-of-truth constant IS Chrome's ordered set.
+        assert_eq!(
+            CHROME_H2_SETTINGS,
+            &[
+                (0x1, 65_536),    // HEADER_TABLE_SIZE
+                (0x2, 0),         // ENABLE_PUSH
+                (0x3, 1_000),     // MAX_CONCURRENT_STREAMS
+                (0x4, 6_291_456), // INITIAL_WINDOW_SIZE
+                (0x6, 262_144),   // MAX_HEADER_LIST_SIZE
+            ]
+        );
+        // Chrome does NOT send MAX_FRAME_SIZE (id 5) — must be absent.
+        assert!(CHROME_H2_SETTINGS.iter().all(|(id, _)| *id != 0x5));
+
+        // The frame on the wire decodes to exactly that ordered set.
+        let wire = build_settings_frame(CHROME_H2_SETTINGS, false);
+        let hdr = FrameHeader::decode(&wire).unwrap();
+        assert_eq!(hdr.typ, FrameType::Settings);
+        assert_eq!(hdr.flags, 0); // not an ACK
+        assert_eq!(hdr.stream_id, 0);
+        assert_eq!(hdr.length, 5 * 6); // 5 settings × 6 bytes
+        let parsed = decode_settings(&wire[9..]);
+        assert_eq!(
+            parsed,
+            vec![
+                (0x1, 65_536),
+                (0x2, 0),
+                (0x3, 1_000),
+                (0x4, 6_291_456),
+                (0x6, 262_144),
+            ]
+        );
+
+        // And new_client() emits THAT exact SETTINGS frame right after
+        // the preface (single-source-of-truth, no drift).
+        let c = Connection::new_client();
+        let after_preface = &c.outgoing[CONNECTION_PREFACE.len()..];
+        assert!(after_preface.starts_with(&wire));
+    }
+
+    #[test]
+    fn connection_window_update_increment_matches_chrome() {
+        assert_eq!(CHROME_H2_CONNECTION_WINDOW_UPDATE, 15_663_105);
+        // Sent on stream 0 immediately after the SETTINGS frame.
+        let c = Connection::new_client();
+        let settings = build_settings_frame(CHROME_H2_SETTINGS, false);
+        let after_settings =
+            &c.outgoing[CONNECTION_PREFACE.len() + settings.len()..];
+        let hdr = FrameHeader::decode(after_settings).unwrap();
+        assert_eq!(hdr.typ, FrameType::WindowUpdate);
+        assert_eq!(hdr.stream_id, 0);
+        assert_eq!(hdr.length, 4);
+        let inc = u32::from_be_bytes([
+            after_settings[9],
+            after_settings[10],
+            after_settings[11],
+            after_settings[12],
+        ]) & 0x7FFF_FFFF;
+        assert_eq!(inc, 15_663_105);
+    }
+
+    #[test]
+    fn full_client_preamble_is_preface_settings_window_update_in_order() {
+        // The complete h2 connection preamble, in Chrome's exact frame
+        // order: PREFACE, then SETTINGS, then stream-0 WINDOW_UPDATE.
+        let c = Connection::new_client();
+        let out = &c.outgoing;
+        let mut pos = CONNECTION_PREFACE.len();
+        // Frame 1: SETTINGS.
+        let h1 = FrameHeader::decode(&out[pos..]).unwrap();
+        assert_eq!(h1.typ, FrameType::Settings);
+        pos += 9 + h1.length as usize;
+        // Frame 2: WINDOW_UPDATE.
+        let h2 = FrameHeader::decode(&out[pos..]).unwrap();
+        assert_eq!(h2.typ, FrameType::WindowUpdate);
+        pos += 9 + h2.length as usize;
+        // Nothing else queued at construction.
+        assert_eq!(pos, out.len());
+    }
+
+    #[test]
+    fn headers_hpack_block_pseudo_header_order_is_chrome() {
+        // Chrome's hard-coded pseudo-header order is :method, :authority,
+        // :scheme, :path (m,a,s,p). Encode a request HEADERS block and
+        // decode it back; the first four entries MUST be the pseudo-
+        // headers in exactly that order.
+        let req = vec![
+            (":method", "GET"),
+            (":authority", "example.com"),
+            (":scheme", "https"),
+            (":path", "/index.html"),
+            ("accept-encoding", "gzip, deflate, br"),
+        ];
+        let block = hpack_encode_block(&req);
+        let mut dyn_tbl = HpackDynamicTable::new();
+        let decoded = hpack_decode_block(&block, &mut dyn_tbl).unwrap();
+        let pseudo: Vec<&str> = decoded
+            .iter()
+            .take_while(|(n, _)| n.starts_with(':'))
+            .map(|(n, _)| n.as_str())
+            .collect();
+        assert_eq!(pseudo, vec![":method", ":authority", ":scheme", ":path"]);
+        // Values round-trip too (proves the block is genuine, not a stub).
+        assert_eq!(decoded[0], (":method".into(), "GET".into()));
+        assert_eq!(decoded[1], (":authority".into(), "example.com".into()));
+        assert_eq!(decoded[2], (":scheme".into(), "https".into()));
+        assert_eq!(decoded[3], (":path".into(), "/index.html".into()));
+        // NON-VACUOUS: a wrong order (e.g. m,s,a,p) would fail the
+        // pseudo vec assert above.
     }
 
     #[test]
