@@ -1733,6 +1733,17 @@ struct WindowState {
     /// scroll position. None when not dragging. (We dropped WS_VSCROLL so the OS
     /// no longer drives the thumb — this is our own drag.)
     scroll_drag: Option<(i32, i32)>,
+    /// HTML drag-and-drop gesture state. On a left-button press over a content
+    /// element we record `(source_element_path, press_x, press_y)`. If the
+    /// cursor then moves past the drag threshold while held, a drag is "in
+    /// progress"; on release over a target element we emit a `tb-drag:` command
+    /// so the worker runs the dragstart→dragover→drop→dragend sequence with a
+    /// real DataTransfer (HTML §6.11). None when no left-button press is held.
+    drag_press: Option<(String, i32, i32)>,
+    /// Set once the held press has moved past `DRAG_THRESHOLD_PX`, i.e. the
+    /// gesture is a drag (not a click). Distinguishes a drag-release (emit
+    /// `tb-drag:`) from a plain click-release.
+    drag_active: bool,
     /// Per-layer tile cache. Populated from the PaintData bitmap on
     /// every `apply_new_paint()`. WM_PAINT composites the visible
     /// viewport from cached tiles instead of reading the raw bitmap
@@ -3354,6 +3365,8 @@ impl Window {
                 pressed_nav: None,
                 nav_press_hot: false,
                 scroll_drag: None,
+                drag_press: None,
+                drag_active: false,
                 tile_cache: cv_compositor::TileCache::new(),
                 hw_presenter: None,
                 compositor_tx: None,
@@ -4823,6 +4836,21 @@ unsafe extern "system" fn wnd_proc(
                     ),
                     None => hit_test_regions(&guard.paint.hit_regions, x, y),
                 };
+                // Record the press source for a potential HTML drag gesture: if
+                // the cursor later moves past the threshold while held and is
+                // released over a target, we emit `tb-drag:` (HTML §6.11). We
+                // record for ANY content element (the page's `dragstart` handler
+                // / `draggable` attribute decides whether a drag actually does
+                // anything) and reset `drag_active` until the threshold is met.
+                if let Some(path) = &element_path_opt {
+                    let src = path
+                        .iter()
+                        .map(|n| n.to_string())
+                        .collect::<Vec<_>>()
+                        .join("/");
+                    guard.drag_press = Some((src, x as i32, y_raw as i32));
+                    guard.drag_active = false;
+                }
                 let url_to_navigate: Option<String> = match (href_opt, element_path_opt) {
                     (Some(href), Some(path)) => {
                         // When a link has both an href AND a known element path,
@@ -4981,6 +5009,29 @@ unsafe extern "system" fn wnd_proc(
                     }
                 }
             }
+            // HTML drag-gesture threshold: once a held left-button press has
+            // moved more than DRAG_THRESHOLD_PX from where it started, mark the
+            // gesture as a drag so the release emits `tb-drag:` instead of a
+            // plain click. Done BEFORE the move throttle so a fast drag isn't
+            // missed. (Chrome uses ~5px; we use the same.)
+            {
+                const DRAG_THRESHOLD_PX: i32 = 5;
+                let state_ptr = OWNER_PTR.load(Ordering::SeqCst);
+                if !state_ptr.is_null() {
+                    let mut guard = unsafe { (*state_ptr).borrow_mut() };
+                    if !guard.drag_active {
+                        if let Some((_src, px, py)) = guard.drag_press.clone() {
+                            let x = (lparam & 0xFFFF) as i16 as i32;
+                            let y = ((lparam >> 16) & 0xFFFF) as i16 as i32;
+                            if (x - px).abs() > DRAG_THRESHOLD_PX
+                                || (y - py).abs() > DRAG_THRESHOLD_PX
+                            {
+                                guard.drag_active = true;
+                            }
+                        }
+                    }
+                }
+            }
             // Coalesce — never fire faster than ~50 ms so JS handlers
             // doing layout-heavy work don't melt. The throttle state
             // lives in a thread-local since the GUI thread is single.
@@ -5063,6 +5114,57 @@ unsafe extern "system" fn wnd_proc(
                         trigger_nav_button(&mut guard, hwnd, pressed);
                     }
                     return 0;
+                }
+            }
+            // HTML drag-and-drop: if the press turned into a drag (moved past
+            // the threshold while held), the release completes a drag — emit a
+            // `tb-drag:<src>:<dst>:<x>:<y>` command so the worker runs the
+            // dragstart→dragover→drop→dragend sequence with a real DataTransfer
+            // (HTML §6.11). Otherwise fall through to the normal `mouseup`.
+            {
+                let state_ptr = OWNER_PTR.load(Ordering::SeqCst);
+                if !state_ptr.is_null() {
+                    let drag = {
+                        let mut guard = unsafe { (*state_ptr).borrow_mut() };
+                        let active = guard.drag_active;
+                        let press = guard.drag_press.take();
+                        guard.drag_active = false;
+                        if active { press } else { None }
+                    };
+                    if let Some((src, _px, _py)) = drag {
+                        // Hit-test the release point for the drop target path.
+                        let (dst, rx, ry) = {
+                            let guard = unsafe { (*state_ptr).borrow() };
+                            let x_raw = (lparam & 0xFFFF) as i16 as f32;
+                            let y_raw = ((lparam >> 16) & 0xFFFF) as i16 as f32;
+                            let chrome_h = guard.paint.chrome_h as f32;
+                            let cx = x_raw;
+                            let cy = if y_raw < chrome_h {
+                                y_raw
+                            } else {
+                                y_raw - chrome_h + guard.scroll_y as f32
+                            };
+                            let dst = match guard.paint.layout_root.as_ref() {
+                                Some(root) => cv_layout::hit_test_element_path(root, cx, cy)
+                                    .map(|p| {
+                                        p.iter()
+                                            .map(|n| n.to_string())
+                                            .collect::<Vec<_>>()
+                                            .join("/")
+                                    })
+                                    .unwrap_or_default(),
+                                None => String::new(),
+                            };
+                            (dst, x_raw as i32, y_raw as i32)
+                        };
+                        let url = format!("tb-drag:{src}:{dst}:{rx}:{ry}");
+                        let mut guard = unsafe { (*state_ptr).borrow_mut() };
+                        pump_input_command(&mut guard, hwnd, &url);
+                        return 0;
+                    }
+                    // Not a drag — clear any stale press record before the click.
+                    let mut guard = unsafe { (*state_ptr).borrow_mut() };
+                    guard.drag_press = None;
                 }
             }
             dispatch_mouse_url(hwnd, "mouseup", lparam, wparam);

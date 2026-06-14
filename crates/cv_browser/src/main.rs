@@ -7754,19 +7754,112 @@ fn build_browser_session(target: &str) -> Result<BrowserParts, String> {
             // Hit-tested target path arrived from the UI layer, so the
             // event fires on the deepest element under the cursor.
             // Empty path = document root (cursor fell outside any box).
-            let fired = st.runtime.dispatch_mouse_event_with_mods(
-                &event_name,
-                &target_path,
-                x,
-                y,
-                ctrl,
-                shift,
-                alt,
-                meta,
-            );
-            if !fired {
+            //
+            // Chrome (Blink PointerEventManager) fires a Pointer Event for every
+            // mouse interaction, immediately BEFORE the compatibility mouse event
+            // of the same phase (Pointer Events 3 §"Mapping for devices that
+            // support hover"). Emit the pointer twin first; if a `pointerdown`
+            // handler calls `preventDefault()`, Chrome suppresses the following
+            // compatibility mouse events for that gesture.
+            let mut pointer_fired = false;
+            let mut suppress_mouse = false;
+            if let Some(ptype) = mouse_to_pointer_event(&event_name) {
+                let (pf, prevented) = st.runtime.dispatch_pointer_event_with_mods(
+                    ptype,
+                    &target_path,
+                    x,
+                    y,
+                    ctrl,
+                    shift,
+                    alt,
+                    meta,
+                );
+                pointer_fired = pf;
+                // Per Pointer Events 3, cancelling `pointerdown` prevents the
+                // subsequent compatibility mouse events (mousedown/up/click).
+                if ptype == "pointerdown" && prevented {
+                    suppress_mouse = true;
+                }
+            }
+            // Fire the compatibility mouse event unless a cancelled pointerdown
+            // suppressed it.
+            let mouse_fired = if suppress_mouse {
+                false
+            } else {
+                st.runtime.dispatch_mouse_event_with_mods(
+                    &event_name,
+                    &target_path,
+                    x,
+                    y,
+                    ctrl,
+                    shift,
+                    alt,
+                    meta,
+                )
+            };
+            if !pointer_fired && !mouse_fired {
                 return None;
             }
+            st.runtime.flush_console();
+            let muts = st.runtime.extract_mutations();
+            let style_overrides = muts.apply_to_doc(&mut st.doc);
+            let title = st.runtime.title_override();
+            let url = st.url.clone();
+            let focus = st.focused_path.clone();
+            set_caret_pos_for_render(st.caret_pos);
+            let paint = render_paint_only_focused(
+                &st.doc,
+                &st.sheets,
+                &url,
+                &cfg_for_nav,
+                &style_overrides,
+                title,
+                focus.as_deref(),
+                None,
+            );
+            tab.title = paint.title.clone();
+            tab.paint = paint.clone();
+            return Some(paint);
+        }
+        // Drag-and-drop sequence routed from the UI layer (HTML §6.11).
+        // Encoding: `tb-drag:<srcPath>:<dstPath>:<x>:<y>`
+        // where srcPath = the drag-source element path (the one a `draggable`
+        // mousedown started on) and dstPath = the element under the cursor at
+        // release. Paths use `/`-joined indices; an empty segment = document.
+        //
+        // We run the full HTML drag-and-drop event sequence with ONE shared
+        // `DataTransfer` so a `dragstart` handler's `setData` is observable via
+        // `getData` in the `drop`/`dragover` handlers:
+        //   dragstart(src) → dragenter(dst) → dragover(dst) → drop(dst, iff
+        //   dragover was preventDefault'd) → dragend(src)
+        // Per HTML, the drop is only performed if a `dragover` (or dragenter)
+        // handler cancelled the event (signalling the target accepts the drop).
+        if let Some(rest) = url.strip_prefix("tb-drag:") {
+            let parts: Vec<&str> = rest.split(':').collect();
+            let parse_path = |s: Option<&&str>| -> Vec<usize> {
+                s.map(|s| s.split('/').filter_map(|n| n.parse().ok()).collect())
+                    .unwrap_or_default()
+            };
+            let src_path = parse_path(parts.first());
+            let dst_path = parse_path(parts.get(1));
+            let x: f32 = parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(0.0);
+            let y: f32 = parts.get(3).and_then(|s| s.parse().ok()).unwrap_or(0.0);
+            let tab = session_guard.active_mut()?;
+            let st = tab.page.as_mut()?;
+            // One DataTransfer shared across the whole drag sequence.
+            let dt = build_data_transfer();
+            // dragstart on the source.
+            st.runtime.dispatch_drag_event("dragstart", &src_path, x, y, &dt);
+            // dragenter then dragover on the target. A cancelled dragover means
+            // the target accepts the drop.
+            st.runtime.dispatch_drag_event("dragenter", &dst_path, x, y, &dt);
+            let (_over_fired, over_prevented) =
+                st.runtime.dispatch_drag_event("dragover", &dst_path, x, y, &dt);
+            if over_prevented {
+                st.runtime.dispatch_drag_event("drop", &dst_path, x, y, &dt);
+            }
+            // dragend always fires on the source to end the sequence.
+            st.runtime.dispatch_drag_event("dragend", &src_path, x, y, &dt);
             st.runtime.flush_console();
             let muts = st.runtime.extract_mutations();
             let style_overrides = muts.apply_to_doc(&mut st.doc);
@@ -7863,6 +7956,25 @@ fn build_browser_session(target: &str) -> Result<BrowserParts, String> {
             let (click_prevented, current_url): (bool, String) = {
                 let tab = session_guard.active_mut()?;
                 let st = tab.page.as_mut()?;
+                // Chrome fires pointerdown→mousedown→pointerup→mouseup before the
+                // click for a primary-button activation (Pointer Events 3). A
+                // cancelled pointerdown suppresses the compatibility mouse twins.
+                let (_pd_f, pd_prevented) = st.runtime.dispatch_pointer_event_with_mods(
+                    "pointerdown", &path, 0.0, 0.0, false, false, false, false,
+                );
+                if !pd_prevented {
+                    let _ = st.runtime.dispatch_mouse_event_with_mods(
+                        "mousedown", &path, 0.0, 0.0, false, false, false, false,
+                    );
+                }
+                let _ = st.runtime.dispatch_pointer_event_with_mods(
+                    "pointerup", &path, 0.0, 0.0, false, false, false, false,
+                );
+                if !pd_prevented {
+                    let _ = st.runtime.dispatch_mouse_event_with_mods(
+                        "mouseup", &path, 0.0, 0.0, false, false, false, false,
+                    );
+                }
                 let (_fired_any, dp) =
                     st.runtime.dispatch_event_with_bubble_status(&path, "click");
                 st.runtime.flush_console();
@@ -7985,6 +8097,30 @@ fn build_browser_session(target: &str) -> Result<BrowserParts, String> {
                     // landing 270ms into the dark phase would feel
                     // unresponsive to the user.
                     caret_blink_reset();
+                }
+                // Chrome fires the full input sequence for a primary-button
+                // click: pointerdown→mousedown (focus happens here) →
+                // pointerup→mouseup→click (Pointer Events 3 + UI Events).
+                // `tb-element:` carries no coordinates, so the pointer/mouse
+                // twins fire at the element origin (0,0); their value is that
+                // pointerdown/up fire at all with pointerType="mouse"/
+                // isPrimary=true, which sites use to begin/track interactions.
+                // `click` itself has NO pointer twin (see mouse_to_pointer_event).
+                let (_pd_fired, pd_prevented) = st.runtime.dispatch_pointer_event_with_mods(
+                    "pointerdown", &path, 0.0, 0.0, false, false, false, false,
+                );
+                if !pd_prevented {
+                    let _ = st.runtime.dispatch_mouse_event_with_mods(
+                        "mousedown", &path, 0.0, 0.0, false, false, false, false,
+                    );
+                }
+                let _ = st.runtime.dispatch_pointer_event_with_mods(
+                    "pointerup", &path, 0.0, 0.0, false, false, false, false,
+                );
+                if !pd_prevented {
+                    let _ = st.runtime.dispatch_mouse_event_with_mods(
+                        "mouseup", &path, 0.0, 0.0, false, false, false, false,
+                    );
                 }
                 let fired = st.runtime.dispatch_click(&path);
                 // Default action: clicking a checkbox/radio toggles its checked
@@ -15928,6 +16064,73 @@ impl LiveInterp {
         self.dispatch_to_path(target_path, event_type, &event_obj).0
     }
 
+    /// Dispatch a Pointer Event (pointerdown/pointermove/pointerup/pointerover/
+    /// pointerout/pointerenter/pointerleave) from the *mouse* path. Chrome fires
+    /// these alongside — and immediately before — the matching compatibility
+    /// mouse event (Pointer Events 3). Returns `(fired_any, default_prevented)`
+    /// so the caller can honour `preventDefault()` on `pointerdown`, which in
+    /// Chrome suppresses the subsequent compatibility mouse events.
+    fn dispatch_pointer_event_with_mods(
+        &mut self,
+        event_type: &str,
+        target_path: &[usize],
+        x: f32,
+        y: f32,
+        ctrl: bool,
+        shift: bool,
+        alt: bool,
+        meta: bool,
+    ) -> (bool, bool) {
+        let target_js = self.find_js_object_for_path(target_path);
+        let event_obj = build_pointer_event_with_mods(
+            event_type,
+            target_js.clone(),
+            target_js,
+            x,
+            y,
+            ctrl,
+            shift,
+            alt,
+            meta,
+        );
+        self.dispatch_to_path(target_path, event_type, &event_obj)
+    }
+
+    /// Dispatch a drag-and-drop event (dragstart/drag/dragenter/dragover/
+    /// dragleave/drop/dragend). Every DnD event exposes the same shared
+    /// `DataTransfer` (HTML §6.11) on `event.dataTransfer`, so a `setData` in a
+    /// `dragstart` handler is observable via `getData` in the `drop` handler.
+    /// The `data_transfer` Value must be the SAME object across one drag
+    /// sequence. Returns `(fired_any, default_prevented)`; a `dragover`/`drop`
+    /// handler calling `preventDefault()` is how a page signals it accepts the
+    /// drop (HTML: "the default action of dragover is to reset the drop").
+    fn dispatch_drag_event(
+        &mut self,
+        event_type: &str,
+        target_path: &[usize],
+        x: f32,
+        y: f32,
+        data_transfer: &cv_js::Value,
+    ) -> (bool, bool) {
+        let target_js = self.find_js_object_for_path(target_path);
+        let event_obj = build_mouse_event_with_mods(
+            event_type,
+            target_js.clone(),
+            target_js,
+            x,
+            y,
+            false,
+            false,
+            false,
+            false,
+        );
+        if let cv_js::Value::Object(o) = &event_obj {
+            o.borrow_mut()
+                .insert("dataTransfer".into(), data_transfer.clone());
+        }
+        self.dispatch_to_path(target_path, event_type, &event_obj)
+    }
+
     /// Unified DOM event propagation: capture (root→target), at-target, then
     /// bubble (target→root) over the element at `target_path`, honoring each
     /// listener's `capture`/`once`/`passive`/`signal` options and the event's
@@ -17355,8 +17558,14 @@ fn build_mouse_event_with_mods(
             2 => 2.0,  // right button → bit 1
             _ => 0.0,
         };
-        // mousemove / mouseenter / mouseleave with no button held → 0
-        let buttons = if matches!(event_type, "mousemove" | "mouseenter" | "mouseleave" | "mouseover" | "mouseout") {
+        // Move / boundary events have no button held → buttons = 0. Covers both
+        // the mouse twins and the pointer twins (build_pointer_event_with_mods
+        // routes through here with the pointer* type).
+        let buttons = if matches!(
+            event_type,
+            "mousemove" | "mouseenter" | "mouseleave" | "mouseover" | "mouseout"
+                | "pointermove" | "pointerenter" | "pointerleave" | "pointerover" | "pointerout"
+        ) {
             0.0
         } else {
             buttons_mask
@@ -17369,6 +17578,238 @@ fn build_mouse_event_with_mods(
         m.insert("relatedTarget".into(), cv_js::Value::Null);
     }
     base
+}
+
+/// Map a compatibility mouse event type to the Pointer Event type Chrome fires
+/// alongside it (immediately before it) for a mouse pointer. `click`/`dblclick`/
+/// `contextmenu` have NO pointer twin (Chrome fires no pointer event for them).
+/// Pointer Events 3 §"Mapping for devices that support hover".
+fn mouse_to_pointer_event(mouse_type: &str) -> Option<&'static str> {
+    match mouse_type {
+        "mousedown" => Some("pointerdown"),
+        "mousemove" => Some("pointermove"),
+        "mouseup" => Some("pointerup"),
+        "mouseover" => Some("pointerover"),
+        "mouseout" => Some("pointerout"),
+        "mouseenter" => Some("pointerenter"),
+        "mouseleave" => Some("pointerleave"),
+        _ => None,
+    }
+}
+
+/// Build a `PointerEvent`-shaped object for a *mouse* pointer.
+///
+/// Chrome (Blink `PointerEventManager`) fires a Pointer Event for every mouse
+/// interaction, immediately BEFORE the compatibility mouse event of the same
+/// phase (Pointer Events 3, "Mapping for devices that support hover":
+/// pointerover→mouseover, pointerdown→mousedown, pointermove→mousemove,
+/// pointerup→mouseup, …). A PointerEvent IS-A MouseEvent, so it carries every
+/// MouseEvent field (clientX/Y, button, buttons, modifiers) plus the
+/// pointer-specific fields below.
+///
+/// Defaults for the primary mouse pointer (Pointer Events 3 §"PointerEvent
+/// interface" and §"Attributes and Default Actions"):
+///   - `pointerId`  = 1  (UA may reserve 1 for the primary mouse pointer)
+///   - `pointerType`= "mouse"
+///   - `isPrimary`  = true
+///   - `width`/`height` = 1
+///   - `pressure`   = 0.5 while a button is held (active-buttons state), else 0
+///   - `tangentialPressure`/`tiltX`/`tiltY`/`twist` = 0
+fn build_pointer_event_with_mods(
+    event_type: &str,
+    target: cv_js::Value,
+    current_target: cv_js::Value,
+    x: f32,
+    y: f32,
+    ctrl: bool,
+    shift: bool,
+    alt: bool,
+    meta: bool,
+) -> cv_js::Value {
+    // A PointerEvent inherits the full MouseEvent shape (clientX/Y, button,
+    // buttons, modifiers), so start from the mouse builder and layer the
+    // pointer-specific fields on top.
+    let base = build_mouse_event_with_mods(
+        event_type,
+        target,
+        current_target,
+        x,
+        y,
+        ctrl,
+        shift,
+        alt,
+        meta,
+    );
+    if let cv_js::Value::Object(o) = &base {
+        let mut m = o.borrow_mut();
+        m.insert("pointerId".into(), cv_js::Value::Number(1.0));
+        m.insert("pointerType".into(), cv_js::Value::str("mouse".to_string()));
+        m.insert("isPrimary".into(), cv_js::Value::Bool(true));
+        m.insert("width".into(), cv_js::Value::Number(1.0));
+        m.insert("height".into(), cv_js::Value::Number(1.0));
+        // Active-buttons state ⇒ pressure 0.5 (no real pressure hardware for a
+        // mouse). pointerdown/up while a button transition is in flight, plus
+        // any pointer event whose `buttons` bitmask is non-zero, count as
+        // active. pointermove with no button held ⇒ 0 (Pointer Events 3).
+        let buttons = match m.get("buttons") {
+            Some(cv_js::Value::Number(n)) => *n,
+            _ => 0.0,
+        };
+        let active = matches!(event_type, "pointerdown" | "pointerup") || buttons != 0.0;
+        m.insert(
+            "pressure".into(),
+            cv_js::Value::Number(if active { 0.5 } else { 0.0 }),
+        );
+        m.insert("tangentialPressure".into(), cv_js::Value::Number(0.0));
+        m.insert("tiltX".into(), cv_js::Value::Number(0.0));
+        m.insert("tiltY".into(), cv_js::Value::Number(0.0));
+        m.insert("twist".into(), cv_js::Value::Number(0.0));
+        // PointerEvent.getCoalescedEvents()/getPredictedEvents() return [] for a
+        // synthesized-from-mouse event (no sub-frame coalescing source here).
+        m.insert(
+            "getCoalescedEvents".into(),
+            cv_js::native_fn("getCoalescedEvents", |_| {
+                Ok(cv_js::Value::Array(std::rc::Rc::new(std::cell::RefCell::new(Vec::new()))))
+            }),
+        );
+        m.insert(
+            "getPredictedEvents".into(),
+            cv_js::native_fn("getPredictedEvents", |_| {
+                Ok(cv_js::Value::Array(std::rc::Rc::new(std::cell::RefCell::new(Vec::new()))))
+            }),
+        );
+    }
+    base
+}
+
+/// Normalize a DataTransfer format string per HTML §"The DataTransfer
+/// interface": ASCII-lowercase, then `"text"` → `"text/plain"` and
+/// `"url"` → `"text/uri-list"`.
+/// https://html.spec.whatwg.org/multipage/dnd.html#the-datatransfer-interface
+fn normalize_dnd_format(format: &str) -> String {
+    let lower = format.to_ascii_lowercase();
+    match lower.as_str() {
+        "text" => "text/plain".to_string(),
+        "url" => "text/uri-list".to_string(),
+        _ => lower,
+    }
+}
+
+/// Build a real `DataTransfer` object backing drag-and-drop (HTML §6.11.5
+/// "The DataTransfer interface"). The drag data store is an ordered
+/// list of (format, data) pairs shared by every method via one `Rc<RefCell>`,
+/// so `setData(f, d)` → `getData(f)` round-trips and the `types` array reflects
+/// the live key order. `dropEffect`/`effectAllowed` are plain settable string
+/// properties (Chrome stores them on the DataTransfer; invalid values for
+/// dropEffect fall back to the current value).
+/// https://html.spec.whatwg.org/multipage/dnd.html#the-datatransfer-interface
+fn build_data_transfer() -> cv_js::Value {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use cv_js::OrderedMap as HashMap;
+
+    // Drag data store item list: ordered (format, data) pairs. setData replaces
+    // in place (preserving order); clearData removes; types mirrors the keys.
+    let store: Rc<RefCell<Vec<(String, String)>>> = Rc::new(RefCell::new(Vec::new()));
+    // The `types` array is a live frozen-array view. We hold the SAME Rc that
+    // we expose as the `types` property, and rebuild its contents whenever the
+    // store changes, so a JS read of `dt.types` always sees current keys.
+    let types_arr: Rc<RefCell<Vec<cv_js::Value>>> = Rc::new(RefCell::new(Vec::new()));
+
+    let refresh_types = {
+        let store = store.clone();
+        let types_arr = types_arr.clone();
+        move || {
+            let s = store.borrow();
+            let mut t = types_arr.borrow_mut();
+            t.clear();
+            for (fmt, _) in s.iter() {
+                t.push(cv_js::Value::str(fmt.clone()));
+            }
+        }
+    };
+
+    let m: Rc<RefCell<HashMap<String, cv_js::Value>>> = Rc::new(RefCell::new(HashMap::new()));
+
+    // setData(format, data)
+    let s_set = store.clone();
+    let refresh_set = refresh_types.clone();
+    let set_data = cv_js::native_fn("setData", move |args| {
+        let format = normalize_dnd_format(
+            &args.first().map(|v| v.to_display_string()).unwrap_or_default(),
+        );
+        let data = args.get(1).map(|v| v.to_display_string()).unwrap_or_default();
+        {
+            let mut s = s_set.borrow_mut();
+            if let Some(entry) = s.iter_mut().find(|(f, _)| f == &format) {
+                // Replace existing in place (HTML: "at the same position").
+                entry.1 = data;
+            } else {
+                s.push((format, data));
+            }
+        }
+        refresh_set();
+        Ok(cv_js::Value::Undefined)
+    });
+
+    // getData(format) → stored data, or "" if absent.
+    let s_get = store.clone();
+    let get_data = cv_js::native_fn("getData", move |args| {
+        let format = normalize_dnd_format(
+            &args.first().map(|v| v.to_display_string()).unwrap_or_default(),
+        );
+        let s = s_get.borrow();
+        let out = s
+            .iter()
+            .find(|(f, _)| f == &format)
+            .map(|(_, d)| d.clone())
+            .unwrap_or_default();
+        Ok(cv_js::Value::str(out))
+    });
+
+    // clearData([format]) — remove one format, or all string data if none given.
+    let s_clear = store.clone();
+    let refresh_clear = refresh_types.clone();
+    let clear_data = cv_js::native_fn("clearData", move |args| {
+        match args.first() {
+            Some(v) if !matches!(v, cv_js::Value::Undefined | cv_js::Value::Null) => {
+                let format = normalize_dnd_format(&v.to_display_string());
+                s_clear.borrow_mut().retain(|(f, _)| f != &format);
+            }
+            _ => {
+                // No argument: remove all (plain-string) drag data.
+                s_clear.borrow_mut().clear();
+            }
+        }
+        refresh_clear();
+        Ok(cv_js::Value::Undefined)
+    });
+
+    // setDragImage(image, x, y) — accepted, no visual drag image in our UI yet.
+    let set_drag_image =
+        cv_js::native_fn("setDragImage", move |_| Ok(cv_js::Value::Undefined));
+
+    {
+        let mut g = m.borrow_mut();
+        g.insert("setData".into(), set_data);
+        g.insert("getData".into(), get_data);
+        g.insert("clearData".into(), clear_data);
+        g.insert("setDragImage".into(), set_drag_image);
+        // Live `types` frozen-array view (shares the Rc updated by setData/clear).
+        g.insert("types".into(), cv_js::Value::Array(types_arr.clone()));
+        // dropEffect / effectAllowed — plain settable string props with the
+        // HTML default initial values.
+        g.insert("dropEffect".into(), cv_js::Value::str("none".to_string()));
+        g.insert(
+            "effectAllowed".into(),
+            cv_js::Value::str("uninitialized".to_string()),
+        );
+        // `items` (DataTransferItemList) and `files` (FileList) — empty for a
+        // mouse-initiated text drag; real file drags are a documented follow-up.
+        g.insert("items".into(), cv_js::Value::Array(Rc::new(RefCell::new(Vec::new()))));
+        g.insert("files".into(), cv_js::Value::Array(Rc::new(RefCell::new(Vec::new()))));
+    }
+    cv_js::Value::Object(m)
 }
 
 /// Map a DOM `key` string to its physical `code` identifier.
@@ -24254,6 +24695,15 @@ fn install_minimal_dom_with_url(interp: &cv_js::Interp, initial_title: String, p
             "VisibilityStateEntry",
             &[("bubbles", false), ("cancelable", false)],
         ),
+    );
+
+    // `DataTransfer` constructor (HTML §6.11.5). Chrome exposes a constructible
+    // DataTransfer (since Chrome 60) that pages use to build synthetic drag data
+    // or programmatic clipboard payloads. `new DataTransfer()` returns a real
+    // object whose setData/getData round-trips and whose `types` reflects keys.
+    interp.define_global(
+        "DataTransfer",
+        cv_js::native_ctor_pure("DataTransfer", 0, |_| Ok(build_data_transfer())),
     );
 
     // AbortController / AbortSignal — used widely with fetch and any
@@ -55251,6 +55701,352 @@ mod tests {
             window_str(&runtime, "__order"),
             "outer-capture;target;outer-bubble;"
         );
+    }
+
+    // ── Pointer Events from the real mouse path ──────────────────────────
+    // Chrome (Blink PointerEventManager) fires a Pointer Event for every mouse
+    // interaction, immediately BEFORE the compatibility mouse event of the same
+    // phase, with pointerType="mouse" / isPrimary=true / pointerId=1.
+    // (Pointer Events 3 §"Mapping for devices that support hover").
+    #[test]
+    fn pointerdown_fires_before_mousedown_with_pointer_fields() {
+        let doc = cv_html::parse(
+            "<!doctype html><html><body><button id='b'>x</button></body></html>",
+        );
+        let mut runtime = LiveInterp::new(&doc, "https://example.com/");
+        runtime
+            .interp
+            .run(
+                "window.__order = '';\
+                 window.__pd = '';\
+                 var b = document.getElementById('b');\
+                 b.addEventListener('pointerdown', function(e){\
+                    window.__order += 'pointerdown;';\
+                    window.__pd = e.pointerType + '|' + e.isPrimary + '|' + e.pointerId + '|' + e.pressure + '|' + e.width + '|' + e.height;\
+                 });\
+                 b.addEventListener('mousedown', function(){ window.__order += 'mousedown;'; });",
+            )
+            .expect("setup listeners");
+        let b_path = {
+            let t = runtime.table.borrow();
+            t.all
+                .iter()
+                .find(|r| r.id.as_deref() == Some("b"))
+                .map(|r| r.path.clone())
+                .unwrap()
+        };
+        // Drive the host path exactly as the `tb-mouse:`/`tb-element:` worker
+        // handler does: pointerdown first, then the compatibility mousedown.
+        let (pf, _prevented) = runtime.dispatch_pointer_event_with_mods(
+            "pointerdown", &b_path, 10.0, 20.0, false, false, false, false,
+        );
+        assert!(pf, "pointerdown listener must fire");
+        runtime.dispatch_mouse_event_with_mods(
+            "mousedown", &b_path, 10.0, 20.0, false, false, false, false,
+        );
+        assert_eq!(
+            window_str(&runtime, "__order"),
+            "pointerdown;mousedown;",
+            "pointerdown must fire BEFORE mousedown (Pointer Events 3)"
+        );
+        assert_eq!(
+            window_str(&runtime, "__pd"),
+            "mouse|true|1|0.5|1|1",
+            "pointerdown: pointerType=mouse, isPrimary=true, pointerId=1, pressure=0.5 (active), width=1, height=1"
+        );
+    }
+
+    // A pointerdown handler that calls preventDefault() must suppress the
+    // compatibility mousedown — exactly what the worker's `tb-mouse:` handler
+    // does (cancelling pointerdown blocks subsequent compatibility mouse events,
+    // Pointer Events 3 §"Attributes and default actions").
+    #[test]
+    fn cancelled_pointerdown_suppresses_compat_mousedown() {
+        let doc = cv_html::parse(
+            "<!doctype html><html><body><button id='b'>x</button></body></html>",
+        );
+        let mut runtime = LiveInterp::new(&doc, "https://example.com/");
+        runtime
+            .interp
+            .run(
+                "window.__hits = '';\
+                 var b = document.getElementById('b');\
+                 b.addEventListener('pointerdown', function(e){ window.__hits += 'pd;'; e.preventDefault(); });\
+                 b.addEventListener('mousedown', function(){ window.__hits += 'md;'; });",
+            )
+            .expect("setup");
+        let b_path = {
+            let t = runtime.table.borrow();
+            t.all.iter().find(|r| r.id.as_deref() == Some("b")).map(|r| r.path.clone()).unwrap()
+        };
+        let (_pf, prevented) = runtime.dispatch_pointer_event_with_mods(
+            "pointerdown", &b_path, 0.0, 0.0, false, false, false, false,
+        );
+        assert!(prevented, "preventDefault on pointerdown must be reported");
+        // Mirror the worker: only fire mousedown if pointerdown was NOT cancelled.
+        if !prevented {
+            runtime.dispatch_mouse_event_with_mods(
+                "mousedown", &b_path, 0.0, 0.0, false, false, false, false,
+            );
+        }
+        assert_eq!(
+            window_str(&runtime, "__hits"),
+            "pd;",
+            "cancelled pointerdown must suppress the compatibility mousedown"
+        );
+    }
+
+    // pointermove with no button held has pressure 0 (no active-buttons state),
+    // and the pointer events bubble to the hit element's ancestors.
+    #[test]
+    fn pointermove_bubbles_and_has_zero_pressure() {
+        let doc = cv_html::parse(
+            "<!doctype html><html><body><div id='outer'><span id='s'>x</span></div></body></html>",
+        );
+        let mut runtime = LiveInterp::new(&doc, "https://example.com/");
+        runtime
+            .interp
+            .run(
+                "window.__hits = ''; window.__pressure = '';\
+                 document.getElementById('outer').addEventListener('pointermove', function(){ window.__hits += 'outer;'; });\
+                 document.getElementById('s').addEventListener('pointermove', function(e){ window.__hits += 's;'; window.__pressure = String(e.pressure); });",
+            )
+            .expect("setup");
+        let s_path = {
+            let t = runtime.table.borrow();
+            t.all.iter().find(|r| r.id.as_deref() == Some("s")).map(|r| r.path.clone()).unwrap()
+        };
+        runtime.dispatch_pointer_event_with_mods(
+            "pointermove", &s_path, 5.0, 5.0, false, false, false, false,
+        );
+        assert_eq!(
+            window_str(&runtime, "__hits"),
+            "s;outer;",
+            "pointermove must bubble from target to ancestor"
+        );
+        assert_eq!(
+            window_str(&runtime, "__pressure"),
+            "0",
+            "pointermove with no button held → pressure 0 (no active-buttons state)"
+        );
+    }
+
+    // ── DataTransfer (HTML §6.11.5) ──────────────────────────────────────
+    // A real DataTransfer round-trips setData→getData, `types` reflects the
+    // added formats (with "text"→"text/plain" normalization), and
+    // dropEffect/effectAllowed are settable.
+    #[test]
+    fn data_transfer_round_trips_set_get_and_types() {
+        let doc = cv_html::parse("<!doctype html><html><body></body></html>");
+        let mut runtime = LiveInterp::new(&doc, "https://example.com/");
+        // Inject a real DataTransfer as a global so JS can exercise it.
+        runtime.interp.define_global("__dt", build_data_transfer());
+        runtime
+            .interp
+            .run(
+                "var dt = __dt;\
+                 dt.setData('text/plain', 'hi');\
+                 dt.setData('text/html', '<b>x</b>');\
+                 window.__plain = dt.getData('text/plain');\
+                 window.__html = dt.getData('text/html');\
+                 window.__missing = dt.getData('application/json');\
+                 window.__types = dt.types.join(',');\
+                 window.__hasPlain = String(dt.types.indexOf('text/plain') !== -1);",
+            )
+            .expect("run");
+        assert_eq!(window_str(&runtime, "__plain"), "hi", "setData→getData round-trip");
+        assert_eq!(window_str(&runtime, "__html"), "<b>x</b>", "second format round-trips");
+        assert_eq!(window_str(&runtime, "__missing"), "", "absent format → empty string");
+        assert_eq!(
+            window_str(&runtime, "__types"),
+            "text/plain,text/html",
+            "types lists formats in insertion order"
+        );
+        assert_eq!(window_str(&runtime, "__hasPlain"), "true", "types includes 'text/plain'");
+    }
+
+    #[test]
+    fn data_transfer_format_normalization_and_clear() {
+        let doc = cv_html::parse("<!doctype html><html><body></body></html>");
+        let mut runtime = LiveInterp::new(&doc, "https://example.com/");
+        runtime.interp.define_global("__dt", build_data_transfer());
+        runtime
+            .interp
+            .run(
+                "var dt = __dt;\n\
+                 dt.setData('text', 'plain-via-shorthand');\n\
+                 dt.setData('URL', 'https://example.com/');\n\
+                 window.__viaPlain = dt.getData('text/plain');\n\
+                 window.__viaUri = dt.getData('text/uri-list');\n\
+                 window.__types1 = dt.types.join(',');\n\
+                 dt.clearData('text/plain');\n\
+                 window.__afterClearPlain = dt.getData('text/plain');\n\
+                 window.__types2 = dt.types.join(',');\n\
+                 dt.clearData();\n\
+                 window.__types3 = dt.types.join(',');",
+            )
+            .expect("run");
+        assert_eq!(window_str(&runtime, "__viaPlain"), "plain-via-shorthand", "'text'→'text/plain'");
+        assert_eq!(window_str(&runtime, "__viaUri"), "https://example.com/", "'url'→'text/uri-list'");
+        assert_eq!(window_str(&runtime, "__types1"), "text/plain,text/uri-list");
+        assert_eq!(window_str(&runtime, "__afterClearPlain"), "", "clearData(format) removes that format");
+        assert_eq!(window_str(&runtime, "__types2"), "text/uri-list", "only the cleared format is removed");
+        assert_eq!(window_str(&runtime, "__types3"), "", "clearData() with no args removes all");
+    }
+
+    #[test]
+    fn data_transfer_drop_effect_and_effect_allowed_settable() {
+        let doc = cv_html::parse("<!doctype html><html><body></body></html>");
+        let mut runtime = LiveInterp::new(&doc, "https://example.com/");
+        runtime.interp.define_global("__dt", build_data_transfer());
+        runtime
+            .interp
+            .run(
+                "var dt = __dt;\
+                 window.__de0 = dt.dropEffect;\
+                 window.__ea0 = dt.effectAllowed;\
+                 dt.dropEffect = 'copy';\
+                 dt.effectAllowed = 'copyMove';\
+                 window.__de1 = dt.dropEffect;\
+                 window.__ea1 = dt.effectAllowed;",
+            )
+            .expect("run");
+        assert_eq!(window_str(&runtime, "__de0"), "none", "dropEffect default is 'none'");
+        assert_eq!(window_str(&runtime, "__ea0"), "uninitialized", "effectAllowed default is 'uninitialized'");
+        assert_eq!(window_str(&runtime, "__de1"), "copy", "dropEffect is settable");
+        assert_eq!(window_str(&runtime, "__ea1"), "copyMove", "effectAllowed is settable");
+    }
+
+    #[test]
+    fn data_transfer_constructor_is_constructible() {
+        // Chrome exposes a constructible DataTransfer (`new DataTransfer()`).
+        let doc = cv_html::parse("<!doctype html><html><body></body></html>");
+        let mut runtime = LiveInterp::new(&doc, "https://example.com/");
+        runtime
+            .interp
+            .run(
+                "var dt = new DataTransfer();\
+                 dt.setData('text/plain', 'ctor');\
+                 window.__got = dt.getData('text/plain');",
+            )
+            .expect("run");
+        assert_eq!(window_str(&runtime, "__got"), "ctor", "new DataTransfer() round-trips");
+    }
+
+    // ── Drag-and-drop sequence with a shared DataTransfer (HTML §6.11) ────
+    // A `setData` in a dragstart handler is observable via `getData` in the
+    // drop handler because every drag event in one sequence shares the same
+    // DataTransfer. The drop only fires when dragover is preventDefault'd.
+    #[test]
+    fn drag_sequence_round_trips_data_transfer_through_drop() {
+        let doc = cv_html::parse(
+            "<!doctype html><html><body>\
+             <div id='src'>drag me</div><div id='dst'>drop here</div>\
+             </body></html>",
+        );
+        let mut runtime = LiveInterp::new(&doc, "https://example.com/");
+        runtime
+            .interp
+            .run(
+                "window.__seq = ''; window.__dropped = '';\
+                 var src = document.getElementById('src');\
+                 var dst = document.getElementById('dst');\
+                 src.addEventListener('dragstart', function(e){\
+                    window.__seq += 'dragstart;';\
+                    e.dataTransfer.setData('text/plain', 'payload-42');\
+                 });\
+                 dst.addEventListener('dragover', function(e){ window.__seq += 'dragover;'; e.preventDefault(); });\
+                 dst.addEventListener('drop', function(e){\
+                    window.__seq += 'drop;';\
+                    window.__dropped = e.dataTransfer.getData('text/plain');\
+                 });\
+                 src.addEventListener('dragend', function(){ window.__seq += 'dragend;'; });",
+            )
+            .expect("setup");
+        let path_for = |rt: &LiveInterp, id: &str| -> Vec<usize> {
+            let t = rt.table.borrow();
+            t.all.iter().find(|r| r.id.as_deref() == Some(id)).map(|r| r.path.clone()).unwrap()
+        };
+        let src_path = path_for(&runtime, "src");
+        let dst_path = path_for(&runtime, "dst");
+        // Run the same sequence the worker's `tb-drag:` handler runs, with ONE
+        // shared DataTransfer across the whole drag.
+        let dt = build_data_transfer();
+        runtime.dispatch_drag_event("dragstart", &src_path, 0.0, 0.0, &dt);
+        runtime.dispatch_drag_event("dragenter", &dst_path, 0.0, 0.0, &dt);
+        let (_f, over_prevented) =
+            runtime.dispatch_drag_event("dragover", &dst_path, 0.0, 0.0, &dt);
+        assert!(over_prevented, "dragover handler called preventDefault → drop allowed");
+        if over_prevented {
+            runtime.dispatch_drag_event("drop", &dst_path, 0.0, 0.0, &dt);
+        }
+        runtime.dispatch_drag_event("dragend", &src_path, 0.0, 0.0, &dt);
+        assert_eq!(
+            window_str(&runtime, "__seq"),
+            "dragstart;dragover;drop;dragend;",
+            "full drag sequence fires in order"
+        );
+        assert_eq!(
+            window_str(&runtime, "__dropped"),
+            "payload-42",
+            "drop's getData reads the dragstart's setData via the shared DataTransfer"
+        );
+    }
+
+    // If no dragover handler cancels the event, the drop must NOT fire (HTML:
+    // the default action of dragover is to NOT allow the drop).
+    #[test]
+    fn drop_does_not_fire_when_dragover_not_prevented() {
+        let doc = cv_html::parse(
+            "<!doctype html><html><body><div id='src'>a</div><div id='dst'>b</div></body></html>",
+        );
+        let mut runtime = LiveInterp::new(&doc, "https://example.com/");
+        runtime
+            .interp
+            .run(
+                "window.__dropFired = 'no';\
+                 var src = document.getElementById('src');\
+                 var dst = document.getElementById('dst');\
+                 src.addEventListener('dragstart', function(e){ e.dataTransfer.setData('text/plain','x'); });\
+                 dst.addEventListener('dragover', function(e){ /* no preventDefault */ });\
+                 dst.addEventListener('drop', function(){ window.__dropFired = 'yes'; });",
+            )
+            .expect("setup");
+        let path_for = |rt: &LiveInterp, id: &str| -> Vec<usize> {
+            let t = rt.table.borrow();
+            t.all.iter().find(|r| r.id.as_deref() == Some(id)).map(|r| r.path.clone()).unwrap()
+        };
+        let src_path = path_for(&runtime, "src");
+        let dst_path = path_for(&runtime, "dst");
+        let dt = build_data_transfer();
+        runtime.dispatch_drag_event("dragstart", &src_path, 0.0, 0.0, &dt);
+        runtime.dispatch_drag_event("dragenter", &dst_path, 0.0, 0.0, &dt);
+        let (_f, over_prevented) =
+            runtime.dispatch_drag_event("dragover", &dst_path, 0.0, 0.0, &dt);
+        if over_prevented {
+            runtime.dispatch_drag_event("drop", &dst_path, 0.0, 0.0, &dt);
+        }
+        runtime.dispatch_drag_event("dragend", &src_path, 0.0, 0.0, &dt);
+        assert_eq!(
+            window_str(&runtime, "__dropFired"),
+            "no",
+            "drop must NOT fire when no dragover handler cancelled the event"
+        );
+    }
+
+    #[test]
+    fn mouse_to_pointer_event_mapping_is_chrome_shaped() {
+        assert_eq!(mouse_to_pointer_event("mousedown"), Some("pointerdown"));
+        assert_eq!(mouse_to_pointer_event("mousemove"), Some("pointermove"));
+        assert_eq!(mouse_to_pointer_event("mouseup"), Some("pointerup"));
+        assert_eq!(mouse_to_pointer_event("mouseover"), Some("pointerover"));
+        assert_eq!(mouse_to_pointer_event("mouseout"), Some("pointerout"));
+        assert_eq!(mouse_to_pointer_event("mouseenter"), Some("pointerenter"));
+        assert_eq!(mouse_to_pointer_event("mouseleave"), Some("pointerleave"));
+        // click / dblclick / contextmenu have NO pointer twin in Chrome.
+        assert_eq!(mouse_to_pointer_event("click"), None);
+        assert_eq!(mouse_to_pointer_event("dblclick"), None);
+        assert_eq!(mouse_to_pointer_event("contextmenu"), None);
     }
 
     #[test]
