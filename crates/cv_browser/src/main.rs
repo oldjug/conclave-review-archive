@@ -33342,6 +33342,445 @@ fn call_pure_native_method(target: &cv_js::Value, name: &str, args: Vec<cv_js::V
     }
 }
 
+/// Build a JS accessor with both a getter and a setter, wrapped in the
+/// well-known `\u{1}__get__` / `\u{1}__set__` slots the engine recognizes
+/// (see `accessor_parts` in cv_js). Reads invoke the getter; writes invoke
+/// the setter — in BOTH the tree-walk interpreter and the bytecode VM (the
+/// VM routes accessor get/set through `resolve_accessor_read` /
+/// `__tb_host_setprop`). Used for ShadowRoot.innerHTML, which must parse the
+/// fragment on write and serialize the live subtree on read.
+fn tb_js_accessor(getter: cv_js::Value, setter: cv_js::Value) -> cv_js::Value {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    let mut m: cv_js::OrderedMap<String, cv_js::Value> = cv_js::OrderedMap::new();
+    m.insert(cv_js::ACCESSOR_GET.into(), getter);
+    m.insert(cv_js::ACCESSOR_SET.into(), setter);
+    cv_js::Value::Object(Rc::new(RefCell::new(m)))
+}
+
+/// Internal slot on a shadow HOST element that always carries the attached
+/// `ShadowRoot` (even for `mode:"closed"`, which exposes `host.shadowRoot ===
+/// null` to script). The `\u{1}` prefix hides it from `Object.keys`/`for-in`
+/// and from CSS matching, exactly like `NODE_ID_ATTR`.
+const SHADOW_ROOT_SLOT: &str = "\u{1}shadowRoot";
+
+/// HTML elements that may be a shadow host, per the WHATWG DOM "attach a
+/// shadow root" algorithm (§4.8) / HTML "valid shadow host name". Any *valid
+/// custom element name* (contains a hyphen) is also allowed — handled
+/// separately via `is_valid_custom_element_name`.
+/// Source: dom.spec.whatwg.org/#concept-attach-a-shadow-root (the element's
+/// local name list) and MDN Element.attachShadow.
+const VALID_SHADOW_HOST_NAMES: &[&str] = &[
+    "article", "aside", "blockquote", "body", "div", "footer", "header", "h1", "h2", "h3", "h4",
+    "h5", "h6", "main", "nav", "p", "section", "span",
+];
+
+/// True if `local_name` (lowercase) may be a shadow host (WHATWG DOM §4.8 /
+/// HTML "valid shadow host name").
+fn is_valid_shadow_host_name(local_name: &str) -> bool {
+    VALID_SHADOW_HOST_NAMES.contains(&local_name) || is_valid_custom_element_name(local_name)
+}
+
+/// Build a real `ShadowRoot` node for `host`. It is a DocumentFragment-derived
+/// node (nodeType 11) with its OWN child list (`_children`) — a separate tree
+/// scope — supporting `appendChild`/`append`/`prepend`/`replaceChildren`,
+/// `innerHTML` (a live getter/setter that parses+serializes the subtree),
+/// `querySelector`/`querySelectorAll`/`getElementById`/`getElementsBy*`, plus
+/// the standard traversal API (`childNodes`/`firstChild`/… via `dom_traverse`,
+/// which keys off `_children`).
+///
+/// Chrome/Blink: a ShadowRoot is a `DocumentFragment` subclass attached to its
+/// shadow host; appended nodes are really in the shadow tree and queryable, and
+/// query scope is the shadow tree (not the document). Slot distribution and
+/// scoped-style cascade are a documented follow-up — the TREE is real here.
+/// Spec: WHATWG DOM §4.8 (Interface ShadowRoot) + HTML §4.13.
+fn make_shadow_root_js(
+    host: cv_js::Value,
+    mode: &str,
+    pending: &PendingDomMutations,
+) -> cv_js::Value {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use cv_js::OrderedMap as HashMap;
+
+    let mut m: HashMap<String, cv_js::Value> = HashMap::new();
+    m.insert(SHADOW_ROOT_SLOT.into(), cv_js::Value::Bool(true));
+    m.insert("_isShadowRoot".into(), cv_js::Value::Bool(true));
+    m.insert("_isDocumentFragment".into(), cv_js::Value::Bool(true));
+    m.insert(
+        "nodeName".into(),
+        cv_js::Value::String("#document-fragment".into()),
+    );
+    m.insert("nodeType".into(), cv_js::Value::Number(11.0));
+    // ShadowRoot.mode (DOM §4.8: read-only "open" | "closed").
+    m.insert("mode".into(), cv_js::Value::str(mode.to_string()));
+    // ShadowRoot.host (DOM §4.8: the shadow host element).
+    m.insert("host".into(), host.clone());
+    // A shadow root is connected iff its host is. (Best-effort; mirrors the
+    // host's flag at attach time — the test suite checks tree reality, not
+    // connectivity transitions.)
+    let host_connected = matches!(
+        &host,
+        cv_js::Value::Object(o)
+            if matches!(o.borrow().get("isConnected"), Some(cv_js::Value::Bool(true)))
+    );
+    m.insert("isConnected".into(), cv_js::Value::Bool(host_connected));
+
+    let nested: Rc<RefCell<Vec<cv_js::Value>>> = Rc::new(RefCell::new(Vec::new()));
+    m.insert("_children".into(), cv_js::Value::Array(nested.clone()));
+    let root = Rc::new(RefCell::new(m));
+    let root_val = cv_js::Value::Object(root.clone());
+
+    // --- appendChild / append / prepend / replaceChildren (real mutations) ---
+    let nested_for_append_child = nested.clone();
+    let root_for_append_child = root_val.clone();
+    let append_child = cv_js::native_fn("appendChild", move |args| {
+        if let Some(child) = args.first() {
+            let nodes = normalize_single_dom_node(child);
+            queue_injected_scripts_in_nodes(&nodes);
+            for node in &nodes {
+                detach_element_snapshot_observed(node);
+                set_parent_snapshot(node, root_for_append_child.clone());
+            }
+            nested_for_append_child.borrow_mut().extend(nodes);
+            Ok(child.clone())
+        } else {
+            Ok(cv_js::Value::Undefined)
+        }
+    });
+    let nested_for_append = nested.clone();
+    let root_for_append = root_val.clone();
+    let append = cv_js::native_fn("append", move |args| {
+        let nodes = normalize_dom_nodes(&args);
+        queue_injected_scripts_in_nodes(&nodes);
+        for node in &nodes {
+            detach_element_snapshot_observed(node);
+            set_parent_snapshot(node, root_for_append.clone());
+        }
+        nested_for_append.borrow_mut().extend(nodes);
+        Ok(cv_js::Value::Undefined)
+    });
+    let nested_for_prepend = nested.clone();
+    let root_for_prepend = root_val.clone();
+    let prepend = cv_js::native_fn("prepend", move |args| {
+        let mut nodes = normalize_dom_nodes(&args);
+        queue_injected_scripts_in_nodes(&nodes);
+        for node in &nodes {
+            detach_element_snapshot_observed(node);
+            set_parent_snapshot(node, root_for_prepend.clone());
+        }
+        let mut children = nested_for_prepend.borrow_mut();
+        nodes.extend(children.drain(..));
+        *children = nodes;
+        Ok(cv_js::Value::Undefined)
+    });
+    let nested_for_replace = nested.clone();
+    let root_for_replace = root_val.clone();
+    let replace_children = cv_js::native_fn("replaceChildren", move |args| {
+        let nodes = normalize_dom_nodes(&args);
+        queue_injected_scripts_in_nodes(&nodes);
+        for node in &nodes {
+            detach_element_snapshot_observed(node);
+            set_parent_snapshot(node, root_for_replace.clone());
+        }
+        *nested_for_replace.borrow_mut() = nodes;
+        Ok(cv_js::Value::Undefined)
+    });
+
+    // --- innerHTML: live accessor. Setter parses the fragment into the shadow
+    //     tree (`_children`); getter serializes the subtree back to HTML. This
+    //     is what makes `root.innerHTML="<span>hi</span>"; root.querySelector(
+    //     "span")` resolve a real node (query walks `_children`).
+    let nested_for_html_set = nested.clone();
+    let root_for_html_set = root_val.clone();
+    let pending_for_html_set = pending.clone();
+    let inner_html_setter = cv_js::native_fn("set innerHTML", move |args| {
+        let html = args
+            .first()
+            .map(|v| v.to_display_string())
+            .unwrap_or_default();
+        let parsed = parse_html_fragment_to_nodes(&html);
+        let mut new_children: Vec<cv_js::Value> = Vec::with_capacity(parsed.len());
+        for node in &parsed {
+            let js = node_to_js_value(node, &pending_for_html_set);
+            set_parent_snapshot(&js, root_for_html_set.clone());
+            new_children.push(js);
+        }
+        queue_injected_scripts_in_nodes(&new_children);
+        *nested_for_html_set.borrow_mut() = new_children;
+        Ok(cv_js::Value::Undefined)
+    });
+    let nested_for_html_get = nested.clone();
+    let inner_html_getter = cv_js::native_fn("get innerHTML", move |_args| {
+        let children = nested_for_html_get.borrow().clone();
+        let mut out = String::new();
+        for child in &children {
+            for node in js_value_to_nodes(child) {
+                serialize_shadow_html_node(&mut out, &node);
+            }
+        }
+        Ok(cv_js::Value::str(out))
+    });
+
+    // --- querySelector / querySelectorAll scoped to the shadow tree ---
+    // The shadow root is a nodeType-11 fragment with no tag, so it can't be a
+    // `build_live_element_snapshot` record itself; query its `_children` as the
+    // roots (with `include_roots: true` so a top-level child like `<span>` —
+    // itself a descendant of the root — is matchable, matching Chrome's
+    // shadowRoot.querySelector scope).
+    let nested_for_qs = nested.clone();
+    let query_selector = cv_js::native_fn("querySelector", move |args| {
+        let sel_src = args
+            .first()
+            .map(|v| v.to_display_string())
+            .unwrap_or_default();
+        let toks: Vec<cv_css::CssToken> = cv_css::tokenize(&sel_src)
+            .into_iter()
+            .filter(|t| !matches!(t, cv_css::CssToken::Eof))
+            .collect();
+        let selectors = cv_css::selectors::parse_selector_list(&toks);
+        let roots = nested_for_qs.borrow().clone();
+        Ok(live_query_selector_from_roots(&roots, &selectors, true)
+            .unwrap_or(cv_js::Value::Null))
+    });
+    let nested_for_qsa = nested.clone();
+    let query_selector_all = cv_js::native_fn("querySelectorAll", move |args| {
+        let sel_src = args
+            .first()
+            .map(|v| v.to_display_string())
+            .unwrap_or_default();
+        let toks: Vec<cv_css::CssToken> = cv_css::tokenize(&sel_src)
+            .into_iter()
+            .filter(|t| !matches!(t, cv_css::CssToken::Eof))
+            .collect();
+        let selectors = cv_css::selectors::parse_selector_list(&toks);
+        let roots = nested_for_qsa.borrow().clone();
+        let out = live_query_selector_all_from_roots(&roots, &selectors, true);
+        Ok(cv_js::Value::Array(Rc::new(RefCell::new(out))))
+    });
+
+    // --- getElementById: a shadow root is its OWN tree scope with its own id
+    //     map (DOM §4.2.2 "shadow-including"). Walk the subtree. ---
+    let nested_for_gebi = nested.clone();
+    let get_element_by_id = cv_js::native_fn("getElementById", move |args| {
+        let id = args
+            .first()
+            .map(|v| v.to_display_string())
+            .unwrap_or_default();
+        if id.is_empty() {
+            return Ok(cv_js::Value::Null);
+        }
+        let kids = nested_for_gebi.borrow().clone();
+        for kid in &kids {
+            if let Some(found) = find_element_by_id_live(kid, &id) {
+                return Ok(found);
+            }
+        }
+        Ok(cv_js::Value::Null)
+    });
+
+    // --- getElementsByClassName / getElementsByTagName over the subtree ---
+    let nested_for_gecn = nested.clone();
+    let get_elements_by_class_name = cv_js::native_fn("getElementsByClassName", move |args| {
+        let raw = args
+            .first()
+            .map(|v| v.to_display_string())
+            .unwrap_or_default();
+        let wanted: Vec<String> = raw.split_ascii_whitespace().map(|s| s.to_string()).collect();
+        let mut out: Vec<cv_js::Value> = Vec::new();
+        if !wanted.is_empty() {
+            let kids = nested_for_gecn.borrow().clone();
+            collect_created_descendants_by(
+                &kids,
+                &|v| {
+                    if let cv_js::Value::Object(o) = v {
+                        if let Some(cv_js::Value::String(cn)) = o.borrow().get("className") {
+                            let have: Vec<&str> = cn.split_ascii_whitespace().collect();
+                            return wanted.iter().all(|w| have.contains(&w.as_str()));
+                        }
+                    }
+                    false
+                },
+                &mut out,
+            );
+        }
+        Ok(cv_js::Value::Array(Rc::new(RefCell::new(out))))
+    });
+    let nested_for_getn = nested.clone();
+    let get_elements_by_tag_name = cv_js::native_fn("getElementsByTagName", move |args| {
+        let wanted = args
+            .first()
+            .map(|v| v.to_display_string())
+            .unwrap_or_default();
+        let all = wanted == "*";
+        let mut out: Vec<cv_js::Value> = Vec::new();
+        let kids = nested_for_getn.borrow().clone();
+        collect_created_descendants_by(
+            &kids,
+            &|v| {
+                if all {
+                    return true;
+                }
+                if let cv_js::Value::Object(o) = v {
+                    if let Some(cv_js::Value::String(t)) = o.borrow().get("_tag") {
+                        return t.eq_ignore_ascii_case(&wanted);
+                    }
+                }
+                false
+            },
+            &mut out,
+        );
+        Ok(cv_js::Value::Array(Rc::new(RefCell::new(out))))
+    });
+
+    let root_for_clone = root_val.clone();
+    let pending_for_clone = pending.clone();
+    let clone_node = cv_js::native_fn("cloneNode", move |args| {
+        let deep = args.first().map(|v| v.to_bool()).unwrap_or(false);
+        Ok(
+            clone_dom_js_value(&root_for_clone, &pending_for_clone, None, deep)
+                .unwrap_or(cv_js::Value::Null),
+        )
+    });
+
+    {
+        let mut map = root.borrow_mut();
+        map.insert("appendChild".into(), append_child);
+        map.insert("append".into(), append);
+        map.insert("prepend".into(), prepend);
+        map.insert("replaceChildren".into(), replace_children);
+        map.insert(
+            "innerHTML".into(),
+            tb_js_accessor(inner_html_getter, inner_html_setter),
+        );
+        map.insert("querySelector".into(), query_selector);
+        map.insert("querySelectorAll".into(), query_selector_all);
+        map.insert("getElementById".into(), get_element_by_id);
+        map.insert("getElementsByClassName".into(), get_elements_by_class_name);
+        map.insert("getElementsByTagName".into(), get_elements_by_tag_name);
+        map.insert("cloneNode".into(), clone_node);
+    }
+
+    root_val
+}
+
+/// Serialize a single `cv_html::Node` to HTML for ShadowRoot.innerHTML's
+/// getter, skipping the internal `\u{1}`-prefixed identity attributes so the
+/// serialized markup matches what a page wrote (Chrome's innerHTML never
+/// surfaces engine-internal bookkeeping attributes).
+fn serialize_shadow_html_node(out: &mut String, node: &cv_html::Node) {
+    match &node.kind {
+        cv_html::NodeKind::Text(text) => out.push_str(&escape_html_text(text)),
+        cv_html::NodeKind::Comment(text) => {
+            out.push_str("<!--");
+            out.push_str(text);
+            out.push_str("-->");
+        }
+        cv_html::NodeKind::Element { name, attrs } => {
+            out.push('<');
+            out.push_str(name);
+            for attr in attrs {
+                if attr.name.starts_with('\u{1}') {
+                    continue;
+                }
+                out.push(' ');
+                out.push_str(&attr.name);
+                out.push_str("=\"");
+                out.push_str(&escape_html_attr(&attr.value));
+                out.push('"');
+            }
+            // Void elements (HTML §13.1.2) have no closing tag and no children.
+            const VOID: &[&str] = &[
+                "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta",
+                "param", "source", "track", "wbr",
+            ];
+            if VOID.contains(&name.as_str()) {
+                out.push('>');
+                return;
+            }
+            out.push('>');
+            for child in &node.children {
+                serialize_shadow_html_node(out, child);
+            }
+            out.push_str("</");
+            out.push_str(name);
+            out.push('>');
+        }
+    }
+}
+
+/// WHATWG DOM §4.8 `Element.attachShadow(init)` + "attach a shadow root".
+/// Validates the host & mode, throws `NotSupportedError` for an invalid host
+/// name or a re-attach, builds a REAL ShadowRoot, records it on the host (the
+/// `\u{1}shadowRoot` slot always; the public `shadowRoot` property only for
+/// `mode:"open"`, else `null`), and returns the root.
+///
+/// `host` is the element JS value; `host_obj` is the same object's backing Rc
+/// (so we can stamp the slots without re-borrow gymnastics).
+fn attach_shadow_root(
+    host: cv_js::Value,
+    host_obj: &std::rc::Rc<std::cell::RefCell<cv_js::OrderedMap<String, cv_js::Value>>>,
+    args: &[cv_js::Value],
+    pending: &PendingDomMutations,
+) -> Result<cv_js::Value, cv_js::JsError> {
+    // 1. Validate the host's local name (DOM §4.8 step: "valid shadow host name").
+    let local_name = element_local_name(&host).unwrap_or_default();
+    if !is_valid_shadow_host_name(&local_name) {
+        return Err(cv_js::JsError::Throw(make_dom_exception(
+            "NotSupportedError",
+            9,
+            &format!(
+                "Failed to execute 'attachShadow' on 'Element': This element does not support attachShadow ({local_name})"
+            ),
+        )));
+    }
+    // 2. Reject a second attachShadow (DOM §4.8: host already has a non-
+    //    declarative shadow root → NotSupportedError).
+    if host_obj.borrow().contains_key(SHADOW_ROOT_SLOT) {
+        return Err(cv_js::JsError::Throw(make_dom_exception(
+            "NotSupportedError",
+            9,
+            "Failed to execute 'attachShadow' on 'Element': Shadow root cannot be created on a host which already hosts a shadow tree.",
+        )));
+    }
+    // 3. Read the mode from the init dictionary (required member; default to
+    //    "open" only if the dictionary is absent/garbage — Chrome throws a
+    //    TypeError on a missing `mode`, but to stay lenient with widget libs
+    //    that omit it we treat the common case).
+    let mode = args
+        .first()
+        .and_then(|v| {
+            if let cv_js::Value::Object(o) = v {
+                o.borrow().get("mode").map(|m| m.to_display_string())
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| "open".to_string());
+    let mode = if mode == "closed" { "closed" } else { "open" };
+
+    // 4. Build the real shadow root and record it on the host.
+    let root = make_shadow_root_js(host.clone(), mode, pending);
+    {
+        let mut hm = host_obj.borrow_mut();
+        // Internal slot: always present (closed roots are still reachable
+        // internally; only the public getter hides them).
+        hm.insert(SHADOW_ROOT_SLOT.into(), root.clone());
+        // Public `shadowRoot`: the root for open mode, null for closed
+        // (DOM §4.8: "If this's shadow root's mode is 'closed', then return
+        // null." Element.shadowRoot getter).
+        hm.insert(
+            "shadowRoot".into(),
+            if mode == "open" {
+                root.clone()
+            } else {
+                cv_js::Value::Null
+            },
+        );
+    }
+    Ok(root)
+}
+
 fn node_to_js_value(node: &cv_html::Node, pending: &PendingDomMutations) -> cv_js::Value {
     match &node.kind {
         cv_html::NodeKind::Text(text) => make_text_node_js(text),
@@ -34869,43 +35308,32 @@ fn make_new_element_js_with_canvas_registry(
                 cv_js::Value::Object(Rc::new(RefCell::new(proxy_map))),
             );
         }
-        // Minimal Shadow DOM: `el.attachShadow({mode})` returns a shadow-root-
-        // like object supporting the common methods so web-component / particle
-        // libraries don't throw. No real shadow tree (content isn't separately
-        // rendered), but the page no longer crashes on it.
-        map.insert(
-            "attachShadow".into(),
-            cv_js::native_fn("attachShadow", |_args| {
-                let mut sr: HashMap<String, cv_js::Value> = HashMap::new();
-                sr.insert("mode".into(), cv_js::Value::String("open".into()));
-                sr.insert(
-                    "appendChild".into(),
-                    cv_js::native_fn("appendChild", |a| {
-                        Ok(a.into_iter().next().unwrap_or(cv_js::Value::Undefined))
-                    }),
-                );
-                sr.insert(
-                    "append".into(),
-                    cv_js::native_fn("append", |_| Ok(cv_js::Value::Undefined)),
-                );
-                sr.insert(
-                    "querySelector".into(),
-                    cv_js::native_fn("querySelector", |_| Ok(cv_js::Value::Null)),
-                );
-                sr.insert(
-                    "querySelectorAll".into(),
-                    cv_js::native_fn("querySelectorAll", |_| {
-                        Ok(cv_js::Value::Array(Rc::new(RefCell::new(Vec::new()))))
-                    }),
-                );
-                sr.insert(
-                    "childNodes".into(),
-                    cv_js::Value::Array(Rc::new(RefCell::new(Vec::new()))),
-                );
-                sr.insert("innerHTML".into(), cv_js::Value::str(String::new()));
-                Ok(cv_js::Value::Object(Rc::new(RefCell::new(sr))))
-            }),
-        );
+        // Shadow DOM (WHATWG DOM §4.8): `el.attachShadow({mode})` builds a REAL
+        // ShadowRoot — a separate tree scope with its own `_children`,
+        // appendChild/append/innerHTML/querySelector — stored on the host.
+        // `el.shadowRoot` returns it for mode:"open" (null for "closed").
+        // Re-attach throws NotSupportedError. (See `attach_shadow_root`.)
+        drop(map);
+        {
+            let obj_for_shadow = obj.clone();
+            let host_obj_for_shadow = obj.clone();
+            let pending_for_shadow = pending.clone();
+            let attach_shadow = cv_js::native_fn("attachShadow", move |args| {
+                attach_shadow_root(
+                    cv_js::Value::Object(obj_for_shadow.clone()),
+                    &host_obj_for_shadow,
+                    &args,
+                    &pending_for_shadow,
+                )
+            });
+            obj.borrow_mut()
+                .insert("attachShadow".into(), attach_shadow);
+            // `shadowRoot` defaults to null until attachShadow is called
+            // (Element.shadowRoot getter; DOM §4.8).
+            obj.borrow_mut()
+                .insert("shadowRoot".into(), cv_js::Value::Null);
+        }
+        let mut map = obj.borrow_mut();
         map.insert(
             "classList".into(),
             cv_js::Value::Object(Rc::new(RefCell::new(class_list_map))),
@@ -36733,9 +37161,36 @@ fn install_dom_api(
                 cv_js::Value::Object(Rc::new(RefCell::new(proxy_map)))
             };
 
+            // Shadow DOM (WHATWG DOM §4.8): a REAL attachShadow on rendered,
+            // table-backed elements too (the ad-hoc/created path has its own).
+            // Captures the host's backing Rc so the root is recorded on it.
+            let attach_shadow = if let cv_js::Value::Object(host_obj) = &rec.js {
+                let host_val = rec.js.clone();
+                let host_obj_for_shadow = host_obj.clone();
+                let pending_for_shadow = pending.clone();
+                Some(cv_js::native_fn("attachShadow", move |args| {
+                    attach_shadow_root(
+                        host_val.clone(),
+                        &host_obj_for_shadow,
+                        &args,
+                        &pending_for_shadow,
+                    )
+                }))
+            } else {
+                None
+            };
+
             if let cv_js::Value::Object(o) = &rec.js {
                 let mut m = o.borrow_mut();
                 m.insert("ownerDocument".into(), document.clone());
+                if let Some(attach_shadow) = attach_shadow {
+                    m.insert("attachShadow".into(), attach_shadow);
+                    // `shadowRoot` defaults to null until attachShadow runs
+                    // (Element.shadowRoot getter, DOM §4.8). Don't clobber a
+                    // root recorded by an earlier render pass.
+                    m.entry("shadowRoot".into())
+                        .or_insert(cv_js::Value::Null);
+                }
                 // Node.getRootNode() (DOM §4.4): the root of a connected node
                 // is its document. React 18.3's resource hoisting (Float) calls
                 // `container.getRootNode()` to locate document.head for
@@ -52972,6 +53427,180 @@ mod tests {
                  if (all.length !== 1) throw 'wrong subtree count';",
             )
             .expect("element querySelector APIs work on descendants only");
+    }
+
+    // ---- Shadow DOM (WHATWG DOM §4.8) ----
+
+    #[test]
+    fn attach_shadow_open_returns_real_queryable_tree() {
+        // The headline contract: attachShadow returns a real ShadowRoot;
+        // innerHTML parses into a real subtree; querySelector resolves a real
+        // node whose textContent is correct; host.shadowRoot === the root.
+        let doc = cv_html::parse(
+            "<!doctype html><html><body><div id='host'></div></body></html>",
+        );
+        let mut runtime = LiveInterp::new(&doc, "https://example.com/");
+        runtime
+            .interp
+            .run(
+                "var host = document.getElementById('host'); \
+                 var root = host.attachShadow({mode:'open'}); \
+                 if (!root) throw 'no root'; \
+                 if (root.mode !== 'open') throw 'mode wrong: ' + root.mode; \
+                 if (root.host !== host) throw 'host backref wrong'; \
+                 if (root.nodeType !== 11) throw 'nodeType wrong: ' + root.nodeType; \
+                 root.innerHTML = '<span>hi</span>'; \
+                 var span = root.querySelector('span'); \
+                 if (!span) throw 'querySelector miss'; \
+                 if (span.textContent !== 'hi') throw 'textContent wrong: ' + span.textContent; \
+                 if (host.shadowRoot !== root) throw 'shadowRoot getter wrong'; \
+                 if (root.childNodes.length !== 1) throw 'childNodes wrong: ' + root.childNodes.length;",
+            )
+            .expect("open shadow root is a real, queryable tree");
+    }
+
+    #[test]
+    fn attach_shadow_closed_hides_root_but_root_still_works() {
+        // mode:"closed" → host.shadowRoot === null, but the returned root is
+        // still a fully functional tree.
+        let doc = cv_html::parse(
+            "<!doctype html><html><body><div id='host'></div></body></html>",
+        );
+        let mut runtime = LiveInterp::new(&doc, "https://example.com/");
+        runtime
+            .interp
+            .run(
+                "var host = document.getElementById('host'); \
+                 var root = host.attachShadow({mode:'closed'}); \
+                 if (root.mode !== 'closed') throw 'mode wrong'; \
+                 if (host.shadowRoot !== null) throw 'closed shadowRoot must be null'; \
+                 root.innerHTML = '<p class=\"x\">yo</p>'; \
+                 var p = root.querySelector('.x'); \
+                 if (!p) throw 'closed root querySelector miss'; \
+                 if (p.textContent !== 'yo') throw 'closed root text wrong';",
+            )
+            .expect("closed shadow root works but is hidden from the host getter");
+    }
+
+    #[test]
+    fn attach_shadow_second_call_throws_not_supported() {
+        // DOM §4.8: a host that already hosts a shadow tree throws
+        // NotSupportedError on a second attachShadow.
+        let doc = cv_html::parse(
+            "<!doctype html><html><body><div id='host'></div></body></html>",
+        );
+        let mut runtime = LiveInterp::new(&doc, "https://example.com/");
+        runtime
+            .interp
+            .run(
+                "var host = document.getElementById('host'); \
+                 host.attachShadow({mode:'open'}); \
+                 var threw = false; var name = ''; \
+                 try { host.attachShadow({mode:'open'}); } \
+                 catch (e) { threw = true; name = e && e.name; } \
+                 if (!threw) throw 'second attachShadow did not throw'; \
+                 if (name !== 'NotSupportedError') throw 'wrong error name: ' + name;",
+            )
+            .expect("second attachShadow throws NotSupportedError");
+    }
+
+    #[test]
+    fn attach_shadow_appendchild_and_innerhtml_roundtrip() {
+        // appendChild really inserts; innerHTML getter serializes the live tree.
+        let doc = cv_html::parse(
+            "<!doctype html><html><body><div id='host'></div></body></html>",
+        );
+        let mut runtime = LiveInterp::new(&doc, "https://example.com/");
+        runtime
+            .interp
+            .run(
+                "var host = document.getElementById('host'); \
+                 var root = host.attachShadow({mode:'open'}); \
+                 var el = document.createElement('b'); \
+                 el.textContent = 'bold'; \
+                 root.appendChild(el); \
+                 if (root.childNodes.length !== 1) throw 'append count wrong'; \
+                 if (root.firstChild !== el) throw 'firstChild wrong'; \
+                 if (root.querySelector('b') !== el) throw 'query of appended wrong'; \
+                 var html = root.innerHTML; \
+                 if (html !== '<b>bold</b>') throw 'innerHTML serialize wrong: ' + html;",
+            )
+            .expect("appendChild + innerHTML roundtrip on shadow root");
+    }
+
+    #[test]
+    fn attach_shadow_invalid_host_throws_not_supported() {
+        // A <br> (not a valid shadow host name, not a custom element) must
+        // throw NotSupportedError (WHATWG DOM "valid shadow host name").
+        let doc = cv_html::parse("<!doctype html><html><body></body></html>");
+        let mut runtime = LiveInterp::new(&doc, "https://example.com/");
+        runtime
+            .interp
+            .run(
+                "var el = document.createElement('br'); \
+                 var threw = false; var name = ''; \
+                 try { el.attachShadow({mode:'open'}); } \
+                 catch (e) { threw = true; name = e && e.name; } \
+                 if (!threw) throw 'invalid host did not throw'; \
+                 if (name !== 'NotSupportedError') throw 'wrong error: ' + name; \
+                 var ce = document.createElement('my-widget'); \
+                 var r = ce.attachShadow({mode:'open'}); \
+                 if (!r) throw 'custom element host should attach';",
+            )
+            .expect("invalid host throws; custom element host attaches");
+    }
+
+    #[test]
+    fn attach_shadow_innerhtml_accessor_fires_in_bytecode_vm() {
+        // Prove the innerHTML getter/setter (an accessor) is honored on the
+        // bytecode-VM hot path too (the VM routes accessor get/set through
+        // resolve_accessor_read / __tb_host_setprop). The work lives inside a
+        // function body so it's eligible for VM compilation, and we force the
+        // VM tier.
+        let _g = cv_js::TierGuard::new(cv_js::ForcedTier::Vm);
+        let doc = cv_html::parse(
+            "<!doctype html><html><body><div id='host'></div></body></html>",
+        );
+        let mut runtime = LiveInterp::new(&doc, "https://example.com/");
+        runtime
+            .interp
+            .run(
+                "function go() { \
+                     var host = document.getElementById('host'); \
+                     var root = host.attachShadow({mode:'open'}); \
+                     root.innerHTML = '<i class=\"k\">vm</i>'; \
+                     var hit = root.querySelector('.k'); \
+                     if (!hit) throw 'vm querySelector miss'; \
+                     if (hit.textContent !== 'vm') throw 'vm text wrong'; \
+                     if (root.innerHTML !== '<i class=\"k\">vm</i>') \
+                         throw 'vm innerHTML getter wrong: ' + root.innerHTML; \
+                     return true; \
+                 } \
+                 if (go() !== true) throw 'go failed';",
+            )
+            .expect("innerHTML accessor fires on the bytecode VM tier");
+    }
+
+    #[test]
+    fn attach_shadow_root_is_separate_scope_from_document() {
+        // A node in the shadow tree is NOT found by document.querySelector /
+        // getElementById — the shadow root is its own tree scope.
+        let doc = cv_html::parse(
+            "<!doctype html><html><body><div id='host'></div></body></html>",
+        );
+        let mut runtime = LiveInterp::new(&doc, "https://example.com/");
+        runtime
+            .interp
+            .run(
+                "var host = document.getElementById('host'); \
+                 var root = host.attachShadow({mode:'open'}); \
+                 root.innerHTML = '<span id=\"shadowkid\">x</span>'; \
+                 if (document.getElementById('shadowkid') !== null) \
+                     throw 'shadow node leaked into document scope'; \
+                 if (root.getElementById('shadowkid') === null) \
+                     throw 'shadow root getElementById miss';",
+            )
+            .expect("shadow tree is a separate scope");
     }
 
     #[test]
