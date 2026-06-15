@@ -48454,6 +48454,14 @@ fn with_cached_selector_index<R>(
         Some((k, d)) if k == key => d,
         _ => {
             SELECTOR_INDEX_BUILDS.with(|b| b.set(b.get() + 1));
+            // The MatchedPropertiesCache holds `*const Declaration` pointers into
+            // `sheets`. We only get here when the SelectorIndex key changed —
+            // i.e. the stylesheet set's pointer/len/rule-count changed — which is
+            // exactly when those declaration pointers could become stale. Clear
+            // the MPC in lockstep with the index rebuild so a hit can never read
+            // a dangling/wrong declaration (the index-reuse arm above keeps the
+            // SAME `Stylesheet` objects, so the cached pointers stay valid there).
+            cv_css::cascade::clear_matched_properties_cache();
             cv_css::SelectorIndex::build_data_with_viewport(sheets, vw, vh)
         }
     });
@@ -49694,6 +49702,13 @@ fn bench_reset_render_thread_locals() {
     // document reuse). Mirrors the live nav path, where a new sheet set produces
     // a fresh fingerprint anyway.
     cv_css::cascade::clear_keyframes_memo();
+    // Drop the MatchedPropertiesCache so each measured build resolves the cascade
+    // cold (the WITHIN-build sibling sharing is the win — 200 identical cards
+    // resolve once, not cross-document reuse). Its decl pointers are into the
+    // previous document's sheets, so clearing here is also the dangling-pointer
+    // guard for the next cold build. (Live nav clears it via the SelectorIndex
+    // rebuild in with_cached_selector_index.)
+    cv_css::cascade::clear_matched_properties_cache();
 }
 
 /// Cap on cached subtree entries; on overflow the cache is left as-is (new

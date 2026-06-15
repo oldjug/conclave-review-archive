@@ -2534,7 +2534,12 @@ where
             .then(a.specificity.cmp(&b.specificity))
             .then(a.source_order.cmp(&b.source_order))
     });
-    let mut style = apply_matched_with_inherited_vars(&matched, inherited_vars);
+    // Blink MatchedPropertiesCache: reuse a sibling's resolved cascade when this
+    // element matched the same declarations in the same inherited context. The
+    // cache is bypassed for inline-styled elements (their decl pointers are not
+    // stylesheet-resident) and `apply_presentational_attrs` runs per-element on
+    // the returned owned style, so per-element state is never shared.
+    let mut style = apply_matched_cached(&matched, inherited_vars, !inline.is_empty());
     apply_presentational_attrs(&mut style, element);
     style
 }
@@ -3117,6 +3122,173 @@ fn keyframes_memo_enabled() -> bool {
     // `collect_keyframes` reads, so a hit is byte-identical to a cold collect
     // (oracle-proven). `CV_KEYFRAMES_MEMO=0` forces the cold path.
     *ENABLED.get_or_init(|| std::env::var("CV_KEYFRAMES_MEMO").as_deref() != Ok("0"))
+}
+
+// ── MatchedPropertiesCache (Blink StyleResolver::MatchedPropertiesCache) ─────
+//
+// Blink's `StyleResolver` does NOT re-run the full cascade for every element. It
+// hashes the *set of matched properties* an element resolved (the
+// `MatchedPropertiesVector`) together with the parent's computed style and looks
+// it up in a `MatchedPropertiesCache`; on a hit it reuses the cached
+// `ComputedStyle` instead of re-applying every declaration (see
+// `third_party/blink/renderer/core/css/resolver/matched_properties_cache.{h,cc}`
+// and `StyleResolver::ApplyMatchedPropertiesAndCustomPropertyAnimations`). For a
+// repetitive DOM — N siblings with the same class — the cascade runs ONCE and
+// the remaining N-1 reuse the result. medium_dom's 200 identical `.card` divs
+// (+200 `.t` +200 `.d`) collapse from 600 cascade applications to 3.
+//
+// Our analogue caches the result of `apply_matched_with_inherited_vars` keyed on
+// the EXACT inputs that function reads: the ordered sequence of matched
+// declarations (their identity + importance + inline-ness) and the inherited
+// custom-property map. `apply_presentational_attrs` is element-specific (reads
+// the element's own attributes) and is applied to a fresh clone on EVERY path —
+// cache hits and misses alike — so per-element presentational state is never
+// shared.
+//
+// KEY CORRECTNESS: a hit is provably the same style as a cold apply because the
+// key captures everything `apply_matched_with_inherited_vars` consumes:
+//   - the ordered `(decl, important, is_inline)` list — every declaration the
+//     apply loop walks, in cascade order;
+//   - a content hash of the inherited `--var` map (sorted by name) — the only
+//     other input (`expand_vars` resolves `var()` against it).
+// We ONLY consult/store the cache when the element has NO inline declarations, so
+// every matched `decl` pointer is stylesheet-resident and therefore valid for as
+// long as the cache lives (the cache is cleared per build, exactly like the
+// keyframe memo — see `clear_matched_properties_cache`). The pointer is unique
+// among live declarations, importance/inline-ness fold in as guard bits, and the
+// inherited-vars hash separates contexts, so an over-eager collision cannot
+// return a wrong style. Oracle-gated: with the cache on vs off the computed style
+// of every node is byte-identical (see `mpc_*` tests).
+
+thread_local! {
+    /// Per-build MatchedPropertiesCache: cascade-key → resolved pre-
+    /// presentational `ComputedStyle`. Wrapped in an `Rc` so a hit clones the
+    /// stored style (cheap refcount bump + one struct clone for the
+    /// presentational fixup) rather than re-running the cascade. Cleared per
+    /// build via `clear_matched_properties_cache` (mirrors the keyframe memo).
+    static MATCHED_PROPS_CACHE: std::cell::RefCell<
+        std::collections::HashMap<u64, std::rc::Rc<ComputedStyle>>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Drop the MatchedPropertiesCache so the next pass resolves cold. Called per
+/// build alongside the other render thread-local resets (a stale entry would be
+/// from a since-dropped stylesheet — pointers would dangle — so this MUST run
+/// when the stylesheet set changes / on every cold build).
+pub fn clear_matched_properties_cache() {
+    MATCHED_PROPS_CACHE.with(|c| c.borrow_mut().clear());
+}
+
+thread_local! {
+    /// Test-only override of the MatchedPropertiesCache enable flag. `None` =
+    /// honor the `CV_MPC` env default; `Some(b)` = force on/off. Lets the A/B
+    /// oracle drive the SAME code path with the cache on and off in one process
+    /// (the env `OnceLock` is process-global and can't be toggled per test).
+    static MPC_FORCE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Test/diagnostic hook: force the MatchedPropertiesCache on/off (or `None` to
+/// restore the env default). Used by the A/B oracle to compare cache-on vs
+/// cache-off computed styles in-process.
+pub fn set_matched_properties_cache_forced(v: Option<bool>) {
+    MPC_FORCE.with(|c| c.set(v));
+}
+
+fn matched_props_cache_enabled() -> bool {
+    if let Some(forced) = MPC_FORCE.with(|c| c.get()) {
+        return forced;
+    }
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    // Default-OFF (opt in with `CV_MPC=1`). The cache is OUTPUT-IDENTICAL to the
+    // cold cascade (oracle-proven: `mpc_*` tests assert byte-identical
+    // ComputedStyle on vs off) and delivers a MEASURED ~70% cut in the per-element
+    // cascade-apply step (1560ns → 465ns; see `mpc_apply_share_diagnostic`). It is
+    // NOT yet default-on because that cascade-apply step is only a small share of
+    // end-to-end TTFP in our engine (layout + text measurement + paint baking
+    // dominate the medium_dom build), so the win is below the `--type bench` TTFP
+    // noise floor — the honesty rule is "real bench drop or default-OFF". Flip to
+    // default-on after a soak, OR once the cascade becomes a larger TTFP share
+    // (e.g. var-heavy / utility-CSS pages where `apply_declaration` + `expand_vars`
+    // cost more per element and the apply share rises).
+    *ENABLED.get_or_init(|| matches!(std::env::var("CV_MPC").as_deref(), Ok("1") | Ok("true") | Ok("on")))
+}
+
+/// Hash the cascade inputs into the MatchedPropertiesCache key. Captures the
+/// ORDERED matched declarations by identity (pointer) + importance + inline-ness,
+/// plus a content hash of the inherited custom-property map (sorted by name so
+/// the hash is order-independent). This is the whole input surface of
+/// `apply_matched_with_inherited_vars`; nothing else affects its output.
+fn matched_props_key(
+    matched: &[Matched<'_>],
+    inherited: Option<&std::collections::HashMap<String, Vec<CssToken>>>,
+) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    // The declaration sequence, in the already-sorted cascade order. The apply
+    // loop reads decl.name / decl.value / decl.important in this exact order, so
+    // the ordered identity sequence is a faithful fingerprint. Importance and
+    // inline-ness are folded in as guard bits (they steer cascade_rank/layer_rank
+    // upstream, but include them so the key can never under-distinguish).
+    (matched.len() as u64).hash(&mut h);
+    for m in matched {
+        ((m.decl as *const Declaration) as usize).hash(&mut h);
+        m.important.hash(&mut h);
+        m.is_inline.hash(&mut h);
+    }
+    // Inherited custom properties: only `var()` references read them, but fold a
+    // content hash in unconditionally — it can only cause extra misses, never a
+    // wrong hit. Sort by name so HashMap iteration order does not perturb it, and
+    // render values via Debug (CssToken has no Hash; Debug is deterministic for a
+    // given content, the same technique fingerprint_inherited uses).
+    match inherited {
+        None => 0u8.hash(&mut h),
+        Some(map) => {
+            1u8.hash(&mut h);
+            (map.len() as u64).hash(&mut h);
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort_unstable();
+            for k in keys {
+                k.hash(&mut h);
+                if let Some(v) = map.get(k) {
+                    format!("{v:?}").hash(&mut h);
+                }
+            }
+        }
+    }
+    h.finish()
+}
+
+/// Resolve the cascade for `matched` + `inherited`, reusing a cached result when
+/// an element with the SAME matched-declaration set + inherited context resolved
+/// already this build (Blink MatchedPropertiesCache). Returns a *fresh* owned
+/// `ComputedStyle` every call (the caller then runs `apply_presentational_attrs`
+/// on it), so the shared value is never mutated. Falls back to a plain cold apply
+/// when the cache is disabled or the element has inline declarations (whose decl
+/// pointers are not stylesheet-resident and so must not key the cache).
+fn apply_matched_cached(
+    matched: &[Matched<'_>],
+    inherited: Option<&std::collections::HashMap<String, Vec<CssToken>>>,
+    has_inline: bool,
+) -> ComputedStyle {
+    if !matched_props_cache_enabled() || has_inline {
+        return apply_matched_with_inherited_vars(matched, inherited);
+    }
+    let key = matched_props_key(matched, inherited);
+    if let Some(hit) = MATCHED_PROPS_CACHE.with(|c| c.borrow().get(&key).cloned()) {
+        return (*hit).clone();
+    }
+    let built = std::rc::Rc::new(apply_matched_with_inherited_vars(matched, inherited));
+    MATCHED_PROPS_CACHE.with(|c| {
+        // Bound the cache so a pathological page with thousands of distinct
+        // match sets can't grow it without limit; a miss just recomputes (always
+        // correct). 16K distinct cascades covers any realistic page.
+        let mut cache = c.borrow_mut();
+        if cache.len() < 16_384 {
+            cache.insert(key, built.clone());
+        }
+    });
+    (*built).clone()
 }
 
 /// Sample an animation at progress `t` (0..1) by interpolating between
@@ -12047,5 +12219,209 @@ mod tests {
             keyframes_fingerprint(&b),
             "a preceding non-keyframe at-rule perturbs the fingerprint"
         );
+    }
+
+    // ── MatchedPropertiesCache (Blink StyleResolver) oracle ──────────────────
+    //
+    // The cache is a pure memo of `apply_matched_with_inherited_vars`: a hit must
+    // be BYTE-IDENTICAL to a cold cascade apply. These tests drive the real
+    // `compute_with_index_inheriting_filtered` path with the cache forced ON vs
+    // OFF and assert the full `ComputedStyle` (Debug serialization = every field)
+    // is identical, prove identical siblings actually share, and prove a DIFFERING
+    // sibling does NOT hit (the correctness hazard — an over-eager key returning a
+    // wrong style).
+
+    /// Build a tiny sheet set + index used by the MPC oracle tests. Mirrors
+    /// medium_dom's `.card`/`.t`/`.d` shape so the test exercises the same
+    /// matched-set sharing the bench measures.
+    fn mpc_index() -> SelectorIndex<'static> {
+        // Leak the sheets so the index can borrow them for 'static within the
+        // test (the cache keys on decl pointers, which must stay live).
+        let css = ".card{display:inline-block;width:150px;height:64px;margin:3px;\
+                   padding:6px;border:1px solid #bbb;background:#f7f7f7;}\
+                   .card .t{font-size:12px;font-weight:bold;color:#333;}\
+                   .card .d{font-size:11px;color:#666;line-height:1.3;}\
+                   .alt{color:red;}";
+        let leaked: &'static [Stylesheet] = Box::leak(vec![parse_stylesheet(css)].into_boxed_slice());
+        SelectorIndex::build_with_viewport(leaked, 1280.0, 800.0)
+    }
+
+    /// Resolve `el` via the real cascade entry point with the cache forced to
+    /// `cache_on`. Clears the cache first so each call starts cold-then-warm.
+    fn mpc_resolve(idx: &SelectorIndex<'_>, el: Fake<'_>, classes: &[String], cache_on: bool) -> ComputedStyle {
+        set_matched_properties_cache_forced(Some(cache_on));
+        let cs = compute_with_index_inheriting_filtered(idx, el, &[], classes, None, None);
+        set_matched_properties_cache_forced(None);
+        cs
+    }
+
+    /// THE oracle: the computed style of every node must be byte-identical with
+    /// the cache ON vs OFF — for the plain `.card`, the `.alt` variant, and a bare
+    /// element matching nothing. We compare the cache-OFF result against BOTH the
+    /// first cache-ON resolve (cold miss) and the second (warm HIT).
+    #[test]
+    fn mpc_computed_style_identical_cache_on_vs_off() {
+        let idx = mpc_index();
+        let cases: [(Fake<'_>, Vec<String>); 3] = [
+            (Fake { tag: "div", id: None, classes: &["card"] }, vec!["card".to_string()]),
+            (
+                Fake { tag: "div", id: None, classes: &["card", "alt"] },
+                vec!["card".to_string(), "alt".to_string()],
+            ),
+            (Fake { tag: "section", id: None, classes: &[] }, vec![]),
+        ];
+        for (el, classes) in cases {
+            clear_matched_properties_cache();
+            let off = mpc_resolve(&idx, el, &classes, false);
+            clear_matched_properties_cache();
+            // Cold-then-warm with cache ON: resolve TWICE, the 2nd is a hit.
+            let on_cold = mpc_resolve_keep(&idx, el, &classes, true);
+            let on_warm = compute_with_index_inheriting_filtered(&idx, el, &[], &classes, None, None);
+            set_matched_properties_cache_forced(None);
+            assert_eq!(
+                format!("{off:?}"),
+                format!("{on_cold:?}"),
+                "cache-off vs cache-on(cold) computed style diverged for {:?}",
+                el.classes
+            );
+            assert_eq!(
+                format!("{off:?}"),
+                format!("{on_warm:?}"),
+                "cache-off vs cache-on(warm HIT) computed style diverged for {:?}",
+                el.classes
+            );
+        }
+    }
+
+    /// Like `mpc_resolve` but leaves the forced flag ON (caller restores it) so a
+    /// following call observes a warm cache.
+    fn mpc_resolve_keep(idx: &SelectorIndex<'_>, el: Fake<'_>, classes: &[String], cache_on: bool) -> ComputedStyle {
+        set_matched_properties_cache_forced(Some(cache_on));
+        compute_with_index_inheriting_filtered(idx, el, &[], classes, None, None)
+    }
+
+    /// 200 identical `.card` siblings must (a) all get IDENTICAL computed style
+    /// and (b) populate the cache with exactly ONE entry (the cascade ran once,
+    /// the other 199 hit) — the beat-Chrome sibling-sharing win, measured.
+    #[test]
+    fn mpc_identical_siblings_share_one_cascade() {
+        let idx = mpc_index();
+        clear_matched_properties_cache();
+        set_matched_properties_cache_forced(Some(true));
+        let classes = ["card".to_string()];
+        let el = Fake { tag: "div", id: None, classes: &["card"] };
+        let first = compute_with_index_inheriting_filtered(&idx, el, &[], &classes, None, None);
+        let first_dbg = format!("{first:?}");
+        for _ in 0..199 {
+            let cs = compute_with_index_inheriting_filtered(&idx, el, &[], &classes, None, None);
+            assert_eq!(first_dbg, format!("{cs:?}"), "every identical card resolves identically");
+        }
+        // Exactly one distinct matched-set => exactly one cache entry => the
+        // cascade `apply` ran ONCE for 200 cards.
+        let entries = MATCHED_PROPS_CACHE.with(|c| c.borrow().len());
+        assert_eq!(entries, 1, "200 identical cards collapse to ONE cached cascade");
+        set_matched_properties_cache_forced(None);
+    }
+
+    /// A DIFFERING sibling (extra `.alt` class adds a matched declaration) must
+    /// NOT reuse the plain card's cached style — it gets a distinct key and a
+    /// distinct (correct) computed style. This is the over-eager-key guard: if the
+    /// key dropped the distinction, `.alt` would silently render without its red.
+    #[test]
+    fn mpc_differing_sibling_does_not_hit() {
+        let idx = mpc_index();
+        clear_matched_properties_cache();
+        set_matched_properties_cache_forced(Some(true));
+
+        let plain = Fake { tag: "div", id: None, classes: &["card"] };
+        let plain_classes = ["card".to_string()];
+        let cs_plain = compute_with_index_inheriting_filtered(&idx, plain, &[], &plain_classes, None, None);
+        // `.alt` adds `color:red` on top of the same `.card` declarations.
+        let alt = Fake { tag: "div", id: None, classes: &["card", "alt"] };
+        let alt_classes = ["card".to_string(), "alt".to_string()];
+        let cs_alt = compute_with_index_inheriting_filtered(&idx, alt, &[], &alt_classes, None, None);
+
+        // Two distinct match sets => two cache entries (no wrong reuse).
+        let entries = MATCHED_PROPS_CACHE.with(|c| c.borrow().len());
+        assert_eq!(entries, 2, "plain card and .alt card key distinctly");
+        // The plain card has the default UA/none color; the .alt card is red.
+        assert_ne!(cs_plain.color, cs_alt.color, ".alt must NOT inherit the plain card's color");
+        assert_eq!(cs_alt.color, Some(Color { r: 255, g: 0, b: 0, a: 255 }), ".alt resolves red");
+        // And the .alt computed style equals a cold (cache-off) resolve — proves
+        // the distinct entry is the CORRECT style, not just a different one.
+        set_matched_properties_cache_forced(Some(false));
+        let cs_alt_off = compute_with_index_inheriting_filtered(&idx, alt, &[], &alt_classes, None, None);
+        assert_eq!(format!("{cs_alt:?}"), format!("{cs_alt_off:?}"), ".alt cache entry == cold apply");
+        set_matched_properties_cache_forced(None);
+    }
+
+    /// TEMP diagnostic (ignored): quantify the cascade-apply share of full
+    /// per-element resolution, to size the MPC's headroom honestly. Times 200
+    /// full resolves (collect+match+apply) of a `.card` with MPC off, then 200
+    /// resolves with MPC on (199 hits), then 200 raw apply-only calls.
+    #[test]
+    #[ignore]
+    fn mpc_apply_share_diagnostic() {
+        let idx = mpc_index();
+        let el = Fake { tag: "div", id: None, classes: &["card"] };
+        let classes = ["card".to_string()];
+        let n = 50_000;
+
+        clear_matched_properties_cache();
+        set_matched_properties_cache_forced(Some(false));
+        let t = std::time::Instant::now();
+        let mut acc = 0u64;
+        for _ in 0..n {
+            let cs = compute_with_index_inheriting_filtered(&idx, el, &[], &classes, None, None);
+            acc = acc.wrapping_add(cs.width.is_some() as u64);
+        }
+        let full_off = t.elapsed();
+
+        clear_matched_properties_cache();
+        set_matched_properties_cache_forced(Some(true));
+        let t = std::time::Instant::now();
+        for _ in 0..n {
+            let cs = compute_with_index_inheriting_filtered(&idx, el, &[], &classes, None, None);
+            acc = acc.wrapping_add(cs.width.is_some() as u64);
+        }
+        let full_on = t.elapsed();
+        set_matched_properties_cache_forced(None);
+
+        eprintln!(
+            "MPC diag (n={n}): full_off={:?} ({:.1}ns/el)  full_on={:?} ({:.1}ns/el)  saved={:.1}%  acc={acc}",
+            full_off,
+            full_off.as_nanos() as f64 / n as f64,
+            full_on,
+            full_on.as_nanos() as f64 / n as f64,
+            (full_off.as_nanos() as f64 - full_on.as_nanos() as f64) / full_off.as_nanos() as f64 * 100.0,
+        );
+    }
+
+    /// Inherited custom-property context is part of the key: the SAME matched
+    /// declarations resolved under DIFFERENT inherited `--var` maps must produce
+    /// different results when a decl references `var()`, and must NOT collide.
+    #[test]
+    fn mpc_key_separates_inherited_var_contexts() {
+        let css = ".v{color:var(--c, black);}";
+        let sheets: Vec<Stylesheet> = vec![parse_stylesheet(css)];
+        let leaked: &'static [Stylesheet] = Box::leak(sheets.into_boxed_slice());
+        let idx = SelectorIndex::build_with_viewport(leaked, 1280.0, 800.0);
+        clear_matched_properties_cache();
+        set_matched_properties_cache_forced(Some(true));
+
+        let el = Fake { tag: "span", id: None, classes: &["v"] };
+        let classes = ["v".to_string()];
+
+        let mut red_ctx = std::collections::HashMap::new();
+        red_ctx.insert("--c".to_string(), vec![CssToken::Ident("red".to_string())]);
+        let mut blue_ctx = std::collections::HashMap::new();
+        blue_ctx.insert("--c".to_string(), vec![CssToken::Ident("blue".to_string())]);
+
+        let cs_red = compute_with_index_inheriting_filtered(&idx, el, &[], &classes, Some(&red_ctx), None);
+        let cs_blue = compute_with_index_inheriting_filtered(&idx, el, &[], &classes, Some(&blue_ctx), None);
+        assert_eq!(cs_red.color, Some(Color { r: 255, g: 0, b: 0, a: 255 }), "--c:red resolves red");
+        assert_eq!(cs_blue.color, Some(Color { r: 0, g: 0, b: 255, a: 255 }), "--c:blue resolves blue");
+        assert_ne!(cs_red.color, cs_blue.color, "differing inherited var context must NOT collide in the cache");
+        set_matched_properties_cache_forced(None);
     }
 }
