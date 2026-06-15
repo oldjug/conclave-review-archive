@@ -3343,12 +3343,69 @@ fn proxy_parts(v: &Value) -> Option<(Value, Value)> {
     None
 }
 
-/// Borrow a typed-array object's element-storage array (`_bytes`).
+/// Borrow a typed-array object's element-storage array (`_bytes`). This is the
+/// shared backing store (`Rc`) of the view's `.buffer` — multiple views over the
+/// same `ArrayBuffer` hold the SAME `Rc`, so a write through one is visible
+/// through every overlapping view (ECMA-262 §10.4.5 IntegerIndexed exotic
+/// objects all read/write the buffer's `[[ArrayBufferData]]`).
 fn typed_array_storage(o: &Rc<RefCell<HashMap<String, Value>>>) -> Option<Rc<RefCell<Vec<Value>>>> {
     match o.borrow().get("_bytes") {
         Some(Value::Array(a)) => Some(a.clone()),
         _ => None,
     }
+}
+
+/// A typed array's `byteOffset` into the shared backing store (the start of this
+/// view's window). Defaults to 0 for whole-buffer views.
+fn typed_array_byte_offset(o: &Rc<RefCell<HashMap<String, Value>>>) -> usize {
+    match o.borrow().get("byteOffset") {
+        Some(Value::Number(n)) if *n >= 0.0 => *n as usize,
+        _ => 0,
+    }
+}
+
+/// The element count this view exposes (`length`). When absent (legacy whole-
+/// buffer views), derive it from the storage length and element size.
+fn typed_array_length(o: &Rc<RefCell<HashMap<String, Value>>>, kind: &str) -> usize {
+    if let Some(Value::Number(n)) = o.borrow().get("length") {
+        if *n >= 0.0 {
+            return *n as usize;
+        }
+    }
+    let store_len = typed_array_storage(o).map(|s| s.borrow().len()).unwrap_or(0);
+    let off = typed_array_byte_offset(o);
+    ta_length_from_bytes(kind, store_len.saturating_sub(off))
+}
+
+/// True if this view's underlying `ArrayBuffer` has been detached
+/// (ECMA-262 §25.1.3.3 DetachArrayBuffer — its `[[ArrayBufferData]]` is null).
+/// Detachment is marked with `_detached: true` on the BUFFER object; we observe
+/// it both directly on the view (defensive) and through the view's `.buffer`
+/// (the single source of truth, so detaching the buffer propagates to every
+/// view at once). Integer-indexed access then behaves as out-of-bounds
+/// (§10.4.5.1 IsValidIntegerIndex returns false → get yields `undefined`, set
+/// is a no-op); DataView access throws a TypeError.
+fn typed_array_detached(o: &Rc<RefCell<HashMap<String, Value>>>) -> bool {
+    let b = o.borrow();
+    if matches!(b.get("_detached"), Some(Value::Bool(true))) {
+        return true;
+    }
+    if let Some(Value::Object(buf)) = b.get("buffer") {
+        return matches!(buf.borrow().get("_detached"), Some(Value::Bool(true)));
+    }
+    false
+}
+
+/// Decode element `idx` of a view, honoring its `byteOffset` window into the
+/// shared store. Returns `undefined` for out-of-range / detached (§10.4.5.1).
+fn ta_decode_elem_off(kind: &str, bytes: &[Value], byte_offset: usize, idx: usize) -> Value {
+    let bpe = ta_elem_size(kind);
+    let start = byte_offset.saturating_add(idx.saturating_mul(bpe));
+    if start + bpe > bytes.len() {
+        return Value::Undefined;
+    }
+    // Reuse the absolute-index decoder by slicing the window's first byte.
+    ta_decode_elem(kind, &bytes[start..], 0)
 }
 
 pub fn iterable_values(v: &Value) -> Vec<Value> {
@@ -9870,13 +9927,16 @@ impl Interp {
             }),
         );
 
-        // TypedArrays / ArrayBuffer / DataView. V1 represents each
-        // typed array as a Value::Array of Numbers. ArrayBuffer is a
-        // tagged Object whose `_bytes` is the same array (one number
-        // per byte). This loses real byte-level aliasing — DataView
-        // and shared buffers between views won't reflect each other —
-        // but covers the common case where code only reads/writes
-        // through one view.
+        // TypedArrays / ArrayBuffer / DataView. The backing store is a
+        // `Value::Array` of Numbers (one number per byte) held behind a single
+        // shared `Rc<RefCell<…>>`. ArrayBuffer is a tagged Object whose `_bytes`
+        // IS that `Rc`; every TypedArray/DataView built over the buffer holds the
+        // SAME `Rc` plus its own `byteOffset`/`length` window. So a write through
+        // one view is immediately visible through every overlapping view (real
+        // byte-level aliasing, ECMA-262 §10.4.5 / §25.3 — see the
+        // `multiple_views_alias_*`, `subarray_aliases_*`, and `dataview_*` tests).
+        // `subarray` aliases (shares the `Rc`); `slice` copies into a fresh store.
+        // Detaching the buffer (`transfer`, §25.1.3.3) makes every view inert.
         // V8 models typed arrays as objects whose [[Prototype]] is
         // `<Kind>.prototype`, which in turn inherits from the shared
         // `%TypedArray.prototype%` (the abstract %TypedArray% supertype's
@@ -9968,34 +10028,37 @@ impl Interp {
                 );
             }
             // `set(source, offset?)` — copy elements from an array-like/typed
-            // array into this one starting at `offset` (ECMA-262 §23.2.3.23).
+            // array into this one starting at element `offset` within this view's
+            // window (ECMA-262 §23.2.3.23). Writes land at the view's `byteOffset`
+            // into the shared store, so they are visible through aliasing views.
             tp.insert(
                 "set".into(),
                 native_fn_with_interp("set", |interp, args| {
                     let this = interp.native_this();
-                    let (dst, kind) = match &this {
+                    let (dst, kind, view_off) = match &this {
                         Value::Object(o) => {
-                            let b = o.borrow();
+                            let kind = o
+                                .borrow()
+                                .get("_typedarray")
+                                .map(|v| v.to_display_string())
+                                .unwrap_or_default();
                             (
-                                match b.get("_bytes") {
-                                    Some(Value::Array(a)) => Some(a.clone()),
-                                    _ => None,
-                                },
-                                b.get("_typedarray")
-                                    .map(|v| v.to_display_string())
-                                    .unwrap_or_default(),
+                                typed_array_storage(o),
+                                kind,
+                                typed_array_byte_offset(o),
                             )
                         }
-                        _ => (None, String::new()),
+                        _ => (None, String::new(), 0),
                     };
                     let Some(dst) = dst else {
                         return Ok(Value::Undefined);
                     };
                     let src = iterable_values(&args.first().cloned().unwrap_or(Value::Undefined));
                     let offset = args.get(1).map(|v| v.to_number() as usize).unwrap_or(0);
+                    let bpe = ta_elem_size(&kind);
                     let mut d = dst.borrow_mut();
                     for (i, v) in src.into_iter().enumerate() {
-                        let start = (offset + i).saturating_mul(ta_elem_size(&kind));
+                        let start = view_off.saturating_add((offset + i).saturating_mul(bpe));
                         let bytes = ta_encode_elem(&kind, &v);
                         if start + bytes.len() <= d.len() {
                             for (off, byte) in bytes.into_iter().enumerate() {
@@ -10006,30 +10069,36 @@ impl Interp {
                     Ok(Value::Undefined)
                 }),
             );
-            // `subarray(begin?, end?)` — a view; we materialise a copy (no shared
-            // buffer aliasing in V1) but with the correct kind + prototype.
+            // `subarray(begin?, end?)` — a NEW view over the SAME backing store
+            // (true aliasing; ECMA-262 §23.2.3.27). It shares the `Rc` + the same
+            // `.buffer` object, only adjusting `byteOffset` and `length`. Mutating
+            // the subarray mutates the parent (and vice versa).
             tp.insert(
                 "subarray".into(),
                 native_fn_with_interp("subarray", |interp, args| {
                     let this = interp.native_this();
                     if let Value::Object(o) = &this {
-                        let (storage, kind, bpe, proto) = {
+                        let store = typed_array_storage(o);
+                        let (kind, bpe, proto, parent_off, parent_len, buffer) = {
                             let b = o.borrow();
+                            let kind = b
+                                .get("_typedarray")
+                                .map(|v| v.to_display_string())
+                                .unwrap_or_default();
+                            let bpe = ta_elem_size(&kind);
                             (
-                                match b.get("_bytes") {
-                                    Some(Value::Array(a)) => a.borrow().clone(),
-                                    _ => Vec::new(),
-                                },
-                                b.get("_typedarray")
-                                    .map(|v| v.to_display_string())
-                                    .unwrap_or_default(),
-                                b.get("BYTES_PER_ELEMENT")
-                                    .map(|v| v.to_number())
-                                    .unwrap_or(1.0),
+                                kind.clone(),
+                                bpe,
                                 b.get(PROTO_KEY).cloned(),
+                                typed_array_byte_offset(o),
+                                typed_array_length(o, &kind),
+                                b.get("buffer").cloned(),
                             )
                         };
-                        let elem_len = ta_length_from_bytes(&kind, storage.len()) as i64;
+                        let Some(store) = store else {
+                            return Ok(Value::Undefined);
+                        };
+                        let elem_len = parent_len as i64;
                         let norm = |x: f64| -> usize {
                             let v = if x < 0.0 {
                                 (elem_len + x as i64).max(0)
@@ -10041,26 +10110,109 @@ impl Interp {
                         let begin = args.first().map(|v| norm(v.to_number())).unwrap_or(0);
                         let end = args
                             .get(1)
+                            .filter(|v| !matches!(v, Value::Undefined))
                             .map(|v| norm(v.to_number()))
-                            .unwrap_or(elem_len as usize);
-                        let bpe = bpe as usize;
-                        let start_byte = begin.saturating_mul(bpe);
-                        let end_byte = end.max(begin).saturating_mul(bpe);
-                        let slice: Vec<Value> = storage
-                            .get(start_byte..end_byte.min(storage.len()))
-                            .map(|s| s.to_vec())
-                            .unwrap_or_default();
-                        let slen = ta_length_from_bytes(&kind, slice.len());
+                            .unwrap_or(parent_len);
+                        let new_len = end.max(begin) - begin;
+                        let new_off = parent_off.saturating_add(begin.saturating_mul(bpe));
                         let mut m: HashMap<String, Value> = HashMap::new();
-                        m.insert("_typedarray".into(), Value::str(kind));
-                        m.insert("_bytes".into(), Value::Array(Rc::new(RefCell::new(slice))));
-                        m.insert("length".into(), Value::Number(slen as f64));
-                        m.insert("byteLength".into(), Value::Number(slen as f64 * bpe as f64));
-                        m.insert("byteOffset".into(), Value::Number(0.0));
+                        m.insert("_typedarray".into(), Value::str(kind.clone()));
+                        m.insert("_bytes".into(), Value::Array(store)); // SAME Rc → alias
+                        m.insert("length".into(), Value::Number(new_len as f64));
+                        m.insert(
+                            "byteLength".into(),
+                            Value::Number((new_len * bpe) as f64),
+                        );
+                        m.insert("byteOffset".into(), Value::Number(new_off as f64));
                         m.insert("BYTES_PER_ELEMENT".into(), Value::Number(bpe as f64));
+                        if let Some(buf) = buffer {
+                            m.insert("buffer".into(), buf); // SAME ArrayBuffer object
+                        }
                         if let Some(p) = proto {
                             m.insert(PROTO_KEY.into(), p);
                         }
+                        return Ok(Value::Object(Rc::new(RefCell::new(m))));
+                    }
+                    Ok(Value::Undefined)
+                }),
+            );
+            // `slice(begin?, end?)` — a NEW typed array of the same kind with a
+            // FRESH, independent backing store (a COPY; ECMA-262 §23.2.3.26).
+            // Mutating the slice does NOT affect the parent. (This overrides the
+            // generic Array.prototype.slice delegation registered above, which
+            // would have produced a plain Array, not a same-kind TypedArray.)
+            tp.insert(
+                "slice".into(),
+                native_fn_with_interp("slice", |interp, args| {
+                    let this = interp.native_this();
+                    if let Value::Object(o) = &this {
+                        let store = typed_array_storage(o);
+                        let (kind, bpe, proto, parent_off, parent_len) = {
+                            let b = o.borrow();
+                            let kind = b
+                                .get("_typedarray")
+                                .map(|v| v.to_display_string())
+                                .unwrap_or_default();
+                            let bpe = ta_elem_size(&kind);
+                            (
+                                kind.clone(),
+                                bpe,
+                                b.get(PROTO_KEY).cloned(),
+                                typed_array_byte_offset(o),
+                                typed_array_length(o, &kind),
+                            )
+                        };
+                        let Some(store) = store else {
+                            return Ok(Value::Undefined);
+                        };
+                        let elem_len = parent_len as i64;
+                        let norm = |x: f64| -> usize {
+                            let v = if x < 0.0 {
+                                (elem_len + x as i64).max(0)
+                            } else {
+                                (x as i64).min(elem_len)
+                            };
+                            v as usize
+                        };
+                        let begin = args.first().map(|v| norm(v.to_number())).unwrap_or(0);
+                        let end = args
+                            .get(1)
+                            .filter(|v| !matches!(v, Value::Undefined))
+                            .map(|v| norm(v.to_number()))
+                            .unwrap_or(parent_len);
+                        let new_len = end.max(begin) - begin;
+                        // Copy bytes [begin, end) of the SOURCE window into a
+                        // brand-new store — no shared `Rc`, so writes don't alias.
+                        let src = store.borrow();
+                        let mut out: Vec<Value> = Vec::with_capacity(new_len * bpe);
+                        for i in 0..new_len {
+                            let v = ta_decode_elem_off(&kind, &src, parent_off, begin + i);
+                            out.extend(ta_encode_elem(&kind, &v));
+                        }
+                        drop(src);
+                        let new_store = Rc::new(RefCell::new(out));
+                        let byte_len = new_len * bpe;
+                        // Mint a fresh ArrayBuffer sharing only this new store.
+                        let mut abuf: HashMap<String, Value> = HashMap::new();
+                        abuf.insert("_isArrayBuffer".into(), Value::Bool(true));
+                        abuf.insert("_arraybuffer".into(), Value::Bool(true));
+                        abuf.insert("_bytes".into(), Value::Array(new_store.clone()));
+                        abuf.insert("byteLength".into(), Value::Number(byte_len as f64));
+                        let mut m: HashMap<String, Value> = HashMap::new();
+                        m.insert("_typedarray".into(), Value::str(kind.clone()));
+                        m.insert("_bytes".into(), Value::Array(new_store));
+                        m.insert("length".into(), Value::Number(new_len as f64));
+                        m.insert("byteLength".into(), Value::Number(byte_len as f64));
+                        m.insert("byteOffset".into(), Value::Number(0.0));
+                        m.insert("BYTES_PER_ELEMENT".into(), Value::Number(bpe as f64));
+                        m.insert(
+                            "buffer".into(),
+                            Value::Object(Rc::new(RefCell::new(abuf))),
+                        );
+                        if let Some(p) = proto {
+                            m.insert(PROTO_KEY.into(), p);
+                        }
+                        let _ = interp;
                         return Ok(Value::Object(Rc::new(RefCell::new(m))));
                     }
                     Ok(Value::Undefined)
@@ -10077,74 +10229,136 @@ impl Interp {
                 native_fn_with_interp($name, move |_interp, args| {
                     let first = args.first().cloned().unwrap_or(Value::Undefined);
                     let kind = $name;
-                    let bpe = $elem_size;
-                    let arr = match first {
+                    let bpe: usize = $elem_size;
+                    // Resolve (shared_store, byte_offset, elem_len, buffer_object).
+                    // The buffer object is the canonical `.buffer` whose `_bytes`
+                    // is the SAME `Rc` as `store` — so every view built over it
+                    // aliases the same memory (ECMA-262 §23.2.5.1).
+                    let (store, byte_offset, elem_len, buffer): (
+                        Rc<RefCell<Vec<Value>>>,
+                        usize,
+                        usize,
+                        Option<Value>,
+                    ) = match &first {
+                        // `new T(length)` — fresh zero-filled backing store.
                         Value::Number(n) => {
-                            let len = n as usize;
-                            Rc::new(RefCell::new(vec![Value::Number(0.0); len * bpe]))
+                            let len = n.max(0.0) as usize;
+                            let store =
+                                Rc::new(RefCell::new(vec![Value::Number(0.0); len * bpe]));
+                            (store, 0, len, None)
                         }
+                        // `new T([..])` — copy element values into a fresh store.
                         Value::Array(a) => {
                             let src = a.borrow().clone();
                             let mut out = Vec::with_capacity(src.len() * bpe);
-                            for v in src {
-                                out.extend(ta_encode_elem(kind, &v));
+                            for v in src.iter() {
+                                out.extend(ta_encode_elem(kind, v));
                             }
-                            Rc::new(RefCell::new(out))
+                            let len = src.len();
+                            (Rc::new(RefCell::new(out)), 0, len, None)
                         }
                         Value::Object(o) => {
-                            // ArrayBuffer or typed array → use _bytes / _data.
-                            let m = o.borrow();
-                            let src_arr = m.get("_bytes").or_else(|| m.get("_data")).cloned();
-                            drop(m);
-                            if let Some(Value::Array(a)) = src_arr {
-                                let bo = args.get(1).map(|v| v.to_number() as usize).unwrap_or(0);
-                                let len_arg = args.get(2).map(|v| v.to_number() as usize);
-                                let snap = a.borrow();
-                                let stride = $elem_size;
-                                let elem_count =
-                                    len_arg.unwrap_or((snap.len().saturating_sub(bo)) / stride);
-                                let byte_len = elem_count.saturating_mul(stride);
-                                let out = snap
-                                    .get(bo..bo.saturating_add(byte_len).min(snap.len()))
-                                    .map(|s| s.to_vec())
+                            let (is_buffer, is_ta) = {
+                                let m = o.borrow();
+                                (
+                                    matches!(m.get("_isArrayBuffer"), Some(Value::Bool(true)))
+                                        || matches!(
+                                            m.get("_arraybuffer"),
+                                            Some(Value::Bool(true))
+                                        ),
+                                    m.contains_key("_typedarray"),
+                                )
+                            };
+                            if is_buffer {
+                                // `new T(arrayBuffer, byteOffset?, length?)` —
+                                // ALIAS the buffer's bytes (share the `Rc`), do not
+                                // copy. byteOffset is into the SHARED store; length
+                                // is in elements (§23.2.5.1 step 9–14).
+                                let store = match o.borrow().get("_bytes") {
+                                    Some(Value::Array(a)) => a.clone(),
+                                    _ => Rc::new(RefCell::new(Vec::new())),
+                                };
+                                let bo = args
+                                    .get(1)
+                                    .map(|v| v.to_number() as usize)
+                                    .unwrap_or(0);
+                                let store_len = store.borrow().len();
+                                let avail = store_len.saturating_sub(bo);
+                                let elem_count = args
+                                    .get(2)
+                                    .filter(|v| !matches!(v, Value::Undefined))
+                                    .map(|v| v.to_number() as usize)
+                                    .unwrap_or(avail / bpe);
+                                (store, bo, elem_count, Some(first.clone()))
+                            } else if is_ta {
+                                // `new T(otherTypedArray)` — COPY element values
+                                // (kind-converted) into a fresh buffer; NOT shared
+                                // (§23.2.5.1 InitializeTypedArrayFromTypedArray).
+                                let src_kind = o
+                                    .borrow()
+                                    .get("_typedarray")
+                                    .map(|v| v.to_display_string())
                                     .unwrap_or_default();
-                                Rc::new(RefCell::new(out))
+                                let src_store = match o.borrow().get("_bytes") {
+                                    Some(Value::Array(a)) => a.clone(),
+                                    _ => Rc::new(RefCell::new(Vec::new())),
+                                };
+                                let src_off = typed_array_byte_offset(o);
+                                let src_len = typed_array_length(o, &src_kind);
+                                let snap = src_store.borrow();
+                                let mut out = Vec::with_capacity(src_len * bpe);
+                                for i in 0..src_len {
+                                    let elem = ta_decode_elem_off(&src_kind, &snap, src_off, i);
+                                    out.extend(ta_encode_elem(kind, &elem));
+                                }
+                                drop(snap);
+                                (Rc::new(RefCell::new(out)), 0, src_len, None)
                             } else {
-                                Rc::new(RefCell::new(Vec::new()))
+                                // Array-like / iterable object → copy values.
+                                let vals = iterable_values(&first);
+                                let mut out = Vec::with_capacity(vals.len() * bpe);
+                                for v in vals.iter() {
+                                    out.extend(ta_encode_elem(kind, v));
+                                }
+                                let len = vals.len();
+                                (Rc::new(RefCell::new(out)), 0, len, None)
                             }
                         }
-                        _ => Rc::new(RefCell::new(Vec::new())),
+                        _ => (Rc::new(RefCell::new(Vec::new())), 0, 0, None),
                     };
-                    let len = ta_length_from_bytes(kind, arr.borrow().len());
-                    let buf_bytes = arr.clone();
+                    let byte_len = elem_len.saturating_mul(bpe);
+                    let buf_bytes = store.clone();
                     let mut m: HashMap<String, Value> = HashMap::new();
                     m.insert("_typedarray".into(), Value::str(kind.to_string()));
-                    m.insert("_bytes".into(), Value::Array(arr));
-                    m.insert("length".into(), Value::Number(len as f64));
-                    // `.buffer` — a real ArrayBuffer sharing this view's byte
-                    // storage, so `new DataView(ta.buffer)` and `ta.buffer
-                    // instanceof ArrayBuffer` work (React's RSC binary flight
-                    // parser builds a DataView over chunk.buffer).
-                    {
-                        let mut abuf: HashMap<String, Value> = HashMap::new();
-                        abuf.insert("_arraybuffer".into(), Value::Bool(true));
-                        abuf.insert("_bytes".into(), Value::Array(buf_bytes));
-                        abuf.insert(
-                            "byteLength".into(),
-                            Value::Number((len * $elem_size) as f64),
-                        );
-                        if let Some(p) = ta_protos_local.borrow().get("\u{1}ArrayBuffer.prototype")
-                        {
-                            abuf.insert(PROTO_KEY.into(), p.clone());
+                    m.insert("_bytes".into(), Value::Array(store));
+                    m.insert("length".into(), Value::Number(elem_len as f64));
+                    // `.buffer` — for a view BUILT OVER an existing ArrayBuffer,
+                    // return that SAME buffer object (identity + shared bytes), so
+                    // `new Uint8Array(buf); new Uint32Array(buf)` alias. For a
+                    // fresh allocation, mint a real ArrayBuffer sharing this store.
+                    let buffer_val = match buffer {
+                        Some(b) => b,
+                        None => {
+                            let mut abuf: HashMap<String, Value> = HashMap::new();
+                            abuf.insert("_isArrayBuffer".into(), Value::Bool(true));
+                            abuf.insert("_arraybuffer".into(), Value::Bool(true));
+                            abuf.insert("_bytes".into(), Value::Array(buf_bytes));
+                            abuf.insert(
+                                "byteLength".into(),
+                                Value::Number(byte_len as f64),
+                            );
+                            if let Some(p) =
+                                ta_protos_local.borrow().get("\u{1}ArrayBuffer.prototype")
+                            {
+                                abuf.insert(PROTO_KEY.into(), p.clone());
+                            }
+                            Value::Object(Rc::new(RefCell::new(abuf)))
                         }
-                        m.insert("buffer".into(), Value::Object(Rc::new(RefCell::new(abuf))));
-                    }
-                    m.insert(
-                        "byteLength".into(),
-                        Value::Number((len * $elem_size) as f64),
-                    );
-                    m.insert("byteOffset".into(), Value::Number(0.0));
-                    m.insert("BYTES_PER_ELEMENT".into(), Value::Number($elem_size as f64));
+                    };
+                    m.insert("buffer".into(), buffer_val);
+                    m.insert("byteLength".into(), Value::Number(byte_len as f64));
+                    m.insert("byteOffset".into(), Value::Number(byte_offset as f64));
+                    m.insert("BYTES_PER_ELEMENT".into(), Value::Number(bpe as f64));
                     if let Some(p) = ta_protos_local.borrow().get($name) {
                         m.insert(PROTO_KEY.into(), p.clone());
                     }
@@ -10152,18 +10366,139 @@ impl Interp {
                 })
             }};
         }
+        // Shared `ArrayBuffer.prototype` carrying `slice`, `transfer`, and the
+        // `detached` accessor. Registered under the internal key the TypedArray
+        // ctor reads so every minted `.buffer` chains to it (ECMA-262 §25.1.5).
+        let ab_proto: Rc<RefCell<HashMap<String, Value>>> = Rc::new(RefCell::new(HashMap::new()));
+        ab_proto
+            .borrow_mut()
+            .insert(PROTO_KEY.into(), Value::Object(protos().object));
+        {
+            let mut p = ab_proto.borrow_mut();
+            // `ArrayBuffer.prototype.slice(begin?, end?)` — a NEW ArrayBuffer with
+            // a COPY of the bytes in [begin, end) (§25.1.5.3). Independent store.
+            p.insert(
+                "slice".into(),
+                native_fn_with_interp("slice", |interp, args| {
+                    let this = interp.native_this();
+                    if let Value::Object(o) = &this {
+                        if matches!(o.borrow().get("_detached"), Some(Value::Bool(true))) {
+                            return Err(type_error_throw(
+                                "Cannot perform ArrayBuffer.prototype.slice on a detached ArrayBuffer",
+                            ));
+                        }
+                        let bytes = match o.borrow().get("_bytes") {
+                            Some(Value::Array(a)) => a.borrow().clone(),
+                            _ => Vec::new(),
+                        };
+                        let len = bytes.len() as i64;
+                        let norm = |x: f64| -> usize {
+                            let v = if x < 0.0 { (len + x as i64).max(0) } else { (x as i64).min(len) };
+                            v as usize
+                        };
+                        let begin = args.first().map(|v| norm(v.to_number())).unwrap_or(0);
+                        let end = args
+                            .get(1)
+                            .filter(|v| !matches!(v, Value::Undefined))
+                            .map(|v| norm(v.to_number()))
+                            .unwrap_or(len as usize);
+                        let slice: Vec<Value> = bytes
+                            .get(begin..end.max(begin))
+                            .map(|s| s.to_vec())
+                            .unwrap_or_default();
+                        let blen = slice.len();
+                        let mut m: HashMap<String, Value> = HashMap::new();
+                        m.insert("_isArrayBuffer".into(), Value::Bool(true));
+                        m.insert("_arraybuffer".into(), Value::Bool(true));
+                        m.insert("_bytes".into(), Value::Array(Rc::new(RefCell::new(slice))));
+                        m.insert("byteLength".into(), Value::Number(blen as f64));
+                        if let Some(Value::Object(proto)) = o.borrow().get(PROTO_KEY) {
+                            m.insert(PROTO_KEY.into(), Value::Object(proto.clone()));
+                        }
+                        return Ok(Value::Object(Rc::new(RefCell::new(m))));
+                    }
+                    Ok(Value::Undefined)
+                }),
+            );
+            // `ArrayBuffer.prototype.transfer(newLength?)` — DETACHES this buffer
+            // (§25.1.3.3 DetachArrayBuffer) and returns a NEW buffer that owns the
+            // (moved) bytes (§25.1.5.5). After transfer, every view + DataView
+            // over the old buffer is detached → access throws / is out-of-bounds.
+            p.insert(
+                "transfer".into(),
+                native_fn_with_interp("transfer", |interp, args| {
+                    let this = interp.native_this();
+                    if let Value::Object(o) = &this {
+                        if matches!(o.borrow().get("_detached"), Some(Value::Bool(true))) {
+                            return Err(type_error_throw(
+                                "Cannot transfer an already detached ArrayBuffer",
+                            ));
+                        }
+                        // Move the bytes out: take the current store and resize to
+                        // the requested new length (default = current length).
+                        let mut moved = match o.borrow().get("_bytes") {
+                            Some(Value::Array(a)) => a.borrow().clone(),
+                            _ => Vec::new(),
+                        };
+                        let new_len = args
+                            .first()
+                            .filter(|v| !matches!(v, Value::Undefined))
+                            .map(|v| v.to_number() as usize)
+                            .unwrap_or(moved.len());
+                        moved.resize(new_len, Value::Number(0.0));
+                        // Detach the source: mark `_detached`, surface `.detached`
+                        // as a data slot, and zero its `byteLength`.
+                        {
+                            let mut b = o.borrow_mut();
+                            b.insert("_detached".into(), Value::Bool(true));
+                            b.insert("detached".into(), Value::Bool(true));
+                            b.insert("byteLength".into(), Value::Number(0.0));
+                            // Drop the storage reference so views observing
+                            // `.buffer._detached` see detachment (they keep their
+                            // own `Rc` but the detached check short-circuits).
+                            b.insert("_bytes".into(), Value::Array(Rc::new(RefCell::new(Vec::new()))));
+                        }
+                        let blen = moved.len();
+                        let mut m: HashMap<String, Value> = HashMap::new();
+                        m.insert("_isArrayBuffer".into(), Value::Bool(true));
+                        m.insert("_arraybuffer".into(), Value::Bool(true));
+                        m.insert("_bytes".into(), Value::Array(Rc::new(RefCell::new(moved))));
+                        m.insert("byteLength".into(), Value::Number(blen as f64));
+                        m.insert("detached".into(), Value::Bool(false));
+                        if let Some(Value::Object(proto)) = o.borrow().get(PROTO_KEY) {
+                            m.insert(PROTO_KEY.into(), Value::Object(proto.clone()));
+                        }
+                        return Ok(Value::Object(Rc::new(RefCell::new(m))));
+                    }
+                    Ok(Value::Undefined)
+                }),
+            );
+            // `detached` is set as a data slot by `transfer`; expose `false`
+            // by default on the prototype (instances shadow it once detached).
+            p.insert("detached".into(), Value::Bool(false));
+        }
+        let ab_proto_val = Value::Object(ab_proto.clone());
+        ta_protos
+            .borrow_mut()
+            .insert("\u{1}ArrayBuffer.prototype".to_string(), ab_proto_val.clone());
+
         // ArrayBuffer(length) → object with a `_bytes` array of 0s.
-        let ab_ctor = native_fn("ArrayBuffer", |args| {
+        let ab_proto_for_ctor = ab_proto.clone();
+        let ab_ctor = native_fn("ArrayBuffer", move |args| {
             let len = args.first().map(|v| v.to_number() as usize).unwrap_or(0);
             let bytes = Value::Array(Rc::new(RefCell::new(vec![Value::Number(0.0); len])));
             let mut m: HashMap<String, Value> = HashMap::new();
             m.insert("_isArrayBuffer".into(), Value::Bool(true));
+            m.insert("_arraybuffer".into(), Value::Bool(true));
             m.insert("_bytes".into(), bytes);
             m.insert("byteLength".into(), Value::Number(len as f64));
+            m.insert("detached".into(), Value::Bool(false));
+            m.insert(PROTO_KEY.into(), Value::Object(ab_proto_for_ctor.clone()));
             Ok(Value::Object(Rc::new(RefCell::new(m))))
         });
         let mut ab_obj: HashMap<String, Value> = HashMap::new();
         ab_obj.insert("_construct".into(), ab_ctor);
+        ab_obj.insert("prototype".into(), ab_proto_val);
         ab_obj.insert(
             "isView".into(),
             native_fn("isView", |args| {
@@ -10321,11 +10656,30 @@ impl Interp {
                 b[pos] = Value::Number(byte);
             }
         }
+        // True if `buf` is a detached ArrayBuffer (ECMA-262 §25.1.3.3). A
+        // DataView operation on a detached buffer throws a TypeError
+        // (§25.3.1.1 GetViewValue / §25.3.1.2 SetViewValue step "If
+        // IsDetachedBuffer(buffer) is true, throw a TypeError").
+        fn dv_buffer_detached(buf: &Option<Rc<RefCell<HashMap<String, Value>>>>) -> bool {
+            match buf {
+                Some(o) => matches!(o.borrow().get("_detached"), Some(Value::Bool(true))),
+                None => false,
+            }
+        }
+        fn dv_detached_err() -> JsError {
+            type_error_throw("Cannot perform DataView operation on a detached ArrayBuffer")
+        }
         fn build_data_view(
             bytes: Rc<RefCell<Vec<Value>>>,
             byte_offset: usize,
             buffer: Value,
         ) -> Value {
+            // Capture the buffer's object handle so each get/set can check for
+            // detachment at call time (the flag is set on the live buffer object).
+            let buf_handle: Option<Rc<RefCell<HashMap<String, Value>>>> = match &buffer {
+                Value::Object(o) => Some(o.clone()),
+                _ => None,
+            };
             let mut m: HashMap<String, Value> = HashMap::new();
             m.insert("_isDataView".into(), Value::Bool(true));
             m.insert("_buffer".into(), buffer);
@@ -10341,9 +10695,13 @@ impl Interp {
                 ("getInt32", 4, true),
             ] {
                 let by = bytes.clone();
+                let det = buf_handle.clone();
                 m.insert(
                     name.into(),
                     native_fn(name, move |a| {
+                        if dv_buffer_detached(&det) {
+                            return Err(dv_detached_err());
+                        }
                         let idx = a.first().map(|v| v.to_number() as usize).unwrap_or(0);
                         let le = matches!(a.get(1), Some(Value::Bool(true)));
                         let raw = read_uint(&by, byte_offset, idx, n, le);
@@ -10362,9 +10720,13 @@ impl Interp {
             }
             {
                 let by = bytes.clone();
+                let det = buf_handle.clone();
                 m.insert(
                     "getBigUint64".into(),
                     native_fn("getBigUint64", move |a| {
+                        if dv_buffer_detached(&det) {
+                            return Err(dv_detached_err());
+                        }
                         let idx = a.first().map(|v| v.to_number() as usize).unwrap_or(0);
                         let le = matches!(a.get(1), Some(Value::Bool(true)));
                         let raw = read_uint(&by, byte_offset, idx, 8, le);
@@ -10374,9 +10736,13 @@ impl Interp {
             }
             {
                 let by = bytes.clone();
+                let det = buf_handle.clone();
                 m.insert(
                     "getBigInt64".into(),
                     native_fn("getBigInt64", move |a| {
+                        if dv_buffer_detached(&det) {
+                            return Err(dv_detached_err());
+                        }
                         let idx = a.first().map(|v| v.to_number() as usize).unwrap_or(0);
                         let le = matches!(a.get(1), Some(Value::Bool(true)));
                         let raw = read_uint(&by, byte_offset, idx, 8, le);
@@ -10386,9 +10752,13 @@ impl Interp {
             }
             {
                 let by = bytes.clone();
+                let det = buf_handle.clone();
                 m.insert(
                     "getFloat32".into(),
                     native_fn("getFloat32", move |a| {
+                        if dv_buffer_detached(&det) {
+                            return Err(dv_detached_err());
+                        }
                         let idx = a.first().map(|v| v.to_number() as usize).unwrap_or(0);
                         let le = matches!(a.get(1), Some(Value::Bool(true)));
                         let raw = read_uint(&by, byte_offset, idx, 4, le) as u32;
@@ -10398,9 +10768,13 @@ impl Interp {
             }
             {
                 let by = bytes.clone();
+                let det = buf_handle.clone();
                 m.insert(
                     "getFloat64".into(),
                     native_fn("getFloat64", move |a| {
+                        if dv_buffer_detached(&det) {
+                            return Err(dv_detached_err());
+                        }
                         let idx = a.first().map(|v| v.to_number() as usize).unwrap_or(0);
                         let le = matches!(a.get(1), Some(Value::Bool(true)));
                         let raw = read_uint(&by, byte_offset, idx, 8, le);
@@ -10417,9 +10791,13 @@ impl Interp {
                 ("setInt32", 4),
             ] {
                 let by = bytes.clone();
+                let det = buf_handle.clone();
                 m.insert(
                     name.into(),
                     native_fn(name, move |a| {
+                        if dv_buffer_detached(&det) {
+                            return Err(dv_detached_err());
+                        }
                         let idx = a.first().map(|v| v.to_number() as usize).unwrap_or(0);
                         let val = a.get(1).map(|v| v.to_number()).unwrap_or(0.0) as i64 as u64;
                         let le = matches!(a.get(2), Some(Value::Bool(true)));
@@ -10435,9 +10813,13 @@ impl Interp {
             // bit-bashing path the int setters use, after IEEE-754 cast.
             {
                 let by = bytes.clone();
+                let det = buf_handle.clone();
                 m.insert(
                     "setFloat32".into(),
                     native_fn("setFloat32", move |a| {
+                        if dv_buffer_detached(&det) {
+                            return Err(dv_detached_err());
+                        }
                         let idx = a.first().map(|v| v.to_number() as usize).unwrap_or(0);
                         let v = a.get(1).map(|v| v.to_number()).unwrap_or(f64::NAN) as f32;
                         let bits = f32::to_bits(v) as u64;
@@ -10449,9 +10831,13 @@ impl Interp {
             }
             {
                 let by = bytes.clone();
+                let det = buf_handle.clone();
                 m.insert(
                     "setFloat64".into(),
                     native_fn("setFloat64", move |a| {
+                        if dv_buffer_detached(&det) {
+                            return Err(dv_detached_err());
+                        }
                         let idx = a.first().map(|v| v.to_number() as usize).unwrap_or(0);
                         let v = a.get(1).map(|v| v.to_number()).unwrap_or(f64::NAN);
                         let bits = f64::to_bits(v);
@@ -10463,9 +10849,13 @@ impl Interp {
             }
             {
                 let by = bytes.clone();
+                let det = buf_handle.clone();
                 m.insert(
                     "setBigUint64".into(),
                     native_fn("setBigUint64", move |a| {
+                        if dv_buffer_detached(&det) {
+                            return Err(dv_detached_err());
+                        }
                         let idx = a.first().map(|v| v.to_number() as usize).unwrap_or(0);
                         let val = match a.get(1).cloned().unwrap_or(Value::bigint(JsBigInt::zero()))
                         {
@@ -10480,9 +10870,13 @@ impl Interp {
             }
             {
                 let by = bytes.clone();
+                let det = buf_handle.clone();
                 m.insert(
                     "setBigInt64".into(),
                     native_fn("setBigInt64", move |a| {
+                        if dv_buffer_detached(&det) {
+                            return Err(dv_detached_err());
+                        }
                         let idx = a.first().map(|v| v.to_number() as usize).unwrap_or(0);
                         let val = match a.get(1).cloned().unwrap_or(Value::bigint(JsBigInt::zero()))
                         {
@@ -10498,20 +10892,39 @@ impl Interp {
             Value::Object(Rc::new(RefCell::new(m)))
         }
         let dv_ctor = native_fn("DataView", |args| {
-            let buf = args.first().cloned().unwrap_or(Value::Undefined);
-            let byte_offset = args.get(1).map(|v| v.to_number() as usize).unwrap_or(0);
-            // Pull the shared byte storage out of the ArrayBuffer / typed-array.
-            let bytes: Rc<RefCell<Vec<Value>>> = match &buf {
+            let arg0 = args.first().cloned().unwrap_or(Value::Undefined);
+            let req_offset = args.get(1).map(|v| v.to_number() as usize).unwrap_or(0);
+            // Resolve the canonical ArrayBuffer object + base offset. If a typed
+            // array view is passed, DataView is built over its underlying buffer,
+            // and the requested offset is relative to that buffer; we add the
+            // view's own byteOffset so the DataView windows correctly. The shared
+            // `_bytes` `Rc` is what makes cross-view writes visible (aliasing).
+            let (buf, base_offset, bytes): (Value, usize, Rc<RefCell<Vec<Value>>>) = match &arg0 {
                 Value::Object(o) => {
-                    let b = o.borrow();
-                    match b.get("_bytes") {
-                        Some(Value::Array(a)) => a.clone(),
-                        _ => Rc::new(RefCell::new(Vec::new())),
+                    let is_ta = o.borrow().contains_key("_typedarray");
+                    if is_ta {
+                        // Use the view's `.buffer` as the canonical buffer object
+                        // (so detachment of that buffer is observed) and add its
+                        // byteOffset to the requested offset.
+                        let view_off = typed_array_byte_offset(o);
+                        let buffer_obj = o.borrow().get("buffer").cloned();
+                        let bytes = match o.borrow().get("_bytes") {
+                            Some(Value::Array(a)) => a.clone(),
+                            _ => Rc::new(RefCell::new(Vec::new())),
+                        };
+                        let buf = buffer_obj.unwrap_or_else(|| arg0.clone());
+                        (buf, view_off + req_offset, bytes)
+                    } else {
+                        let bytes = match o.borrow().get("_bytes") {
+                            Some(Value::Array(a)) => a.clone(),
+                            _ => Rc::new(RefCell::new(Vec::new())),
+                        };
+                        (arg0.clone(), req_offset, bytes)
                     }
                 }
-                _ => Rc::new(RefCell::new(Vec::new())),
+                _ => (arg0.clone(), req_offset, Rc::new(RefCell::new(Vec::new()))),
             };
-            Ok(build_data_view(bytes, byte_offset, buf))
+            Ok(build_data_view(bytes, base_offset, buf))
         });
         let mut dv_obj: HashMap<String, Value> = HashMap::new();
         dv_obj.insert("_construct".into(), dv_ctor);
@@ -16417,16 +16830,28 @@ impl Interp {
         match obj {
             Value::Object(o) => {
                 // Typed-array integer-indexed read: `ta[i]` returns the element
-                // from the `_bytes` storage (CanonicalNumericIndexString path).
+                // from the shared `_bytes` storage at this view's `byteOffset`
+                // window (CanonicalNumericIndexString path, §10.4.5.1
+                // IntegerIndexedElementGet). A detached buffer or out-of-bounds
+                // index yields `undefined` (IsValidIntegerIndex → false).
                 if is_typed_array_obj(o) {
                     if let Ok(idx) = key.parse::<usize>() {
+                        if typed_array_detached(o) {
+                            return Value::Undefined;
+                        }
                         if let Some(st) = typed_array_storage(o) {
                             let kind = o
                                 .borrow()
                                 .get("_typedarray")
                                 .map(|v| v.to_display_string())
                                 .unwrap_or_default();
-                            return ta_decode_elem(&kind, &st.borrow(), idx);
+                            // Respect the view's exposed length (subarray windows
+                            // are narrower than the whole backing store).
+                            if idx >= typed_array_length(o, &kind) {
+                                return Value::Undefined;
+                            }
+                            let off = typed_array_byte_offset(o);
+                            return ta_decode_elem_off(&kind, &st.borrow(), off, idx);
                         }
                     }
                 }
@@ -18681,19 +19106,31 @@ impl Interp {
         match obj {
             Value::Object(o) => {
                 // Typed-array integer-indexed write: `ta[i] = v` stores the
-                // kind-coerced number into `_bytes` (out-of-range is ignored,
-                // per IntegerIndexedElementSet).
+                // kind-coerced number into the shared `_bytes` store at this
+                // view's `byteOffset` window (§10.4.5.3 IntegerIndexedElementSet).
+                // Out-of-range / detached / out-of-view-length writes are silently
+                // ignored (IsValidIntegerIndex → false). Because the store is the
+                // SAME `Rc` across every view of the buffer, the write is
+                // immediately visible through all overlapping views.
                 if is_typed_array_obj(o) {
                     if let Ok(idx) = key.parse::<usize>() {
+                        if typed_array_detached(o) {
+                            return;
+                        }
                         let kind = o
                             .borrow()
                             .get("_typedarray")
                             .map(|v| v.to_display_string())
                             .unwrap_or_default();
+                        if idx >= typed_array_length(o, &kind) {
+                            return;
+                        }
+                        let byte_offset = typed_array_byte_offset(o);
                         if let Some(st) = typed_array_storage(o) {
                             let mut s = st.borrow_mut();
                             let bytes = ta_encode_elem(&kind, &value);
-                            let start = idx.saturating_mul(ta_elem_size(&kind));
+                            let start =
+                                byte_offset.saturating_add(idx.saturating_mul(ta_elem_size(&kind)));
                             if start + bytes.len() <= s.len() {
                                 for (off, byte) in bytes.into_iter().enumerate() {
                                     s[start + off] = byte;
@@ -25358,6 +25795,192 @@ log(probe());
              console.log(dv.getUint8(1)); \
              console.log(words[1]);");
         assert_eq!(out, vec!["2", "8", "287454020", "68", "51", "1432778632"]);
+    }
+
+    // ── TypedArray multi-view aliasing over one ArrayBuffer (ECMA-262 §23.2 /
+    //    §10.4.5). Two views over the same buffer must alias the same bytes. ──
+
+    #[test]
+    fn multiple_views_alias_one_arraybuffer_u8_to_u32() {
+        // u8[0..3] written little-endian, then read as u32[0] gives the
+        // assembled value. Both views share the buffer's backing store, so the
+        // u8 writes are visible through u32 (§10.4.5.1 IntegerIndexedElementGet).
+        let (_, out) = run(
+            "const buf = new ArrayBuffer(4); \
+             const u8 = new Uint8Array(buf); \
+             const u32 = new Uint32Array(buf); \
+             u8[0] = 0x44; u8[1] = 0x33; u8[2] = 0x22; u8[3] = 0x11; \
+             console.log(u32[0]); \
+             u32[0] = 0xAABBCCDD; \
+             console.log(u8[0]); console.log(u8[1]); console.log(u8[2]); console.log(u8[3]);",
+        );
+        // 0x11223344 = 287454020 (little-endian assembly). Then 0xAABBCCDD bytes
+        // little-endian are DD, CC, BB, AA = 221, 204, 187, 170.
+        assert_eq!(out, vec!["287454020", "221", "204", "187", "170"]);
+    }
+
+    #[test]
+    fn view_with_byte_offset_aliases_correct_window() {
+        // A Uint8Array(buf) and a Uint32Array(buf, 4) over the same buffer alias
+        // overlapping regions: the second u32 element starts at byte offset 4.
+        let (_, out) = run(
+            "const buf = new ArrayBuffer(8); \
+             const u8 = new Uint8Array(buf); \
+             const u32 = new Uint32Array(buf, 4); \
+             console.log(u32.length); \
+             console.log(u32.byteOffset); \
+             u32[0] = 0x01020304; \
+             console.log(u8[4]); console.log(u8[5]); console.log(u8[6]); console.log(u8[7]); \
+             console.log(u8[0]);",
+        );
+        // length=1 (4 bytes / 4), byteOffset=4. 0x01020304 LE at bytes 4..8 =
+        // 04,03,02,01. byte 0 untouched = 0.
+        assert_eq!(out, vec!["1", "4", "4", "3", "2", "1", "0"]);
+    }
+
+    #[test]
+    fn dataview_float64_le_layout_matches_ieee754_via_uint8array() {
+        // Writing a f64 via DataView little-endian then reading the bytes via a
+        // Uint8Array over the same buffer matches the IEEE-754 layout
+        // (§25.3.1.2 SetViewValue honors littleEndian).
+        let (_, out) = run(
+            "const buf = new ArrayBuffer(8); \
+             const dv = new DataView(buf); \
+             const u8 = new Uint8Array(buf); \
+             dv.setFloat64(0, 1.0, true); \
+             let s = ''; for (let i = 0; i < 8; i++) s += u8[i] + ','; \
+             console.log(s); \
+             console.log(dv.getFloat64(0, true));",
+        );
+        // 1.0 as IEEE-754 double = 0x3FF0000000000000; little-endian bytes are
+        // 0,0,0,0,0,0,240,63.
+        assert_eq!(out, vec!["0,0,0,0,0,0,240,63,", "1"]);
+    }
+
+    #[test]
+    fn dataview_endianness_arg_is_honored() {
+        // The littleEndian flag flips byte order: same value written LE then read
+        // BE yields the byte-swapped integer (§25.3.1.1 GetViewValue).
+        let (_, out) = run(
+            "const buf = new ArrayBuffer(4); \
+             const dv = new DataView(buf); \
+             dv.setUint32(0, 0x01020304, true); \
+             console.log(dv.getUint32(0, true)); \
+             console.log(dv.getUint32(0, false));",
+        );
+        // LE read = 0x01020304 = 16909060. BE read of the same bytes (04,03,02,01)
+        // = 0x04030201 = 67305985.
+        assert_eq!(out, vec!["16909060", "67305985"]);
+    }
+
+    #[test]
+    fn subarray_aliases_parent_but_slice_copies() {
+        // subarray returns a view over the SAME buffer (mutating it mutates the
+        // parent; §23.2.3.27). slice returns an independent COPY (§23.2.3.26).
+        let (_, out) = run(
+            "const a = new Uint8Array([1, 2, 3, 4, 5]); \
+             const sub = a.subarray(1, 4); \
+             console.log(sub.length); \
+             console.log(sub.byteOffset); \
+             sub[0] = 99; \
+             console.log(a[1]); \
+             const sl = a.slice(1, 4); \
+             sl[0] = 7; \
+             console.log(a[1]); \
+             console.log(sl[0]);",
+        );
+        // sub.length=3, byteOffset=1. sub[0]=99 -> a[1]=99 (aliased). sl is a
+        // copy: sl[0]=7 does NOT change a[1] (still 99); sl[0] reads back 7.
+        assert_eq!(out, vec!["3", "1", "99", "99", "7"]);
+    }
+
+    #[test]
+    fn subarray_of_offset_view_chains_byte_offsets() {
+        // subarray of a view that already has a byteOffset accumulates offsets so
+        // the window still lands on the right shared bytes.
+        let (_, out) = run(
+            "const buf = new ArrayBuffer(8); \
+             const all = new Uint8Array(buf); \
+             for (let i = 0; i < 8; i++) all[i] = i; \
+             const mid = all.subarray(2);       /* offset 2, len 6 */ \
+             const inner = mid.subarray(1, 3);  /* offset 3, len 2 */ \
+             console.log(inner.byteOffset); \
+             console.log(inner[0]); console.log(inner[1]); \
+             inner[0] = 100; \
+             console.log(all[3]);",
+        );
+        assert_eq!(out, vec!["3", "3", "4", "100"]);
+    }
+
+    #[test]
+    fn detached_buffer_typed_array_access_is_inert_and_dataview_throws() {
+        // After ArrayBuffer.prototype.transfer detaches the buffer (§25.1.3.3),
+        // integer-indexed reads return undefined / writes are no-ops on every
+        // view (§10.4.5.1 IsValidIntegerIndex false), and DataView access throws
+        // a TypeError (§25.3.1.1 GetViewValue).
+        let (_, out) = run(
+            "const buf = new ArrayBuffer(8); \
+             const u8 = new Uint8Array(buf); \
+             const dv = new DataView(buf); \
+             u8[0] = 42; \
+             const moved = buf.transfer(); \
+             console.log(buf.detached); \
+             console.log(moved.detached); \
+             console.log(u8[0]); \
+             u8[0] = 7;            /* no-op on detached */ \
+             console.log(u8[0]); \
+             console.log(moved.byteLength); \
+             let threw = false; \
+             try { dv.getUint8(0); } catch (e) { threw = (e instanceof TypeError); } \
+             console.log(threw); \
+             const mv8 = new Uint8Array(moved); \
+             console.log(mv8[0]);",
+        );
+        // buf detached=true; moved detached=false; u8[0] reads undefined; write
+        // ignored so still undefined; moved keeps the 8 bytes incl. the 42;
+        // DataView throws TypeError; the moved buffer's first byte is 42.
+        assert_eq!(
+            out,
+            vec!["true", "false", "undefined", "undefined", "8", "true", "42"]
+        );
+    }
+
+    #[test]
+    fn new_view_from_typed_array_copies_not_aliases() {
+        // `new T(otherTypedArray)` copies element VALUES (kind-converted) into a
+        // fresh buffer — it does NOT alias (§23.2.5.1
+        // InitializeTypedArrayFromTypedArray).
+        let (_, out) = run(
+            "const a = new Uint8Array([1, 2, 3]); \
+             const b = new Uint8Array(a); \
+             b[0] = 250; \
+             console.log(a[0]); console.log(b[0]); \
+             const widened = new Uint16Array(a); \
+             console.log(widened.length); console.log(widened[2]);",
+        );
+        // a[0] unchanged (1) because b is a copy; b[0]=250. Uint16Array(a) copies
+        // VALUES → length 3, element [2] = 3.
+        assert_eq!(out, vec!["1", "250", "3", "3"]);
+    }
+
+    #[test]
+    fn arraybuffer_slice_is_independent_copy() {
+        // ArrayBuffer.prototype.slice copies the byte region into a new buffer
+        // (§25.1.5.3); writes through a view of the slice don't touch the source.
+        let (_, out) = run(
+            "const buf = new ArrayBuffer(4); \
+             const u8 = new Uint8Array(buf); \
+             u8[0] = 10; u8[1] = 20; u8[2] = 30; u8[3] = 40; \
+             const sl = buf.slice(1, 3); \
+             console.log(sl.byteLength); \
+             const v = new Uint8Array(sl); \
+             console.log(v[0]); console.log(v[1]); \
+             v[0] = 200; \
+             console.log(u8[1]);",
+        );
+        // slice [1,3) -> byteLength 2, bytes 20,30. Mutating the slice view does
+        // not change the source (still 20).
+        assert_eq!(out, vec!["2", "20", "30", "20"]);
     }
 
     #[test]
