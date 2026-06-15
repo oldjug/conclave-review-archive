@@ -15,9 +15,16 @@
 //! (zero-width assertions compiled to an `Op::Look` sub-program; positive
 //! lookarounds keep their inner captures).
 //!
-//! Not yet: Unicode property escapes (\p{}), `v` flag set notation — noted as
-//! gaps; failure mode is a parse error that surfaces as a TypeError to the
-//! user, never a panic.
+//! Unicode property escapes `\p{…}` / `\P{…}` ARE supported under the `u`/`v`
+//! flag (ECMA-262 §22.2.1): General_Category (`\p{L}`, `\p{Lu}`, `\p{Nd}`, …),
+//! Scripts (`\p{Script=Greek}` / `\p{sc=Grek}`), Script_Extensions, and binary
+//! properties (`\p{White_Space}`, `\p{Alphabetic}`, …). Data is UCD-derived
+//! (see `crate::unicode_props`). An unknown property name is a SyntaxError
+//! (matching V8), never a silent match-nothing.
+//!
+//! The `v` flag (UnicodeSets) additionally enables in-class set notation —
+//! intersection `[\p{L}&&[a-z]]` and subtraction `[\p{L}--[aeiou]]` —
+//! compiled to a single computed `Op::Class`.
 
 /// Compiled regex program: a flat array of bytecode ops, executed
 /// against a UTF-16 codeunit slice by `exec`.
@@ -36,6 +43,10 @@ pub struct Regex {
     pub multiline: bool,
     pub dot_all: bool,
     pub sticky: bool,
+    /// `u` flag (Unicode mode) — enables `\p{}` property escapes & `\u{...}`.
+    pub unicode: bool,
+    /// `v` flag (UnicodeSets) — superset of `u`; adds in-class set notation.
+    pub unicode_sets: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -103,6 +114,8 @@ impl Regex {
     /// Compile a pattern + flags string. Returns a parse error on
     /// malformed input.
     pub fn new(pattern: &str, flags: &str) -> Result<Self, String> {
+        let unicode = flags.contains('u') || flags.contains('v');
+        let unicode_sets = flags.contains('v');
         let mut p = Parser {
             src: pattern.chars().collect(),
             pos: 0,
@@ -110,6 +123,8 @@ impl Regex {
             group_count: 0,
             named: Vec::new(),
             ignore_case: flags.contains('i'),
+            unicode,
+            unicode_sets,
         };
         // Whole-match implicit group 0 — push Save(0)/Restore(0) around
         // the top-level alternation.
@@ -128,6 +143,8 @@ impl Regex {
             multiline: flags.contains('m'),
             dot_all: flags.contains('s'),
             sticky: flags.contains('y'),
+            unicode,
+            unicode_sets,
         })
     }
 
@@ -228,6 +245,10 @@ struct Parser {
     group_count: usize,
     named: Vec<(String, usize)>,
     ignore_case: bool,
+    /// `u` or `v` flag set — enables `\p{}` & strict escape handling.
+    unicode: bool,
+    /// `v` flag set — enables in-class set notation (`&&`, `--`).
+    unicode_sets: bool,
 }
 
 impl Parser {
@@ -639,6 +660,14 @@ impl Parser {
             }),
             'b' => self.prog.push(Op::Boundary(true)),
             'B' => self.prog.push(Op::Boundary(false)),
+            'p' | 'P' if self.unicode => {
+                // Unicode property escape `\p{…}` / `\P{…}` (ECMA-262 §22.2.1,
+                // production `CharacterClassEscape :: p{ … }`). Only valid in
+                // Unicode mode (`u`/`v` flag).
+                let negate = c == 'P';
+                let ranges = self.parse_unicode_property()?;
+                self.prog.push(Op::Class { ranges, negate });
+            }
             'n' => self.emit_char('\n'),
             'r' => self.emit_char('\r'),
             't' => self.emit_char('\t'),
@@ -660,38 +689,185 @@ impl Parser {
         Ok(())
     }
 
+    /// Parse the `{…}` body of a `\p`/`\P` escape (the leading `p`/`P` is
+    /// already consumed) and resolve it to a code-point range list.
+    ///
+    /// Grammar (ECMA-262 §22.2.1 `UnicodePropertyValueExpression`):
+    ///   `{ LoneUnicodePropertyNameOrValue }`  e.g. `\p{L}`, `\p{White_Space}`
+    ///   `{ UnicodePropertyName = UnicodePropertyValue }`  e.g. `\p{Script=Greek}`
+    ///
+    /// On an unrecognized name/value, returns `Err` — the RegExp constructor
+    /// turns that into a `SyntaxError` (V8 parity), never a silent empty class.
+    fn parse_unicode_property(&mut self) -> Result<Vec<(u32, u32)>, String> {
+        if !self.eat('{') {
+            return Err("Invalid property name: expected '{' after \\p".into());
+        }
+        let mut name = String::new();
+        let mut value: Option<String> = None;
+        loop {
+            match self.peek() {
+                None => return Err("Invalid property name: unterminated \\p{".into()),
+                Some('}') => {
+                    self.bump();
+                    break;
+                }
+                Some('=') if value.is_none() => {
+                    self.bump();
+                    value = Some(String::new());
+                }
+                Some(c) => {
+                    self.bump();
+                    match &mut value {
+                        Some(v) => v.push(c),
+                        None => name.push(c),
+                    }
+                }
+            }
+        }
+        if name.is_empty() {
+            return Err("Invalid property name: empty \\p{}".into());
+        }
+        match crate::unicode_props::resolve(&name, value.as_deref()) {
+            Some(r) => Ok(r),
+            None => Err(format!(
+                "Invalid property name in regular expression: {}{}",
+                name,
+                value.map(|v| format!("={}", v)).unwrap_or_default()
+            )),
+        }
+    }
+
     fn parse_class(&mut self) -> Result<(), String> {
         self.bump(); // consume '['
         let mut negate = false;
         if self.eat('^') {
             negate = true;
         }
+        // Parse the class body as a set expression. With the `v` flag this may
+        // contain set operators (`&&` intersection, `--` subtraction); without
+        // it, it's a plain union of atoms/ranges/escapes. `parse_class_body`
+        // returns the resolved range list (already normalized).
+        let mut ranges = self.parse_class_body()?;
+        if !self.eat(']') {
+            return Err("unterminated character class".into());
+        }
+        if self.ignore_case {
+            // Case-fold ranges: expand A-Z to a-z and vice versa.
+            let mut extra: Vec<(u32, u32)> = Vec::new();
+            for &(lo, hi) in &ranges {
+                for cu in lo..=hi {
+                    if let Some(c) = char::from_u32(cu) {
+                        if c.is_ascii_alphabetic() {
+                            let other = if c.is_ascii_lowercase() {
+                                c.to_ascii_uppercase() as u32
+                            } else {
+                                c.to_ascii_lowercase() as u32
+                            };
+                            extra.push((other, other));
+                        }
+                    }
+                }
+            }
+            ranges.extend(extra);
+        }
+        self.prog.push(Op::Class { ranges, negate });
+        Ok(())
+    }
+
+    /// Parse a character-class body (everything between `[` and the matching
+    /// `]`, the `]` left unconsumed). Returns the resolved code-point range set.
+    ///
+    /// In `v` mode (UnicodeSets, ECMA-262 §22.2.1 `ClassSetExpression`) this
+    /// honors the binary operators `&&` (intersection) and `--` (subtraction),
+    /// which are left-associative and must not be mixed at the same level
+    /// (`[\p{L}&&[a-z]]`, `[\p{L}--[aeiou]]`). In `u`/legacy mode it's a plain
+    /// union, and `&`/`-` are literal characters (handled by the union parser).
+    fn parse_class_body(&mut self) -> Result<Vec<(u32, u32)>, String> {
+        let first = self.parse_class_union()?;
+        if !self.unicode_sets {
+            return Ok(first);
+        }
+        // Look for a set operator at this level.
+        let op = match (self.peek(), self.src.get(self.pos + 1).copied()) {
+            (Some('&'), Some('&')) => Some('&'),
+            (Some('-'), Some('-')) => Some('-'),
+            _ => None,
+        };
+        let Some(op) = op else { return Ok(first) };
+        let mut acc = crate::unicode_props::normalize_pub(first);
+        loop {
+            let cur = match (self.peek(), self.src.get(self.pos + 1).copied()) {
+                (Some('&'), Some('&')) => '&',
+                (Some('-'), Some('-')) => '-',
+                _ => break,
+            };
+            if cur != op {
+                return Err("mixed set operators in character class require parentheses".into());
+            }
+            self.bump();
+            self.bump();
+            let rhs = self.parse_class_union()?;
+            acc = if op == '&' {
+                crate::unicode_props::intersection(&acc, &rhs)
+            } else {
+                crate::unicode_props::difference(&acc, &rhs)
+            };
+        }
+        Ok(acc)
+    }
+
+    /// Parse a union operand: a run of atoms/ranges/escapes/`\p` (and, in `v`
+    /// mode, nested `[...]` class operands) up to a set operator (`&&`/`--`) or
+    /// the closing `]`.
+    fn parse_class_union(&mut self) -> Result<Vec<(u32, u32)>, String> {
         let mut ranges: Vec<(u32, u32)> = Vec::new();
         while let Some(c) = self.peek() {
             if c == ']' {
-                self.bump();
-                if self.ignore_case {
-                    // Case-fold ranges: expand A-Z to a-z and vice versa.
-                    let mut extra: Vec<(u32, u32)> = Vec::new();
-                    for &(lo, hi) in &ranges {
-                        for cu in lo..=hi {
-                            if let Some(c) = char::from_u32(cu) {
-                                if c.is_ascii_alphabetic() {
-                                    let other = if c.is_ascii_lowercase() {
-                                        c.to_ascii_uppercase() as u32
-                                    } else {
-                                        c.to_ascii_lowercase() as u32
-                                    };
-                                    extra.push((other, other));
-                                }
-                            }
-                        }
-                    }
-                    ranges.extend(extra);
-                }
-                self.prog.push(Op::Class { ranges, negate });
-                return Ok(());
+                return Ok(ranges);
             }
+            // In v mode, stop at a set operator so the body parser handles it.
+            if self.unicode_sets {
+                match (c, self.src.get(self.pos + 1).copied()) {
+                    ('&', Some('&')) | ('-', Some('-')) => return Ok(ranges),
+                    _ => {}
+                }
+                // Nested class operand `[...]` (v-mode operand grouping).
+                if c == '[' {
+                    self.bump();
+                    let mut neg = false;
+                    if self.eat('^') {
+                        neg = true;
+                    }
+                    let inner = self.parse_class_body()?;
+                    if !self.eat(']') {
+                        return Err("unterminated nested character class".into());
+                    }
+                    let inner = if neg {
+                        crate::unicode_props::complement(&inner)
+                    } else {
+                        inner
+                    };
+                    ranges.extend(inner);
+                    continue;
+                }
+            }
+            // `\p{}` / `\P{}` property escape inside the class (u/v mode).
+            if c == '\\' && self.unicode {
+                if let Some(e) = self.src.get(self.pos + 1).copied() {
+                    if e == 'p' || e == 'P' {
+                        self.bump(); // backslash
+                        self.bump(); // p / P
+                        let pr = self.parse_unicode_property()?;
+                        if e == 'P' {
+                            ranges.extend(crate::unicode_props::complement(&pr));
+                        } else {
+                            ranges.extend(pr);
+                        }
+                        continue;
+                    }
+                }
+            }
+            // `\d \w \s` and negated forms expand to fixed range lists.
             if c == '\\' {
                 if let Some(escaped) = self.src.get(self.pos + 1).copied() {
                     if let Some(mut escaped_ranges) = class_escape_ranges(escaped) {
@@ -703,7 +879,10 @@ impl Parser {
                 }
             }
             let lo = self.class_atom()?;
-            let hi = if self.peek() == Some('-') && self.src.get(self.pos + 1).copied() != Some(']')
+            let hi = if self.peek() == Some('-')
+                && self.src.get(self.pos + 1).copied() != Some(']')
+                // In v mode `--` is the subtraction operator, not a range dash.
+                && !(self.unicode_sets && self.src.get(self.pos + 1).copied() == Some('-'))
             {
                 self.bump();
                 self.class_atom()?
@@ -1251,5 +1430,139 @@ mod tests {
         assert!(r.test("aa"));
         assert!(r.test("aaaa"));
         assert!(!r.test("a"));
+    }
+
+    // ------------------------------------------------------------------
+    // Unicode property escapes \p{}/\P{} (ECMA-262 §22.2.1) end-to-end.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn prop_letter_matches_latin_and_greek_not_digit() {
+        let r = Regex::new(r"\p{L}", "u").unwrap();
+        assert!(r.test("a"));
+        assert!(r.test("λ")); // U+03BB
+        assert!(!r.test("1"));
+        assert!(!r.test(" "));
+    }
+
+    #[test]
+    fn prop_decimal_number() {
+        let r = Regex::new(r"\p{Nd}", "u").unwrap();
+        assert!(r.test("5"));
+        assert!(!r.test("a"));
+        // A Roman numeral is Nl, not Nd, so \p{Nd} must NOT match it.
+        let nl = "\u{2164}"; // Ⅴ
+        assert!(!r.test(nl));
+    }
+
+    #[test]
+    fn prop_negation_capital_p() {
+        let r = Regex::new(r"\P{L}", "u").unwrap();
+        assert!(r.test("1"));
+        assert!(r.test(" "));
+        assert!(!r.test("a"));
+        // \P{L} should not match an isolated Greek letter either.
+        assert!(!Regex::new(r"^\P{L}$", "u").unwrap().test("λ"));
+    }
+
+    #[test]
+    fn prop_script_greek_vs_latin() {
+        let r = Regex::new(r"\p{Script=Greek}", "u").unwrap();
+        assert!(r.test("α")); // U+03B1
+        assert!(!r.test("a"));
+        // Short alias form.
+        let r2 = Regex::new(r"\p{sc=Grek}", "u").unwrap();
+        assert!(r2.test("α"));
+        assert!(!r2.test("a"));
+    }
+
+    #[test]
+    fn prop_white_space() {
+        let r = Regex::new(r"\p{White_Space}", "u").unwrap();
+        assert!(r.test(" "));
+        assert!(r.test("\t"));
+        assert!(r.test("\u{00A0}")); // NBSP
+        assert!(!r.test("a"));
+    }
+
+    #[test]
+    fn prop_general_category_long_form() {
+        let r = Regex::new(r"\p{General_Category=Uppercase_Letter}", "u").unwrap();
+        assert!(r.test("A"));
+        assert!(!r.test("a"));
+        let r2 = Regex::new(r"\p{gc=Lu}", "u").unwrap();
+        assert!(r2.test("Λ")); // GREEK CAPITAL LAMDA
+        assert!(!r2.test("λ"));
+    }
+
+    #[test]
+    fn prop_requires_u_flag_else_literal() {
+        // Without the u flag, \p is the legacy IdentityEscape (literal 'p').
+        let r = Regex::new(r"\p", "").unwrap();
+        assert!(r.test("p"));
+        assert!(!r.test("a"));
+    }
+
+    #[test]
+    fn prop_unknown_name_is_error() {
+        // V8 raises SyntaxError on an invalid property name; we return Err.
+        assert!(Regex::new(r"\p{LizardPeople}", "u").is_err());
+        assert!(Regex::new(r"\p{Script=Klingon}", "u").is_err());
+    }
+
+    #[test]
+    fn prop_inside_character_class() {
+        // \p inside a class unions into the class set.
+        let r = Regex::new(r"[\p{Nd}a]", "u").unwrap();
+        assert!(r.test("5"));
+        assert!(r.test("a"));
+        assert!(!r.test("b"));
+        // Negated class with a property.
+        let r2 = Regex::new(r"[^\p{L}]", "u").unwrap();
+        assert!(r2.test("1"));
+        assert!(!r2.test("a"));
+    }
+
+    #[test]
+    fn vflag_intersection() {
+        // [\p{L}&&[a-z]] — letters AND ASCII lowercase = a..z only.
+        let r = Regex::new(r"[\p{L}&&[a-z]]", "v").unwrap();
+        assert!(r.test("a"));
+        assert!(r.test("z"));
+        assert!(!r.test("A")); // letter but not in [a-z]
+        assert!(!r.test("λ")); // letter but not in [a-z]
+        assert!(!r.test("1")); // not a letter
+    }
+
+    #[test]
+    fn vflag_subtraction() {
+        // [\p{L}--[aeiou]] — letters EXCEPT ASCII vowels.
+        let r = Regex::new(r"[\p{L}--[aeiou]]", "v").unwrap();
+        assert!(r.test("b"));
+        assert!(r.test("z"));
+        assert!(r.test("λ")); // still a letter, not a removed vowel
+        assert!(!r.test("a"));
+        assert!(!r.test("e"));
+        assert!(!r.test("1"));
+    }
+
+    #[test]
+    fn vflag_nested_class_complement() {
+        // [[\p{L}]--[^a-c]] = letters minus (everything that's not a..c) = a,b,c.
+        let r = Regex::new(r"[\p{L}--[^a-c]]", "v").unwrap();
+        assert!(r.test("a"));
+        assert!(r.test("c"));
+        assert!(!r.test("d"));
+        assert!(!r.test("λ"));
+    }
+
+    #[test]
+    fn prop_astral_emoji_and_han() {
+        // Astral code points: emoji + Han ideographs (full-scalar matching).
+        let emoji = Regex::new(r"\p{Emoji}", "u").unwrap();
+        assert!(emoji.test("\u{1F600}")); // 😀
+        let han = Regex::new(r"\p{Script=Han}", "u").unwrap();
+        assert!(han.test("中"));
+        assert!(!han.test("a"));
     }
 }

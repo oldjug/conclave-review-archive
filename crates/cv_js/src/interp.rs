@@ -20864,6 +20864,8 @@ pub fn build_regex_value(source: &str, flags: &str) -> Value {
         mm.insert("multiline".into(), Value::Bool(compiled.multiline));
         mm.insert("dotAll".into(), Value::Bool(compiled.dot_all));
         mm.insert("sticky".into(), Value::Bool(compiled.sticky));
+        mm.insert("unicode".into(), Value::Bool(compiled.unicode && !compiled.unicode_sets));
+        mm.insert("unicodeSets".into(), Value::Bool(compiled.unicode_sets));
         mm.insert("lastIndex".into(), Value::Number(0.0));
     }
     let c1 = compiled.clone();
@@ -28536,6 +28538,88 @@ log(probe());
             vec!["function", "function", "object", "object"],
             "globals: {out:?}"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // RegExp \p{} Unicode property escapes — JS-level e2e (ECMA-262 §22.2.1).
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn js_regexp_unicode_property_escapes() {
+        // \p{L} matches a Latin and a Greek letter but not a digit.
+        let (_, out) = run(
+            "console.log(/\\p{L}/u.test('a'));\
+             console.log(/\\p{L}/u.test('\\u03BB'));\
+             console.log(/\\p{L}/u.test('1'));\
+             console.log(/\\p{Nd}/u.test('5'));\
+             console.log(/\\P{L}/u.test('1'));\
+             console.log(/\\p{Script=Greek}/u.test('\\u03B1'));\
+             console.log(/\\p{Script=Greek}/u.test('a'));\
+             console.log(/\\p{White_Space}/u.test(' '));",
+        );
+        assert_eq!(
+            out,
+            vec![
+                "true",  // \p{L} 'a'
+                "true",  // \p{L} 'λ'
+                "false", // \p{L} '1'
+                "true",  // \p{Nd} '5'
+                "true",  // \P{L} '1'
+                "true",  // \p{Script=Greek} 'α'
+                "false", // \p{Script=Greek} 'a'
+                "true",  // \p{White_Space} ' '
+            ]
+        );
+    }
+
+    #[test]
+    fn js_regexp_unicode_property_match_extracts() {
+        // String.prototype.match with a global \p escape extracts the letters.
+        let (_, out) = run(
+            "var m = 'a1b2c3'.match(/\\p{L}/gu);\
+             console.log(m.join(','));\
+             console.log('hello123'.replace(/\\P{L}/gu, ''));",
+        );
+        assert_eq!(out, vec!["a,b,c", "hello"]);
+    }
+
+    #[test]
+    fn js_regexp_invalid_property_is_syntax_error() {
+        // An unknown property must NOT silently compile to a match-anything or
+        // match-nothing regex. The function-call form `RegExp(...)` returns the
+        // raw build_regex_value result, which is the SyntaxError sentinel.
+        let mut i = Interp::new();
+        i.install_basic_globals();
+        let r = i.run("RegExp('\\\\p{LizardPeople}', 'u')").unwrap();
+        match r {
+            Value::String(s) => assert!(
+                s.as_str().contains("SyntaxError"),
+                "expected SyntaxError sentinel, got {:?}",
+                s.as_str()
+            ),
+            // It must never produce a working RegExp object (one with the
+            // _isRegExp tag and a `.test` method that matches anything).
+            Value::Object(o) => {
+                assert!(
+                    !matches!(o.borrow().get("_isRegExp"), Some(Value::Bool(true))),
+                    "invalid \\p compiled to a usable RegExp — that is a stub"
+                );
+            }
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn js_regexp_valid_property_compiles_and_matches() {
+        // The contrast case: a VALID property must compile to a real, working
+        // RegExp that matches per the UCD (not match-nothing).
+        let (_, out) = run(
+            "var re = new RegExp('\\\\p{Lu}', 'u');\
+             console.log(re.test('A'));\
+             console.log(re.test('a'));\
+             console.log(re.unicode);",
+        );
+        assert_eq!(out, vec!["true", "false", "true"]);
     }
 }
 

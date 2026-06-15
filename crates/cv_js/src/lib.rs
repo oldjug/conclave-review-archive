@@ -53,6 +53,11 @@ pub mod osr;
 pub mod parser;
 pub mod regex;
 pub mod runtime_features;
+/// Unicode property data for RegExp `\p{...}` / `\P{...}` property escapes
+/// (ECMA-262 §22.2.1). UCD-derived code-point range tables (General_Category,
+/// binary properties, common Scripts) consumed by `regex.rs` under the `u`/`v`
+/// flag. Always on (additive; only reachable via `\p`/`\P` with the `u` flag).
+pub mod unicode_props;
 pub mod sab;
 pub mod shapes;
 /// T3 — the optimizing tier (B2 of PHASE B): bytecode → SSA-ish IR →
