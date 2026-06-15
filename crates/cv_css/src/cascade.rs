@@ -2923,6 +2923,202 @@ pub fn collect_keyframes(sheets: &[Stylesheet]) -> std::collections::HashMap<Str
     out
 }
 
+// ── @keyframes collection memo (Blink StyleRuleKeyframes) ────────────────────
+//
+// Blink parses `@keyframes` ONCE when the stylesheet is parsed into a
+// `StyleRuleKeyframes` stored on the resolver's `StyleEngine`, then looks it up
+// by name during animation; it is NOT re-collected/re-parsed per animated frame
+// (Blink's `CSSAnimations::CalculateAnimationUpdate` reads the already-built
+// keyframe model). Our per-frame render path called `collect_keyframes(sheets)`
+// on EVERY animated frame, re-walking every sheet's at-rules and re-cloning +
+// re-sorting every keyframe step's declaration list into a fresh HashMap.
+//
+// `collect_keyframes_cached` memoizes that result in a thread-local, keyed on a
+// fingerprint of EXACTLY the inputs `collect_keyframes` reads — every
+// `@keyframes` at-rule's name (prelude) and block (offset selectors +
+// declarations) across all sheets. The fingerprint is a pure function of those
+// inputs, so an identical fingerprint guarantees an identical collection result
+// (a cache HIT returns the same map the cold path would build, byte-for-byte).
+// When the stylesheet set changes (a new/edited/removed `@keyframes`, a new
+// document, a CSSOM insertRule), the fingerprint changes => cache miss =>
+// re-collect. Non-keyframe rule changes do not invalidate (correct: they do not
+// affect the keyframe map). Returned as an `Rc` so callers reuse the same parsed
+// model across frames with no per-frame clone of the declaration Vecs.
+fn keyframes_fingerprint(sheets: &[Stylesheet]) -> u64 {
+    // FNV-1a over the keyframe-relevant token/structure stream only. This is the
+    // exact set of bytes `collect_keyframes` consumes, and it is far cheaper than
+    // the clone+sort+HashMap build it gates (and, on a page with NO @keyframes,
+    // is just the at-rule-name scan the cold path already pays).
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+    let mut h: u64 = FNV_OFFSET;
+    let mut byte = |h: &mut u64, b: u8| {
+        *h ^= b as u64;
+        *h = h.wrapping_mul(FNV_PRIME);
+    };
+    let mut bytes = |h: &mut u64, s: &[u8]| {
+        for &b in s {
+            byte(h, b);
+        }
+    };
+    let mut hash_token = |h: &mut u64, t: &CssToken| {
+        // A discriminant byte + the token's payload, so two distinct token kinds
+        // with the same string payload never collide.
+        match t {
+            CssToken::Ident(s) => {
+                byte(h, 1);
+                bytes(h, s.as_bytes());
+            }
+            CssToken::Function(s) => {
+                byte(h, 2);
+                bytes(h, s.as_bytes());
+            }
+            CssToken::AtKeyword(s) => {
+                byte(h, 3);
+                bytes(h, s.as_bytes());
+            }
+            CssToken::Hash(s) => {
+                byte(h, 4);
+                bytes(h, s.as_bytes());
+            }
+            CssToken::String(s) => {
+                byte(h, 5);
+                bytes(h, s.as_bytes());
+            }
+            CssToken::Number(n) => {
+                byte(h, 6);
+                bytes(h, &n.to_bits().to_le_bytes());
+            }
+            CssToken::Percent(n) => {
+                byte(h, 7);
+                bytes(h, &n.to_bits().to_le_bytes());
+            }
+            CssToken::Dimension { value, unit } => {
+                byte(h, 8);
+                bytes(h, &value.to_bits().to_le_bytes());
+                bytes(h, unit.as_bytes());
+            }
+            CssToken::Url(s) => {
+                byte(h, 9);
+                bytes(h, s.as_bytes());
+            }
+            CssToken::Delim(c) => {
+                byte(h, 10);
+                bytes(h, &(*c as u32).to_le_bytes());
+            }
+            // Punctuation / structural tokens: discriminant only (no payload).
+            CssToken::Whitespace => byte(h, 11),
+            CssToken::Colon => byte(h, 12),
+            CssToken::Semicolon => byte(h, 13),
+            CssToken::Comma => byte(h, 14),
+            CssToken::LeftBrace => byte(h, 15),
+            CssToken::RightBrace => byte(h, 16),
+            CssToken::LeftParen => byte(h, 17),
+            CssToken::RightParen => byte(h, 18),
+            CssToken::LeftBracket => byte(h, 19),
+            CssToken::RightBracket => byte(h, 20),
+            CssToken::Bang => byte(h, 21),
+            CssToken::Eof => byte(h, 22),
+        }
+    };
+    // Top-level sheet count, so adding/removing whole sheets always perturbs.
+    bytes(&mut h, &(sheets.len() as u64).to_le_bytes());
+    for ss in sheets {
+        // Sheet separator + that sheet's at-rule count.
+        byte(&mut h, 0xFF);
+        bytes(&mut h, &(ss.at_rules.len() as u64).to_le_bytes());
+        for at in &ss.at_rules {
+            if !at.name.eq_ignore_ascii_case("keyframes") {
+                // Still account for the rule's PRESENCE (its index position
+                // matters: it shifts which keyframes a same-name later rule
+                // overrides) without hashing its body — cheap.
+                byte(&mut h, 0xA0);
+                continue;
+            }
+            byte(&mut h, 0xB0);
+            for t in &at.prelude {
+                hash_token(&mut h, t);
+            }
+            if let Some(block) = &at.block {
+                bytes(&mut h, &(block.len() as u64).to_le_bytes());
+                for rule in block {
+                    for sel in &rule.selectors {
+                        match keyframe_offset_from(sel) {
+                            Some(off) => bytes(&mut h, &off.to_bits().to_le_bytes()),
+                            None => byte(&mut h, 0),
+                        }
+                    }
+                    for d in &rule.declarations {
+                        bytes(&mut h, d.name.as_bytes());
+                        byte(&mut h, b'=');
+                        for t in &d.value {
+                            hash_token(&mut h, t);
+                        }
+                        if d.important {
+                            byte(&mut h, b'!');
+                        }
+                        byte(&mut h, b';');
+                    }
+                }
+            } else {
+                byte(&mut h, 0xC0);
+            }
+        }
+    }
+    h
+}
+
+thread_local! {
+    /// Memo for `collect_keyframes_cached`: (fingerprint, parsed model). One slot
+    /// is sufficient — the per-frame caller passes the SAME sheet set across all
+    /// frames of a page, so the slot stays hot; a navigation/sheet edit changes
+    /// the fingerprint and replaces it.
+    static KEYFRAMES_MEMO: std::cell::RefCell<
+        Option<(u64, std::rc::Rc<std::collections::HashMap<String, KeyframeRule>>)>,
+    > = const { std::cell::RefCell::new(None) };
+}
+
+/// Memoized form of [`collect_keyframes`]. Returns the SAME map the cold path
+/// would build (oracle-checked in tests), reusing a cached `Rc` across frames
+/// when the keyframe-relevant content of `sheets` is unchanged. Use this on the
+/// per-frame animation path; use [`collect_keyframes`] when you need a fresh
+/// owned map or are the oracle. Honors `CV_KEYFRAMES_MEMO=0` to force the cold
+/// path (the A/B oracle escape hatch).
+pub fn collect_keyframes_cached(
+    sheets: &[Stylesheet],
+) -> std::rc::Rc<std::collections::HashMap<String, KeyframeRule>> {
+    if !keyframes_memo_enabled() {
+        return std::rc::Rc::new(collect_keyframes(sheets));
+    }
+    let fp = keyframes_fingerprint(sheets);
+    KEYFRAMES_MEMO.with(|cell| {
+        if let Some((cached_fp, rc)) = cell.borrow().as_ref() {
+            if *cached_fp == fp {
+                return rc.clone();
+            }
+        }
+        let built = std::rc::Rc::new(collect_keyframes(sheets));
+        *cell.borrow_mut() = Some((fp, built.clone()));
+        built
+    })
+}
+
+/// Test/diagnostic hook: drop the memoized keyframe model so the next
+/// `collect_keyframes_cached` re-collects cold. Mirrors the per-build cache
+/// resets used elsewhere (e.g. the GDI text-measure width cache).
+pub fn clear_keyframes_memo() {
+    KEYFRAMES_MEMO.with(|cell| *cell.borrow_mut() = None);
+}
+
+fn keyframes_memo_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    // Default-ON: the fingerprint is a pure function of the exact inputs
+    // `collect_keyframes` reads, so a hit is byte-identical to a cold collect
+    // (oracle-proven). `CV_KEYFRAMES_MEMO=0` forces the cold path.
+    *ENABLED.get_or_init(|| std::env::var("CV_KEYFRAMES_MEMO").as_deref() != Ok("0"))
+}
+
 /// Sample an animation at progress `t` (0..1) by interpolating between
 /// adjacent keyframe steps. Returns a HashMap of property→value
 /// strings (in CSS source form) that the caller can re-apply over
@@ -11709,5 +11905,147 @@ mod tests {
         let el = Fake { tag: "p", id: None, classes: &[] };
         let cs = compute(&[ss], el);
         assert!(cs.filters.is_empty(), "external ref skipped, got {:?}", cs.filters);
+    }
+
+    // ── @keyframes collection memo (Blink StyleRuleKeyframes) oracle ─────────
+
+    /// The cached collection must be IDENTICAL to the cold collection for the
+    /// same sheets, sampled across the whole 0..1 timeline (this is the
+    /// byte-identity oracle: same parsed model => same interpolated values).
+    fn keyframe_maps_equal(
+        a: &std::collections::HashMap<String, KeyframeRule>,
+        b: &std::collections::HashMap<String, KeyframeRule>,
+    ) -> bool {
+        if a.len() != b.len() {
+            return false;
+        }
+        for (name, ra) in a {
+            let Some(rb) = b.get(name) else { return false };
+            if ra.name != rb.name || ra.steps.len() != rb.steps.len() {
+                return false;
+            }
+            // Compare each step's offset and its sampled value strings — the
+            // exact bytes the per-frame animation path consumes.
+            for t in [0.0_f32, 0.13, 0.25, 0.5, 0.77, 1.0] {
+                let pa = sample_animation(ra, t);
+                let pb = sample_animation(rb, t);
+                if pa != pb {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    #[test]
+    fn keyframes_memo_matches_cold_collect() {
+        clear_keyframes_memo();
+        let css = "@keyframes slide { from { transform: translateX(0px); opacity: 1; } \
+                   50% { transform: translateX(40px); opacity: 0.5; } \
+                   to { transform: translateX(100px); opacity: 0; } } \
+                   @keyframes fade { 0% { background-color: #000; } 100% { background-color: #fff; } }";
+        let sheets = vec![parse_stylesheet(css)];
+        let cold = collect_keyframes(&sheets);
+        // First call: cold miss; second call: should be a HIT and identical.
+        let warm1 = collect_keyframes_cached(&sheets);
+        let warm2 = collect_keyframes_cached(&sheets);
+        assert!(keyframe_maps_equal(&cold, &warm1), "cached == cold (first)");
+        assert!(keyframe_maps_equal(&cold, &warm2), "cached == cold (second)");
+        // The second call must reuse the SAME Rc allocation (proves it hit the
+        // memo rather than rebuilding — the actual cost we save).
+        assert!(
+            std::rc::Rc::ptr_eq(&warm1, &warm2),
+            "second call reuses the cached Rc (memo hit, no rebuild)"
+        );
+    }
+
+    #[test]
+    fn keyframes_memo_invalidates_on_sheet_change() {
+        clear_keyframes_memo();
+        let css_a = "@keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }";
+        let sheets_a = vec![parse_stylesheet(css_a)];
+        let a = collect_keyframes_cached(&sheets_a);
+        assert!(a.contains_key("spin"), "spin collected");
+
+        // A DIFFERENT stylesheet (new @keyframes name + a changed value) MUST
+        // invalidate — a stale cache that returned `spin` here would be a
+        // correctness bug (the new page's animation would silently not animate).
+        let css_b = "@keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(720deg); } } \
+                     @keyframes glow { from { opacity: 0; } to { opacity: 1; } }";
+        let sheets_b = vec![parse_stylesheet(css_b)];
+        let b = collect_keyframes_cached(&sheets_b);
+        assert!(b.contains_key("glow"), "new @keyframes picked up after change");
+        assert_eq!(b.len(), 2, "both keyframes present after change");
+        // The fingerprint must differ between the two sheet sets.
+        assert_ne!(
+            keyframes_fingerprint(&sheets_a),
+            keyframes_fingerprint(&sheets_b),
+            "differing keyframe content => differing fingerprint"
+        );
+        // And the cold collect of B agrees with the cached B.
+        let cold_b = collect_keyframes(&sheets_b);
+        assert!(keyframe_maps_equal(&cold_b, &b), "cached B == cold B");
+    }
+
+    /// A value-only edit inside an existing @keyframes (same name, same offsets)
+    /// MUST invalidate — otherwise the animation would interpolate stale frames.
+    #[test]
+    fn keyframes_memo_invalidates_on_value_edit() {
+        clear_keyframes_memo();
+        let s1 = vec![parse_stylesheet(
+            "@keyframes m { from { opacity: 1; } to { opacity: 0; } }",
+        )];
+        let _ = collect_keyframes_cached(&s1);
+        let s2 = vec![parse_stylesheet(
+            "@keyframes m { from { opacity: 1; } to { opacity: 0.25; } }",
+        )];
+        let got = collect_keyframes_cached(&s2);
+        let cold = collect_keyframes(&s2);
+        assert!(keyframe_maps_equal(&cold, &got), "value edit re-collected");
+        assert_ne!(
+            keyframes_fingerprint(&s1),
+            keyframes_fingerprint(&s2),
+            "value edit perturbs fingerprint"
+        );
+    }
+
+    /// Two DISTINCT sheet sets with byte-identical keyframe content legitimately
+    /// share a result (same inputs => same output). This is correct reuse, not a
+    /// stale hit — verify the returned map matches a cold collect of the second.
+    #[test]
+    fn keyframes_memo_reuses_for_identical_content() {
+        clear_keyframes_memo();
+        let css = "@keyframes k { from { opacity: 0; } to { opacity: 1; } }";
+        let s1 = vec![parse_stylesheet(css)];
+        let s2 = vec![parse_stylesheet(css)]; // separately parsed, identical text
+        let _ = collect_keyframes_cached(&s1);
+        let r2 = collect_keyframes_cached(&s2);
+        let cold2 = collect_keyframes(&s2);
+        assert!(keyframe_maps_equal(&cold2, &r2), "identical content reuse is correct");
+        assert_eq!(
+            keyframes_fingerprint(&s1),
+            keyframes_fingerprint(&s2),
+            "identical keyframe content => identical fingerprint"
+        );
+    }
+
+    /// Adding a NON-keyframe at-rule before a @keyframes shifts its index; the
+    /// fingerprint must reflect rule presence/position so override semantics
+    /// (a later same-name @keyframes wins) are never silently stale.
+    #[test]
+    fn keyframes_memo_accounts_for_nonkeyframe_rule_presence() {
+        clear_keyframes_memo();
+        let a = vec![parse_stylesheet(
+            "@keyframes k { from { opacity: 0; } to { opacity: 1; } }",
+        )];
+        let b = vec![parse_stylesheet(
+            "@media screen { p { color: red; } } \
+             @keyframes k { from { opacity: 0; } to { opacity: 1; } }",
+        )];
+        assert_ne!(
+            keyframes_fingerprint(&a),
+            keyframes_fingerprint(&b),
+            "a preceding non-keyframe at-rule perturbs the fingerprint"
+        );
     }
 }

@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Conclave bench — CSS @keyframes animation</title>
+<style>
+  body { margin: 0; padding: 0; background: #111; overflow: hidden; }
+  .stage { position: relative; width: 1200px; height: 600px; }
+  /* A real CSS @keyframes animation: transform + opacity + color interpolated
+     per frame. This is the path collect_keyframes() + sample_animation() drive.
+     Many boxes share the same @keyframes name, so the parsed model is looked up
+     and sampled once per box per frame — exactly the work memoization targets. */
+  @keyframes drift {
+    0%   { transform: translateX(0px) rotate(0deg);   opacity: 1;   background-color: #f55; }
+    50%  { transform: translateX(120px) rotate(180deg); opacity: 0.5; background-color: #5cf; }
+    100% { transform: translateX(0px) rotate(360deg); opacity: 1;   background-color: #5f5; }
+  }
+  @keyframes pulse {
+    from { transform: scale(1);   border-radius: 6px;  }
+    to   { transform: scale(1.4); border-radius: 24px; }
+  }
+  .box {
+    position: absolute;
+    width: 48px; height: 48px;
+    background: #4cf;
+    border-radius: 6px;
+  }
+  .a { animation: drift 2s linear infinite; }
+  .b { animation: pulse 1.5s ease-in-out infinite; }
+  #b0 { top: 40px;  left: 40px;  }
+  #b1 { top: 110px; left: 80px;  }
+  #b2 { top: 180px; left: 120px; }
+  #b3 { top: 250px; left: 160px; }
+  #b4 { top: 320px; left: 200px; }
+  #b5 { top: 390px; left: 240px; }
+  #b6 { top: 460px; left: 280px; }
+  #b7 { top: 40px;  left: 360px; }
+  #b8 { top: 110px; left: 400px; }
+  #b9 { top: 180px; left: 440px; }
+</style>
+</head>
+<body>
+  <div class="stage">
+    <div class="box a" id="b0"></div>
+    <div class="box b" id="b1"></div>
+    <div class="box a" id="b2"></div>
+    <div class="box b" id="b3"></div>
+    <div class="box a" id="b4"></div>
+    <div class="box b" id="b5"></div>
+    <div class="box a" id="b6"></div>
+    <div class="box b" id="b7"></div>
+    <div class="box a" id="b8"></div>
+    <div class="box b" id="b9"></div>
+  </div>
+  <script>
+    // The animation is driven ENTIRELY by CSS @keyframes (no per-frame JS DOM
+    // mutation). Each re-arming rAF advances the host clock by one frame so the
+    // render path re-collects @keyframes (without memo) and re-samples every
+    // animated box. We only keep the rAF loop alive so the bench's frame ticks
+    // engage has_active_animation() -> the animation render path.
+    function step() { requestAnimationFrame(step); }
+    requestAnimationFrame(step);
+  </script>
+</body>
+</html>

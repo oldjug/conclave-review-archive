@@ -399,6 +399,42 @@ fn measure_animation(cfg: &cv_layout::LayoutConfig) -> Result<AnimResult, String
     })
 }
 
+struct KeyframeAnimResult {
+    frames_total: usize,
+    frame_ms: Vec<f64>,
+}
+
+/// Load a page driven ENTIRELY by CSS `@keyframes` (no per-frame JS DOM
+/// mutation) and tick N frames back-to-back, timing each frame. This is the path
+/// the @keyframes-collection memo targets: every animated frame re-collects the
+/// keyframe model (without the memo) and re-samples every animated box. Unlike
+/// `anim.html` (which mutates `style.width` via JS and has NO `@keyframes`), this
+/// page exercises `collect_keyframes()` + `sample_animation()` for real, so the
+/// memo's effect is visible in `frame_ms_median`. The animation output is
+/// deterministic per host frame tick (one rAF advance per tick), so the two
+/// configs (memo on/off) render the SAME frames — only the per-frame parse work
+/// differs.
+fn measure_animation_keyframes(cfg: &cv_layout::LayoutConfig) -> Result<KeyframeAnimResult, String> {
+    let html = read_input("anim_keyframes.html")?;
+    let label = "file:///benchfix/anim_keyframes.html";
+    crate::bench_reset_render_thread_locals();
+    let (mut rt, mut doc, sheets, _first_paint) =
+        crate::build_runtime_and_first_paint(&html, label, cfg, "")
+            .map_err(|e| format!("anim_keyframes build: {e}"))?;
+
+    let mut frame_ms = Vec::with_capacity(ANIM_FRAMES);
+    for _ in 0..ANIM_FRAMES {
+        let t = Instant::now();
+        let _paint = crate::render_with_existing_runtime(&mut rt, &mut doc, &sheets, cfg, None);
+        frame_ms.push(t.elapsed().as_secs_f64() * 1000.0);
+    }
+
+    Ok(KeyframeAnimResult {
+        frames_total: ANIM_FRAMES,
+        frame_ms,
+    })
+}
+
 // ── JS-EXEC (JIT vs VM honesty) ──────────────────────────────────────────────
 
 /// Run a JS microbench through the real interpreter (`Interp::run` — the
@@ -537,6 +573,9 @@ pub fn run_bench(cli: &Cli) -> Result<(), String> {
     // ── ANIMATION ──
     let anim = measure_animation(&cfg)?;
 
+    // ── ANIMATION (CSS @keyframes-driven; exercises the keyframe-collection memo) ──
+    let anim_kf = measure_animation_keyframes(&cfg)?;
+
     // ── JS-EXEC ──
     let js_loop = measure_js("loop.js", "__bench_loop_result")?;
     let js_jit = measure_js("jit.js", "__bench_jit_result")?;
@@ -642,6 +681,21 @@ pub fn run_bench(cli: &Cli) -> Result<(), String> {
                         ("changed_nodes_median", J::I(median_usize(anim.changed_nodes.clone()) as i64)),
                         ("doc_chunks", J::I(anim.doc_chunks as i64)),
                         ("changed_fraction_median", J::F(changed_fraction_median)),
+                    ]),
+                ),
+                (
+                    // CSS @keyframes-driven animation: the path the keyframe-
+                    // collection memo (Blink StyleRuleKeyframes) targets. Lower
+                    // frame_ms_median with the memo on == real per-frame parse
+                    // work removed (identical rendered frames, oracle-proven).
+                    "animation_keyframes",
+                    J::Obj(vec![
+                        ("frames_total", J::I(anim_kf.frames_total as i64)),
+                        ("frame_ms_median", J::F(median(&anim_kf.frame_ms))),
+                        ("frame_ms_p95", J::F(p95(&anim_kf.frame_ms))),
+                        ("keyframes_memo_enabled", J::Bool(
+                            std::env::var("CV_KEYFRAMES_MEMO").as_deref() != Ok("0"),
+                        )),
                     ]),
                 ),
                 (

@@ -9009,7 +9009,11 @@ fn build_browser_session(target: &str) -> Result<BrowserParts, String> {
             .map_or(false, |lr| has_active_animation(lr))
             || any_transition_active();
         if !inputs_changed && !verify && anim_running {
-            let kf = cv_css::cascade::collect_keyframes(&st.sheets);
+            // Blink-shaped: reuse the parsed @keyframes model across frames
+            // (StyleRuleKeyframes lives on the resolver, not re-collected per
+            // animated frame). Invalidated by content fingerprint — see
+            // cv_css::cascade::collect_keyframes_cached.
+            let kf = cv_css::cascade::collect_keyframes_cached(&st.sheets);
             if !kf.is_empty() || any_transition_active() {
                 let mut lb = tab.paint.layout_root.take().unwrap();
                 let old_trees = tab.paint.property_trees.clone();
@@ -9180,7 +9184,7 @@ fn build_browser_session(target: &str) -> Result<BrowserParts, String> {
             // Advance CSS @keyframes animations on the reused layout, so a
             // rotating/spinning element keeps moving on these canvas-driven
             // frames without paying a full re-layout.
-            let kf = cv_css::cascade::collect_keyframes(&st.sheets);
+            let kf = cv_css::cascade::collect_keyframes_cached(&st.sheets);
             if !kf.is_empty() {
                 apply_css_animations(&mut lb, &kf, raf_clock_now());
             }
@@ -19421,7 +19425,11 @@ fn render_paint_only_focused(
     let t_start = std::time::Instant::now();
     let mut lb = build_layout_tree(doc, sheets, label, cfg, style_overrides);
     // Drive CSS @keyframes animations for this frame (transform/opacity).
-    let keyframes = cv_css::cascade::collect_keyframes(sheets);
+    // Blink-shaped: the @keyframes model is parsed ONCE and reused across frames
+    // (see cv_css::cascade::collect_keyframes_cached) — not re-collected/re-parsed
+    // per animated frame. Content-fingerprint keyed, so a stylesheet edit on a
+    // later render re-collects.
+    let keyframes = cv_css::cascade::collect_keyframes_cached(sheets);
     if !keyframes.is_empty() {
         apply_css_animations(&mut lb, &keyframes, raf_clock_now());
     }
@@ -21330,6 +21338,92 @@ mod transition_tests {
         assert_eq!(lb.text_color, LC { r: 0, g: 0, b: 0, a: 255 }, "color ends black");
         assert!((lb.border_radius_px - 40.0).abs() < 0.5, "radius ends 40px");
         assert!(!still_end, "single-iteration animation finished");
+    }
+
+    /// END-TO-END ORACLE for the @keyframes-collection memo: the animation must
+    /// produce BYTE-IDENTICAL per-frame box state whether the keyframes come from
+    /// the memoized `collect_keyframes_cached` or the cold `collect_keyframes`,
+    /// across the whole 0..1 timeline. A "faster" number from the memo is only a
+    /// real win if the rendered frames are identical — this proves it on the
+    /// actual `apply_css_animations` -> LayoutBox paint-field path (the same path
+    /// the bench frame uses), not just on the parsed map.
+    #[test]
+    fn keyframes_memo_renders_identical_frames_end_to_end() {
+        let css = "@keyframes drift { \
+            0%   { transform: translateX(0px) rotate(0deg);   opacity: 1;   background-color: #f55; } \
+            50%  { transform: translateX(120px) rotate(180deg); opacity: 0.5; background-color: #5cf; } \
+            100% { transform: translateX(0px) rotate(360deg); opacity: 1;   background-color: #5f5; } }";
+        let sheets = vec![cv_css::parse_stylesheet(css)];
+        let doc = cv_html::parse(
+            "<!doctype html><html><body><div id=m></div></body></html>",
+        );
+        let cfg = cv_layout::LayoutConfig {
+            viewport_w: 800.0,
+            viewport_h: 600.0,
+            ..cv_layout::LayoutConfig::default()
+        };
+
+        // Build two independent layout trees, wire the same animation onto the
+        // box in each, then drive one with the COLD map and one with the MEMO.
+        let mk = || {
+            let mut lb = build_layout_tree(&doc, &sheets, "file:///t", &cfg, &Default::default());
+            fn arm(b: &mut cv_layout::LayoutBox) {
+                if b.children.is_empty() {
+                    // leaf — not our target
+                }
+                b.animation_name = Some("drift".to_string());
+                b.animation_duration_ms = 2000.0;
+                b.animation_delay_ms = 0.0;
+                b.animation_iteration_count = f32::INFINITY;
+                b.animation_timing = 0;
+                for c in &mut b.children {
+                    arm(c);
+                }
+            }
+            arm(&mut lb);
+            lb
+        };
+
+        cv_css::cascade::clear_keyframes_memo();
+        let cold_map = cv_css::cascade::collect_keyframes(&sheets);
+        // Prime + reuse the memo (the per-frame path returns the same Rc).
+        let memo_map = cv_css::cascade::collect_keyframes_cached(&sheets);
+
+        // Sample across the timeline (200 frames over 2s = the bench cadence).
+        for frame in 0..200u32 {
+            let now_ms = frame as f64 * 10.0; // 0..2000ms
+            let mut lb_cold = mk();
+            let mut lb_memo = mk();
+            apply_css_animations(&mut lb_cold, &cold_map, now_ms);
+            apply_css_animations(&mut lb_memo, &memo_map, now_ms);
+
+            // Compare every box's animated paint fields recursively.
+            fn cmp(a: &cv_layout::LayoutBox, b: &cv_layout::LayoutBox, frame: u32) {
+                assert_eq!(a.opacity.to_bits(), b.opacity.to_bits(),
+                    "frame {frame}: opacity identical (memo vs cold)");
+                assert_eq!(a.background, b.background,
+                    "frame {frame}: background identical");
+                assert_eq!(a.text_color, b.text_color, "frame {frame}: color identical");
+                assert_eq!(a.border_radius_px.to_bits(), b.border_radius_px.to_bits(),
+                    "frame {frame}: border-radius identical");
+                // Transform components written by anim_apply_transform.
+                assert_eq!(a.rotate_deg.to_bits(), b.rotate_deg.to_bits(),
+                    "frame {frame}: rotate identical");
+                assert_eq!(a.scale_x.to_bits(), b.scale_x.to_bits(),
+                    "frame {frame}: scale_x identical");
+                assert_eq!(a.scale_y.to_bits(), b.scale_y.to_bits(),
+                    "frame {frame}: scale_y identical");
+                assert_eq!(a.translate_x_px.to_bits(), b.translate_x_px.to_bits(),
+                    "frame {frame}: translate_x identical");
+                assert_eq!(a.translate_y_px.to_bits(), b.translate_y_px.to_bits(),
+                    "frame {frame}: translate_y identical");
+                assert_eq!(a.children.len(), b.children.len());
+                for (ca, cb) in a.children.iter().zip(b.children.iter()) {
+                    cmp(ca, cb, frame);
+                }
+            }
+            cmp(&lb_cold, &lb_memo, frame);
+        }
     }
 
     // ── Compositor layer promotion + recomposite (CV_COMPOSITOR_ANIM) ─────────
@@ -49457,6 +49551,11 @@ fn bench_reset_render_thread_locals() {
     // deliberately kept (it holds only a handful of fonts and is a one-time GDI
     // realization cost, exactly like a process-global font table).
     cv_ui::clear_measure_width_cache();
+    // Drop the memoized @keyframes model so each measured build re-collects cold
+    // (the per-FRAME reuse within a single animation is the win, not cross-
+    // document reuse). Mirrors the live nav path, where a new sheet set produces
+    // a fresh fingerprint anyway.
+    cv_css::cascade::clear_keyframes_memo();
 }
 
 /// Cap on cached subtree entries; on overflow the cache is left as-is (new
