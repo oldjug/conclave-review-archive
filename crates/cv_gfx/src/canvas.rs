@@ -172,7 +172,7 @@ impl FillStyle {
 }
 
 /// Interpolate through `stops` at position `t` in [0, 1].
-fn sample_stops(stops: &[GradientStop], t: f32, global_alpha: f32) -> Color {
+pub(crate) fn sample_stops(stops: &[GradientStop], t: f32, global_alpha: f32) -> Color {
     debug_assert!(!stops.is_empty());
     if stops.len() == 1 {
         let mut c = stops[0].color;

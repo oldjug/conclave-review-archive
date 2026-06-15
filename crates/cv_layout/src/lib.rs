@@ -27,6 +27,72 @@ pub struct LinearGradientSpec {
     pub angle_deg: f32,
 }
 
+/// One color stop of a full N-stop gradient carried to the painter.
+/// Mirrors `cv_css::cascade::GradientColorStop` (this crate stays free
+/// of the CSS-crate dependency).
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct GradientStopSpec {
+    pub color: Color,
+    /// Position as a fraction of the gradient extent (0..1), or `None`
+    /// if unspecified (distributed at paint per CSS Images 3 §3.4.3).
+    pub pos_frac: Option<f32>,
+    /// Absolute px position (resolved against the gradient extent at
+    /// paint), or `None`.
+    pub pos_px: Option<f32>,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum GradRadialShape {
+    Circle,
+    Ellipse,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum GradRadialSize {
+    ClosestSide,
+    FarthestSide,
+    ClosestCorner,
+    FarthestCorner,
+    /// Explicit radii — px and/or percentage-of-box per axis.
+    Explicit {
+        rx_px: Option<f32>,
+        ry_px: Option<f32>,
+        rx_pct: Option<f32>,
+        ry_pct: Option<f32>,
+    },
+}
+
+/// A gradient center axis: px or percentage-of-box.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum GradPosAxis {
+    Px(f32),
+    Pct(f32),
+}
+
+/// Full N-stop gradient carried on a layout box (linear / radial /
+/// conic + repeating). The painter rasterizes this. CSS Images 3 §3.
+#[derive(Clone, Debug, PartialEq)]
+pub enum GradientSpec {
+    Linear {
+        angle_deg: f32,
+        stops: Vec<GradientStopSpec>,
+        repeating: bool,
+    },
+    Radial {
+        shape: GradRadialShape,
+        size: GradRadialSize,
+        center: Option<(GradPosAxis, GradPosAxis)>,
+        stops: Vec<GradientStopSpec>,
+        repeating: bool,
+    },
+    Conic {
+        from_deg: f32,
+        center: Option<(GradPosAxis, GradPosAxis)>,
+        stops: Vec<GradientStopSpec>,
+        repeating: bool,
+    },
+}
+
 /// Resolved CSS `box-shadow`. V1 supports the single drop-shadow form
 /// (no blur, no spread, no inset). Sites whose shorthand has only
 /// offsets + color get a proper visual; the blur radius is parsed but
@@ -396,6 +462,9 @@ pub struct LayoutBox {
     pub background_gradient: Option<LinearGradientSpec>,
     /// Resolved radial gradient — center-out two-stop fade.
     pub background_radial_gradient: Option<LinearGradientSpec>,
+    /// Full N-stop gradient (linear/radial/conic + repeating). When set,
+    /// the painter rasterizes this instead of the 2-stop approximations.
+    pub background_gradient_full: Option<GradientSpec>,
     /// `background-image: url(...)` URL string (unresolved). Painter
     /// looks this up in the image cache to draw the background bitmap.
     pub background_image_url: Option<String>,
@@ -952,6 +1021,8 @@ pub struct Style {
     /// `fill_rect_gradient` for the background instead of solid fill.
     pub background_gradient: Option<LinearGradientSpec>,
     pub background_radial_gradient: Option<LinearGradientSpec>,
+    /// Full N-stop gradient — rasterized verbatim by the painter.
+    pub background_gradient_full: Option<GradientSpec>,
     /// `background-image: url(...)` URL, passed through to the painter
     /// so it can resolve against the document base URL and look up the
     /// bitmap in the image cache.
@@ -2982,6 +3053,7 @@ fn build_box_inner(node: &StyledNode, cfg: &LayoutConfig) -> LayoutBox {
                 mask_image_url: node.style.mask_image_url.clone(),
                 background_gradient: node.style.background_gradient,
                 background_radial_gradient: node.style.background_radial_gradient,
+                background_gradient_full: node.style.background_gradient_full.clone(),
                 background_image_url: node.style.background_image_url.clone(),
                 background_repeat: node.style.background_repeat,
                 position: node.style.position.unwrap_or(Position::Static),
@@ -3114,6 +3186,7 @@ fn build_box_inner(node: &StyledNode, cfg: &LayoutConfig) -> LayoutBox {
             mask_image_url: None,
             background_gradient: None,
             background_radial_gradient: None,
+            background_gradient_full: None,
             background_image_url: None,
             background_repeat: BackgroundRepeat::default(),
             position: Position::Static,

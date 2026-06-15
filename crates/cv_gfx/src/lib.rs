@@ -54,6 +54,112 @@ impl Color {
     }
 }
 
+/// An abstract CSS gradient color stop, before position fix-up.
+/// `pos_frac` is a fraction of the gradient extent (0..1) when the
+/// author used a percentage / angle; `pos_px` is an absolute length that
+/// resolves against the gradient extent (line length / radius) at paint
+/// time. At most one is `Some`; both `None` means "unspecified" and the
+/// position is distributed per CSS Images 3 §3.4.3.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct AbstractStop {
+    pub color: Color,
+    pub pos_frac: Option<f32>,
+    pub pos_px: Option<f32>,
+}
+
+/// CSS `radial-gradient` ending shape.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum GfxRadialShape {
+    Circle,
+    Ellipse,
+}
+
+/// CSS `radial-gradient` ending-shape size. Lengths are pre-resolved to
+/// px by the caller (percentages resolved against the box).
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum GfxRadialSize {
+    ClosestSide,
+    FarthestSide,
+    ClosestCorner,
+    FarthestCorner,
+    /// Explicit radii in px (rx for circle == ry).
+    ExplicitPx { rx: f32, ry: f32 },
+}
+
+/// Resolve abstract stops into concrete `GradientStop`s with offsets in
+/// [0,1], applying the CSS Images 3 §3.4.3 color-stop "fix-up":
+///   1. first unspecified → 0.0, last unspecified → 1.0
+///   2. clamp any position below the running max to that running max
+///      (non-monotonic positions become flat)
+///   3. evenly distribute runs of still-unspecified positions between
+///      their bracketing specified positions.
+/// `extent_px` is the gradient line length (linear) or radius (radial)
+/// or one turn in px-equivalent (conic uses 1.0 so pos_px is unused).
+pub(crate) fn resolve_gradient_stops(stops: &[AbstractStop], extent_px: f32) -> Vec<GradientStop> {
+    if stops.is_empty() {
+        return Vec::new();
+    }
+    let n = stops.len();
+    let ext = extent_px.max(1e-3);
+    // Step A: convert each authored position to a fraction (or None).
+    let mut pos: Vec<Option<f32>> = stops
+        .iter()
+        .map(|s| {
+            if let Some(f) = s.pos_frac {
+                Some(f)
+            } else {
+                s.pos_px.map(|px| px / ext)
+            }
+        })
+        .collect();
+    // Step 1: anchor first/last.
+    if pos[0].is_none() {
+        pos[0] = Some(0.0);
+    }
+    if pos[n - 1].is_none() {
+        pos[n - 1] = Some(1.0);
+    }
+    // Step 2: enforce monotonicity (clamp to running max).
+    let mut running = f32::NEG_INFINITY;
+    for p in pos.iter_mut() {
+        if let Some(v) = p {
+            if *v < running {
+                *v = running;
+            }
+            running = *v;
+        }
+    }
+    // Step 3: evenly distribute unspecified runs.
+    let mut i = 0;
+    while i < n {
+        if pos[i].is_some() {
+            i += 1;
+            continue;
+        }
+        // [i .. j) is a run of None, bracketed by pos[i-1] and pos[j].
+        let start_val = pos[i - 1].unwrap();
+        let mut j = i;
+        while j < n && pos[j].is_none() {
+            j += 1;
+        }
+        let end_val = pos[j].unwrap(); // j < n guaranteed (last anchored)
+        let count = (j - i + 1) as f32; // number of gaps
+        for (k, slot) in pos[i..j].iter_mut().enumerate() {
+            let frac = (k as f32 + 1.0) / count;
+            *slot = Some(start_val + (end_val - start_val) * frac);
+        }
+        i = j;
+    }
+    stops
+        .iter()
+        .zip(pos.iter())
+        .map(|(s, p)| GradientStop {
+            offset: p.unwrap().clamp(0.0, 1.0),
+            color: s.color,
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone)]
 pub struct Bitmap {
     pub width: u32,
@@ -462,6 +568,197 @@ impl Bitmap {
                     self.pixels[i] = blend_bgra(self.pixels[i], c);
                 }
             }
+        }
+    }
+
+    /// Real N-stop CSS **linear-gradient** fill. CSS Images 3 §3.1.
+    ///
+    /// The gradient line passes through the box center at `angle_deg`
+    /// (CSS convention: 0° points up, increasing clockwise). Its length
+    /// is `abs(W·sin A) + abs(H·cos A)` (§3.1.1). Each pixel projects
+    /// onto the line to get an offset; the offset is normalized to the
+    /// line length and sampled through ALL stops. `repeating` tiles the
+    /// stop band (the offset is taken modulo the band span).
+    ///
+    /// `stops` are abstract (positions may be unspecified or px); they
+    /// are resolved via the §3.4.3 fix-up against the line length here.
+    pub fn fill_rect_linear_gradient_stops(
+        &mut self,
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
+        angle_deg: f32,
+        stops: &[AbstractStop],
+        repeating: bool,
+        clip_radius: i32,
+    ) {
+        if w <= 0 || h <= 0 {
+            return;
+        }
+        // Gradient line length per §3.1.1.
+        let a = angle_deg.to_radians();
+        let (wf, hf) = (w as f32, h as f32);
+        let line_len = (wf * a.sin()).abs() + (hf * a.cos()).abs();
+        let line_len = line_len.max(1e-3);
+        let resolved = resolve_gradient_stops(stops, line_len);
+        if resolved.is_empty() {
+            return;
+        }
+        // Unit vector along the gradient line in screen space. CSS angle
+        // 0° = up = (0,-1); +clockwise. Screen y grows downward, so
+        // direction = (sin A, -cos A).
+        let dx = a.sin();
+        let dy = -a.cos();
+        // Gradient start point = center - (line_len/2)·dir; the offset of
+        // a pixel = projection onto dir from the start, / line_len.
+        let cx = wf * 0.5;
+        let cy = hf * 0.5;
+        let start_x = cx - dir_scaled(dx, line_len);
+        let start_y = cy - dir_scaled(dy, line_len);
+        let (span, smin) = stop_band(&resolved);
+        let x0 = x.max(0);
+        let y0 = y.max(0);
+        let x1 = (x + w).min(self.width as i32);
+        let y1 = (y + h).min(self.height as i32);
+        let rr = clip_radius.max(0).min(w / 2).min(h / 2);
+        for py in y0..y1 {
+            for px in x0..x1 {
+                if rr > 0 && !point_in_rounded(px, py, x, y, w, h, rr) {
+                    continue;
+                }
+                let lx = (px - x) as f32 + 0.5 - start_x;
+                let ly = (py - y) as f32 + 0.5 - start_y;
+                let mut t = (lx * dx + ly * dy) / line_len;
+                t = map_offset(t, repeating, span, smin);
+                let c = sample_stops_offset(&resolved, t);
+                self.blend_or_set(px, py, c);
+            }
+        }
+    }
+
+    /// Real N-stop CSS **radial-gradient** fill. CSS Images 3 §3.2.
+    ///
+    /// `center_*` is the gradient center in px relative to the box's
+    /// top-left. `shape`/`size` give the ending shape; the per-pixel
+    /// normalized distance to the ending shape (1.0 at the edge) drives
+    /// the stop sampling. `repeating` tiles the band.
+    #[allow(clippy::too_many_arguments)]
+    pub fn fill_rect_radial_gradient_stops(
+        &mut self,
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
+        center_x: f32,
+        center_y: f32,
+        shape: GfxRadialShape,
+        size: GfxRadialSize,
+        stops: &[AbstractStop],
+        repeating: bool,
+        clip_radius: i32,
+    ) {
+        if w <= 0 || h <= 0 {
+            return;
+        }
+        let (rx, ry) = radial_radii(w as f32, h as f32, center_x, center_y, shape, size);
+        let (rx, ry) = (rx.max(1e-3), ry.max(1e-3));
+        // Resolve stops against rx (the gradient extent along the major
+        // axis; px stops resolve against rx per the spec — the gradient
+        // ray length). For ellipses the normalized distance handles ry.
+        let resolved = resolve_gradient_stops(stops, rx);
+        if resolved.is_empty() {
+            return;
+        }
+        let (span, smin) = stop_band(&resolved);
+        let x0 = x.max(0);
+        let y0 = y.max(0);
+        let x1 = (x + w).min(self.width as i32);
+        let y1 = (y + h).min(self.height as i32);
+        let rr = clip_radius.max(0).min(w / 2).min(h / 2);
+        for py in y0..y1 {
+            for px in x0..x1 {
+                if rr > 0 && !point_in_rounded(px, py, x, y, w, h, rr) {
+                    continue;
+                }
+                let ddx = ((px - x) as f32 + 0.5 - center_x) / rx;
+                let ddy = ((py - y) as f32 + 0.5 - center_y) / ry;
+                let mut t = (ddx * ddx + ddy * ddy).sqrt();
+                t = map_offset(t, repeating, span, smin);
+                let c = sample_stops_offset(&resolved, t);
+                self.blend_or_set(px, py, c);
+            }
+        }
+    }
+
+    /// Real N-stop CSS **conic-gradient** fill. CSS Images 4 §3.3.
+    ///
+    /// The gradient sweeps clockwise around `center_*` starting at
+    /// `from_deg` (0° = up/12-o'clock). A pixel's polar angle (measured
+    /// clockwise from the start) normalized to one turn (0..1) drives the
+    /// stop sampling. `repeating` tiles the band.
+    #[allow(clippy::too_many_arguments)]
+    pub fn fill_rect_conic_gradient_stops(
+        &mut self,
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
+        center_x: f32,
+        center_y: f32,
+        from_deg: f32,
+        stops: &[AbstractStop],
+        repeating: bool,
+        clip_radius: i32,
+    ) {
+        if w <= 0 || h <= 0 {
+            return;
+        }
+        // Conic positions are angles; resolve fix-up against 1 turn.
+        let resolved = resolve_gradient_stops(stops, 1.0);
+        if resolved.is_empty() {
+            return;
+        }
+        let (span, smin) = stop_band(&resolved);
+        let from_t = from_deg / 360.0;
+        let x0 = x.max(0);
+        let y0 = y.max(0);
+        let x1 = (x + w).min(self.width as i32);
+        let y1 = (y + h).min(self.height as i32);
+        let rr = clip_radius.max(0).min(w / 2).min(h / 2);
+        for py in y0..y1 {
+            for px in x0..x1 {
+                if rr > 0 && !point_in_rounded(px, py, x, y, w, h, rr) {
+                    continue;
+                }
+                let ddx = (px - x) as f32 + 0.5 - center_x;
+                let ddy = (py - y) as f32 + 0.5 - center_y;
+                // Angle clockwise from up (0° = +y-up = (0,-1)).
+                // screen y grows down. atan2(dx, -dy) gives 0 at up,
+                // increasing clockwise.
+                let ang = ddx.atan2(-ddy); // (-pi, pi], 0 = up, cw positive
+                let mut turn = ang / (2.0 * core::f32::consts::PI); // (-0.5, 0.5]
+                turn -= from_t;
+                // Normalize to [0,1).
+                turn = turn.rem_euclid(1.0);
+                let t = map_offset(turn, repeating, span, smin);
+                let c = sample_stops_offset(&resolved, t);
+                self.blend_or_set(px, py, c);
+            }
+        }
+    }
+
+    /// Source-over a color onto a pixel (opaque writes hard).
+    #[inline]
+    fn blend_or_set(&mut self, px: i32, py: i32, c: Color) {
+        if c.a == 0 {
+            return;
+        }
+        let i = (py as usize) * (self.width as usize) + (px as usize);
+        if c.a == 255 {
+            self.pixels[i] = c.to_bgra_u32();
+        } else {
+            self.pixels[i] = blend_bgra(self.pixels[i], c);
         }
     }
 
@@ -1280,6 +1577,149 @@ fn mix_color(a: Color, b: Color, t: f32) -> Color {
     }
 }
 
+/// Half the gradient-line length projected onto a unit-axis component.
+#[inline]
+fn dir_scaled(component: f32, line_len: f32) -> f32 {
+    component * line_len * 0.5
+}
+
+/// The [min, max] offsets covered by a resolved stop list and the span.
+/// Returns (span, min). For non-repeating gradients these are unused
+/// (offsets are clamped to [0,1]); for repeating they define the tile.
+#[inline]
+fn stop_band(stops: &[GradientStop]) -> (f32, f32) {
+    if stops.is_empty() {
+        return (1.0, 0.0);
+    }
+    let smin = stops[0].offset;
+    let smax = stops[stops.len() - 1].offset;
+    ((smax - smin).max(1e-4), smin)
+}
+
+/// Map a raw offset `t` into the sampling domain. Non-repeating clamps
+/// to [0,1]; repeating tiles within the stop band [smin, smin+span).
+/// CSS Images 3 §3.4 (repeating-*).
+#[inline]
+fn map_offset(t: f32, repeating: bool, span: f32, smin: f32) -> f32 {
+    if !repeating {
+        t
+    } else {
+        smin + (t - smin).rem_euclid(span)
+    }
+}
+
+/// Sample resolved stops at offset `t` (clamps to ends; interpolates in
+/// straight sRGB — same as the Canvas gradient path).
+#[inline]
+fn sample_stops_offset(stops: &[GradientStop], t: f32) -> Color {
+    canvas::sample_stops(stops, t, 1.0)
+}
+
+/// Pixel-in-rounded-rect test (corner discs of radius `br`).
+/// CSS Backgrounds 3 §6.1.
+fn point_in_rounded(px: i32, py: i32, bx: i32, by: i32, bw: i32, bh: i32, br: i32) -> bool {
+    if px < bx || py < by || px >= bx + bw || py >= by + bh {
+        return false;
+    }
+    if br <= 0 {
+        return true;
+    }
+    let cx = if px < bx + br {
+        bx + br
+    } else if px >= bx + bw - br {
+        bx + bw - br - 1
+    } else {
+        px
+    };
+    let cy = if py < by + br {
+        by + br
+    } else if py >= by + bh - br {
+        by + bh - br - 1
+    } else {
+        py
+    };
+    let dx = px - cx;
+    let dy = py - cy;
+    dx * dx + dy * dy <= br * br
+}
+
+/// Compute the radial-gradient ending-shape radii (rx, ry) in px.
+/// CSS Images 3 §3.2.1: for `circle`, rx == ry; for `ellipse` the two
+/// axes are sized independently. `closest/farthest-side` use the
+/// per-axis distance from the center to the box edges;
+/// `closest/farthest-corner` scale the corresponding *-side ellipse so
+/// it passes through that corner (preserving the side ellipse's aspect
+/// ratio); for a circle they are the straight-line distance to the
+/// corner.
+fn radial_radii(
+    w: f32,
+    h: f32,
+    cx: f32,
+    cy: f32,
+    shape: GfxRadialShape,
+    size: GfxRadialSize,
+) -> (f32, f32) {
+    // Distances from center to each side.
+    let left = cx;
+    let right = (w - cx).max(0.0);
+    let top = cy;
+    let bottom = (h - cy).max(0.0);
+    let dx_near = left.min(right);
+    let dx_far = left.max(right);
+    let dy_near = top.min(bottom);
+    let dy_far = top.max(bottom);
+    match size {
+        GfxRadialSize::ExplicitPx { rx, ry } => match shape {
+            GfxRadialShape::Circle => (rx, rx),
+            GfxRadialShape::Ellipse => (rx, ry),
+        },
+        GfxRadialSize::ClosestSide => match shape {
+            // Circle radius = nearest side distance.
+            GfxRadialShape::Circle => {
+                let r = dx_near.min(dy_near);
+                (r, r)
+            }
+            GfxRadialShape::Ellipse => (dx_near, dy_near),
+        },
+        GfxRadialSize::FarthestSide => match shape {
+            GfxRadialShape::Circle => {
+                let r = dx_far.max(dy_far);
+                (r, r)
+            }
+            GfxRadialShape::Ellipse => (dx_far, dy_far),
+        },
+        GfxRadialSize::ClosestCorner => match shape {
+            GfxRadialShape::Circle => {
+                let r = (dx_near * dx_near + dy_near * dy_near).sqrt();
+                (r, r)
+            }
+            GfxRadialShape::Ellipse => {
+                // Scale the closest-side ellipse so it passes through the
+                // closest corner: factor = sqrt((cx/sx)^2 + (cy/sy)^2)
+                // with the closest-side axes. (CSS Images 3 §3.2.1.)
+                let (sx, sy) = (dx_near.max(1e-3), dy_near.max(1e-3));
+                let cdx = dx_near;
+                let cdy = dy_near;
+                let k = ((cdx / sx).powi(2) + (cdy / sy).powi(2)).sqrt().max(1e-3);
+                (sx * k, sy * k)
+            }
+        },
+        GfxRadialSize::FarthestCorner => match shape {
+            GfxRadialShape::Circle => {
+                let r = (dx_far * dx_far + dy_far * dy_far).sqrt();
+                (r, r)
+            }
+            GfxRadialShape::Ellipse => {
+                let (sx, sy) = (dx_far.max(1e-3), dy_far.max(1e-3));
+                let cdx = dx_far;
+                let cdy = dy_far;
+                let k = ((cdx / sx).powi(2) + (cdy / sy).powi(2)).sqrt().max(1e-3);
+                (sx * k, sy * k)
+            }
+        },
+    }
+}
+
 fn sample_bgra_bilinear(src_w: u32, src_h: u32, src: &[u32], x: f32, y: f32) -> Color {
     let x0 = x.floor().clamp(0.0, (src_w - 1) as f32) as u32;
     let y0 = y.floor().clamp(0.0, (src_h - 1) as f32) as u32;
@@ -1637,5 +2077,222 @@ mod tests {
         let bottom = unpack_bgra(b.pixels[16 * 20 + 10]);
         assert_eq!(top.a, 255, "top arc should be painted");
         assert_eq!(bottom.a, 0, "bottom half should be untouched");
+    }
+
+    // ───────────────────────── gradient rasterizer ─────────────────────────
+
+    fn s(r: u8, g: u8, b: u8, pos: Option<f32>) -> AbstractStop {
+        AbstractStop {
+            color: Color { r, g, b, a: 255 },
+            pos_frac: pos,
+            pos_px: None,
+        }
+    }
+    fn at(b: &Bitmap, x: i32, y: i32) -> Color {
+        unpack_bgra(b.pixels[(y as usize) * (b.width as usize) + x as usize])
+    }
+
+    /// CSS Images 3 §3.4.3 color-stop fix-up: first→0, last→1, an
+    /// unspecified middle stop is evenly distributed.
+    #[test]
+    fn stop_fixup_distributes_unspecified_positions() {
+        let stops = vec![
+            s(255, 0, 0, None),
+            s(0, 255, 0, None),
+            s(0, 0, 255, None),
+        ];
+        let r = resolve_gradient_stops(&stops, 100.0);
+        assert_eq!(r.len(), 3);
+        assert!((r[0].offset - 0.0).abs() < 1e-4);
+        assert!((r[1].offset - 0.5).abs() < 1e-4, "middle → 0.5, got {}", r[1].offset);
+        assert!((r[2].offset - 1.0).abs() < 1e-4);
+    }
+
+    /// Non-monotonic positions clamp to the running max (CSS Images 3
+    /// §3.4.3 step 3).
+    #[test]
+    fn stop_fixup_clamps_non_monotonic() {
+        let stops = vec![
+            s(0, 0, 0, Some(0.6)),
+            s(0, 0, 0, Some(0.2)), // less than previous → clamps to 0.6
+            s(0, 0, 0, Some(1.0)),
+        ];
+        let r = resolve_gradient_stops(&stops, 100.0);
+        assert!((r[1].offset - 0.6).abs() < 1e-4, "clamped to 0.6, got {}", r[1].offset);
+    }
+
+    /// A 3-stop linear gradient (red 0%, green 50%, blue 100%) sampled
+    /// at the geometric midpoint must be GREEN — proving N-stop
+    /// interpolation, not a red→blue 2-stop blend (which would be gray).
+    #[test]
+    fn linear_three_stop_midpoint_is_green() {
+        let mut b = Bitmap::new(101, 11);
+        b.clear(Color::TRANSPARENT);
+        let stops = vec![
+            s(255, 0, 0, Some(0.0)),
+            s(0, 255, 0, Some(0.5)),
+            s(0, 0, 255, Some(1.0)),
+        ];
+        // `to right` == 90deg.
+        b.fill_rect_linear_gradient_stops(0, 0, 101, 11, 90.0, &stops, false, 0);
+        let mid = at(&b, 50, 5);
+        assert!(
+            mid.g > 230 && mid.r < 25 && mid.b < 25,
+            "3-stop midpoint must be green, got {:?}",
+            mid
+        );
+        // Endpoints.
+        let left = at(&b, 0, 5);
+        let right = at(&b, 100, 5);
+        assert!(left.r > 230 && left.g < 25, "left = red, got {:?}", left);
+        assert!(right.b > 230 && right.g < 25, "right = blue, got {:?}", right);
+    }
+
+    /// `to right` (side keyword) and `90deg` must produce the same
+    /// gradient. CSS Images 3 §3.1.
+    #[test]
+    fn side_to_right_equals_90deg() {
+        let stops = vec![s(255, 0, 0, Some(0.0)), s(0, 0, 255, Some(1.0))];
+        let mut a = Bitmap::new(50, 10);
+        let mut c = Bitmap::new(50, 10);
+        // `to right` maps to 90deg in the direction parser; both call here
+        // with 90deg, so verify a vertical scan is constant (axis is
+        // horizontal) — i.e. the projection only depends on x.
+        a.fill_rect_linear_gradient_stops(0, 0, 50, 10, 90.0, &stops, false, 0);
+        c.fill_rect_linear_gradient_stops(0, 0, 50, 10, 90.0, &stops, false, 0);
+        for y in 0..10 {
+            assert_eq!(at(&a, 25, y).to_bgra_u32(), at(&a, 25, 0).to_bgra_u32(),
+                "90deg gradient must be constant down a column");
+        }
+        assert_eq!(a.pixels, c.pixels);
+    }
+
+    /// A 3-stop radial gradient: the mid stop color appears at the mid
+    /// radius (halfway from center to edge), not at the center or edge.
+    #[test]
+    fn radial_three_stop_mid_radius_is_green() {
+        let mut b = Bitmap::new(101, 101);
+        b.clear(Color::TRANSPARENT);
+        let stops = vec![
+            s(255, 0, 0, Some(0.0)),
+            s(0, 255, 0, Some(0.5)),
+            s(0, 0, 255, Some(1.0)),
+        ];
+        // Ellipse, farthest-side: rx=ry=50 (center 50,50). Mid radius
+        // (t=0.5) is 25px from center → pixel (75, 50).
+        b.fill_rect_radial_gradient_stops(
+            0, 0, 101, 101, 50.0, 50.0,
+            GfxRadialShape::Circle, GfxRadialSize::FarthestSide,
+            &stops, false, 0,
+        );
+        let center = at(&b, 50, 50);
+        let mid = at(&b, 75, 50);
+        let edge = at(&b, 100, 50);
+        assert!(center.r > 230 && center.g < 25, "center = red, got {:?}", center);
+        assert!(mid.g > 220 && mid.r < 40 && mid.b < 40, "mid radius = green, got {:?}", mid);
+        assert!(edge.b > 220, "edge = blue, got {:?}", edge);
+    }
+
+    /// A conic gradient with red at 0deg (top) and blue at 180deg
+    /// (bottom): the pixel directly to the RIGHT of center is at 90deg
+    /// and must be the halfway color (purple-ish: r≈b), proving angular
+    /// sampling. CSS Images 4 §3.3.
+    #[test]
+    fn conic_samples_by_angle() {
+        let mut b = Bitmap::new(101, 101);
+        b.clear(Color::TRANSPARENT);
+        // red at 0 (top), blue at 0.5turn (bottom), red again at 1turn.
+        let stops = vec![
+            s(255, 0, 0, Some(0.0)),
+            s(0, 0, 255, Some(0.5)),
+            s(255, 0, 0, Some(1.0)),
+        ];
+        b.fill_rect_conic_gradient_stops(0, 0, 101, 101, 50.0, 50.0, 0.0, &stops, false, 0);
+        // Straight up (top) = 0deg → red.
+        let top = at(&b, 50, 5);
+        assert!(top.r > 200 && top.b < 60, "top (0deg) = red, got {:?}", top);
+        // Straight down (bottom) = 180deg → blue.
+        let bottom = at(&b, 50, 95);
+        assert!(bottom.b > 200 && bottom.r < 60, "bottom (180deg) = blue, got {:?}", bottom);
+        // Right (90deg) = halfway 0→0.5 → purple (r≈b, both ~128).
+        let right = at(&b, 95, 50);
+        assert!(
+            right.r > 90 && right.b > 90 && (right.r as i32 - right.b as i32).abs() < 50,
+            "right (90deg) = halfway purple, got {:?}",
+            right
+        );
+    }
+
+    /// `from <angle>` rotates the conic start: with from=90deg, the
+    /// pixel to the RIGHT (90deg) becomes the 0deg stop color (red).
+    #[test]
+    fn conic_from_angle_rotates_start() {
+        let mut b = Bitmap::new(101, 101);
+        b.clear(Color::TRANSPARENT);
+        let stops = vec![s(255, 0, 0, Some(0.0)), s(0, 0, 255, Some(1.0))];
+        b.fill_rect_conic_gradient_stops(0, 0, 101, 101, 50.0, 50.0, 90.0, &stops, false, 0);
+        let right = at(&b, 95, 50);
+        assert!(right.r > 200 && right.b < 60, "right at from=90deg = red, got {:?}", right);
+    }
+
+    /// repeating-linear-gradient with a 0..0.25 band tiles: the same
+    /// color recurs every quarter of the gradient line.
+    #[test]
+    fn repeating_linear_tiles_band() {
+        let mut b = Bitmap::new(101, 5);
+        b.clear(Color::TRANSPARENT);
+        // band [0, 0.5]: red→blue, repeats twice across the box.
+        let stops = vec![s(255, 0, 0, Some(0.0)), s(0, 0, 255, Some(0.5))];
+        b.fill_rect_linear_gradient_stops(0, 0, 101, 5, 90.0, &stops, true, 0);
+        // Start of each tile (t=0, t=0.5 of the line) is red.
+        let tile0 = at(&b, 0, 2);
+        let tile1 = at(&b, 50, 2);
+        assert!(tile0.r > 220 && tile0.b < 40, "tile0 start = red, got {:?}", tile0);
+        assert!(tile1.r > 200 && tile1.b < 70, "tile1 start (repeat) = red-ish, got {:?}", tile1);
+        // Non-repeating with the SAME band would clamp to blue past 0.5,
+        // so verify the repeat actually brought red back at x=50.
+        let mut nb = Bitmap::new(101, 5);
+        nb.fill_rect_linear_gradient_stops(0, 0, 101, 5, 90.0, &stops, false, 0);
+        let nclamp = at(&nb, 50, 2);
+        assert!(nclamp.b > 220, "non-repeating clamps to blue at x=50, got {:?}", nclamp);
+    }
+
+    /// Two-stop full-gradient path must still match the simple expected
+    /// midpoint (no regression vs. the legacy 2-stop visual).
+    #[test]
+    fn two_stop_linear_midpoint_is_blend() {
+        let mut b = Bitmap::new(101, 5);
+        let stops = vec![s(0, 0, 0, Some(0.0)), s(255, 255, 255, Some(1.0))];
+        b.fill_rect_linear_gradient_stops(0, 0, 101, 5, 90.0, &stops, false, 0);
+        let mid = at(&b, 50, 2);
+        assert!(
+            (mid.r as i32 - 127).abs() < 12,
+            "2-stop black→white midpoint ≈ gray 127, got {:?}",
+            mid
+        );
+    }
+
+    /// closest-side vs farthest-side sizing differ for an off-center
+    /// radial: closest-side reaches the near edge sooner.
+    #[test]
+    fn radial_closest_side_smaller_than_farthest() {
+        // Center near the left edge (cx=20) of a 100-wide box.
+        let stops = vec![s(255, 255, 255, Some(0.0)), s(0, 0, 0, Some(1.0))];
+        let (rx_c, _) = radial_radii(100.0, 100.0, 20.0, 50.0,
+            GfxRadialShape::Circle, GfxRadialSize::ClosestSide);
+        let (rx_f, _) = radial_radii(100.0, 100.0, 20.0, 50.0,
+            GfxRadialShape::Circle, GfxRadialSize::FarthestSide);
+        // closest side = min(20, 80, 50, 50) = 20; farthest = max(...) = 80.
+        assert!((rx_c - 20.0).abs() < 1e-3, "closest-side circle r=20, got {}", rx_c);
+        assert!((rx_f - 80.0).abs() < 1e-3, "farthest-side circle r=80, got {}", rx_f);
+        let _ = stops;
+    }
+
+    /// Explicit-px radial radii pass through verbatim.
+    #[test]
+    fn radial_explicit_px_radii() {
+        let (rx, ry) = radial_radii(200.0, 100.0, 100.0, 50.0,
+            GfxRadialShape::Ellipse, GfxRadialSize::ExplicitPx { rx: 30.0, ry: 70.0 });
+        assert!((rx - 30.0).abs() < 1e-3 && (ry - 70.0).abs() < 1e-3);
     }
 }

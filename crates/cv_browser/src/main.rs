@@ -43133,6 +43133,20 @@ fn resolve_current_color(style: &mut cv_layout::Style, resolved: cv_layout::Colo
             g.to = resolved;
         }
     }
+    // Resolve `currentColor` inside full N-stop gradient stops too, so
+    // `linear-gradient(currentColor, …)` follows the element's color.
+    if let Some(fg) = style.background_gradient_full.as_mut() {
+        let stops = match fg {
+            cv_layout::GradientSpec::Linear { stops, .. }
+            | cv_layout::GradientSpec::Radial { stops, .. }
+            | cv_layout::GradientSpec::Conic { stops, .. } => stops,
+        };
+        for s in stops.iter_mut() {
+            if s.color.is_current_color() {
+                s.color = resolved;
+            }
+        }
+    }
     for f in style.filters.iter_mut() {
         if let cv_layout::FilterEffect::DropShadow(sh) = f {
             if sh.color.is_current_color() {
@@ -43675,6 +43689,14 @@ fn lower_style(
         mask_image_url: cs.mask_image_url.clone(),
         background_gradient,
         background_radial_gradient,
+        background_gradient_full: if cs.background_clip_text {
+            // background-clip:text suppresses box background paint.
+            None
+        } else {
+            cs.background_gradient_full
+                .as_ref()
+                .map(lower_css_gradient)
+        },
         background_image_url: cs.background_image_url.clone(),
         background_repeat: match cs.background_repeat {
             cv_css::cascade::BackgroundRepeat::Repeat => cv_layout::BackgroundRepeat::Repeat,
@@ -43742,6 +43764,173 @@ fn lower_style(
             };
             (conv(x), conv(y))
         }),
+    }
+}
+
+/// Rasterize a full N-stop CSS gradient into `bmp` over the box rect
+/// `(x, y, w, h)` (border-box). `radius` is the border-radius clip in
+/// px (0 = square). `opacity` is the element's group opacity, folded
+/// into each stop's alpha. CSS Images 3 §3 + §4 (conic).
+#[allow(clippy::too_many_arguments)]
+fn paint_full_gradient(
+    bmp: &mut cv_gfx::Bitmap,
+    g: &cv_layout::GradientSpec,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    radius: i32,
+    opacity: f32,
+) {
+    if w <= 0 || h <= 0 {
+        return;
+    }
+    let wf = w as f32;
+    let hf = h as f32;
+    let to_abstract = |stops: &[cv_layout::GradientStopSpec]| -> Vec<cv_gfx::AbstractStop> {
+        stops
+            .iter()
+            .map(|s| cv_gfx::AbstractStop {
+                color: cv_gfx::Color {
+                    r: s.color.r,
+                    g: s.color.g,
+                    b: s.color.b,
+                    a: ((s.color.a as f32) * opacity).round().clamp(0.0, 255.0) as u8,
+                },
+                pos_frac: s.pos_frac,
+                pos_px: s.pos_px,
+            })
+            .collect()
+    };
+    // Resolve a center axis to px (percentage against the box dimension).
+    let resolve_axis = |a: cv_layout::GradPosAxis, extent: f32| -> f32 {
+        match a {
+            cv_layout::GradPosAxis::Px(v) => v,
+            cv_layout::GradPosAxis::Pct(p) => extent * p / 100.0,
+        }
+    };
+    match g {
+        cv_layout::GradientSpec::Linear { angle_deg, stops, repeating } => {
+            let abs = to_abstract(stops);
+            bmp.fill_rect_linear_gradient_stops(
+                x, y, w, h, *angle_deg, &abs, *repeating, radius,
+            );
+        }
+        cv_layout::GradientSpec::Radial { shape, size, center, stops, repeating } => {
+            let (cx, cy) = match center {
+                Some((ax, ay)) => (resolve_axis(*ax, wf), resolve_axis(*ay, hf)),
+                None => (wf * 0.5, hf * 0.5),
+            };
+            let gshape = match shape {
+                cv_layout::GradRadialShape::Circle => cv_gfx::GfxRadialShape::Circle,
+                cv_layout::GradRadialShape::Ellipse => cv_gfx::GfxRadialShape::Ellipse,
+            };
+            let gsize = match size {
+                cv_layout::GradRadialSize::ClosestSide => cv_gfx::GfxRadialSize::ClosestSide,
+                cv_layout::GradRadialSize::FarthestSide => cv_gfx::GfxRadialSize::FarthestSide,
+                cv_layout::GradRadialSize::ClosestCorner => cv_gfx::GfxRadialSize::ClosestCorner,
+                cv_layout::GradRadialSize::FarthestCorner => cv_gfx::GfxRadialSize::FarthestCorner,
+                cv_layout::GradRadialSize::Explicit { rx_px, ry_px, rx_pct, ry_pct } => {
+                    // Resolve explicit radii: px verbatim, % against the
+                    // box dimension along each axis. CSS Images 3 §3.2.2.
+                    let rx = rx_px
+                        .or_else(|| rx_pct.map(|p| wf * p / 100.0))
+                        .unwrap_or(wf * 0.5);
+                    let ry = ry_px
+                        .or_else(|| ry_pct.map(|p| hf * p / 100.0))
+                        .unwrap_or(rx);
+                    cv_gfx::GfxRadialSize::ExplicitPx { rx, ry }
+                }
+            };
+            let abs = to_abstract(stops);
+            bmp.fill_rect_radial_gradient_stops(
+                x, y, w, h, cx, cy, gshape, gsize, &abs, *repeating, radius,
+            );
+        }
+        cv_layout::GradientSpec::Conic { from_deg, center, stops, repeating } => {
+            let (cx, cy) = match center {
+                Some((ax, ay)) => (resolve_axis(*ax, wf), resolve_axis(*ay, hf)),
+                None => (wf * 0.5, hf * 0.5),
+            };
+            let abs = to_abstract(stops);
+            bmp.fill_rect_conic_gradient_stops(
+                x, y, w, h, cx, cy, *from_deg, &abs, *repeating, radius,
+            );
+        }
+    }
+}
+
+/// Lower a parsed `cv_css::cascade::CssGradient` into the layout-level
+/// `cv_layout::GradientSpec` carried to the painter. Pure structural
+/// re-mapping (the two enums mirror each other; cv_layout stays free of
+/// the cv_css dependency). CSS Images 3 §3.
+fn lower_css_gradient(g: &cv_css::cascade::CssGradient) -> cv_layout::GradientSpec {
+    use cv_css::cascade as csc;
+    let lower_stops = |stops: &[csc::GradientColorStop]| -> Vec<cv_layout::GradientStopSpec> {
+        stops
+            .iter()
+            .map(|s| cv_layout::GradientStopSpec {
+                color: cv_layout::Color {
+                    r: s.color.r,
+                    g: s.color.g,
+                    b: s.color.b,
+                    a: s.color.a,
+                },
+                pos_frac: s.pos_frac,
+                pos_px: s.pos_px,
+            })
+            .collect()
+    };
+    let lower_axis = |a: csc::GradientPosAxis| match a {
+        csc::GradientPosAxis::Px(v) => cv_layout::GradPosAxis::Px(v),
+        csc::GradientPosAxis::Pct(v) => cv_layout::GradPosAxis::Pct(v),
+    };
+    let lower_center = |c: Option<(csc::GradientPosAxis, csc::GradientPosAxis)>| {
+        c.map(|(x, y)| (lower_axis(x), lower_axis(y)))
+    };
+    match g {
+        csc::CssGradient::Linear { angle_deg, stops, repeating } => {
+            cv_layout::GradientSpec::Linear {
+                angle_deg: *angle_deg,
+                stops: lower_stops(stops),
+                repeating: *repeating,
+            }
+        }
+        csc::CssGradient::Radial { shape, size, center, stops, repeating } => {
+            let shape = match shape {
+                csc::RadialShape::Circle => cv_layout::GradRadialShape::Circle,
+                csc::RadialShape::Ellipse => cv_layout::GradRadialShape::Ellipse,
+            };
+            let size = match size {
+                csc::RadialSize::ClosestSide => cv_layout::GradRadialSize::ClosestSide,
+                csc::RadialSize::FarthestSide => cv_layout::GradRadialSize::FarthestSide,
+                csc::RadialSize::ClosestCorner => cv_layout::GradRadialSize::ClosestCorner,
+                csc::RadialSize::FarthestCorner => cv_layout::GradRadialSize::FarthestCorner,
+                csc::RadialSize::Explicit { rx_px, ry_px, rx_pct, ry_pct } => {
+                    cv_layout::GradRadialSize::Explicit {
+                        rx_px: *rx_px,
+                        ry_px: *ry_px,
+                        rx_pct: *rx_pct,
+                        ry_pct: *ry_pct,
+                    }
+                }
+            };
+            cv_layout::GradientSpec::Radial {
+                shape,
+                size,
+                center: lower_center(*center),
+                stops: lower_stops(stops),
+                repeating: *repeating,
+            }
+        }
+        csc::CssGradient::Conic { from_deg, center, stops, repeating } => {
+            cv_layout::GradientSpec::Conic {
+                from_deg: *from_deg,
+                center: lower_center(*center),
+                stops: lower_stops(stops),
+                repeating: *repeating,
+            }
+        }
     }
 }
 
@@ -48092,6 +48281,7 @@ fn paint_box_offset_t(
     if b.background.is_some()
         || b.background_gradient.is_some()
         || b.background_radial_gradient.is_some()
+        || b.background_gradient_full.is_some()
         || b.box_shadow.is_some()
         || b.background_image.is_some()
     {
@@ -48330,7 +48520,25 @@ fn paint_box_offset_t(
         // element's own background colour.
         let r = b.border_rect();
         let radius = used_border_radius_px(b, r.w as i32, r.h as i32);
+        // Full N-stop gradient (production path). When present it
+        // rasterizes the real linear/radial/conic gradient and SKIPS the
+        // 2-stop legacy fields + solid bg below (handled by the
+        // `has_full_gradient` guard). CSS Images 3 §3.
+        let has_full_gradient = b.background_gradient_full.is_some();
+        if let Some(fg) = b.background_gradient_full.as_ref() {
+            paint_full_gradient(
+                bmp,
+                fg,
+                r.x as i32 + ox,
+                r.y as i32 + oy,
+                r.w as i32,
+                r.h as i32,
+                radius,
+                opacity,
+            );
+        }
         // Gradient takes precedence over solid background.
+        if !has_full_gradient {
         if let Some(g) = b.background_gradient {
             let from_a = scale_alpha(g.from.a);
             let to_a = scale_alpha(g.to.a);
@@ -48389,7 +48597,11 @@ fn paint_box_offset_t(
                 );
             }
         }
-        if b.background_gradient.is_none() && b.background_radial_gradient.is_none() {
+        } // end `if !has_full_gradient`
+        if !has_full_gradient
+            && b.background_gradient.is_none()
+            && b.background_radial_gradient.is_none()
+        {
             if let Some(bg) = b.background {
                 let alpha = scale_alpha(bg.a);
                 if alpha == 0 {
@@ -53586,6 +53798,7 @@ mod tests {
             mask_image_url: None,
             background_gradient: None,
             background_radial_gradient: None,
+            background_gradient_full: None,
             background_image_url: None,
             background_repeat: cv_layout::BackgroundRepeat::Repeat,
             top_px: None,
@@ -54109,6 +54322,7 @@ mod tests {
             animation_timing: 3,
             background_gradient: None,
             background_radial_gradient: None,
+            background_gradient_full: None,
             background_image_url: None,
             background_repeat: cv_layout::BackgroundRepeat::default(),
             top_px: None,
@@ -54259,6 +54473,7 @@ mod tests {
                 angle_deg: 180.0,
             }),
             background_radial_gradient: None,
+            background_gradient_full: None,
             background_image_url: None,
             background_repeat: cv_layout::BackgroundRepeat::default(),
             top_px: None,
@@ -54406,6 +54621,7 @@ mod tests {
             animation_timing: 3,
             background_gradient: None,
             background_radial_gradient: None,
+            background_gradient_full: None,
             background_image_url: None,
             background_repeat: cv_layout::BackgroundRepeat::default(),
             top_px: None,
@@ -54549,6 +54765,7 @@ mod tests {
             animation_timing: 3,
             background_gradient: None,
             background_radial_gradient: None,
+            background_gradient_full: None,
             background_image_url: None,
             background_repeat: cv_layout::BackgroundRepeat::default(),
             top_px: None,
@@ -62497,6 +62714,128 @@ var el = document.getElementById('el');
             );
             clear_scroll_offsets();
         }
+    }
+
+    // ───────── full N-stop CSS gradient: end-to-end paint (HTML→CSS→box→pixel) ─────────
+
+    /// Find the first box whose full gradient is set, depth-first.
+    fn find_grad_box(b: &cv_layout::LayoutBox) -> Option<&cv_layout::LayoutBox> {
+        if b.background_gradient_full.is_some() {
+            return Some(b);
+        }
+        b.children.iter().find_map(find_grad_box)
+    }
+
+    fn unpack(px: u32) -> (u8, u8, u8, u8) {
+        (
+            ((px >> 16) & 0xFF) as u8,
+            ((px >> 8) & 0xFF) as u8,
+            (px & 0xFF) as u8,
+            ((px >> 24) & 0xFF) as u8,
+        )
+    }
+
+    /// END-TO-END: a 3-stop `linear-gradient(to right, red 0%, lime 50%,
+    /// blue 100%)` declared in CSS, laid out, and painted through the
+    /// real `paint_box` path renders GREEN at the box's horizontal
+    /// midpoint pixel — proving the production paint path does real
+    /// N-stop sampling rather than a red→blue 2-stop blend (which would
+    /// be gray at the midpoint). CSS Images 3 §3.1.
+    #[test]
+    fn e2e_three_stop_linear_paints_green_at_midpoint() {
+        let html = "<div style=\"width:200px;height:40px;background:linear-gradient(to right, red 0%, lime 50%, blue 100%)\"></div>";
+        let mut doc = cv_html::parse(html);
+        assign_node_ids(&mut doc.root);
+        let mut sheets = vec![parse_user_agent_stylesheet()];
+        sheets.extend(collect_stylesheets(&doc));
+        let cfg = cv_layout::LayoutConfig::default();
+        let layout = build_layout_tree(&doc, &sheets, "https://t/", &cfg, &Default::default());
+        let gb = find_grad_box(&layout).expect("a box with a full gradient");
+        // The full N-stop model must have all 3 stops.
+        match gb.background_gradient_full.as_ref().unwrap() {
+            cv_layout::GradientSpec::Linear { stops, .. } => {
+                assert_eq!(stops.len(), 3, "must carry 3 stops end-to-end")
+            }
+            other => panic!("expected Linear, got {other:?}"),
+        }
+        // Paint the whole layout tree.
+        let r = gb.border_rect();
+        let mut bmp = cv_gfx::Bitmap::new((r.w as u32).max(1) + 4, (r.h as u32).max(1) + 4);
+        bmp.clear(cv_gfx::Color::TRANSPARENT);
+        let mut texts = Vec::new();
+        paint_box(&layout, &mut bmp, &mut texts);
+        // Sample the gradient box's midpoint.
+        let mx = (r.x + r.w * 0.5) as i32;
+        let my = (r.y + r.h * 0.5) as i32;
+        let (gr, gg, gb_, _) = unpack(bmp.pixels[(my as usize) * (bmp.width as usize) + mx as usize]);
+        assert!(
+            gg > 200 && gr < 60 && gb_ < 60,
+            "midpoint of 3-stop gradient must be green, got ({gr},{gg},{gb_})"
+        );
+        // Left edge is red.
+        let lx = (r.x + 1.0) as i32;
+        let (lr, lg, _, _) = unpack(bmp.pixels[(my as usize) * (bmp.width as usize) + lx as usize]);
+        assert!(lr > 200 && lg < 60, "left edge = red, got ({lr},{lg})");
+    }
+
+    /// END-TO-END radial: `radial-gradient(circle farthest-side, red,
+    /// lime 50%, blue)` renders green at the mid radius via `paint_box`.
+    #[test]
+    fn e2e_radial_paints_green_at_mid_radius() {
+        let html = "<div style=\"width:100px;height:100px;background:radial-gradient(circle farthest-side, red, lime 50%, blue)\"></div>";
+        let mut doc = cv_html::parse(html);
+        assign_node_ids(&mut doc.root);
+        let mut sheets = vec![parse_user_agent_stylesheet()];
+        sheets.extend(collect_stylesheets(&doc));
+        let cfg = cv_layout::LayoutConfig::default();
+        let layout = build_layout_tree(&doc, &sheets, "https://t/", &cfg, &Default::default());
+        let gb = find_grad_box(&layout).expect("radial gradient box");
+        let r = gb.border_rect();
+        let mut bmp = cv_gfx::Bitmap::new((r.w as u32) + 4, (r.h as u32) + 4);
+        bmp.clear(cv_gfx::Color::TRANSPARENT);
+        let mut texts = Vec::new();
+        paint_box(&layout, &mut bmp, &mut texts);
+        let cx = (r.x + r.w * 0.5) as i32;
+        let cy = (r.y + r.h * 0.5) as i32;
+        // Center = red.
+        let (cr, cg, _, _) = unpack(bmp.pixels[(cy as usize) * (bmp.width as usize) + cx as usize]);
+        assert!(cr > 200 && cg < 60, "center = red, got ({cr},{cg})");
+        // Mid radius: farthest-side circle r = 50 (square box), so t=0.5
+        // at 25px from center → x = cx+25.
+        let midx = cx + 25;
+        let (mr, mg, mb, _) = unpack(bmp.pixels[(cy as usize) * (bmp.width as usize) + midx as usize]);
+        assert!(mg > 200 && mr < 60 && mb < 60, "mid radius = green, got ({mr},{mg},{mb})");
+    }
+
+    /// `paint_full_gradient` honors element opacity by folding it into
+    /// stop alpha (so a 50%-opaque solid-red gradient blends to ~half
+    /// over white).
+    #[test]
+    fn paint_full_gradient_applies_opacity() {
+        let g = cv_layout::GradientSpec::Linear {
+            angle_deg: 90.0,
+            stops: vec![
+                cv_layout::GradientStopSpec {
+                    color: cv_layout::Color { r: 255, g: 0, b: 0, a: 255 },
+                    pos_frac: Some(0.0),
+                    pos_px: None,
+                },
+                cv_layout::GradientStopSpec {
+                    color: cv_layout::Color { r: 255, g: 0, b: 0, a: 255 },
+                    pos_frac: Some(1.0),
+                    pos_px: None,
+                },
+            ],
+            repeating: false,
+        };
+        let mut bmp = cv_gfx::Bitmap::new(10, 10);
+        bmp.clear(cv_gfx::Color::WHITE);
+        paint_full_gradient(&mut bmp, &g, 0, 0, 10, 10, 0, 0.5);
+        let (r, gg, b, _) = unpack(bmp.pixels[5 * 10 + 5]);
+        // 50% red over white ≈ (255, 128, 128).
+        assert!(r > 240, "red channel stays high, got {r}");
+        assert!(gg > 100 && gg < 160 && b > 100 && b < 160,
+            "g,b ≈ 128 from 50% blend, got ({r},{gg},{b})");
     }
 }
 

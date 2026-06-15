@@ -2934,6 +2934,7 @@ mod tests {
             mask_image_url: None,
             background_gradient: None,
             background_radial_gradient: None,
+            background_gradient_full: None,
             background_image_url: None,
             background_repeat: BackgroundRepeat::Repeat,
             top_px: None,
