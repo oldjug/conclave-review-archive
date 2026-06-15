@@ -9435,6 +9435,44 @@ impl Interp {
             }),
         );
         self.define_global("Reflect", Value::Object(Rc::new(RefCell::new(reflect))));
+
+        // Iterator (ECMA-262 §27.1.3) — the abstract base whose `.prototype`
+        // carries the lazy/eager helper methods (map/filter/take/drop/flatMap/
+        // reduce/toArray/forEach/some/every/find). The constructor itself is
+        // abstract: §27.1.3.1 throws TypeError when called or constructed
+        // directly (only subclasses may construct). `Iterator.from(O)`
+        // (§27.1.3.2) returns an iterator: if `O` is already an Iterator (or
+        // iterable), its iterator; otherwise a wrapper. `Iterator.prototype` is
+        // the shared %Iterator.prototype% intrinsic so `x.values() instanceof`-
+        // style chains and helper inheritance both resolve to one object.
+        let mut iterator_obj: HashMap<String, Value> = HashMap::new();
+        iterator_obj.insert(
+            "_call".into(),
+            native_fn("Iterator", |_| {
+                Err(type_error_throw(
+                    "Abstract class Iterator not directly constructable",
+                ))
+            }),
+        );
+        iterator_obj.insert(
+            "_construct".into(),
+            native_fn("Iterator", |_| {
+                Err(type_error_throw(
+                    "Abstract class Iterator not directly constructable",
+                ))
+            }),
+        );
+        iterator_obj.insert("prototype".into(), Value::Object(iterator_proto()));
+        // Iterator.from(O) — §27.1.3.2 GetIteratorFlattenable(O, iterate-strings).
+        iterator_obj.insert(
+            "from".into(),
+            native_fn_with_interp("from", |interp, args| {
+                let o = args.first().cloned().unwrap_or(Value::Undefined);
+                interp.get_iterator_flattenable(&o)
+            }),
+        );
+        self.define_global("Iterator", Value::Object(Rc::new(RefCell::new(iterator_obj))));
+
         self.define_global(
             "__tb_object_rest__",
             native_fn_with_interp("__tb_object_rest__", |interp, args| {
@@ -15252,6 +15290,119 @@ impl Interp {
         Ok(to_integer_or_inf(&prim))
     }
 
+    /// Pull one step from an iterator object (ECMA-262 §27.1.5.2 IteratorStep +
+    /// §27.1.5.4 IteratorValue). Calls the iterator's `next()` with `iter` as the
+    /// receiver, then inspects the result record: `Ok(None)` when `done` is true
+    /// (iterator exhausted), `Ok(Some(value))` otherwise. The result of `next()`
+    /// MUST be an object per §27.1.5.2 step 2 — a non-object throws TypeError.
+    /// This is the single primitive every Iterator-helper consumer drives, so
+    /// helpers compose over ANY iterator: array iterators, generators, Map/Set
+    /// iterators, custom user objects with a `next` method, and other helpers.
+    pub fn iter_step(&mut self, iter: &Value) -> Result<Option<Value>, JsError> {
+        let next = self.read_property(iter, "next");
+        if !self.is_callable(&next) {
+            return Err(type_error_throw("iterator.next is not a function"));
+        }
+        let r = self.call_value_with_this(next, iter.clone(), vec![])?;
+        if !matches!(r, Value::Object(_)) {
+            return Err(type_error_throw("iterator result is not an object"));
+        }
+        if self.read_property(&r, "done").to_bool() {
+            Ok(None)
+        } else {
+            Ok(Some(self.read_property(&r, "value")))
+        }
+    }
+
+    /// Close an iterator (ECMA-262 §7.4.11 IteratorClose): if it has a `return`
+    /// method, call it with the iterator as receiver and ignore the outcome
+    /// (a non-throwing best-effort close — the spec discards the value but
+    /// rethrows if `return` itself throws; the eager helpers below only close on
+    /// the success/short-circuit path so we swallow a throwing `return` to keep
+    /// the original completion). Used by the short-circuiting consumers
+    /// (some/every/find) and the lazy helpers' own `return` plumbing.
+    pub fn iter_close(&mut self, iter: &Value) {
+        let ret = self.read_property(iter, "return");
+        if self.is_callable(&ret) {
+            let _ = self.call_value_with_this(ret, iter.clone(), vec![]);
+        }
+    }
+
+    /// Validate the `limit` argument of `Iterator.prototype.{take,drop}`
+    /// (ECMA-262 §27.1.4.5 / §27.1.4.4 steps 3-5): `numLimit =
+    /// ToIntegerOrInfinity(limit)`; if `numLimit` is NaN throw RangeError; if
+    /// `numLimit` < 0 throw RangeError. Returns the (possibly +Infinity) limit.
+    pub fn take_drop_limit(&mut self, v: &Value) -> Result<f64, JsError> {
+        // ToIntegerOrInfinity, but we must catch a NaN BEFORE it collapses to 0.
+        let prim = match v {
+            Value::String(s) if is_symbol_key(s) => {
+                return Err(type_error_throw("Cannot convert a Symbol value to a number"));
+            }
+            Value::BigInt(_) => {
+                return Err(type_error_throw("Cannot convert a BigInt value to a number"));
+            }
+            Value::Object(_) | Value::Array(_) => self.to_primitive_throwing(v, false)?,
+            other => other.clone(),
+        };
+        if let Value::BigInt(_) = &prim {
+            return Err(type_error_throw("Cannot convert a BigInt value to a number"));
+        }
+        let num = prim.to_number();
+        if num.is_nan() {
+            return Err(JsError::Throw(err_str(
+                "RangeError: limit must not be NaN".to_string(),
+            )));
+        }
+        // ToIntegerOrInfinity: +Inf/-Inf pass through; otherwise truncate.
+        let int = if num.is_infinite() { num } else { num.trunc() };
+        if int < 0.0 {
+            return Err(JsError::Throw(err_str(
+                "RangeError: limit must not be negative".to_string(),
+            )));
+        }
+        Ok(int)
+    }
+
+    /// GetIteratorFlattenable (ECMA-262 §27.1.4.7 step used by flatMap): the
+    /// mapped value must be flattenable to an iterator. If it's an object with a
+    /// `Symbol.iterator` method, call it to obtain the iterator; otherwise (the
+    /// "iterate strings primitives = reject" rule for flatMap, which uses
+    /// `reject-primitives`) throw TypeError. Strings ARE iterable objects when
+    /// coerced, but the proposal's flatMap rejects primitive non-objects to
+    /// surface mistakes — matching V8, a string yields its code points because
+    /// `String.prototype[@@iterator]` exists once boxed. We coerce a primitive
+    /// string to its iterator (V8 behaviour) and reject other primitives.
+    pub fn get_iterator_flattenable(&mut self, v: &Value) -> Result<Value, JsError> {
+        match v {
+            Value::Object(_) | Value::Array(_) => {
+                // Prefer an explicit @@iterator (generators, custom iterables,
+                // arrays, Map/Set). If the value is already an iterator (has a
+                // callable `next`) and is NOT iterable, use it directly.
+                let method = self.read_property(v, "@@sym:Symbol.iterator");
+                if self.is_callable(&method) {
+                    let it = self.call_value_with_this(method, v.clone(), vec![])?;
+                    return Ok(it);
+                }
+                // Already an iterator object (own `next`): use as-is.
+                let next = self.read_property(v, "next");
+                if self.is_callable(&next) {
+                    return Ok(v.clone());
+                }
+                // An array-like / built-in collection: snapshot to an iterator.
+                let fast = iterable_values(v);
+                Ok(build_value_iterator(fast))
+            }
+            // §27.1.4.7: a primitive STRING is iterable per the @@iterator on
+            // String.prototype — V8 flattens its code points.
+            Value::String(s) => Ok(build_value_iterator(
+                s.chars().map(|c| Value::str(c.to_string())).collect(),
+            )),
+            _ => Err(type_error_throw(
+                "Iterator.prototype.flatMap: mapper did not return an iterable",
+            )),
+        }
+    }
+
     /// Walk an explicit `[[Prototype]]` chain (the `\u{1}__proto__` slots)
     /// looking for `key`. Returns the first hit, or None if the chain ends.
     fn walk_proto_chain(
@@ -16341,6 +16492,25 @@ impl Interp {
                     let m = self.read_property(&probe, key);
                     if !matches!(m, Value::Undefined) {
                         return m;
+                    }
+                }
+                // Iterator Helpers (ECMA-262 §27.1.4): an iterator-shaped object
+                // (own callable `next`, or an engine iterator marker) that has no
+                // own/explicit-proto entry for `key` inherits %Iterator.prototype%
+                // — map/filter/take/drop/flatMap/reduce/toArray/forEach/some/
+                // every/find + @@iterator. Grafted here (rather than wiring a
+                // real [[Prototype]] onto every ad-hoc iterator object) so it
+                // applies uniformly to array iterators, generators, Map/Set
+                // iterators, custom iterators, and chained helpers. Guarded to
+                // iterator-shaped objects so arbitrary plain objects are
+                // unaffected. Skip the Object.prototype-recursion case (`o` IS
+                // Iterator.prototype) — impossible here since it's a separate cell.
+                if is_iterator_shaped(o) {
+                    let ip = iterator_proto();
+                    if !Rc::ptr_eq(o, &ip) {
+                        if let Some(v) = ip.borrow().get(key) {
+                            return v.clone();
+                        }
                     }
                 }
                 Value::Undefined
@@ -21781,6 +21951,488 @@ fn js_parse_float(s: &str) -> f64 {
     s[..i].parse::<f64>().unwrap_or(f64::NAN)
 }
 
+// ===========================================================================
+// Iterator Helpers (ECMA-262 §27.1.4 "Iterator Helper Objects", ES2025).
+//
+// `Iterator.prototype` carries the lazy helpers map/filter/take/drop/flatMap
+// (each returns a NEW Iterator Helper that pulls from the source on demand) and
+// the eager consumers reduce/toArray/forEach/some/every/find. They operate on
+// the receiver (`this`) as an iterator via the IteratorStep/IteratorValue
+// primitive (`iter_step`), so they work over ANY iterator: array iterators
+// (`[].values()`), generators, Map/Set iterators, custom user iterators, and
+// other helpers (chaining). `read_property_inner` installs this prototype as the
+// fallback for any iterator-shaped object that doesn't carry the method itself.
+// ===========================================================================
+
+thread_local! {
+    /// The realm's `%Iterator.prototype%` intrinsic — built once per thread and
+    /// shared (it's a stateless bag of `this`-aware builtin methods).
+    static ITERATOR_PROTO: RefCell<Option<Rc<RefCell<HashMap<String, Value>>>>> =
+        const { RefCell::new(None) };
+}
+
+/// Accessor for the thread's `Iterator.prototype`, building it lazily.
+pub fn iterator_proto() -> Rc<RefCell<HashMap<String, Value>>> {
+    ITERATOR_PROTO.with(|cell| {
+        if let Some(p) = cell.borrow().as_ref() {
+            return p.clone();
+        }
+        let built = build_iterator_proto();
+        *cell.borrow_mut() = Some(built.clone());
+        built
+    })
+}
+
+/// Is `o` an iterator-shaped object — i.e. does it expose a callable `next`
+/// (own or somewhere recognizable)? Used so `read_property` only grafts the
+/// Iterator-helper prototype onto things that are genuinely iterators, never
+/// arbitrary plain objects. We accept an own `next`, or the engine's iterator
+/// markers (`__iterator__`, `_isGenerator`, `_isIteratorHelper`).
+fn is_iterator_shaped(o: &Rc<RefCell<HashMap<String, Value>>>) -> bool {
+    let m = o.borrow();
+    if m.contains_key("__iterator__")
+        || matches!(m.get("_isGenerator"), Some(Value::Bool(true)))
+        || matches!(m.get("_isIteratorHelper"), Some(Value::Bool(true)))
+    {
+        return true;
+    }
+    matches!(
+        m.get("next"),
+        Some(Value::NativeFunction(_) | Value::Function(_) | Value::BcClosure(_))
+    )
+}
+
+/// Build a LAZY Iterator Helper object (ECMA-262 §27.1.4.2 CreateIteratorHelper-
+/// style). `step` is pulled on each `.next()`: it returns `Ok(Some(v))` to yield
+/// `v`, or `Ok(None)` when exhausted. Once exhausted (or after `return()`), the
+/// helper latches `done` and yields `{value:undefined, done:true}` forever
+/// (§27.1.4.1, generator already-completed semantics). The helper is
+/// self-iterable (`@@iterator` returns itself) and inherits `Iterator.prototype`
+/// so helpers chain (`it.map(f).filter(g).take(2)`).
+fn build_lazy_iterator<F>(close_source: Option<Value>, step: F) -> Value
+where
+    F: Fn(&mut Interp) -> Result<Option<Value>, JsError> + 'static,
+{
+    let done = Rc::new(std::cell::Cell::new(false));
+    let mut it: HashMap<String, Value> = HashMap::new();
+    it.insert("_isIteratorHelper".into(), Value::Bool(true));
+
+    let done_next = done.clone();
+    it.insert(
+        "next".into(),
+        native_fn_with_interp("next", move |interp, _args| {
+            if done_next.get() {
+                return Ok(make_iter_result(Value::Undefined, true));
+            }
+            match step(interp) {
+                Ok(Some(v)) => Ok(make_iter_result(v, false)),
+                Ok(None) => {
+                    done_next.set(true);
+                    Ok(make_iter_result(Value::Undefined, true))
+                }
+                Err(e) => {
+                    // A throw from the step (callback/source) closes the helper.
+                    done_next.set(true);
+                    Err(e)
+                }
+            }
+        }),
+    );
+
+    // §27.1.4.1 Iterator Helper `return`: mark done and close the underlying
+    // iterator (best-effort) so `for...of` early-exit and `take` propagate close.
+    let done_ret = done;
+    it.insert(
+        "return".into(),
+        native_fn_with_interp("return", move |interp, args| {
+            done_ret.set(true);
+            if let Some(src) = &close_source {
+                interp.iter_close(src);
+            }
+            let v = args.into_iter().next().unwrap_or(Value::Undefined);
+            Ok(make_iter_result(v, true))
+        }),
+    );
+
+    let cell: Rc<RefCell<HashMap<String, Value>>> = Rc::new(RefCell::new(it));
+    // Self-iterable: `it[Symbol.iterator]()` returns the helper itself
+    // (§27.1.3.6 — %Iterator.prototype%[@@iterator] returns `this`).
+    {
+        let self_ref = cell.clone();
+        cell.borrow_mut().insert(
+            "@@sym:Symbol.iterator".into(),
+            native_fn("[Symbol.iterator]", move |_| Ok(Value::Object(self_ref.clone()))),
+        );
+    }
+    Value::Object(cell)
+}
+
+/// Read the source iterator a helper method is invoked on (its `this`).
+/// ECMA-262 §27.1.4.x step 1: RequireObjectCoercible / the receiver must be an
+/// Object (it is the iterator). Throws TypeError otherwise.
+fn helper_this(interp: &Interp) -> Result<Value, JsError> {
+    let this = interp.native_this();
+    match this {
+        Value::Object(_) => Ok(this),
+        _ => Err(type_error_throw(
+            "Iterator helper called on a non-object receiver",
+        )),
+    }
+}
+
+/// Build `%Iterator.prototype%` with all the helper methods.
+fn build_iterator_proto() -> Rc<RefCell<HashMap<String, Value>>> {
+    let proto: Rc<RefCell<HashMap<String, Value>>> = Rc::new(RefCell::new(HashMap::new()));
+    let mut m = proto.borrow_mut();
+
+    // §27.1.3.6 %Iterator.prototype%[@@iterator] — returns `this`.
+    m.insert(
+        "@@sym:Symbol.iterator".into(),
+        native_fn_with_interp("[Symbol.iterator]", |interp, _| Ok(interp.native_this())),
+    );
+
+    // --- §27.1.4.3 Iterator.prototype.map(mapper) — LAZY.
+    m.insert(
+        "map".into(),
+        native_fn_with_interp("map", |interp, args| {
+            let src = helper_this(interp)?;
+            let mapper = args.first().cloned().unwrap_or(Value::Undefined);
+            if !interp.is_callable(&mapper) {
+                return Err(type_error_throw("Iterator.prototype.map: mapper is not a function"));
+            }
+            let counter = Rc::new(std::cell::Cell::new(0i64));
+            Ok(build_lazy_iterator(Some(src.clone()), move |interp| {
+                match interp.iter_step(&src)? {
+                    None => Ok(None),
+                    Some(v) => {
+                        let i = counter.get();
+                        counter.set(i + 1);
+                        // §27.1.4.3: Call(mapper, undefined, «value, counter»).
+                        let mapped = interp.call_value_with_this(
+                            mapper.clone(),
+                            Value::Undefined,
+                            vec![v, Value::Number(i as f64)],
+                        )?;
+                        Ok(Some(mapped))
+                    }
+                }
+            }))
+        }),
+    );
+
+    // --- §27.1.4.2 Iterator.prototype.filter(predicate) — LAZY.
+    m.insert(
+        "filter".into(),
+        native_fn_with_interp("filter", |interp, args| {
+            let src = helper_this(interp)?;
+            let pred = args.first().cloned().unwrap_or(Value::Undefined);
+            if !interp.is_callable(&pred) {
+                return Err(type_error_throw(
+                    "Iterator.prototype.filter: predicate is not a function",
+                ));
+            }
+            let counter = Rc::new(std::cell::Cell::new(0i64));
+            Ok(build_lazy_iterator(Some(src.clone()), move |interp| {
+                // Pull until the predicate accepts a value or the source ends.
+                loop {
+                    match interp.iter_step(&src)? {
+                        None => return Ok(None),
+                        Some(v) => {
+                            let i = counter.get();
+                            counter.set(i + 1);
+                            let keep = interp.call_value_with_this(
+                                pred.clone(),
+                                Value::Undefined,
+                                vec![v.clone(), Value::Number(i as f64)],
+                            )?;
+                            if keep.to_bool() {
+                                return Ok(Some(v));
+                            }
+                        }
+                    }
+                }
+            }))
+        }),
+    );
+
+    // --- §27.1.4.5 Iterator.prototype.take(limit) — LAZY.
+    m.insert(
+        "take".into(),
+        native_fn_with_interp("take", |interp, args| {
+            let src = helper_this(interp)?;
+            // §27.1.4.5 steps 3-5: numLimit = ToIntegerOrInfinity(limit);
+            // if numLimit is NaN throw RangeError; if numLimit < 0 throw RangeError.
+            let raw = args.first().cloned().unwrap_or(Value::Undefined);
+            let lim = interp.take_drop_limit(&raw)?;
+            let remaining = Rc::new(std::cell::Cell::new(lim));
+            Ok(build_lazy_iterator(Some(src.clone()), move |interp| {
+                // §27.1.4.5: if remaining == 0, close the source and finish.
+                let r = remaining.get();
+                if r <= 0.0 {
+                    interp.iter_close(&src);
+                    return Ok(None);
+                }
+                if r.is_finite() {
+                    remaining.set(r - 1.0);
+                }
+                interp.iter_step(&src)
+            }))
+        }),
+    );
+
+    // --- §27.1.4.4 Iterator.prototype.drop(limit) — LAZY.
+    m.insert(
+        "drop".into(),
+        native_fn_with_interp("drop", |interp, args| {
+            let src = helper_this(interp)?;
+            let raw = args.first().cloned().unwrap_or(Value::Undefined);
+            let lim = interp.take_drop_limit(&raw)?;
+            let to_drop = Rc::new(std::cell::Cell::new(lim));
+            let dropped = Rc::new(std::cell::Cell::new(false));
+            Ok(build_lazy_iterator(Some(src.clone()), move |interp| {
+                // §27.1.4.4 step 5.b.i: drop the first `limit` values once,
+                // then pass the rest through. Infinite `limit` drains forever.
+                if !dropped.get() {
+                    let mut n = to_drop.get();
+                    while n > 0.0 {
+                        if interp.iter_step(&src)?.is_none() {
+                            dropped.set(true);
+                            return Ok(None);
+                        }
+                        if n.is_finite() {
+                            n -= 1.0;
+                        }
+                    }
+                    dropped.set(true);
+                }
+                interp.iter_step(&src)
+            }))
+        }),
+    );
+
+    // --- §27.1.4.7 Iterator.prototype.flatMap(mapper) — LAZY, one-level flatten.
+    m.insert(
+        "flatMap".into(),
+        native_fn_with_interp("flatMap", |interp, args| {
+            let src = helper_this(interp)?;
+            let mapper = args.first().cloned().unwrap_or(Value::Undefined);
+            if !interp.is_callable(&mapper) {
+                return Err(type_error_throw(
+                    "Iterator.prototype.flatMap: mapper is not a function",
+                ));
+            }
+            let counter = Rc::new(std::cell::Cell::new(0i64));
+            // The currently-open inner iterator (None between outer steps).
+            let inner: Rc<RefCell<Option<Value>>> = Rc::new(RefCell::new(None));
+            Ok(build_lazy_iterator(Some(src.clone()), move |interp| {
+                loop {
+                    // Drain the open inner iterator first.
+                    let cur = inner.borrow().clone();
+                    if let Some(inner_it) = cur {
+                        match interp.iter_step(&inner_it)? {
+                            Some(v) => return Ok(Some(v)),
+                            None => {
+                                *inner.borrow_mut() = None;
+                            }
+                        }
+                    } else {
+                        // Pull the next outer value, map it, open it as an iterator.
+                        match interp.iter_step(&src)? {
+                            None => return Ok(None),
+                            Some(v) => {
+                                let i = counter.get();
+                                counter.set(i + 1);
+                                let mapped = interp.call_value_with_this(
+                                    mapper.clone(),
+                                    Value::Undefined,
+                                    vec![v, Value::Number(i as f64)],
+                                )?;
+                                // §27.1.4.7 step 6.b.viii: GetIteratorFlattenable
+                                // — the mapped value must be an iterable/iterator.
+                                let it = interp.get_iterator_flattenable(&mapped)?;
+                                *inner.borrow_mut() = Some(it);
+                            }
+                        }
+                    }
+                }
+            }))
+        }),
+    );
+
+    // --- §27.1.4.9 Iterator.prototype.reduce(reducer [, initialValue]) — EAGER.
+    m.insert(
+        "reduce".into(),
+        native_fn_with_interp("reduce", |interp, args| {
+            let src = helper_this(interp)?;
+            let reducer = args.first().cloned().unwrap_or(Value::Undefined);
+            if !interp.is_callable(&reducer) {
+                return Err(type_error_throw(
+                    "Iterator.prototype.reduce: reducer is not a function",
+                ));
+            }
+            let mut counter = 0i64;
+            let mut acc;
+            if args.len() >= 2 {
+                acc = args[1].clone();
+            } else {
+                // §27.1.4.9 step 5.b: no initial value — the first element is the
+                // accumulator; if the iterator is empty, throw TypeError.
+                match interp.iter_step(&src)? {
+                    Some(v) => {
+                        acc = v;
+                        counter = 1;
+                    }
+                    None => {
+                        return Err(type_error_throw(
+                            "Reduce of empty iterator with no initial value",
+                        ));
+                    }
+                }
+            }
+            loop {
+                match interp.iter_step(&src)? {
+                    None => return Ok(acc),
+                    Some(v) => {
+                        acc = interp.call_value_with_this(
+                            reducer.clone(),
+                            Value::Undefined,
+                            vec![acc, v, Value::Number(counter as f64)],
+                        )?;
+                        counter += 1;
+                    }
+                }
+            }
+        }),
+    );
+
+    // --- §27.1.4.10 Iterator.prototype.toArray() — EAGER.
+    m.insert(
+        "toArray".into(),
+        native_fn_with_interp("toArray", |interp, _args| {
+            let src = helper_this(interp)?;
+            let mut out: Vec<Value> = Vec::new();
+            while let Some(v) = interp.iter_step(&src)? {
+                out.push(v);
+            }
+            Ok(Value::Array(Rc::new(RefCell::new(out))))
+        }),
+    );
+
+    // --- §27.1.4.8 Iterator.prototype.forEach(fn) — EAGER.
+    m.insert(
+        "forEach".into(),
+        native_fn_with_interp("forEach", |interp, args| {
+            let src = helper_this(interp)?;
+            let cb = args.first().cloned().unwrap_or(Value::Undefined);
+            if !interp.is_callable(&cb) {
+                return Err(type_error_throw(
+                    "Iterator.prototype.forEach: callback is not a function",
+                ));
+            }
+            let mut counter = 0i64;
+            while let Some(v) = interp.iter_step(&src)? {
+                interp.call_value_with_this(
+                    cb.clone(),
+                    Value::Undefined,
+                    vec![v, Value::Number(counter as f64)],
+                )?;
+                counter += 1;
+            }
+            Ok(Value::Undefined)
+        }),
+    );
+
+    // --- §27.1.4.11 Iterator.prototype.some(predicate) — EAGER, short-circuits.
+    m.insert(
+        "some".into(),
+        native_fn_with_interp("some", |interp, args| {
+            let src = helper_this(interp)?;
+            let pred = args.first().cloned().unwrap_or(Value::Undefined);
+            if !interp.is_callable(&pred) {
+                return Err(type_error_throw(
+                    "Iterator.prototype.some: predicate is not a function",
+                ));
+            }
+            let mut counter = 0i64;
+            while let Some(v) = interp.iter_step(&src)? {
+                let r = interp.call_value_with_this(
+                    pred.clone(),
+                    Value::Undefined,
+                    vec![v, Value::Number(counter as f64)],
+                )?;
+                if r.to_bool() {
+                    // §27.1.4.11 step 6.f: IteratorClose then return true.
+                    interp.iter_close(&src);
+                    return Ok(Value::Bool(true));
+                }
+                counter += 1;
+            }
+            Ok(Value::Bool(false))
+        }),
+    );
+
+    // --- §27.1.4.6 Iterator.prototype.every(predicate) — EAGER, short-circuits.
+    m.insert(
+        "every".into(),
+        native_fn_with_interp("every", |interp, args| {
+            let src = helper_this(interp)?;
+            let pred = args.first().cloned().unwrap_or(Value::Undefined);
+            if !interp.is_callable(&pred) {
+                return Err(type_error_throw(
+                    "Iterator.prototype.every: predicate is not a function",
+                ));
+            }
+            let mut counter = 0i64;
+            while let Some(v) = interp.iter_step(&src)? {
+                let r = interp.call_value_with_this(
+                    pred.clone(),
+                    Value::Undefined,
+                    vec![v, Value::Number(counter as f64)],
+                )?;
+                if !r.to_bool() {
+                    // §27.1.4.6 step 6.f: IteratorClose then return false.
+                    interp.iter_close(&src);
+                    return Ok(Value::Bool(false));
+                }
+                counter += 1;
+            }
+            Ok(Value::Bool(true))
+        }),
+    );
+
+    // --- §27.1.4.1 Iterator.prototype.find(predicate) — EAGER, short-circuits.
+    m.insert(
+        "find".into(),
+        native_fn_with_interp("find", |interp, args| {
+            let src = helper_this(interp)?;
+            let pred = args.first().cloned().unwrap_or(Value::Undefined);
+            if !interp.is_callable(&pred) {
+                return Err(type_error_throw(
+                    "Iterator.prototype.find: predicate is not a function",
+                ));
+            }
+            let mut counter = 0i64;
+            while let Some(v) = interp.iter_step(&src)? {
+                let r = interp.call_value_with_this(
+                    pred.clone(),
+                    Value::Undefined,
+                    vec![v.clone(), Value::Number(counter as f64)],
+                )?;
+                if r.to_bool() {
+                    // IteratorClose then return the matching value.
+                    interp.iter_close(&src);
+                    return Ok(v);
+                }
+                counter += 1;
+            }
+            Ok(Value::Undefined)
+        }),
+    );
+
+    drop(m);
+    proto
+}
+
 /// Build a spec-shaped iterator object over a snapshot of `items`.
 /// Has `.next()` returning `{value, done}` and is self-iterable via the
 /// `__iterator__` array the for-of path understands. Used by
@@ -23492,6 +24144,219 @@ mod tests {
             var e = [5, 6].entries().next().value; console.log(e[0] + ":" + e[1]);
         "#);
         assert_eq!(out, vec!["0,1", "10,false", "0:5"]);
+    }
+
+    // ----- Iterator Helpers (ECMA-262 §27.1.4) -----------------------------
+
+    #[test]
+    fn iterator_helpers_map_filter_to_array() {
+        // The headline example from the task: map then filter then toArray.
+        // [1,2,3,4].values().map(x=>x*2).filter(x=>x>4).toArray() === [6,8]
+        let (_, out) = run(r#"
+            var r = [1,2,3,4].values().map(x => x*2).filter(x => x>4).toArray();
+            console.log(r.join(","));
+            console.log(Array.isArray(r));
+        "#);
+        assert_eq!(out, vec!["6,8", "true"]);
+    }
+
+    #[test]
+    fn iterator_helpers_take_is_lazy() {
+        // take(2) must pull the source EXACTLY twice — proving laziness. We use
+        // a generator that records each pull in `pulled`; after take(2).toArray()
+        // it must show only [1,2] were produced (3,4,5 never pulled).
+        let (_, out) = run(r#"
+            var pulled = [];
+            function* gen() {
+                for (var i = 1; i <= 5; i++) { pulled.push(i); yield i; }
+            }
+            var r = gen().take(2).toArray();
+            console.log(r.join(","));
+            console.log("pulled:" + pulled.join(","));
+        "#);
+        // Only 2 values produced; the source generator advanced no further.
+        assert_eq!(out, vec!["1,2", "pulled:1,2"]);
+    }
+
+    #[test]
+    fn iterator_helpers_drop_skips() {
+        let (_, out) = run(r#"
+            console.log([1,2,3,4,5].values().drop(2).toArray().join(","));
+            console.log([1,2,3].values().drop(0).toArray().join(","));
+            console.log([1,2,3].values().drop(10).toArray().length);
+        "#);
+        assert_eq!(out, vec!["3,4,5", "1,2,3", "0"]);
+    }
+
+    #[test]
+    fn iterator_helpers_flatmap_flattens_one_level() {
+        // flatMap maps each element to an iterable and flattens one level.
+        let (_, out) = run(r#"
+            var r = [1,2,3].values().flatMap(x => [x, x*10]).toArray();
+            console.log(r.join(","));
+            // mapper returning another iterator also works.
+            var s = ["ab","cd"].values().flatMap(w => w).toArray();
+            console.log(s.join(","));
+        "#);
+        assert_eq!(out, vec!["1,10,2,20,3,30", "a,b,c,d"]);
+    }
+
+    #[test]
+    fn iterator_helpers_generator_map_to_array() {
+        // A generator function's iterator works directly with .map().toArray().
+        let (_, out) = run(r#"
+            function* g() { yield 1; yield 2; yield 3; }
+            console.log(g().map(x => x + 100).toArray().join(","));
+        "#);
+        assert_eq!(out, vec!["101,102,103"]);
+    }
+
+    #[test]
+    fn iterator_helpers_reduce_sums() {
+        let (_, out) = run(r#"
+            console.log([1,2,3,4].values().reduce((a,b) => a+b, 0));
+            // No initial value: first element seeds the accumulator.
+            console.log([10,20,30].values().reduce((a,b) => a+b));
+        "#);
+        assert_eq!(out, vec!["10", "60"]);
+    }
+
+    #[test]
+    fn iterator_helpers_reduce_empty_no_init_throws() {
+        // §27.1.4.9 step 5.b: empty iterator + no initial value → TypeError.
+        let (_, out) = run(r#"
+            try {
+                [].values().reduce((a,b) => a+b);
+                console.log("no throw");
+            } catch (e) {
+                console.log(e instanceof TypeError);
+            }
+        "#);
+        assert_eq!(out, vec!["true"]);
+    }
+
+    #[test]
+    fn iterator_helpers_some_every_find_short_circuit() {
+        // some/every/find consume eagerly but short-circuit. We assert both the
+        // return value AND that they stopped pulling early (laziness of the
+        // source is honored — find stops at the first match).
+        let (_, out) = run(r#"
+            var seen = [];
+            function* g() { for (var i=1;i<=10;i++){ seen.push(i); yield i; } }
+            console.log(g().some(x => x === 3));     // true
+            console.log("some-seen:" + seen.join(","));
+            seen = [];
+            console.log(g().every(x => x < 3));      // false (stops at 3)
+            console.log("every-seen:" + seen.join(","));
+            seen = [];
+            console.log(g().find(x => x % 4 === 0)); // 4
+            console.log("find-seen:" + seen.join(","));
+        "#);
+        assert_eq!(
+            out,
+            vec![
+                "true",
+                "some-seen:1,2,3",
+                "false",
+                "every-seen:1,2,3",
+                "4",
+                "find-seen:1,2,3,4",
+            ]
+        );
+    }
+
+    #[test]
+    fn iterator_helpers_foreach_and_counter() {
+        // forEach returns undefined; the callback receives (value, index).
+        let (_, out) = run(r#"
+            var log = [];
+            ["a","b","c"].values().forEach((v, i) => log.push(i + ":" + v));
+            console.log(log.join(","));
+            // map's callback also gets the 0-based counter.
+            console.log([9,8,7].values().map((v,i) => i).toArray().join(","));
+        "#);
+        assert_eq!(out, vec!["0:a,1:b,2:c", "0,1,2"]);
+    }
+
+    #[test]
+    fn iterator_helpers_take_drop_range_errors() {
+        // §27.1.4.5/.4 steps 3-5: NaN → RangeError, negative → RangeError.
+        let (_, out) = run(r#"
+            function err(fn){ try { fn(); return "no-throw"; } catch(e){ return e.name; } }
+            console.log(err(() => [1,2].values().take(NaN)));
+            console.log(err(() => [1,2].values().take(-1)));
+            console.log(err(() => [1,2].values().drop(NaN)));
+            console.log(err(() => [1,2].values().drop(-5)));
+            // Infinity is a valid take/drop limit (no error).
+            console.log([1,2,3].values().take(Infinity).toArray().join(","));
+            // Fractional limits truncate toward zero.
+            console.log([1,2,3,4].values().take(2.9).toArray().join(","));
+        "#);
+        assert_eq!(
+            out,
+            vec![
+                "RangeError",
+                "RangeError",
+                "RangeError",
+                "RangeError",
+                "1,2,3",
+                "1,2",
+            ]
+        );
+    }
+
+    #[test]
+    fn iterator_helpers_work_on_custom_iterator() {
+        // A hand-rolled iterator object (own `next` returning {value,done}) must
+        // inherit the helper methods via %Iterator.prototype%.
+        let (_, out) = run(r#"
+            function range(n) {
+                var i = 0;
+                return { next: function(){ return i < n ? {value:i++,done:false} : {value:undefined,done:true}; } };
+            }
+            console.log(range(5).filter(x => x % 2 === 0).toArray().join(","));
+            console.log(range(4).map(x => x*x).reduce((a,b)=>a+b, 0));
+        "#);
+        assert_eq!(out, vec!["0,2,4", "14"]); // 0+1+4+9
+    }
+
+    #[test]
+    fn iterator_helpers_iterator_from_and_global() {
+        // The Iterator global exists; Iterator.from(arr) yields an iterator that
+        // chains helpers; calling Iterator() directly throws (abstract).
+        let (_, out) = run(r#"
+            console.log(typeof Iterator);
+            console.log(Iterator.from([1,2,3,4]).filter(x=>x>2).toArray().join(","));
+            try { Iterator(); console.log("no throw"); } catch(e){ console.log(e instanceof TypeError); }
+        "#);
+        // `typeof Iterator === "function"` (it's a callable constructor object).
+        assert_eq!(out, vec!["function", "3,4", "true"]);
+    }
+
+    #[test]
+    fn iterator_helpers_lazy_infinite_take() {
+        // The defining use case: take(N) from an INFINITE generator terminates.
+        // Without laziness this hangs (watchdog) — proving pull-based semantics.
+        let (_, out) = run(r#"
+            function* nat() { var i = 0; while (true) { yield i++; } }
+            console.log(nat().map(x => x*x).take(5).toArray().join(","));
+            // find on an infinite source stops at the first match.
+            function* nat2() { var i = 0; while (true) { yield i++; } }
+            console.log(nat2().find(x => x >= 100));
+        "#);
+        assert_eq!(out, vec!["0,1,4,9,16", "100"]);
+    }
+
+    #[test]
+    fn iterator_helpers_chaining_in_for_of() {
+        // A helper is self-iterable: usable directly in `for...of` and spread.
+        let (_, out) = run(r#"
+            var acc = [];
+            for (const x of [1,2,3,4,5].values().drop(1).take(2)) { acc.push(x); }
+            console.log(acc.join(","));
+            console.log([...[1,2,3].values().map(x => x*3)].join(","));
+        "#);
+        assert_eq!(out, vec!["2,3", "3,6,9"]);
     }
 
     #[test]
