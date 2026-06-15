@@ -32,6 +32,7 @@ pub mod quic;
 pub mod safe_browsing;
 pub mod security;
 pub mod socket;
+pub mod sse;
 pub mod stun;
 pub mod sys;
 pub mod tls;
@@ -48,6 +49,7 @@ pub use security::{
     validate_cors_response,
 };
 pub use socket::{Socket, SocketError};
+pub use sse::SseConnection;
 pub use websocket::{WebSocket, WsFrame};
 
 #[derive(Debug)]

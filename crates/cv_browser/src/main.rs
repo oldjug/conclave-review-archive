@@ -12617,7 +12617,7 @@ fn install_fetch_inner(
             // Read the request the page actually configured: method (open),
             // headers (setRequestHeader), and the send() body. Previously all
             // three were dropped and every XHR went out as a bodyless GET.
-            let (method, header_pairs, url_str) = {
+            let (method, header_pairs, url_str, is_async) = {
                 let m = send_inner.borrow();
                 let method = m
                     .get("_method")
@@ -12633,7 +12633,13 @@ fn install_fetch_inner(
                     .get("_url")
                     .map(|v| v.to_display_string())
                     .unwrap_or_default();
-                (method, headers, url_str)
+                // open() stored `_async` (default true). The async path runs the
+                // network off-thread and dispatches readyState/load on later ticks.
+                let is_async = match m.get("_async") {
+                    Some(cv_js::Value::Bool(b)) => *b,
+                    _ => true,
+                };
+                (method, headers, url_str, is_async)
             };
             let url = match resolve_runtime_url(interp, &url_str) {
                 Ok(u) => u,
@@ -12786,120 +12792,190 @@ fn install_fetch_inner(
                     header_pairs.push(("Origin".into(), request_origin.0.clone()));
                 }
             }
-            let client = session_client(30_000);
             let is_get_like =
                 matches!(method.to_ascii_uppercase().as_str(), "GET" | "HEAD") && body.is_empty();
-            let result = if is_get_like {
-                // Cache-friendly GET fast path (now carries Fetch Metadata).
-                client.fetch_with_meta(&url, Some(xhr_meta.clone()))
-            } else {
-                let mut req = build_xhr_request(&method, url.clone(), header_pairs, body);
-                req.fetch_meta = Some(xhr_meta.clone());
-                client.send_with_redirects(req, 5)
-            };
-            let resp = match result {
-                Ok(r) => r,
-                Err(e) => {
-                    return fire_xhr_error(interp, &send_inner, &format!("NetworkError: {e}"));
+            let final_url_str = url.to_string();
+
+            // The network round-trip. Captured into a closure so the SAME logic
+            // runs either inline (sync XHR) or off-thread (async XHR). It only
+            // touches `Send` data — no interp / DOM — and returns an XhrResult.
+            // request_origin / cors_* / xhr_meta are all `Send`.
+            let run_network = {
+                let url = url.clone();
+                let method = method.clone();
+                let header_pairs = header_pairs.clone();
+                let body = body.clone();
+                let xhr_meta = xhr_meta.clone();
+                let request_origin = request_origin.clone();
+                let final_url_str = final_url_str.clone();
+                move || -> XhrResult {
+                    let client = session_client(30_000);
+                    let result = if is_get_like {
+                        client.fetch_with_meta(&url, Some(xhr_meta.clone()))
+                    } else {
+                        let mut req = build_xhr_request(&method, url.clone(), header_pairs, body);
+                        req.fetch_meta = Some(xhr_meta.clone());
+                        client.send_with_redirects(req, 5)
+                    };
+                    let resp = match result {
+                        Ok(r) => r,
+                        Err(e) => return XhrResult::Err(format!("NetworkError: {e}")),
+                    };
+                    // CORS response validation (Fetch spec §4.7 step 7).
+                    if cors_needs_validation {
+                        if let Err(reason) = cv_net::security::validate_cors_response(
+                            &resp.headers,
+                            &request_origin,
+                            &[],
+                            false, // credentials_mode: TODO respect withCredentials
+                        ) {
+                            return XhrResult::Err(format!(
+                                "NetworkError: CORS error on '{final_url_str}': {reason}"
+                            ));
+                        }
+                    }
+                    // Opaque response (no-cors): XHR exposes no status/body.
+                    if cors_is_opaque {
+                        return XhrResult::Ok {
+                            status: 0,
+                            reason: String::new(),
+                            headers: Vec::new(),
+                            body: Vec::new(),
+                            final_url: final_url_str,
+                        };
+                    }
+                    if !is_http_success(resp.status) {
+                        eprintln!(
+                            "XMLHttpRequest: {final_url_str} returned status {}",
+                            resp.status
+                        );
+                    }
+                    if let Err(e) = validate_response_length(&resp, &final_url_str) {
+                        eprintln!("XMLHttpRequest: {e}");
+                    }
+                    XhrResult::Ok {
+                        status: resp.status,
+                        reason: resp.reason,
+                        headers: resp.headers,
+                        body: resp.body,
+                        final_url: final_url_str,
+                    }
                 }
             };
 
-            // CORS response validation (Fetch spec §4.7 step 7): check
-            // Access-Control-Allow-Origin on the actual response.
-            if cors_needs_validation {
-                if let Err(reason) = cv_net::security::validate_cors_response(
-                    &resp.headers,
-                    &request_origin,
-                    &[],
-                    false, // credentials_mode: TODO respect withCredentials
-                ) {
-                    return fire_xhr_error(
-                        interp,
-                        &send_inner,
-                        &format!(
-                            "NetworkError: CORS error on '{}': {reason}",
-                            url.to_string()
-                        ),
+            if is_async {
+                // ── Asynchronous path ──────────────────────────────────────
+                // Fire loadstart immediately (XHR Standard §4.6 step "fire an
+                // event named loadstart"), then run the network on the shared
+                // compute pool and register a `_pump` to deliver the result on a
+                // later tick. The UI thread is never blocked.
+                fire_xhr_callback(interp, &send_inner, "onloadstart");
+                let (tx, rx) = std::sync::mpsc::channel::<XhrResult>();
+                compute_pool().submit(cv_sched::Priority::Normal, move || {
+                    let result = run_network();
+                    let _ = tx.send(result);
+                });
+                let chan: std::rc::Rc<std::cell::RefCell<Option<XhrChannel>>> =
+                    std::rc::Rc::new(std::cell::RefCell::new(Some(rx)));
+                // Mark in-flight so abort() can suppress delivery.
+                send_inner
+                    .borrow_mut()
+                    .insert("\u{1}__xhr_inflight".into(), cv_js::Value::Bool(true));
+                // _pump — drain the channel; when the result arrives, deliver it.
+                let pump_inner = send_inner.clone();
+                let pump_chan = chan.clone();
+                let pump_fn = cv_js::native_fn_with_interp("_pump", move |interp, _args| {
+                    // Aborted? Stop pumping (abort() fired its own events).
+                    let inflight = matches!(
+                        pump_inner.borrow().get("\u{1}__xhr_inflight"),
+                        Some(cv_js::Value::Bool(true))
                     );
+                    if !inflight {
+                        *pump_chan.borrow_mut() = None;
+                        return Ok(cv_js::Value::Bool(false));
+                    }
+                    let got = pump_chan
+                        .borrow()
+                        .as_ref()
+                        .and_then(|rx| rx.try_recv().ok());
+                    let Some(result) = got else {
+                        return Ok(cv_js::Value::Bool(false));
+                    };
+                    // One-shot: drop the channel so we never deliver twice.
+                    *pump_chan.borrow_mut() = None;
+                    pump_inner
+                        .borrow_mut()
+                        .insert("\u{1}__xhr_inflight".into(), cv_js::Value::Bool(false));
+                    match result {
+                        XhrResult::Ok {
+                            status,
+                            reason,
+                            headers,
+                            body,
+                            final_url,
+                        } => {
+                            deliver_xhr_response(
+                                interp, &pump_inner, status, &reason, &headers, &body, &final_url,
+                            );
+                        }
+                        XhrResult::Err(msg) => {
+                            let _ = fire_xhr_error(interp, &pump_inner, &msg);
+                        }
+                    }
+                    Ok(cv_js::Value::Bool(true))
+                });
+                send_inner.borrow_mut().insert("_pump".into(), pump_fn);
+                // Register so the host drains this XHR every tick.
+                let self_val = cv_js::Value::Object(send_inner.clone());
+                if let Some(cv_js::Value::Array(items)) =
+                    interp.get_global("__tb_async_xhrs")
+                {
+                    items.borrow_mut().push(self_val);
                 }
-            }
-
-            // Opaque response (no-cors mode): XHR doesn't expose status/body.
-            if cors_is_opaque {
-                let mut m = send_inner.borrow_mut();
-                m.insert("status".into(), cv_js::Value::Number(0.0));
-                m.insert("statusText".into(), cv_js::Value::str(String::new()));
-                m.insert("responseText".into(), cv_js::Value::str(String::new()));
-                m.insert("response".into(), cv_js::Value::str(String::new()));
-                m.insert("responseURL".into(), cv_js::Value::str(url.to_string()));
-                m.insert("readyState".into(), cv_js::Value::Number(4.0));
-                drop(m);
-                fire_xhr_callback(interp, &send_inner, "onreadystatechange");
-                fire_xhr_callback(interp, &send_inner, "onload");
-                fire_xhr_callback(interp, &send_inner, "onloadend");
                 return Ok(cv_js::Value::Undefined);
             }
 
-            // Validate HTTP status code (XMLHttpRequest doesn't reject non-2xx, but we log them)
-            if !is_http_success(resp.status) {
-                eprintln!(
-                    "XMLHttpRequest: {} returned status {}",
-                    url.to_string(),
-                    resp.status
-                );
-            }
-
-            // Validate response body length against Content-Length header
-            if let Err(e) = validate_response_length(&resp, &url.to_string()) {
-                eprintln!("XMLHttpRequest: {}", e);
-            }
-
-            // Decode body with explicit error handling
-            let body_text = match response_to_text(&resp, &url.to_string()) {
-                Ok(text) => text,
-                Err(e) => {
-                    eprintln!("XMLHttpRequest: {}", e);
-                    // Fall back to lossy conversion for JavaScript compatibility
-                    String::from_utf8_lossy(&resp.body).into_owned()
+            // ── Synchronous path (open(..., false)) ────────────────────────
+            // Run inline and deliver immediately, preserving the legacy behavior.
+            match run_network() {
+                XhrResult::Ok {
+                    status,
+                    reason,
+                    headers,
+                    body,
+                    final_url,
+                } => {
+                    deliver_xhr_response(
+                        interp, &send_inner, status, &reason, &headers, &body, &final_url,
+                    );
+                    Ok(cv_js::Value::Undefined)
                 }
-            };
-            {
-                let mut m = send_inner.borrow_mut();
-                m.insert(
-                    "status".into(),
-                    cv_js::Value::Number(f64::from(resp.status)),
-                );
-                m.insert(
-                    "statusText".into(),
-                    cv_js::Value::str(resp.reason.clone()),
-                );
-                m.insert(
-                    "responseText".into(),
-                    cv_js::Value::str(body_text.clone()),
-                );
-                m.insert("response".into(), cv_js::Value::str(body_text));
-                m.insert("responseURL".into(), cv_js::Value::str(url.to_string()));
-                if let Some(cv_js::Value::Object(rh)) = m.get("_response_headers") {
-                    let mut rhm = rh.borrow_mut();
-                    for (k, v) in &resp.headers {
-                        rhm.insert(k.to_ascii_lowercase(), cv_js::Value::str(v.clone()));
-                    }
-                }
+                XhrResult::Err(msg) => fire_xhr_error(interp, &send_inner, &msg),
             }
-            // readyState 2 → 3 → 4, firing onreadystatechange at each step.
-            for rs in [2.0, 3.0, 4.0] {
-                send_inner
-                    .borrow_mut()
-                    .insert("readyState".into(), cv_js::Value::Number(rs));
-                fire_xhr_callback(interp, &send_inner, "onreadystatechange");
-            }
-            fire_xhr_callback(interp, &send_inner, "onload");
-            fire_xhr_callback(interp, &send_inner, "onloadend");
-            Ok(cv_js::Value::Undefined)
         });
 
         let abort_inner = inner.clone();
-        let abort_fn = cv_js::native_fn("abort", move |_args| {
+        let abort_fn = cv_js::native_fn_with_interp("abort", move |interp, _args| {
+            // XHR Standard §4.5.7 abort(): if a request is in flight, run the
+            // "request error steps" with the `abort` event, then reset state.
+            let was_inflight = matches!(
+                abort_inner.borrow().get("\u{1}__xhr_inflight"),
+                Some(cv_js::Value::Bool(true))
+            );
+            // Mark not-inflight so the async `_pump` suppresses any late result.
+            abort_inner
+                .borrow_mut()
+                .insert("\u{1}__xhr_inflight".into(), cv_js::Value::Bool(false));
+            if was_inflight {
+                // readyState DONE then fire readystatechange + abort + loadend,
+                // then UNSENT (per the spec the state ends at UNSENT/0).
+                abort_inner
+                    .borrow_mut()
+                    .insert("readyState".into(), cv_js::Value::Number(4.0));
+                fire_xhr_callback(interp, &abort_inner, "onreadystatechange");
+                fire_xhr_callback(interp, &abort_inner, "onabort");
+                fire_xhr_callback(interp, &abort_inner, "onloadend");
+            }
             abort_inner
                 .borrow_mut()
                 .insert("readyState".into(), cv_js::Value::Number(0.0));
@@ -12949,37 +13025,94 @@ fn install_fetch_inner(
     });
     interp.define_global("XMLHttpRequest", xhr_ctor);
 
-    // EventSource (Server-Sent Events) — RFC text/event-stream. Our V1
-    // does a synchronous GET on construction, parses the body as SSE,
-    // and dispatches all `message` events back through the registered
-    // `onmessage` / `onopen` handlers. Persistent reconnection isn't
-    // implemented (we close after the first body). Real implementation
-    // would need a background reader thread + reconnection back-off.
+    // EventSource (Server-Sent Events) — WHATWG HTML §9.2. A dedicated worker
+    // thread (`spawn_event_source`) owns the streaming `text/event-stream`
+    // connection: it connects off the UI thread, parses event/data/id/retry
+    // fields, and AUTO-RECONNECTS on drop after the retry interval (default
+    // 3000ms; server-settable via `retry:`), resending `Last-Event-ID`. The
+    // JS-thread `_pump` (drained every tick by the host, mirroring WebSocket)
+    // consumes the worker's channel and dispatches `open`/`message`/named/
+    // `error` events.
     let es_ctor = cv_js::native_ctor("EventSource", 0, move |interp, args| {
+        use std::cell::RefCell;
+        use std::rc::Rc;
         let url_str = args
             .first()
             .map(|v| v.to_display_string())
             .unwrap_or_default();
-        let inner: std::rc::Rc<std::cell::RefCell<cv_js::OrderedMap<String, cv_js::Value>>> =
-            std::rc::Rc::new(std::cell::RefCell::new(cv_js::OrderedMap::new()));
+        // with_credentials from the options dict (2nd arg `{ withCredentials }`).
+        let with_credentials = args
+            .get(1)
+            .and_then(|o| {
+                if let cv_js::Value::Object(m) = o {
+                    m.borrow().get("withCredentials").map(|v| v.to_bool())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(false);
+        // Resolve relative URLs against the document base (HTML §9.2 step 2).
+        let abs_url = resolve_runtime_url(interp, &url_str)
+            .map(|u| u.to_string())
+            .unwrap_or_else(|_| url_str.clone());
+
+        let inner: Rc<RefCell<cv_js::OrderedMap<String, cv_js::Value>>> =
+            Rc::new(RefCell::new(cv_js::OrderedMap::new()));
         {
             let mut m = inner.borrow_mut();
-            m.insert("url".into(), cv_js::Value::str(url_str.clone()));
+            m.insert("url".into(), cv_js::Value::str(abs_url.clone()));
             m.insert("readyState".into(), cv_js::Value::Number(0.0)); // CONNECTING
-            m.insert("withCredentials".into(), cv_js::Value::Bool(false));
+            m.insert("withCredentials".into(), cv_js::Value::Bool(with_credentials));
             m.insert("CONNECTING".into(), cv_js::Value::Number(0.0));
             m.insert("OPEN".into(), cv_js::Value::Number(1.0));
             m.insert("CLOSED".into(), cv_js::Value::Number(2.0));
         }
 
-        // close() — flips readyState to 2 (CLOSED).
+        // The live worker handle (None once connect URL is invalid / closed).
+        let handle: Rc<RefCell<Option<SseHandle>>> = Rc::new(RefCell::new(None));
+        // Origin string for MessageEvent.origin (HTML: "the origin of the
+        // event stream's final URL").
+        let origin = Url::parse(&abs_url)
+            .map(|u| {
+                let mut o = format!("{}://{}", u.scheme.as_str(), u.host);
+                if let Some(p) = u.port {
+                    o.push_str(&format!(":{p}"));
+                }
+                o
+            })
+            .unwrap_or_default();
+
+        // Spawn the worker if the URL is valid and http(s).
+        if let Ok(url) = Url::parse(&abs_url) {
+            if matches!(url.scheme, cv_url::Scheme::Http | cv_url::Scheme::Https) {
+                // Same-origin EventSource carries the document's cookies (the
+                // common case). Captured here on the JS thread where the jar
+                // lives, then sent verbatim by the worker. (Cross-origin
+                // credentialed SSE — honoring withCredentials for the CORS path
+                // — is a follow-up; we never withhold same-origin cookies.)
+                let _ = with_credentials;
+                let cookies = cookie_header_for_url(&abs_url).unwrap_or_default();
+                *handle.borrow_mut() = Some(spawn_event_source(url, cookies));
+            }
+        }
+
+        // close() — stops the worker thread and flips readyState to CLOSED.
         let close_inner = inner.clone();
+        let close_handle = handle.clone();
         let close_fn = cv_js::native_fn("close", move |_args| {
+            if let Some(h) = close_handle.borrow().as_ref() {
+                h.closed
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            *close_handle.borrow_mut() = None;
             close_inner
                 .borrow_mut()
                 .insert("readyState".into(), cv_js::Value::Number(2.0));
             Ok(cv_js::Value::Undefined)
         });
+        // addEventListener — store the handler under `on<type>` so both the
+        // property form and addEventListener feed the same dispatch (V1 keeps a
+        // single handler per type, matching the existing surface).
         let add_inner = inner.clone();
         let add_fn = cv_js::native_fn("addEventListener", move |args| {
             let evt = args
@@ -12990,7 +13123,15 @@ fn install_fetch_inner(
             add_inner.borrow_mut().insert(format!("on{}", evt), cb);
             Ok(cv_js::Value::Undefined)
         });
-        let remove_fn = cv_js::native_fn("removeEventListener", move |_args| {
+        let remove_inner = inner.clone();
+        let remove_fn = cv_js::native_fn("removeEventListener", move |args| {
+            let evt = args
+                .first()
+                .map(|v| v.to_display_string())
+                .unwrap_or_default();
+            remove_inner
+                .borrow_mut()
+                .insert(format!("on{}", evt), cv_js::Value::Null);
             Ok(cv_js::Value::Undefined)
         });
 
@@ -13000,124 +13141,73 @@ fn install_fetch_inner(
             .borrow_mut()
             .insert("removeEventListener".into(), remove_fn);
 
-        // Fetch the body synchronously and parse SSE frames.
-        if let Ok(url) = Url::parse(&url_str) {
-            let client = session_client(30_000);
-            if let Ok(resp) = client.fetch(&url) {
-                inner
-                    .borrow_mut()
-                    .insert("readyState".into(), cv_js::Value::Number(1.0));
-                // Dispatch onopen.
-                let onopen = inner
-                    .borrow()
-                    .get("onopen")
-                    .cloned()
-                    .unwrap_or(cv_js::Value::Undefined);
-                if !matches!(onopen, cv_js::Value::Undefined | cv_js::Value::Null) {
-                    let mut ev: cv_js::OrderedMap<String, cv_js::Value> = cv_js::OrderedMap::new();
-                    ev.insert("type".into(), cv_js::Value::String("open".into()));
-                    let _ = interp.call_value(
-                        onopen,
-                        vec![cv_js::Value::Object(std::rc::Rc::new(
-                            std::cell::RefCell::new(ev),
-                        ))],
-                    );
+        // _pump — drain the worker channel and dispatch events. The host calls
+        // this every tick via `pump_event_sources` (see `drain_due_deadline`).
+        let pump_inner = inner.clone();
+        let pump_handle = handle.clone();
+        let pump_origin = origin.clone();
+        let pump_fn = cv_js::native_fn_with_interp("_pump", move |interp, _args| {
+            let mut delivered = false;
+            // Snapshot any pending messages from the worker without blocking.
+            let msgs: Vec<SseMsg> = {
+                let h = pump_handle.borrow();
+                match h.as_ref() {
+                    Some(handle) => handle.rx.try_iter().collect(),
+                    None => Vec::new(),
                 }
-                let body = String::from_utf8_lossy(&resp.body).into_owned();
-                // Parse text/event-stream: events separated by blank
-                // line, each line is `field: value` (lines without `:`
-                // are comments). Common fields: data, event, id, retry.
-                let mut event_name = "message".to_string();
-                let mut data_buf = String::new();
-                let mut last_event_id = String::new();
-                for raw_line in body.split('\n') {
-                    let line = raw_line.trim_end_matches('\r');
-                    if line.is_empty() {
-                        // Dispatch.
-                        if !data_buf.is_empty() {
-                            let key = format!("on{}", event_name);
-                            let cb = inner
-                                .borrow()
-                                .get(&key)
-                                .cloned()
-                                .unwrap_or(cv_js::Value::Undefined);
-                            if !matches!(cb, cv_js::Value::Undefined | cv_js::Value::Null) {
-                                let mut ev: cv_js::OrderedMap<String, cv_js::Value> =
-                                    cv_js::OrderedMap::new();
-                                ev.insert("type".into(), cv_js::Value::str(event_name.clone()));
-                                // Strip trailing \n added by per-line accum.
-                                ev.insert(
-                                    "data".into(),
-                                    cv_js::Value::str(
-                                        data_buf.trim_end_matches('\n').to_string(),
-                                    ),
-                                );
-                                ev.insert(
-                                    "lastEventId".into(),
-                                    cv_js::Value::str(last_event_id.clone()),
-                                );
-                                ev.insert(
-                                    "origin".into(),
-                                    cv_js::Value::str(
-                                        format!("{:?}://{}", url.scheme, url.host)
-                                            .to_ascii_lowercase(),
-                                    ),
-                                );
-                                let _ = interp.call_value(
-                                    cb,
-                                    vec![cv_js::Value::Object(std::rc::Rc::new(
-                                        std::cell::RefCell::new(ev),
-                                    ))],
-                                );
-                            }
-                        }
-                        event_name = "message".to_string();
-                        data_buf.clear();
-                        continue;
+            };
+            for msg in msgs {
+                delivered = true;
+                match msg {
+                    SseMsg::Open => {
+                        pump_inner
+                            .borrow_mut()
+                            .insert("readyState".into(), cv_js::Value::Number(1.0));
+                        dispatch_es_event(interp, &pump_inner, "open", None, "", &pump_origin);
                     }
-                    if line.starts_with(':') {
-                        continue; // comment
+                    SseMsg::Event {
+                        event_type,
+                        data,
+                        last_event_id,
+                    } => {
+                        // Track the last seen id on the object (readable as
+                        // `lastEventId`-ish; spec keeps it internal).
+                        pump_inner.borrow_mut().insert(
+                            "\u{1}__last_event_id".into(),
+                            cv_js::Value::str(last_event_id.clone()),
+                        );
+                        dispatch_es_event(
+                            interp,
+                            &pump_inner,
+                            &event_type,
+                            Some(&data),
+                            &last_event_id,
+                            &pump_origin,
+                        );
                     }
-                    if let Some((field, value)) = line.split_once(':') {
-                        let value = value.strip_prefix(' ').unwrap_or(value);
-                        match field {
-                            "event" => event_name = value.to_string(),
-                            "data" => {
-                                data_buf.push_str(value);
-                                data_buf.push('\n');
-                            }
-                            "id" => last_event_id = value.to_string(),
-                            "retry" => {}
-                            _ => {}
+                    SseMsg::Reconnecting { fatal } => {
+                        let new_state = if fatal { 2.0 } else { 0.0 }; // CLOSED vs CONNECTING
+                        pump_inner
+                            .borrow_mut()
+                            .insert("readyState".into(), cv_js::Value::Number(new_state));
+                        dispatch_es_event(interp, &pump_inner, "error", None, "", &pump_origin);
+                        if fatal {
+                            // Give up: drop the worker handle.
+                            *pump_handle.borrow_mut() = None;
                         }
                     }
-                }
-                // After body ends, mark as CLOSED.
-                inner
-                    .borrow_mut()
-                    .insert("readyState".into(), cv_js::Value::Number(2.0));
-            } else {
-                inner
-                    .borrow_mut()
-                    .insert("readyState".into(), cv_js::Value::Number(2.0));
-                let onerror = inner
-                    .borrow()
-                    .get("onerror")
-                    .cloned()
-                    .unwrap_or(cv_js::Value::Undefined);
-                if !matches!(onerror, cv_js::Value::Undefined | cv_js::Value::Null) {
-                    let mut ev: cv_js::OrderedMap<String, cv_js::Value> = cv_js::OrderedMap::new();
-                    ev.insert("type".into(), cv_js::Value::String("error".into()));
-                    let _ = interp.call_value(
-                        onerror,
-                        vec![cv_js::Value::Object(std::rc::Rc::new(
-                            std::cell::RefCell::new(ev),
-                        ))],
-                    );
                 }
             }
+            Ok(cv_js::Value::Bool(delivered))
+        });
+        inner.borrow_mut().insert("_pump".into(), pump_fn);
+
+        // Register on the global so the host pumps it every tick.
+        let value = cv_js::Value::Object(inner);
+        if let Some(cv_js::Value::Array(items)) = interp.get_global("__tb_eventsources") {
+            items.borrow_mut().push(value.clone());
         }
-        Ok(cv_js::Value::Object(inner))
+        Ok(value)
     });
     interp.define_global("EventSource", es_ctor);
 
@@ -15385,6 +15475,39 @@ fn fire_xhr_callback(
     );
 }
 
+/// Dispatch an EventSource event to the handler registered under `on<type>`.
+/// For `message`/named events a MessageEvent-shaped object (type/data/
+/// lastEventId/origin) is delivered; for `open`/`error` only the type is set.
+/// `data == None` means no `data` field (open/error). The `message` handler is
+/// also invoked for the implicit-default event type per HTML §9.2.
+fn dispatch_es_event(
+    interp: &mut cv_js::Interp,
+    inner: &std::rc::Rc<std::cell::RefCell<cv_js::OrderedMap<String, cv_js::Value>>>,
+    event_type: &str,
+    data: Option<&str>,
+    last_event_id: &str,
+    origin: &str,
+) {
+    let key = format!("on{event_type}");
+    let cb = inner.borrow().get(&key).cloned().unwrap_or(cv_js::Value::Undefined);
+    if matches!(cb, cv_js::Value::Undefined | cv_js::Value::Null) {
+        return;
+    }
+    let mut ev: cv_js::OrderedMap<String, cv_js::Value> = cv_js::OrderedMap::new();
+    ev.insert("type".into(), cv_js::Value::str(event_type.to_string()));
+    if let Some(d) = data {
+        ev.insert("data".into(), cv_js::Value::str(d.to_string()));
+        ev.insert("lastEventId".into(), cv_js::Value::str(last_event_id.to_string()));
+        ev.insert("origin".into(), cv_js::Value::str(origin.to_string()));
+    }
+    ev.insert("target".into(), cv_js::Value::Object(inner.clone()));
+    ev.insert("currentTarget".into(), cv_js::Value::Object(inner.clone()));
+    let _ = interp.call_value(
+        cb,
+        vec![cv_js::Value::Object(std::rc::Rc::new(std::cell::RefCell::new(ev)))],
+    );
+}
+
 fn fire_xhr_error(
     interp: &mut cv_js::Interp,
     inner: &std::rc::Rc<std::cell::RefCell<cv_js::OrderedMap<String, cv_js::Value>>>,
@@ -15400,6 +15523,98 @@ fn fire_xhr_error(
     fire_xhr_callback(interp, inner, "onerror");
     fire_xhr_callback(interp, inner, "onloadend");
     Ok(cv_js::Value::Undefined)
+}
+
+/// Compute the `response` attribute value for an XHR given its `responseType`
+/// and the raw response bytes (XHR Standard §3.6 "response"):
+///   `""`/`"text"`   → decoded text
+///   `"json"`        → parsed JSON value (or null on parse failure)
+///   `"arraybuffer"` → an ArrayBuffer-shaped object holding the bytes
+///   `"blob"`        → a Blob-shaped object (MIME from Content-Type)
+/// `responseText` is always the decoded text (only meaningful for ""/"text").
+fn xhr_response_value(
+    response_type: &str,
+    body: &[u8],
+    body_text: &str,
+    content_type: &str,
+) -> cv_js::Value {
+    match response_type {
+        "arraybuffer" => make_array_buffer_value(body),
+        "blob" => {
+            let mime = content_type.split(';').next().unwrap_or("").trim();
+            make_blob_value(body, mime)
+        }
+        "json" => {
+            // XHR Standard: get a JSON value; on failure `response` is null.
+            cv_js::json::parse(body_text).unwrap_or(cv_js::Value::Null)
+        }
+        // "" | "text" | "document" (document falls back to text here)
+        _ => cv_js::Value::str(body_text.to_string()),
+    }
+}
+
+/// Apply a completed XHR response to the object and fire the async event
+/// progression: readyState 2 (HEADERS_RECEIVED) → 3 (LOADING, + `progress`) →
+/// 4 (DONE, + `load` + `loadend`), each firing `readystatechange`. This is the
+/// shared tail used by BOTH the synchronous and asynchronous send() paths.
+fn deliver_xhr_response(
+    interp: &mut cv_js::Interp,
+    inner: &std::rc::Rc<std::cell::RefCell<cv_js::OrderedMap<String, cv_js::Value>>>,
+    status: u16,
+    reason: &str,
+    headers: &[(String, String)],
+    body: &[u8],
+    final_url: &str,
+) {
+    let response_type = inner
+        .borrow()
+        .get("responseType")
+        .map(|v| v.to_display_string())
+        .unwrap_or_default();
+    let content_type = headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+        .map(|(_, v)| v.clone())
+        .unwrap_or_default();
+    let body_text = String::from_utf8_lossy(body).into_owned();
+    let response_val =
+        xhr_response_value(&response_type, body, &body_text, &content_type);
+    {
+        let mut m = inner.borrow_mut();
+        m.insert("status".into(), cv_js::Value::Number(f64::from(status)));
+        m.insert("statusText".into(), cv_js::Value::str(reason.to_string()));
+        // responseText is only valid for ""/"text"; we always store the decoded
+        // text (a getter for other types would throw, but our surface returns it).
+        if response_type.is_empty() || response_type == "text" {
+            m.insert("responseText".into(), cv_js::Value::str(body_text.clone()));
+        } else {
+            m.insert("responseText".into(), cv_js::Value::str(String::new()));
+        }
+        m.insert("response".into(), response_val);
+        m.insert("responseURL".into(), cv_js::Value::str(final_url.to_string()));
+        if let Some(cv_js::Value::Object(rh)) = m.get("_response_headers") {
+            let mut rhm = rh.borrow_mut();
+            for (k, v) in headers {
+                rhm.insert(k.to_ascii_lowercase(), cv_js::Value::str(v.clone()));
+            }
+        }
+    }
+    // readyState 2 → 3 → 4 (XHR Standard §4.6 "the steps to be run on …").
+    inner
+        .borrow_mut()
+        .insert("readyState".into(), cv_js::Value::Number(2.0));
+    fire_xhr_callback(interp, inner, "onreadystatechange");
+    inner
+        .borrow_mut()
+        .insert("readyState".into(), cv_js::Value::Number(3.0));
+    fire_xhr_callback(interp, inner, "onreadystatechange");
+    fire_xhr_callback(interp, inner, "onprogress");
+    inner
+        .borrow_mut()
+        .insert("readyState".into(), cv_js::Value::Number(4.0));
+    fire_xhr_callback(interp, inner, "onreadystatechange");
+    fire_xhr_callback(interp, inner, "onload");
+    fire_xhr_callback(interp, inner, "onloadend");
 }
 
 /// Persistent across renders in the same process.
@@ -16335,6 +16550,21 @@ impl LiveInterp {
                 // drain before the next fetch/timer iteration.
                 self.interp.drain_microtasks();
             }
+            // Same model for Server-Sent Events: drain each EventSource worker's
+            // channel and dispatch open/message/error on the JS thread, then a
+            // microtask checkpoint for any reactions the handler queued.
+            let had_sse = self.pump_event_sources();
+            if had_sse {
+                fired = true;
+                self.interp.drain_microtasks();
+            }
+            // And asynchronous XMLHttpRequest: deliver any off-thread network
+            // result whose worker finished since the last iteration.
+            let had_axhr = self.pump_async_xhrs();
+            if had_axhr {
+                fired = true;
+                self.interp.drain_microtasks();
+            }
             // Keep any CV_WEBAUDIO realtime device endpoints fed with freshly
             // rendered audio quanta (no-op unless the flag opened a device).
             pump_webaudio_outputs();
@@ -16357,7 +16587,14 @@ impl LiveInterp {
                 self.interp.drain_microtasks();
                 fired = true;
             }
-            if !had_timers && !had_scripts && !had_ws && !had_fetch && !had_micro {
+            if !had_timers
+                && !had_scripts
+                && !had_ws
+                && !had_sse
+                && !had_axhr
+                && !had_fetch
+                && !had_micro
+            {
                 break;
             }
         }
@@ -16391,6 +16628,94 @@ impl LiveInterp {
                 Ok(_) => {}
                 Err(e) => eprintln!("[websocket pump error] {e:?}"),
             }
+        }
+        delivered
+    }
+
+    /// Drain every live EventSource worker channel and dispatch its pending
+    /// `open`/`message`/named/`error` events on the JS thread. Mirrors
+    /// `pump_live_websockets`: called every tick from `drain_due_deadline`, so
+    /// SSE events surface asynchronously without blocking the UI, and the SSE
+    /// worker's auto-reconnect (which signals `Reconnecting`) is observed here.
+    fn pump_event_sources(&mut self) -> bool {
+        let Some(cv_js::Value::Array(items)) = self.interp.get_global("__tb_eventsources") else {
+            return false;
+        };
+        let sources = items.borrow().clone();
+        let mut delivered = false;
+        for src in sources {
+            let cv_js::Value::Object(obj) = &src else {
+                continue;
+            };
+            let pump = obj.borrow().get("_pump").cloned();
+            let Some(pump) = pump else {
+                continue;
+            };
+            if !matches!(
+                pump,
+                cv_js::Value::Function(_)
+                    | cv_js::Value::NativeFunction(_)
+                    | cv_js::Value::BcClosure(_)
+            ) {
+                continue;
+            }
+            match self.interp.call_value(pump, vec![src.clone()]) {
+                Ok(cv_js::Value::Bool(true)) => delivered = true,
+                Ok(_) => {}
+                Err(e) => eprintln!("[eventsource pump error] {e:?}"),
+            }
+        }
+        delivered
+    }
+
+    /// Drain every in-flight asynchronous XMLHttpRequest: poll its worker
+    /// channel and, when the off-thread network round-trip has completed,
+    /// dispatch the readyState 2→3→4 progression + load/error events on the JS
+    /// thread. Mirrors `pump_live_websockets`; called every tick from
+    /// `drain_due_deadline`. Delivered/aborted XHRs (whose `_pump` returned a
+    /// non-pending state and dropped their channel) are pruned from the global.
+    fn pump_async_xhrs(&mut self) -> bool {
+        let Some(cv_js::Value::Array(items)) = self.interp.get_global("__tb_async_xhrs") else {
+            return false;
+        };
+        let xhrs = items.borrow().clone();
+        let mut delivered = false;
+        for xhr in &xhrs {
+            let cv_js::Value::Object(obj) = xhr else {
+                continue;
+            };
+            let pump = obj.borrow().get("_pump").cloned();
+            let Some(pump) = pump else {
+                continue;
+            };
+            if !matches!(
+                pump,
+                cv_js::Value::Function(_)
+                    | cv_js::Value::NativeFunction(_)
+                    | cv_js::Value::BcClosure(_)
+            ) {
+                continue;
+            }
+            match self.interp.call_value(pump, vec![xhr.clone()]) {
+                Ok(cv_js::Value::Bool(true)) => delivered = true,
+                Ok(_) => {}
+                Err(e) => eprintln!("[async xhr pump error] {e:?}"),
+            }
+        }
+        // Prune XHRs that are no longer in flight (delivered or aborted): the
+        // `_pump` clears `__xhr_inflight` once it acts, so they need no further
+        // pumping. Keeps the array bounded across many requests.
+        if let Some(cv_js::Value::Array(items)) = self.interp.get_global("__tb_async_xhrs") {
+            items.borrow_mut().retain(|v| {
+                if let cv_js::Value::Object(o) = v {
+                    matches!(
+                        o.borrow().get("\u{1}__xhr_inflight"),
+                        Some(cv_js::Value::Bool(true))
+                    )
+                } else {
+                    false
+                }
+            });
         }
         delivered
     }
@@ -25553,6 +25878,18 @@ fn install_minimal_dom_with_url(interp: &cv_js::Interp, initial_title: String, p
     interp.define_global("window", window);
     interp.define_global(
         "__tb_websockets",
+        cv_js::Value::Array(Rc::new(RefCell::new(Vec::new()))),
+    );
+    // Live EventSource (Server-Sent Events) objects, each carrying a `_pump`
+    // native fn the host drains every tick (mirrors `__tb_websockets`).
+    interp.define_global(
+        "__tb_eventsources",
+        cv_js::Value::Array(Rc::new(RefCell::new(Vec::new()))),
+    );
+    // In-flight asynchronous XMLHttpRequest objects, each carrying a `_pump`
+    // native fn the host drains every tick to deliver the off-thread result.
+    interp.define_global(
+        "__tb_async_xhrs",
         cv_js::Value::Array(Rc::new(RefCell::new(Vec::new()))),
     );
     interp.define_global("ethereum", provider_value);
@@ -50764,6 +51101,300 @@ pub(crate) fn wait_for_pending_images(deadline: std::time::Duration) {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// Asynchronous XMLHttpRequest — real off-thread network + readyState progression
+// ─────────────────────────────────────────────────────────────────────────
+//
+// An async `xhr.send()` no longer blocks the UI thread on the network. The
+// fully-prepared request (method/url/headers/body + the security verdict, all
+// computed on the JS thread where the thread-locals live) is handed to the
+// shared compute pool (`compute_pool`, the same off-thread path images use).
+// The worker runs the network round-trip and pushes a single completion message
+// back over an mpsc channel. The JS-thread `_pump` (drained every tick by the
+// host) consumes it and fires the readyState 2→3→4 progression plus
+// progress/load/error events — matching Chrome's "request runs off the main
+// thread; events dispatch on it" model.
+
+/// The completed result of an off-thread async XHR network round-trip.
+#[derive(Debug)]
+enum XhrResult {
+    /// Success: status code, reason phrase, lowercased response headers, and
+    /// the raw response bytes (decoded to text / arraybuffer / blob per
+    /// `responseType` on the JS thread).
+    Ok {
+        status: u16,
+        reason: String,
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+        final_url: String,
+    },
+    /// A network / CORS / CSP failure — the message is surfaced via the
+    /// `error` event and `statusText`.
+    Err(String),
+}
+
+/// Per-XHR delivery channel for the async result.
+type XhrChannel = std::sync::mpsc::Receiver<XhrResult>;
+
+// ─────────────────────────────────────────────────────────────────────────
+// Server-Sent Events (EventSource) — real off-thread streaming + auto-reconnect
+// ─────────────────────────────────────────────────────────────────────────
+//
+// A live EventSource runs a dedicated OS worker thread that owns the
+// `cv_net::SseConnection` (raw socket / TLS — `Send`, like the image-fetch
+// pool). The worker connects, polls body bytes, parses `text/event-stream`
+// frames per WHATWG HTML §9.2, and pushes parsed messages back over an mpsc
+// channel. On a connection drop it waits the reconnection interval (default
+// 3000ms; the server can set it via a `retry:` field) and reconnects, sending
+// the last seen event id as the `Last-Event-ID` request header — REAL
+// auto-reconnect, not a one-shot. The JS-thread `_pump` (drained every tick by
+// `drain_due_deadline`, mirroring `pump_live_websockets`) consumes the channel
+// and dispatches `open`/`message`/named/`error` events to the JS handlers.
+
+/// One message handed from the SSE worker thread to the JS thread.
+#[derive(Debug, Clone)]
+enum SseMsg {
+    /// Connection established (HTTP 200 + `text/event-stream`). Fires `open`,
+    /// readyState → OPEN.
+    Open,
+    /// A dispatched event: (type, data, lastEventId).
+    Event {
+        event_type: String,
+        data: String,
+        last_event_id: String,
+    },
+    /// Connection dropped; the worker is now waiting `retry_ms` before
+    /// reconnecting. Fires `error`, readyState → CONNECTING (per HTML §9.2:
+    /// "reestablish the connection"). `fatal` = the worker gave up (4xx/5xx or
+    /// non-event-stream content type) → readyState CLOSED, no reconnect.
+    Reconnecting { fatal: bool },
+}
+
+/// Shared control handle between the JS thread and an SSE worker thread.
+struct SseHandle {
+    rx: std::sync::mpsc::Receiver<SseMsg>,
+    /// Set by `close()` on the JS thread; the worker checks it and exits.
+    closed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Parse incoming `text/event-stream` bytes into dispatchable events,
+/// maintaining the data/event-type/last-event-id buffers across calls per
+/// WHATWG HTML §9.2 "interpret the event stream". `pending` is the leftover
+/// partial line carried between feeds; `last_event_id` persists for the whole
+/// connection (and is what the worker sends as `Last-Event-ID` on reconnect).
+#[derive(Default)]
+struct SseParser {
+    /// Bytes not yet split into a complete line (no trailing `\n` yet).
+    pending: String,
+    data_buf: String,
+    event_type: String,
+    /// The "last event ID buffer" (HTML §9.2). Updated by `id:` fields.
+    last_event_id: String,
+    /// The server-requested reconnection time, if any (`retry:` field).
+    retry_ms: Option<u64>,
+}
+
+impl SseParser {
+    /// Feed a slice of newly-arrived stream text; returns the events ready to
+    /// dispatch (each already through the §9.2 "dispatch the event" step).
+    fn feed(&mut self, chunk: &str) -> Vec<SseMsg> {
+        let mut out = Vec::new();
+        self.pending.push_str(chunk);
+        // Split on \n; the SSE line terminator is \n, \r\n, or a lone \r, but
+        // \r\n and \r are normalized: we strip a trailing \r from each line and
+        // also treat a lone \r as a line break by pre-normalizing.
+        // Normalize lone-\r line endings to \n so split('\n') sees every line.
+        if self.pending.contains('\r') {
+            self.pending = self.pending.replace("\r\n", "\n").replace('\r', "\n");
+        }
+        // Keep the trailing partial (no terminating \n yet) in `pending`.
+        let last_nl = self.pending.rfind('\n');
+        let complete = match last_nl {
+            Some(idx) => {
+                let done: String = self.pending[..=idx].to_string();
+                self.pending = self.pending[idx + 1..].to_string();
+                done
+            }
+            None => return out, // no complete line yet
+        };
+        for line in complete.split('\n') {
+            // The final element after the last \n is empty (we sliced inclusive
+            // of the last \n), so this never yields a bogus partial line.
+            if line.is_empty() {
+                // Blank line → dispatch.
+                if let Some(ev) = self.dispatch() {
+                    out.push(ev);
+                }
+                continue;
+            }
+            if line.starts_with(':') {
+                continue; // comment line — ignored.
+            }
+            // Split at first colon; no colon → whole line is the field name
+            // with an empty value (HTML §9.2).
+            let (field, value) = match line.split_once(':') {
+                Some((f, v)) => (f, v.strip_prefix(' ').unwrap_or(v)),
+                None => (line, ""),
+            };
+            match field {
+                "event" => self.event_type = value.to_string(),
+                "data" => {
+                    // "Append the field value to the data buffer, then append a
+                    // single U+000A LINE FEED."
+                    self.data_buf.push_str(value);
+                    self.data_buf.push('\n');
+                }
+                "id" => {
+                    // "If the field value does not contain U+0000 NULL, set the
+                    // last event ID buffer; otherwise ignore the field."
+                    if !value.contains('\u{0}') {
+                        self.last_event_id = value.to_string();
+                    }
+                }
+                "retry" => {
+                    // "If the field value consists of only ASCII digits, then
+                    // interpret it as base-ten and set the reconnection time."
+                    if !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()) {
+                        if let Ok(ms) = value.parse::<u64>() {
+                            self.retry_ms = Some(ms);
+                        }
+                    }
+                }
+                _ => {} // any other field is ignored.
+            }
+        }
+        out
+    }
+
+    /// HTML §9.2 "dispatch the event": if the data buffer is empty, reset and
+    /// fire nothing. Otherwise strip a single trailing LF and emit a
+    /// MessageEvent of the current event type (default "message").
+    fn dispatch(&mut self) -> Option<SseMsg> {
+        if self.data_buf.is_empty() {
+            // Spec: empty data buffer → reset both buffers, fire nothing.
+            self.event_type.clear();
+            return None;
+        }
+        // Remove the single trailing U+000A added per data line.
+        let mut data = std::mem::take(&mut self.data_buf);
+        if data.ends_with('\n') {
+            data.pop();
+        }
+        // `std::mem::take` empties the event-type buffer in the non-default
+        // branch; the default branch leaves it already-empty — so it is reset
+        // either way (HTML §9.2 dispatch: "set the event type buffer to empty").
+        let event_type = if self.event_type.is_empty() {
+            "message".to_string()
+        } else {
+            std::mem::take(&mut self.event_type)
+        };
+        Some(SseMsg::Event {
+            event_type,
+            data,
+            last_event_id: self.last_event_id.clone(),
+        })
+    }
+}
+
+/// Spawn the EventSource worker thread. Returns the JS-side control handle.
+/// `cookie_header` is captured ON the JS thread (where the cookie jar lives)
+/// and sent verbatim; `with_credentials` is honored only insofar as we always
+/// send the document's cookies for same-origin EventSource (cross-origin
+/// credentialed SSE is a follow-up).
+fn spawn_event_source(url: Url, cookie_header: String) -> SseHandle {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, mpsc};
+    let (tx, rx) = mpsc::channel::<SseMsg>();
+    let closed = Arc::new(AtomicBool::new(false));
+    let worker_closed = closed.clone();
+    std::thread::Builder::new()
+        .name("eventsource".into())
+        .spawn(move || {
+            // The reconnection time (HTML §9.2 default ≈ a few seconds; we use
+            // 3000ms like Chrome). The server can change it via `retry:`.
+            let mut retry_ms: u64 = 3000;
+            let mut last_event_id = String::new();
+            loop {
+                if worker_closed.load(Ordering::Relaxed) {
+                    return;
+                }
+                match cv_net::SseConnection::connect(&url, &last_event_id, &cookie_header) {
+                    Ok(mut conn) => {
+                        // HTML §9.2: a non-200 status or a Content-Type that is
+                        // not `text/event-stream` is a FATAL failure (no
+                        // reconnect). 200 + text/event-stream → announce + open.
+                        if conn.status != 200 || !conn.is_event_stream() {
+                            let _ = tx.send(SseMsg::Reconnecting { fatal: true });
+                            return;
+                        }
+                        if tx.send(SseMsg::Open).is_err() {
+                            return; // JS side gone.
+                        }
+                        let mut parser = SseParser::default();
+                        parser.last_event_id = last_event_id.clone();
+                        // Read loop: poll the stream with a short timeout so we
+                        // remain responsive to close() and to a peer drop.
+                        loop {
+                            if worker_closed.load(Ordering::Relaxed) {
+                                return;
+                            }
+                            match conn.poll(500) {
+                                Ok(Some(bytes)) => {
+                                    let text = String::from_utf8_lossy(&bytes);
+                                    for ev in parser.feed(&text) {
+                                        if let SseMsg::Event { last_event_id: ref id, .. } = ev {
+                                            last_event_id = id.clone();
+                                        }
+                                        if tx.send(ev).is_err() {
+                                            return;
+                                        }
+                                    }
+                                    if let Some(ms) = parser.retry_ms.take() {
+                                        retry_ms = ms;
+                                    }
+                                    if conn.is_eof() {
+                                        break; // server closed the stream → reconnect.
+                                    }
+                                }
+                                Ok(None) => {
+                                    if conn.is_eof() {
+                                        break;
+                                    }
+                                    // timeout, no data — loop again.
+                                }
+                                Err(_) => break, // transport error → reconnect.
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        // Connection failed — treat as a transient drop and
+                        // retry after the interval (HTML §9.2 reconnection).
+                    }
+                }
+                // Connection dropped. Signal CONNECTING + error, then wait the
+                // reconnection interval before looping to reconnect.
+                if worker_closed.load(Ordering::Relaxed) {
+                    return;
+                }
+                if tx.send(SseMsg::Reconnecting { fatal: false }).is_err() {
+                    return;
+                }
+                // Sleep in small slices so close() is honored promptly.
+                let mut slept = 0u64;
+                while slept < retry_ms {
+                    if worker_closed.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    let step = (retry_ms - slept).min(100);
+                    std::thread::sleep(std::time::Duration::from_millis(step));
+                    slept += step;
+                }
+            }
+        })
+        .expect("spawn eventsource thread");
+    SseHandle { rx, closed }
+}
+
 /// Kick off a background fetch+decode for `url` unless it's already loaded, in
 /// flight, or known-failed. Returns immediately.
 /// The shared compute work pool (`cv_sched`, Milestone 1.3). Background image
@@ -69828,5 +70459,388 @@ mod media_element_tests {
             "window.__r",
         );
         assert_eq!(out, "open", "MediaSource opens on construction");
+    }
+}
+
+#[cfg(test)]
+mod sse_parser_tests {
+    use super::*;
+
+    /// Helper: feed a full stream string and collect (type, data, id) tuples.
+    fn parse_events(stream: &str) -> Vec<(String, String, String)> {
+        let mut p = SseParser::default();
+        p.feed(stream)
+            .into_iter()
+            .filter_map(|m| match m {
+                SseMsg::Event {
+                    event_type,
+                    data,
+                    last_event_id,
+                } => Some((event_type, data, last_event_id)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn basic_message_event_defaults_to_message_type() {
+        let evs = parse_events("data: hello\n\n");
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0], ("message".into(), "hello".into(), "".into()));
+    }
+
+    #[test]
+    fn multi_line_data_joins_with_newline() {
+        // HTML §9.2: each `data:` appends value + LF; trailing LF stripped at
+        // dispatch → "line1\nline2".
+        let evs = parse_events("data: line1\ndata: line2\n\n");
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0].1, "line1\nline2");
+    }
+
+    #[test]
+    fn named_event_and_id_are_honored() {
+        let evs = parse_events("event: ping\ndata: 42\nid: 7\n\n");
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0].0, "ping", "event: sets the type");
+        assert_eq!(evs[0].1, "42");
+        assert_eq!(evs[0].2, "7", "id: sets lastEventId");
+    }
+
+    #[test]
+    fn id_with_null_is_ignored() {
+        // HTML §9.2: an `id` field whose value contains U+0000 is ignored — the
+        // last event ID buffer is unchanged.
+        let mut p = SseParser::default();
+        let _ = p.feed("id: 5\ndata: a\n\n");
+        let evs = p.feed("id: x\u{0}y\ndata: b\n\n");
+        assert_eq!(evs.len(), 1);
+        let last_id = match &evs[0] {
+            SseMsg::Event { last_event_id, .. } => last_event_id.clone(),
+            _ => panic!("expected an Event"),
+        };
+        assert_eq!(
+            last_id, "5",
+            "NULL-bearing id ignored → lastEventId stays at the prior value"
+        );
+    }
+
+    #[test]
+    fn comment_lines_and_empty_data_do_not_dispatch() {
+        // A comment (`:`-prefixed) is ignored; a blank line with an empty data
+        // buffer fires NOTHING (HTML §9.2 dispatch step 2).
+        let evs = parse_events(": this is a comment\n\n");
+        assert!(evs.is_empty(), "comment + empty-data blank line → no event");
+    }
+
+    #[test]
+    fn retry_field_sets_reconnection_time() {
+        let mut p = SseParser::default();
+        let _ = p.feed("retry: 1500\ndata: x\n\n");
+        assert_eq!(p.retry_ms, Some(1500), "retry: sets the reconnection time");
+    }
+
+    #[test]
+    fn retry_non_digits_ignored() {
+        let mut p = SseParser::default();
+        let _ = p.feed("retry: abc\ndata: x\n\n");
+        assert_eq!(p.retry_ms, None, "non-numeric retry value is ignored");
+    }
+
+    #[test]
+    fn field_split_across_feeds_is_buffered() {
+        // A line that arrives in two poll() chunks must not dispatch early.
+        let mut p = SseParser::default();
+        let first = p.feed("data: hel");
+        assert!(first.is_empty(), "partial line buffered, no dispatch yet");
+        let second = p.feed("lo\n\n");
+        assert_eq!(second.len(), 1);
+        let data = match &second[0] {
+            SseMsg::Event { data, .. } => data.clone(),
+            _ => panic!("expected an Event"),
+        };
+        assert_eq!(data, "hello", "the line completes across feeds");
+    }
+
+    #[test]
+    fn crlf_line_endings_normalized() {
+        let evs = parse_events("data: hi\r\n\r\n");
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0].1, "hi");
+    }
+
+    #[test]
+    fn value_strips_only_one_leading_space() {
+        // "data:  x" → field value is " x" (one leading space removed).
+        let evs = parse_events("data:  x\n\n");
+        assert_eq!(evs[0].1, " x");
+    }
+}
+
+#[cfg(test)]
+mod async_io_e2e_tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    /// Read the request bytes up to the header terminator and return the raw
+    /// request head as a string.
+    fn read_request_head(stream: &mut std::net::TcpStream) -> String {
+        let mut buf = Vec::new();
+        let mut byte = [0u8; 1];
+        loop {
+            match stream.read(&mut byte) {
+                Ok(0) => break,
+                Ok(_) => {
+                    buf.push(byte[0]);
+                    if buf.ends_with(b"\r\n\r\n") {
+                        break;
+                    }
+                    if buf.len() > 8192 {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        String::from_utf8_lossy(&buf).into_owned()
+    }
+
+    #[test]
+    fn async_xhr_fires_readystatechange_1_through_4_off_thread() {
+        // A localhost server returns a small JSON body. The async XHR must NOT
+        // block (readyState is still 1/OPENED right after send()), then the host
+        // ticks deliver readyState 2→3→4 and `load` with the body.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let _ = read_request_head(&mut stream);
+                let body = "{\"ok\":true,\"n\":42}";
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+
+        let doc = cv_html::parse("<!doctype html><html><body></body></html>");
+        // Same-origin as the server (matching port) so the request is not a
+        // cross-origin CORS request. The document origin thread-local (which the
+        // XHR CORS gate reads) is set on navigation in production; set it here.
+        let origin = format!("http://127.0.0.1:{port}");
+        DOCUMENT_ORIGIN_STR.with(|o| *o.borrow_mut() = origin.clone());
+        let mut rt = LiveInterp::new(&doc, &format!("http://127.0.0.1:{port}/"));
+        rt.run_script(&format!(
+            "window.__states = [];\
+             window.__loaded = false;\
+             window.__body = '';\
+             var x = new XMLHttpRequest();\
+             x.onreadystatechange = function() {{ window.__states.push(x.readyState); }};\
+             x.onload = function() {{ window.__loaded = true; window.__body = x.responseText; }};\
+             x.open('GET', 'http://127.0.0.1:{port}/data.json', true);\
+             x.send();\
+             window.__after_send = x.readyState;",
+            port = port
+        ));
+
+        // The send() must NOT have blocked: readyState is OPENED(1), not DONE(4).
+        let after = rt
+            .interp
+            .run_completion_value("window.__after_send")
+            .unwrap()
+            .to_display_string();
+        assert_eq!(after, "1", "async send() returns without blocking (readyState OPENED)");
+
+        // Pump until the off-thread result is delivered (bounded).
+        let mut loaded = false;
+        for _ in 0..200 {
+            rt.drain_due(50);
+            let v = rt
+                .interp
+                .run_completion_value("window.__loaded")
+                .unwrap()
+                .to_display_string();
+            if v == "true" {
+                loaded = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        server.join().ok();
+        let dbg_state = rt
+            .interp
+            .run_completion_value(
+                "'rs=' + x.readyState + ' status=' + x.status + ' st=' + x.statusText + ' states=' + window.__states.join(',')",
+            )
+            .map(|v| v.to_display_string())
+            .unwrap_or_default();
+        assert!(loaded, "async XHR eventually fired load off the UI thread [{dbg_state}]");
+
+        let states = rt
+            .interp
+            .run_completion_value("window.__states.join(',')")
+            .unwrap()
+            .to_display_string();
+        // readystatechange must fire in order through 2,3,4 (the OPENED 1 was
+        // fired by open() before our handler was attached, so we assert the
+        // async progression suffix).
+        assert!(
+            states.contains("2,3,4"),
+            "readystatechange fired HEADERS_RECEIVED→LOADING→DONE in order, got: {states}"
+        );
+        let body = rt
+            .interp
+            .run_completion_value("window.__body")
+            .unwrap()
+            .to_display_string();
+        assert!(body.contains("\"n\":42"), "load delivered the body, got: {body}");
+    }
+
+    #[test]
+    fn async_xhr_response_type_json_parses_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let _ = read_request_head(&mut stream);
+                let body = "{\"n\":7}";
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+
+        let doc = cv_html::parse("<!doctype html><html><body></body></html>");
+        let origin = format!("http://127.0.0.1:{port}");
+        DOCUMENT_ORIGIN_STR.with(|o| *o.borrow_mut() = origin.clone());
+        let mut rt = LiveInterp::new(&doc, &format!("http://127.0.0.1:{port}/"));
+        rt.run_script(&format!(
+            "window.__n = -1;\
+             var x = new XMLHttpRequest();\
+             x.responseType = 'json';\
+             x.onload = function() {{ window.__n = x.response ? x.response.n : -2; }};\
+             x.open('GET', 'http://127.0.0.1:{port}/j', true);\
+             x.send();",
+            port = port
+        ));
+        let mut ok = false;
+        for _ in 0..200 {
+            rt.drain_due(50);
+            if rt
+                .interp
+                .run_completion_value("window.__n")
+                .unwrap()
+                .to_display_string()
+                == "7"
+            {
+                ok = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        server.join().ok();
+        assert!(ok, "responseType=json delivered a parsed object (response.n === 7)");
+    }
+
+    #[test]
+    fn eventsource_parses_stream_then_reconnects_with_last_event_id() {
+        // The server accepts TWO connections. The first sends two events
+        // (ids 1 and 2) then CLOSES, forcing a reconnect. On the second
+        // connection it captures the `Last-Event-ID` request header and sends
+        // one more event whose data echoes that header — proving the client
+        // auto-reconnected AND resent the last id.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        let captured_id = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let captured_for_server = captured_id.clone();
+        let server = std::thread::spawn(move || {
+            // First connection: serve two events, then drop (close).
+            if let Ok((mut s1, _)) = listener.accept() {
+                let _ = read_request_head(&mut s1);
+                // A short retry so the test reconnects quickly.
+                let body = "retry: 200\nid: 1\ndata: first\n\nid: 2\ndata: second\n\n";
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = s1.write_all(resp.as_bytes());
+                let _ = s1.flush();
+                drop(s1); // close → client must reconnect.
+            }
+            // Second connection: capture Last-Event-ID, serve one more event.
+            if let Ok((mut s2, _)) = listener.accept() {
+                let head = read_request_head(&mut s2);
+                let mut last_id = String::new();
+                for line in head.lines() {
+                    if let Some(v) = line.strip_prefix("Last-Event-ID:") {
+                        last_id = v.trim().to_string();
+                    }
+                }
+                *captured_for_server.lock().unwrap() = last_id.clone();
+                let body = format!("id: 3\ndata: resumed-from-{last_id}\n\n");
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = s2.write_all(resp.as_bytes());
+                let _ = s2.flush();
+            }
+        });
+
+        let doc = cv_html::parse("<!doctype html><html><body></body></html>");
+        let mut rt = LiveInterp::new(&doc, &format!("http://127.0.0.1:{port}/"));
+        rt.run_script(&format!(
+            "window.__msgs = [];\
+             var es = new EventSource('http://127.0.0.1:{port}/sse');\
+             es.onmessage = function(e) {{ window.__msgs.push(e.data); }};",
+            port = port
+        ));
+
+        // Pump until we see the resumed (3rd) event or time out.
+        let mut got_resume = false;
+        for _ in 0..400 {
+            rt.drain_due(50);
+            let msgs = rt
+                .interp
+                .run_completion_value("window.__msgs.join('|')")
+                .unwrap()
+                .to_display_string();
+            if msgs.contains("resumed-from-2") {
+                got_resume = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        // Stop the worker thread so the process exits cleanly.
+        rt.run_script("es.close();");
+        server.join().ok();
+
+        let msgs = rt
+            .interp
+            .run_completion_value("window.__msgs.join('|')")
+            .unwrap()
+            .to_display_string();
+        assert!(
+            msgs.contains("first") && msgs.contains("second"),
+            "first connection's events delivered, got: {msgs}"
+        );
+        assert!(
+            got_resume,
+            "EventSource auto-reconnected and delivered the resumed event, got: {msgs}"
+        );
+        let id = captured_id.lock().unwrap().clone();
+        assert_eq!(
+            id, "2",
+            "reconnect sent Last-Event-ID of the last seen id (2), got: {id:?}"
+        );
     }
 }
