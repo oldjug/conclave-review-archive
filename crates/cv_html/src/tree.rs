@@ -53,6 +53,13 @@ pub struct Document {
 
 pub fn parse(input: &str) -> Document {
     let tokens = Tokenizer::new(input).run();
+    // WHATWG insertion-mode builder, gated behind CV_WHATWG_PARSER
+    // (default OFF). When off, this is byte-identical to the legacy builder
+    // below — all ~150 `cv_html::parse` call sites inherit the switch for
+    // free because they funnel through here. See `treebuilder` module docs.
+    if crate::treebuilder::whatwg_enabled() {
+        return crate::treebuilder::build_whatwg(tokens, None);
+    }
     build(tokens)
 }
 
@@ -442,6 +449,70 @@ fn dump_node(n: &Node, s: &mut String, depth: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ------------------------------------------------------------------
+    // parse_both drift guard (off-by-default path rot protection).
+    //
+    // CV_WHATWG_PARSER is OFF by default, so the legacy `build` below is the
+    // production path. This guard keeps the legacy path from rotting AND
+    // confirms the design's claim that on WELL-FORMED inputs (explicit
+    // html/head/body, properly nested, closed tags) the new WHATWG builder
+    // agrees with the legacy builder structurally. We serialize both trees
+    // with `dump` (the existing trimmed serializer) and require equality.
+    //
+    // Tag-soup inputs are intentionally EXCLUDED here (that is where the
+    // builders are *supposed* to diverge, and the WHATWG-correct results are
+    // asserted in `treebuilder`'s own tests). This guard only covers inputs
+    // where both should land in the same place.
+    // ------------------------------------------------------------------
+    fn legacy(input: &str) -> String {
+        dump(&build(Tokenizer::new(input).run()))
+    }
+    fn whatwg(input: &str) -> String {
+        dump(&crate::treebuilder::build_whatwg(
+            Tokenizer::new(input).run(),
+            None,
+        ))
+    }
+
+    #[test]
+    fn parse_both_byte_identity_on_well_formed() {
+        // Each input has an EXPLICIT <head>…</head> so the only structural
+        // wrinkle that legitimately differs between the builders (the WHATWG
+        // builder always synthesizes <head>; the legacy builder skips a
+        // synthesized <head> when a <body> already exists) is removed. With
+        // an explicit head and proper nesting, the two must agree exactly.
+        let well_formed = [
+            "<!DOCTYPE html><html><head><title>T</title></head><body><h1>Hi</h1><p>x</p></body></html>",
+            "<html><head></head><body><div id=\"a\"><span>1</span></div></body></html>",
+            "<html><head></head><body><ul><li>a</li><li>b</li></ul></body></html>",
+            "<html><head></head><body><table><tbody><tr><td>1</td><td>2</td></tr></tbody></table></body></html>",
+            "<html><head></head><body><p>hello <b>world</b></p></body></html>",
+            "<html><head></head><body><a href=\"x\">link</a></body></html>",
+            "<html><head><meta charset=\"utf-8\"></head><body><p>ok</p></body></html>",
+            "<html><head></head><body><dl><dt>x</dt><dd>y</dd></dl></body></html>",
+            "<html><head></head><body><select><option>a</option><option>b</option></select></body></html>",
+            "<html><head></head><body><div><div><div>deep</div></div></div></body></html>",
+            "<html><head></head><body><h1>Title</h1><h2>Sub</h2></body></html>",
+            "<html><head></head><body><pre>line</pre></body></html>",
+            "<html><head></head><body><blockquote><p>q</p></blockquote></body></html>",
+            "<html><head></head><body><section><article>text</article></section></body></html>",
+            "<html><head></head><body><img src=\"a.png\"><br><hr></body></html>",
+            "<html><head></head><body><ol><li>1</li><li>2</li><li>3</li></ol></body></html>",
+            "<html><head></head><body><table><caption>C</caption><tbody><tr><td>x</td></tr></tbody></table></body></html>",
+            "<html><head></head><body><form><input name=\"q\"></form></body></html>",
+            "<html><head></head><body><nav><a href=\"/\">home</a></nav></body></html>",
+            "<html><head></head><body><p>just text</p></body></html>",
+        ];
+        for input in well_formed {
+            let l = legacy(input);
+            let w = whatwg(input);
+            assert_eq!(
+                l, w,
+                "WHATWG vs legacy drift on well-formed input:\n  IN: {input}\n  legacy:\n{l}\n  whatwg:\n{w}"
+            );
+        }
+    }
 
     #[test]
     fn builds_simple_tree() {

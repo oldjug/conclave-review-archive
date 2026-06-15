@@ -11,6 +11,7 @@ pub mod fragment;
 pub mod token;
 pub mod tokenizer;
 pub mod tree;
+pub mod treebuilder;
 
 pub use token::{Attribute, Token};
 pub use tokenizer::Tokenizer;

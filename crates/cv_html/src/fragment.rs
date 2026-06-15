@@ -12,7 +12,16 @@ use crate::tree::{Node, parse as parse_doc};
 /// Parse `html` as a fragment inserted into a parent of tag `context`
 /// (used to nudge the tokenizer's insertion mode). Returns the
 /// resulting top-level nodes the caller appends to the host element.
-pub fn parse_fragment(html: &str, _context: &str) -> Vec<Node> {
+pub fn parse_fragment(html: &str, context: &str) -> Vec<Node> {
+    // When CV_WHATWG_PARSER is on, upgrade to the real §13.4 context-seeded
+    // fragment algorithm; otherwise fall through to the legacy path below
+    // (byte-identical to today — which ignores `context`). See `treebuilder`.
+    if crate::treebuilder::whatwg_enabled() {
+        let tokens = crate::tokenizer::Tokenizer::new(html).run();
+        let doc = crate::treebuilder::build_whatwg(tokens, Some(context));
+        return crate::treebuilder::lift_fragment_children(doc);
+    }
+    let _ = context; // legacy path is context-insensitive (unchanged behavior)
     let doc = parse_doc(html);
     // Drop the synthetic <html>/<head>/<body> the document builder
     // wraps content in; surface whatever the caller appended.
