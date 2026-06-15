@@ -23,6 +23,8 @@ pub mod dxgi;
 pub(crate) mod hlsl;
 pub mod hw_present;
 pub mod present;
+pub mod quad_draw;
 
 pub use hw_present::{HwPresenter, HwPresentError};
 pub use present::{PresentConfig, PresentDescriptor, PresentLayer, SwapChain, SwapChainError};
+pub use quad_draw::{GpuQuad, QuadDrawError, QuadDrawer, QuadFill, Rgba, quad_raster_enabled};
