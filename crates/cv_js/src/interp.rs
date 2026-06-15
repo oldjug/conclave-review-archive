@@ -3830,6 +3830,21 @@ fn type_error_throw(msg: impl Into<String>) -> JsError {
     ))
 }
 
+/// Public helper for native built-ins (e.g. the Temporal module) to throw a
+/// spec-shaped Error-subclass object (`RangeError`/`TypeError`/…) that carries
+/// the `_errorClasses` tags so `instanceof RangeError` and `e.name` work.
+/// `class_name` must be one of the registered Error subclasses; its parent
+/// chain is derived (e.g. RangeError → [RangeError, Error]).
+pub fn make_temporal_error(class_name: &str, msg: impl Into<String>) -> JsError {
+    let parents: &[&str] = match class_name {
+        "RangeError" => &["RangeError", "Error"],
+        "TypeError" => &["TypeError", "Error"],
+        "SyntaxError" => &["SyntaxError", "Error"],
+        _ => &["Error"],
+    };
+    JsError::Throw(make_error_value(class_name, parents, msg.into()))
+}
+
 /// ECMA-262 §7.1.7 ToUint32 on an already-coerced `f64`: NaN/±Inf → 0; else
 /// truncate toward zero and reduce mod 2^32 (wrapping, so a negative integer
 /// like `-5` becomes `4294967291`). Rust's bare `n as u32` cast SATURATES a
@@ -12494,6 +12509,12 @@ impl Interp {
             "Function",
             Value::Object(Rc::new(RefCell::new(function_ctor))),
         );
+
+        // `Temporal` — the TC39 Temporal date/time API (Stage 3, shipping in
+        // V8). Real ISO-8601 calendar/time arithmetic. Additive: only reachable
+        // via the `Temporal` global, so installing it here is always-on with
+        // zero risk to existing code.
+        crate::temporal::install(self);
     }
 
     /// Look up a value in the global scope. Used by the browser to read

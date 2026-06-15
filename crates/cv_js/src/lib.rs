@@ -60,6 +60,13 @@ pub mod runtime_features;
 pub mod unicode_props;
 pub mod sab;
 pub mod shapes;
+/// `Temporal` — the TC39 Temporal date/time API (Stage 3, shipping in V8).
+/// Real ISO-8601 calendar/time arithmetic (leap years, month-overflow
+/// constrain/reject, calendar difference, ns-exact Instants). Always on
+/// (additive: only reachable via the `Temporal` global). ZonedDateTime is a
+/// UTC-offset core; named-IANA-zone DST + non-ISO calendars are documented
+/// followups (see module footer), not stubs.
+pub mod temporal;
 /// T3 — the optimizing tier (B2 of PHASE B): bytecode → SSA-ish IR →
 /// conservative semantics-preserving passes → linear-scan regalloc → the proven
 /// T2-lite backend. Gated by `CV_T3` / `ForcedTier::T3`, DEFAULT OFF.
