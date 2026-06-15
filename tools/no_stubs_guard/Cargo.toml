@@ -1,0 +1,14 @@
+[package]
+name = "no_stubs_guard"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+# A guard crate: it ships no code, only a test (tests/no_stubs.rs) that scans
+# the workspace source for stub signatures and FAILS the build if new ones
+# appear. This is a MECHANICAL enforcement of the project's "no stubs, ever"
+# rule — it does not depend on anyone remembering to be careful.
+[lib]
+path = "src/lib.rs"

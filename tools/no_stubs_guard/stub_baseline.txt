@@ -1,0 +1,5 @@
+# no-stubs guard tier-2 baseline. The guard FAILS if any count exceeds these.
+# Lower these as stubs are removed; only RAISE with a justification in the commit.
+# Regenerate with NO_STUBS_GUARD_WRITE_BASELINE=1 cargo test -p no_stubs_guard.
+comment_stub_phrase = 4
+native_fn_undefined_body = 105

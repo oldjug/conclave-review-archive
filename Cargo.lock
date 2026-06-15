@@ -250,6 +250,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "no_stubs_guard"
+version = "0.0.1"
+
+[[package]]
 name = "ucd_gen"
 version = "0.0.1"
 

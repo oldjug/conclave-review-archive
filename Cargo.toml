@@ -49,6 +49,7 @@ members = [
     "tools/webidl_gen",
     "tools/ucd_gen",
     "tools/wpt_runner",
+    "tools/no_stubs_guard",
 ]
 
 [workspace.package]
