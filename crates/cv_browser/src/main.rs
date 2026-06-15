@@ -20045,6 +20045,243 @@ fn apply_persisted_scroll_offsets(root: &mut cv_layout::LayoutBox) {
     walk(root);
 }
 
+thread_local! {
+    /// Registry of inline SVG `<filter id=...>` definitions in the current
+    /// document, resolved to a ready-to-run primitive chain. Populated once
+    /// per render by [`collect_svg_filter_defs`] (which has the document DOM)
+    /// and read at paint time by the `FilterEffect::Reference` arm (which does
+    /// not). This is how `filter: url(#id)` reaches the rasterizer.
+    static SVG_FILTER_DEFS: std::cell::RefCell<
+        std::collections::HashMap<String, Vec<cv_gfx::SvgFePrimitive>>
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Look up a previously-collected `<filter>` primitive chain by id.
+fn svg_filter_def(id: &str) -> Option<Vec<cv_gfx::SvgFePrimitive>> {
+    SVG_FILTER_DEFS.with(|d| d.borrow().get(id).cloned())
+}
+
+/// Read an attribute (case-insensitive) off an element node.
+fn fe_attr<'a>(attrs: &'a [cv_html::Attribute], name: &str) -> Option<&'a str> {
+    attrs
+        .iter()
+        .find(|a| a.name.eq_ignore_ascii_case(name))
+        .map(|a| a.value.as_str())
+}
+
+/// Parse a `feColorMatrix` `values`/`type` pair into a 5×4 matrix
+/// (Filter Effects 1 §15.10). Supports `matrix` (20 numbers), `saturate`
+/// (1 number), `hueRotate` (1 deg), `luminanceToAlpha` (fixed).
+fn parse_fe_color_matrix(attrs: &[cv_html::Attribute]) -> [f32; 20] {
+    let ty = fe_attr(attrs, "type").unwrap_or("matrix");
+    let nums: Vec<f32> = fe_attr(attrs, "values")
+        .map(|v| {
+            v.split([' ', ',', '\t', '\n', '\r'])
+                .filter(|s| !s.is_empty())
+                .filter_map(|s| s.parse::<f32>().ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    let ident = [
+        1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+        1.0, 0.0,
+    ];
+    match ty.to_ascii_lowercase().as_str() {
+        "saturate" => cv_gfx::fe_saturate_matrix(nums.first().copied().unwrap_or(1.0)),
+        "huerotate" => {
+            let deg = nums.first().copied().unwrap_or(0.0);
+            let t = deg.to_radians();
+            let (c, s) = (t.cos(), t.sin());
+            // SVG 1.1 §15.10 hueRotate matrix (RGB block; alpha row = identity).
+            [
+                0.213 + c * 0.787 - s * 0.213,
+                0.715 - c * 0.715 - s * 0.715,
+                0.072 - c * 0.072 + s * 0.928,
+                0.0,
+                0.0,
+                0.213 - c * 0.213 + s * 0.143,
+                0.715 + c * 0.285 + s * 0.140,
+                0.072 - c * 0.072 - s * 0.283,
+                0.0,
+                0.0,
+                0.213 - c * 0.213 - s * 0.787,
+                0.715 - c * 0.715 + s * 0.715,
+                0.072 + c * 0.928 + s * 0.072,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                1.0,
+                0.0,
+            ]
+        }
+        "luminancetoalpha" => [
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.2125,
+            0.7154, 0.0721, 0.0, 0.0,
+        ],
+        _ => {
+            if nums.len() == 20 {
+                let mut m = [0f32; 20];
+                m.copy_from_slice(&nums[..20]);
+                m
+            } else {
+                ident
+            }
+        }
+    }
+}
+
+/// Walk an SVG `<filter>` element into a primitive chain.
+///
+/// We collect filter primitives in DOCUMENT ORDER via a pre-order traversal.
+/// This is robust to BOTH tree shapes our HTML parser can produce: the
+/// WHATWG builder (default-off) keeps self-closing `<feX/>` as siblings, while
+/// the legacy builder (default-on) ignores self-closing on foreign elements
+/// and so NESTS each primitive inside the previous one. A pre-order DFS yields
+/// the same flat, ordered primitive list either way. `feMergeNode` children
+/// (which carry no own output) are attached to the most recent `feMerge`.
+fn parse_filter_primitives(filter_node: &cv_html::Node) -> Vec<cv_gfx::SvgFePrimitive> {
+    use cv_gfx::{FeCompositeOp, SvgFePrimitive};
+    // 1) Flatten every element under <filter> into pre-order.
+    let mut flat: Vec<&cv_html::Node> = Vec::new();
+    fn collect<'a>(n: &'a cv_html::Node, out: &mut Vec<&'a cv_html::Node>) {
+        for c in &n.children {
+            if matches!(&c.kind, cv_html::NodeKind::Element { .. }) {
+                out.push(c);
+                collect(c, out);
+            }
+        }
+    }
+    collect(filter_node, &mut flat);
+
+    let mut out: Vec<SvgFePrimitive> = Vec::new();
+    for child in flat {
+        let cv_html::NodeKind::Element { name, attrs } = &child.kind else {
+            continue;
+        };
+        let nm = name.to_ascii_lowercase();
+        // A feMergeNode contributes its `in` to the most recent feMerge.
+        if nm == "femergenode" {
+            if let Some(SvgFePrimitive::Merge { inputs, .. }) = out.last_mut() {
+                inputs.push(fe_attr(attrs, "in").unwrap_or("").to_string());
+            }
+            continue;
+        }
+        let input = fe_attr(attrs, "in").unwrap_or("").to_string();
+        let in2 = fe_attr(attrs, "in2").unwrap_or("").to_string();
+        let result = fe_attr(attrs, "result").map(|s| s.to_string());
+        match nm.as_str() {
+            "fegaussianblur" => {
+                // stdDeviation may be "x" or "x y"; use x (we blur isotropic).
+                let std_dev = fe_attr(attrs, "stddeviation")
+                    .and_then(|v| {
+                        v.split([' ', ','])
+                            .filter(|s| !s.is_empty())
+                            .next()
+                            .and_then(|s| s.parse::<f32>().ok())
+                    })
+                    .unwrap_or(0.0);
+                out.push(SvgFePrimitive::GaussianBlur {
+                    input,
+                    std_dev,
+                    result,
+                });
+            }
+            "fecolormatrix" => {
+                out.push(SvgFePrimitive::ColorMatrix {
+                    input,
+                    matrix: parse_fe_color_matrix(attrs),
+                    result,
+                });
+            }
+            "feoffset" => {
+                let dx = fe_attr(attrs, "dx").and_then(|s| s.parse::<f32>().ok()).unwrap_or(0.0);
+                let dy = fe_attr(attrs, "dy").and_then(|s| s.parse::<f32>().ok()).unwrap_or(0.0);
+                out.push(SvgFePrimitive::Offset {
+                    input,
+                    dx: dx.round() as i32,
+                    dy: dy.round() as i32,
+                    result,
+                });
+            }
+            "feflood" => {
+                let col_str = fe_attr(attrs, "flood-color")
+                    .or_else(|| fe_attr(attrs, "color"))
+                    .unwrap_or("black");
+                let opacity = fe_attr(attrs, "flood-opacity")
+                    .and_then(|s| s.parse::<f32>().ok())
+                    .unwrap_or(1.0)
+                    .clamp(0.0, 1.0);
+                let c = cv_css::cascade::parse_color_str(col_str)
+                    .unwrap_or(cv_css::properties::Color { r: 0, g: 0, b: 0, a: 255 });
+                out.push(SvgFePrimitive::Flood {
+                    color: cv_gfx::Color {
+                        r: c.r,
+                        g: c.g,
+                        b: c.b,
+                        a: ((c.a as f32) * opacity).round() as u8,
+                    },
+                    result,
+                });
+            }
+            "fecomposite" => {
+                let op = match fe_attr(attrs, "operator").unwrap_or("over").to_ascii_lowercase().as_str() {
+                    "in" => FeCompositeOp::In,
+                    "out" => FeCompositeOp::Out,
+                    "atop" => FeCompositeOp::Atop,
+                    "xor" => FeCompositeOp::Xor,
+                    "arithmetic" => FeCompositeOp::Arithmetic {
+                        k1: fe_attr(attrs, "k1").and_then(|s| s.parse().ok()).unwrap_or(0.0),
+                        k2: fe_attr(attrs, "k2").and_then(|s| s.parse().ok()).unwrap_or(0.0),
+                        k3: fe_attr(attrs, "k3").and_then(|s| s.parse().ok()).unwrap_or(0.0),
+                        k4: fe_attr(attrs, "k4").and_then(|s| s.parse().ok()).unwrap_or(0.0),
+                    },
+                    _ => FeCompositeOp::Over,
+                };
+                out.push(SvgFePrimitive::Composite { input, in2, op, result });
+            }
+            "feblend" => {
+                out.push(SvgFePrimitive::Blend { input, in2, result });
+            }
+            "femerge" => {
+                // Inputs are appended by the feMergeNode handler above as the
+                // pre-order walk reaches each <feMergeNode> (whether sibling or,
+                // under the legacy parser, nested).
+                out.push(SvgFePrimitive::Merge {
+                    inputs: Vec::new(),
+                    result,
+                });
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Walk the document DOM, collecting every `<filter id=...>` element into the
+/// `SVG_FILTER_DEFS` registry so `filter: url(#id)` can resolve it at paint.
+fn collect_svg_filter_defs(doc: &cv_html::Document) {
+    fn walk(node: &cv_html::Node, defs: &mut std::collections::HashMap<String, Vec<cv_gfx::SvgFePrimitive>>) {
+        if let cv_html::NodeKind::Element { name, attrs } = &node.kind {
+            if name.eq_ignore_ascii_case("filter") {
+                if let Some(id) = fe_attr(attrs, "id") {
+                    let prims = parse_filter_primitives(node);
+                    if !prims.is_empty() {
+                        defs.insert(id.to_string(), prims);
+                    }
+                }
+            }
+        }
+        for c in &node.children {
+            walk(c, defs);
+        }
+    }
+    let mut map = std::collections::HashMap::new();
+    walk(&doc.root, &mut map);
+    SVG_FILTER_DEFS.with(|d| *d.borrow_mut() = map);
+}
+
 fn build_layout_tree(
     doc: &cv_html::Document,
     sheets: &[cv_css::Stylesheet],
@@ -20052,6 +20289,10 @@ fn build_layout_tree(
     cfg: &cv_layout::LayoutConfig,
     style_overrides: &cv_js::OrderedMap<Vec<usize>, cv_js::OrderedMap<String, String>>,
 ) -> cv_layout::LayoutBox {
+    // Collect inline SVG `<filter id=...>` definitions up front so the paint
+    // pass can resolve `filter: url(#id)` references (Filter Effects 1 §4).
+    // Cheap DOM walk; runs once per layout build.
+    collect_svg_filter_defs(doc);
     // S5: when CV_DOM is set, render from the arena DOM. We rebuild the arena
     // from the (possibly JS-mutated) cv_html tree each render, so it always
     // reflects the live DOM without needing mutation-sync yet (that's S8). The
@@ -43637,6 +43878,9 @@ fn lower_style(
                 inset: false,
             })
         }
+        cv_css::cascade::FilterFn::Reference(id) => {
+            cv_layout::FilterEffect::Reference(id.clone())
+        }
     };
     let filters: Vec<cv_layout::FilterEffect> = cs.filters.iter().map(map_filter).collect();
     let backdrop_filters: Vec<cv_layout::FilterEffect> =
@@ -48734,35 +48978,39 @@ fn paint_box_offset_t(
         }
         if fw > 0 && fh > 0 {
             for f in &b.backdrop_filters {
-                match *f {
+                match f {
                     cv_layout::FilterEffect::Blur(r) => {
-                        bmp.apply_filter_rect(fx, fy, fw, fh, cv_gfx::FilterOp::Blur(r));
+                        bmp.apply_filter_rect(fx, fy, fw, fh, cv_gfx::FilterOp::Blur(*r));
                     }
                     cv_layout::FilterEffect::Brightness(a) => {
-                        bmp.apply_filter_rect(fx, fy, fw, fh, cv_gfx::FilterOp::Brightness(a));
+                        bmp.apply_filter_rect(fx, fy, fw, fh, cv_gfx::FilterOp::Brightness(*a));
                     }
                     cv_layout::FilterEffect::Contrast(a) => {
-                        bmp.apply_filter_rect(fx, fy, fw, fh, cv_gfx::FilterOp::Contrast(a));
+                        bmp.apply_filter_rect(fx, fy, fw, fh, cv_gfx::FilterOp::Contrast(*a));
                     }
                     cv_layout::FilterEffect::Grayscale(a) => {
-                        bmp.apply_filter_rect(fx, fy, fw, fh, cv_gfx::FilterOp::Grayscale(a));
+                        bmp.apply_filter_rect(fx, fy, fw, fh, cv_gfx::FilterOp::Grayscale(*a));
                     }
                     cv_layout::FilterEffect::Invert(a) => {
-                        bmp.apply_filter_rect(fx, fy, fw, fh, cv_gfx::FilterOp::Invert(a));
+                        bmp.apply_filter_rect(fx, fy, fw, fh, cv_gfx::FilterOp::Invert(*a));
                     }
                     cv_layout::FilterEffect::Sepia(a) => {
-                        bmp.apply_filter_rect(fx, fy, fw, fh, cv_gfx::FilterOp::Sepia(a));
+                        bmp.apply_filter_rect(fx, fy, fw, fh, cv_gfx::FilterOp::Sepia(*a));
                     }
                     cv_layout::FilterEffect::Saturate(a) => {
-                        bmp.apply_filter_rect(fx, fy, fw, fh, cv_gfx::FilterOp::Saturate(a));
+                        bmp.apply_filter_rect(fx, fy, fw, fh, cv_gfx::FilterOp::Saturate(*a));
                     }
                     cv_layout::FilterEffect::HueRotate(d) => {
-                        bmp.apply_filter_rect(fx, fy, fw, fh, cv_gfx::FilterOp::HueRotate(d));
+                        bmp.apply_filter_rect(fx, fy, fw, fh, cv_gfx::FilterOp::HueRotate(*d));
                     }
                     cv_layout::FilterEffect::Opacity(a) => {
-                        bmp.apply_filter_rect(fx, fy, fw, fh, cv_gfx::FilterOp::Opacity(a));
+                        bmp.apply_filter_rect(fx, fy, fw, fh, cv_gfx::FilterOp::Opacity(*a));
                     }
                     cv_layout::FilterEffect::DropShadow(_) => {}
+                    // `backdrop-filter: url(#id)` against the backdrop is a
+                    // separate stacking concept; not applied here (matches the
+                    // V1 backdrop scope).
+                    cv_layout::FilterEffect::Reference(_) => {}
                 }
             }
         }
@@ -50200,33 +50448,52 @@ fn paint_box_offset_t(
         let fh = border_rect.h as i32;
         if fw > 0 && fh > 0 {
             for f in &b.filters {
-                match *f {
+                match f {
                     cv_layout::FilterEffect::Blur(r) => {
-                        bmp.apply_filter_rect(fx, fy, fw, fh, cv_gfx::FilterOp::Blur(r));
+                        bmp.apply_filter_rect(fx, fy, fw, fh, cv_gfx::FilterOp::Blur(*r));
                     }
                     cv_layout::FilterEffect::Brightness(a) => {
-                        bmp.apply_filter_rect(fx, fy, fw, fh, cv_gfx::FilterOp::Brightness(a));
+                        bmp.apply_filter_rect(fx, fy, fw, fh, cv_gfx::FilterOp::Brightness(*a));
                     }
                     cv_layout::FilterEffect::Contrast(a) => {
-                        bmp.apply_filter_rect(fx, fy, fw, fh, cv_gfx::FilterOp::Contrast(a));
+                        bmp.apply_filter_rect(fx, fy, fw, fh, cv_gfx::FilterOp::Contrast(*a));
                     }
                     cv_layout::FilterEffect::Grayscale(a) => {
-                        bmp.apply_filter_rect(fx, fy, fw, fh, cv_gfx::FilterOp::Grayscale(a));
+                        bmp.apply_filter_rect(fx, fy, fw, fh, cv_gfx::FilterOp::Grayscale(*a));
                     }
                     cv_layout::FilterEffect::Invert(a) => {
-                        bmp.apply_filter_rect(fx, fy, fw, fh, cv_gfx::FilterOp::Invert(a));
+                        bmp.apply_filter_rect(fx, fy, fw, fh, cv_gfx::FilterOp::Invert(*a));
                     }
                     cv_layout::FilterEffect::Sepia(a) => {
-                        bmp.apply_filter_rect(fx, fy, fw, fh, cv_gfx::FilterOp::Sepia(a));
+                        bmp.apply_filter_rect(fx, fy, fw, fh, cv_gfx::FilterOp::Sepia(*a));
                     }
                     cv_layout::FilterEffect::Saturate(a) => {
-                        bmp.apply_filter_rect(fx, fy, fw, fh, cv_gfx::FilterOp::Saturate(a));
+                        bmp.apply_filter_rect(fx, fy, fw, fh, cv_gfx::FilterOp::Saturate(*a));
                     }
                     cv_layout::FilterEffect::HueRotate(d) => {
-                        bmp.apply_filter_rect(fx, fy, fw, fh, cv_gfx::FilterOp::HueRotate(d));
+                        bmp.apply_filter_rect(fx, fy, fw, fh, cv_gfx::FilterOp::HueRotate(*d));
                     }
                     cv_layout::FilterEffect::Opacity(a) => {
-                        bmp.apply_filter_rect(fx, fy, fw, fh, cv_gfx::FilterOp::Opacity(a));
+                        bmp.apply_filter_rect(fx, fy, fw, fh, cv_gfx::FilterOp::Opacity(*a));
+                    }
+                    cv_layout::FilterEffect::Reference(id) => {
+                        // `filter: url(#id)` — run the referenced inline SVG
+                        // <filter> primitive chain over the element's border
+                        // box (Filter Effects 1 §4). The filter region is
+                        // expanded by the spec default (-10% .. +120%, i.e. a
+                        // 10% margin on each side) so blurs/offsets that reach
+                        // outside the box are not clipped.
+                        if let Some(prims) = svg_filter_def(id) {
+                            let mx = (fw as f32 * 0.1).ceil() as i32;
+                            let my = (fh as f32 * 0.1).ceil() as i32;
+                            bmp.apply_svg_filter_rect(
+                                fx - mx,
+                                fy - my,
+                                fw + mx * 2,
+                                fh + my * 2,
+                                &prims,
+                            );
+                        }
                     }
                     cv_layout::FilterEffect::DropShadow(sh) => {
                         // Better approximation: paint a shape-matched
@@ -65213,5 +65480,91 @@ mod multicol_paint_tests {
         let v = bmp.pixels[30 * 320 + 150];
         let (r, g, b) = (((v >> 16) & 0xFF) as u8, ((v >> 8) & 0xFF) as u8, (v & 0xFF) as u8);
         assert_eq!((r, g, b), (255, 255, 255), "rule-style none → gap stays white, got {:?}", (r, g, b));
+    }
+}
+
+#[cfg(test)]
+mod svg_filter_ref_tests {
+    use super::*;
+
+    /// `collect_svg_filter_defs` + `parse_filter_primitives` resolve an inline
+    /// `<filter id=blur>` containing `feGaussianBlur` into a real primitive
+    /// chain registered under its id — the `filter: url(#blur)` resolution.
+    #[test]
+    fn collects_inline_filter_def_with_gaussian_blur() {
+        let html = r##"<!doctype html><html><body>
+            <svg width="0" height="0">
+              <filter id="blur"><feGaussianBlur stdDeviation="3"/></filter>
+            </svg>
+        </body></html>"##;
+        let doc = cv_html::parse(html);
+        collect_svg_filter_defs(&doc);
+        let prims = svg_filter_def("blur").expect("filter #blur registered");
+        assert_eq!(prims.len(), 1, "one primitive, got {prims:?}");
+        match &prims[0] {
+            cv_gfx::SvgFePrimitive::GaussianBlur { std_dev, .. } => {
+                assert!((std_dev - 3.0).abs() < 1e-6, "stdDeviation parsed, got {std_dev}");
+            }
+            other => panic!("expected GaussianBlur, got {other:?}"),
+        }
+    }
+
+    /// The canonical drop-shadow `<filter>` (feGaussianBlur → feOffset →
+    /// feFlood → feComposite-in → feMerge) parses into the full 5-primitive
+    /// chain in order — proving every primitive kind is recognised.
+    #[test]
+    fn collects_drop_shadow_filter_chain() {
+        let html = r##"<!doctype html><html><body>
+          <svg width="0" height="0"><filter id="ds">
+            <feGaussianBlur in="SourceAlpha" stdDeviation="2" result="b"/>
+            <feOffset in="b" dx="4" dy="4" result="o"/>
+            <feFlood flood-color="#00ff00" flood-opacity="0.8" result="f"/>
+            <feComposite in="f" in2="o" operator="in" result="s"/>
+            <feMerge><feMergeNode in="s"/><feMergeNode in="SourceGraphic"/></feMerge>
+          </filter></svg>
+        </body></html>"##;
+        let doc = cv_html::parse(html);
+        collect_svg_filter_defs(&doc);
+        let p = svg_filter_def("ds").expect("filter #ds registered");
+        assert_eq!(p.len(), 5, "five primitives, got {p:?}");
+        assert!(matches!(&p[0], cv_gfx::SvgFePrimitive::GaussianBlur { std_dev, .. } if (*std_dev - 2.0).abs() < 1e-6));
+        assert!(matches!(&p[1], cv_gfx::SvgFePrimitive::Offset { dx, dy, .. } if *dx == 4 && *dy == 4));
+        // feFlood colour with 0.8 opacity → alpha ≈ 204.
+        match &p[2] {
+            cv_gfx::SvgFePrimitive::Flood { color, .. } => {
+                assert_eq!((color.r, color.g, color.b), (0, 255, 0), "flood green");
+                assert!((color.a as i32 - 204).abs() <= 2, "flood-opacity 0.8 → a≈204, got {}", color.a);
+            }
+            other => panic!("expected Flood, got {other:?}"),
+        }
+        assert!(matches!(&p[3], cv_gfx::SvgFePrimitive::Composite { op: cv_gfx::FeCompositeOp::In, .. }));
+        match &p[4] {
+            cv_gfx::SvgFePrimitive::Merge { inputs, .. } => {
+                assert_eq!(inputs.len(), 2, "two merge nodes");
+                assert_eq!(inputs[1], "SourceGraphic");
+            }
+            other => panic!("expected Merge, got {other:?}"),
+        }
+    }
+
+    /// `feColorMatrix type="saturate"` parses to the spec saturate matrix.
+    #[test]
+    fn collects_fecolormatrix_saturate() {
+        let html = r##"<!doctype html><html><body>
+          <svg width="0" height="0"><filter id="g">
+            <feColorMatrix type="saturate" values="0"/>
+          </filter></svg></body></html>"##;
+        let doc = cv_html::parse(html);
+        collect_svg_filter_defs(&doc);
+        let p = svg_filter_def("g").expect("filter #g registered");
+        match &p[0] {
+            cv_gfx::SvgFePrimitive::ColorMatrix { matrix, .. } => {
+                // saturate(0): row0 = [0.213, 0.715, 0.072, 0, 0].
+                assert!((matrix[0] - 0.213).abs() < 1e-4, "m[0]={}", matrix[0]);
+                assert!((matrix[1] - 0.715).abs() < 1e-4, "m[1]={}", matrix[1]);
+                assert!((matrix[2] - 0.072).abs() < 1e-4, "m[2]={}", matrix[2]);
+            }
+            other => panic!("expected ColorMatrix, got {other:?}"),
+        }
     }
 }

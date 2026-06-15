@@ -953,7 +953,11 @@ pub enum ClipPath {
 }
 
 /// One CSS `filter:` function invocation.
-#[derive(Copy, Clone, Debug, PartialEq)]
+///
+/// Not `Copy`: the `Reference` variant carries an `Rc<str>` id. All other
+/// variants are scalar; cloning a `FilterFn` is cheap (an `Rc` bump at
+/// worst).
+#[derive(Clone, Debug, PartialEq)]
 pub enum FilterFn {
     /// `blur(radius_px)` — box-blur radius in pixels.
     Blur(f32),
@@ -975,7 +979,19 @@ pub enum FilterFn {
     HueRotate(f32),
     /// `drop-shadow(x y blur color)` — same shape as a box-shadow.
     DropShadow(BoxShadowSpec),
+    /// `url(#id)` — reference to an inline SVG `<filter>` element. The
+    /// `String` is the bare fragment id (without the leading `#`). The
+    /// painter resolves it to the `<filter>`'s primitive chain
+    /// (feGaussianBlur / feColorMatrix / feOffset / feMerge) per Filter
+    /// Effects 1 §4. Carried as the id only; resolution happens at paint
+    /// time where the document DOM is available.
+    Reference(IdRef),
 }
+
+/// A heap id string used by `FilterFn::Reference`. `Arc<str>` (not `Rc`)
+/// so the enclosing style stays `Send + Sync` — required because the
+/// off-main renderer sends resolved styles across threads (cv_ui).
+pub type IdRef = std::sync::Arc<str>;
 
 #[derive(Copy, Clone, Debug)]
 pub enum LineHeight {
@@ -2699,6 +2715,19 @@ fn parse_filter_chain(toks: &[CssToken]) -> Vec<FilterFn> {
             }
             CssToken::Ident(name) if name.eq_ignore_ascii_case("none") => {
                 return Vec::new();
+            }
+            CssToken::Url(u) => {
+                // `filter: url(#id)` — SVG filter reference (Filter Effects 1
+                // §4). Accept only same-document fragment refs (`#id`); strip
+                // the leading `#`. An external-document ref (`foo.svg#id`) is
+                // not resolvable here, so skip it (under-apply, never crash).
+                let frag = u.trim();
+                if let Some(id) = frag.strip_prefix('#') {
+                    if !id.is_empty() {
+                        out.push(FilterFn::Reference(std::sync::Arc::from(id)));
+                    }
+                }
+                i += 1;
             }
             CssToken::Function(name) => {
                 // Walk to matching RightParen.
@@ -11226,5 +11255,42 @@ mod tests {
         // vertical-lr RTL
         assert_eq!(map_logical_side(LOGICAL_INLINE_START, VerticalLr, Rtl), 2);
         assert_eq!(map_logical_side(LOGICAL_INLINE_END, VerticalLr, Rtl), 0);
+    }
+
+    /// `filter: url(#blur)` parses to a `Reference` carrying the bare id
+    /// (without the leading `#`) — the SVG filter-reference path.
+    #[test]
+    fn filter_url_parses_to_reference() {
+        let ss = parse_stylesheet("p { filter: url(#blur); }");
+        let el = Fake { tag: "p", id: None, classes: &[] };
+        let cs = compute(&[ss], el);
+        assert_eq!(cs.filters.len(), 1, "one filter parsed");
+        match &cs.filters[0] {
+            FilterFn::Reference(id) => assert_eq!(&**id, "blur", "bare id, no '#'"),
+            other => panic!("expected Reference, got {other:?}"),
+        }
+    }
+
+    /// A mixed chain `grayscale(50%) url(#f) blur(2px)` keeps all three
+    /// entries in declaration order — the url ref does not swallow the rest.
+    #[test]
+    fn filter_chain_mixes_functions_and_reference() {
+        let ss = parse_stylesheet("p { filter: grayscale(50%) url(#f) blur(2px); }");
+        let el = Fake { tag: "p", id: None, classes: &[] };
+        let cs = compute(&[ss], el);
+        assert_eq!(cs.filters.len(), 3, "three entries, got {:?}", cs.filters);
+        assert!(matches!(cs.filters[0], FilterFn::Grayscale(g) if (g - 0.5).abs() < 1e-6));
+        assert!(matches!(&cs.filters[1], FilterFn::Reference(id) if &**id == "f"));
+        assert!(matches!(cs.filters[2], FilterFn::Blur(b) if (b - 2.0).abs() < 1e-6));
+    }
+
+    /// An external-document ref `url(foo.svg#x)` is not resolvable here, so it
+    /// is skipped (under-apply, never a bogus same-doc reference).
+    #[test]
+    fn filter_external_url_ref_skipped() {
+        let ss = parse_stylesheet("p { filter: url(foo.svg#x); }");
+        let el = Fake { tag: "p", id: None, classes: &[] };
+        let cs = compute(&[ss], el);
+        assert!(cs.filters.is_empty(), "external ref skipped, got {:?}", cs.filters);
     }
 }

@@ -373,7 +373,10 @@ pub enum ClipShape {
 /// One filter operation resolved for a layout box. conclave
 /// converts the parsed `cv_css::FilterFn` into one of these at the
 /// `lower_style` stage so this crate doesn't depend on cv_css.
-#[derive(Copy, Clone, Debug, PartialEq)]
+///
+/// Not `Copy`: `Reference` carries an `Rc<str>` filter id. Every other
+/// variant is scalar; cloning is cheap.
+#[derive(Clone, Debug, PartialEq)]
 pub enum FilterEffect {
     Blur(f32),
     Brightness(f32),
@@ -385,6 +388,11 @@ pub enum FilterEffect {
     HueRotate(f32),
     Opacity(f32),
     DropShadow(BoxShadow),
+    /// `filter: url(#id)` — reference to an inline SVG `<filter>` element.
+    /// The painter resolves the id to the `<filter>`'s primitive chain at
+    /// paint time (Filter Effects 1 §4). `Arc<str>` keeps `FilterEffect`
+    /// `Send + Sync` for the off-main renderer.
+    Reference(std::sync::Arc<str>),
 }
 
 /// A CSS `mix-blend-mode` / `background-blend-mode` value resolved at the

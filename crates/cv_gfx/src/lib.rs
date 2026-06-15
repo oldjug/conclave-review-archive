@@ -1515,12 +1515,27 @@ impl Bitmap {
                 if radius <= 0.0 {
                     return;
                 }
-                // Two-pass box blur — separable, O(W·H) per pass.
-                // Radius is clamped to a sane upper bound to avoid
-                // catastrophic O(W·H·r) blow-up on huge values.
-                let r = (radius.round() as i32).clamp(1, 32);
-                blur_h(self, x0, y0, x1, y1, r);
-                blur_v(self, x0, y0, x1, y1, r);
+                // True Gaussian blur, approximated by THREE successive box
+                // blurs per axis exactly as specified for `feGaussianBlur`
+                // (SVG 1.1 §15.17 / Filter Effects 1 §9.14). For a standard
+                // deviation `s` the box size is
+                //     d = floor(s * 3 * sqrt(2*PI) / 4 + 0.5)
+                // applied as:
+                //   - if d is odd:  three box blurs of size d, centred.
+                //   - if d is even: two box blurs of size d offset by ±½ px
+                //                   (left/right boundary) and one of size d+1
+                //                   centred.
+                // `blur(radius)` maps `radius` directly to `stdDeviation`
+                // (Filter Effects 1 §8.x: "The passed parameter defines the
+                // value of the standard deviation to the Gaussian function").
+                // This replaces the old single box blur, which produced a flat
+                // (non-Gaussian) falloff that did not match Chrome/Skia.
+                let s = radius.clamp(0.0, 200.0);
+                let d = (s * 3.0 * (2.0 * std::f32::consts::PI).sqrt() / 4.0 + 0.5).floor() as i32;
+                if d < 1 {
+                    return;
+                }
+                gaussian_box3(self, x0, y0, x1, y1, d);
             }
             FilterOp::Brightness(a) => {
                 color_per_pixel(self, x0, y0, x1, y1, |r, g, b| {
@@ -1576,14 +1591,27 @@ impl Bitmap {
                 });
             }
             FilterOp::Saturate(amt) => {
-                // Saturation around per-pixel luminance.
+                // CSS `saturate(s)` is exactly `feColorMatrix type="saturate"`
+                // (Filter Effects 1 §8.4 / SVG 1.1 §15.10). The previous
+                // per-pixel-luminance form used the wrong (Rec.709) weights and
+                // is NOT what Chrome/Skia compute. The spec matrix:
+                //   [0.213+0.787s  0.715-0.715s  0.072-0.072s]
+                //   [0.213-0.213s  0.715+0.285s  0.072-0.072s]
+                //   [0.213-0.213s  0.715-0.715s  0.072+0.928s]
+                let s = amt;
+                let m = [
+                    [0.213 + 0.787 * s, 0.715 - 0.715 * s, 0.072 - 0.072 * s],
+                    [0.213 - 0.213 * s, 0.715 + 0.285 * s, 0.072 - 0.072 * s],
+                    [0.213 - 0.213 * s, 0.715 - 0.715 * s, 0.072 + 0.928 * s],
+                ];
                 color_per_pixel(self, x0, y0, x1, y1, |r, g, b| {
-                    let l = 0.2126 * r as f32 + 0.7152 * g as f32 + 0.0722 * b as f32;
-                    let nudge = |c: u8| -> u8 {
-                        let v = l + (c as f32 - l) * amt;
-                        v.clamp(0.0, 255.0) as u8
-                    };
-                    (nudge(r), nudge(g), nudge(b))
+                    let rf = r as f32;
+                    let gf = g as f32;
+                    let bf = b as f32;
+                    let nr = (m[0][0] * rf + m[0][1] * gf + m[0][2] * bf).clamp(0.0, 255.0);
+                    let ng = (m[1][0] * rf + m[1][1] * gf + m[1][2] * bf).clamp(0.0, 255.0);
+                    let nb = (m[2][0] * rf + m[2][1] * gf + m[2][2] * bf).clamp(0.0, 255.0);
+                    (nr as u8, ng as u8, nb as u8)
                 });
             }
             FilterOp::HueRotate(degrees) => {
@@ -1628,6 +1656,155 @@ impl Bitmap {
                         let a = ((p >> 24) & 0xFF) as f32 * amt;
                         self.pixels[i] = (p & 0x00FFFFFF) | ((a as u32) << 24);
                     }
+                }
+            }
+        }
+    }
+
+    /// Run an SVG `<filter>` primitive chain over the rect, in place.
+    ///
+    /// This is the `filter: url(#id)` paint path (Filter Effects 1 §4 / SVG
+    /// 1.1 §15). The primitives are evaluated as a small named-result graph:
+    /// `SourceGraphic` is the rect's current pixels, `SourceAlpha` is the
+    /// rect's alpha as black, and each primitive writes a named result that
+    /// later primitives can read. The final primitive's result is composited
+    /// back over the rect's region. We support the primitives that make up
+    /// every common filter (blur, colour matrix, offset, flood, merge,
+    /// composite) — exactly the recipe Chrome/Skia build for the standard
+    /// filter functions.
+    pub fn apply_svg_filter_rect(
+        &mut self,
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
+        prims: &[SvgFePrimitive],
+    ) {
+        if prims.is_empty() {
+            return;
+        }
+        let (x0, y0, x1, y1) = (
+            x.max(0),
+            y.max(0),
+            (x + w).min(self.width as i32),
+            (y + h).min(self.height as i32),
+        );
+        if x1 <= x0 || y1 <= y0 {
+            return;
+        }
+        let rw = (x1 - x0) as usize;
+        let rh = (y1 - y0) as usize;
+        // A named image is an RGBA8 buffer the size of the rect (0xAARRGGBB).
+        let lift = |bmp: &Bitmap| -> Vec<u32> {
+            let mut v = vec![0u32; rw * rh];
+            for ry in 0..rh {
+                let srow = (y0 as usize + ry) * bmp.width as usize + x0 as usize;
+                v[ry * rw..ry * rw + rw].copy_from_slice(&bmp.pixels[srow..srow + rw]);
+            }
+            v
+        };
+        let source_graphic = lift(self);
+        // SourceAlpha: keep alpha, force RGB to 0 (Filter Effects 1 §15.7.2).
+        let source_alpha: Vec<u32> = source_graphic.iter().map(|p| p & 0xFF00_0000).collect();
+        let mut results: Vec<(String, Vec<u32>)> = Vec::new();
+        // Resolve a named filter input to its image buffer (Filter Effects 1
+        // §15.7.2). An empty name = the previous primitive's result, or
+        // SourceGraphic for the first primitive.
+        let pick = |name: &str,
+                    results: &[(String, Vec<u32>)],
+                    last: Option<&Vec<u32>>|
+         -> Vec<u32> {
+            match name {
+                "SourceGraphic" => source_graphic.clone(),
+                "SourceAlpha" => source_alpha.clone(),
+                "BackgroundImage" | "BackgroundAlpha" => vec![0u32; rw * rh],
+                "" => last.cloned().unwrap_or_else(|| source_graphic.clone()),
+                other => {
+                    if let Some((_, buf)) = results.iter().rev().find(|(n, _)| n == other) {
+                        buf.clone()
+                    } else if let Some(l) = last {
+                        l.clone()
+                    } else {
+                        source_graphic.clone()
+                    }
+                }
+            }
+        };
+        let mut last_result: Option<Vec<u32>> = None;
+        for prim in prims {
+            let out = match prim {
+                SvgFePrimitive::GaussianBlur { input, std_dev, .. } => {
+                    let mut buf = if input.is_empty() {
+                        last_result
+                            .clone()
+                            .unwrap_or_else(|| source_graphic.clone())
+                    } else {
+                        pick(input, &results, last_result.as_ref())
+                    };
+                    fe_gaussian_blur(&mut buf, rw, rh, *std_dev);
+                    buf
+                }
+                SvgFePrimitive::ColorMatrix { input, matrix, .. } => {
+                    let buf = if input.is_empty() {
+                        last_result
+                            .clone()
+                            .unwrap_or_else(|| source_graphic.clone())
+                    } else {
+                        pick(input, &results, last_result.as_ref())
+                    };
+                    fe_color_matrix(&buf, matrix)
+                }
+                SvgFePrimitive::Offset { input, dx, dy, .. } => {
+                    let buf = if input.is_empty() {
+                        last_result
+                            .clone()
+                            .unwrap_or_else(|| source_graphic.clone())
+                    } else {
+                        pick(input, &results, last_result.as_ref())
+                    };
+                    fe_offset(&buf, rw, rh, *dx, *dy)
+                }
+                SvgFePrimitive::Flood { color, .. } => {
+                    let packed = color.to_bgra_u32();
+                    vec![packed; rw * rh]
+                }
+                SvgFePrimitive::Composite { input, in2, op, .. } => {
+                    let a = pick(input, &results, last_result.as_ref());
+                    let b = pick(in2, &results, last_result.as_ref());
+                    fe_composite(&a, &b, *op)
+                }
+                SvgFePrimitive::Merge { inputs, .. } => {
+                    // Stack each input source-over, bottom-to-top.
+                    let mut acc = vec![0u32; rw * rh];
+                    for name in inputs {
+                        let layer = pick(name, &results, last_result.as_ref());
+                        for i in 0..acc.len() {
+                            acc[i] = src_over_u32(layer[i], acc[i]);
+                        }
+                    }
+                    acc
+                }
+                SvgFePrimitive::Blend { input, in2, .. } => {
+                    let a = pick(input, &results, last_result.as_ref());
+                    let b = pick(in2, &results, last_result.as_ref());
+                    let mut acc = vec![0u32; rw * rh];
+                    for i in 0..acc.len() {
+                        acc[i] = src_over_u32(a[i], b[i]);
+                    }
+                    acc
+                }
+            };
+            if let Some(res_name) = prim.result_name() {
+                results.push((res_name.to_string(), out.clone()));
+            }
+            last_result = Some(out);
+        }
+        // Composite the final primitive result back over the rect.
+        if let Some(final_img) = last_result {
+            for ry in 0..rh {
+                let drow = (y0 as usize + ry) * self.width as usize + x0 as usize;
+                for rx in 0..rw {
+                    self.pixels[drow + rx] = final_img[ry * rw + rx];
                 }
             }
         }
@@ -1822,6 +1999,274 @@ pub enum FilterOp {
     Opacity(f32),
 }
 
+/// `feComposite` operators (Filter Effects 1 §15.10 / Porter-Duff).
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum FeCompositeOp {
+    Over,
+    In,
+    Out,
+    Atop,
+    Xor,
+    Arithmetic { k1: f32, k2: f32, k3: f32, k4: f32 },
+}
+
+/// One SVG filter primitive (`feGaussianBlur`, `feColorMatrix`, …) as
+/// consumed by [`Bitmap::apply_svg_filter_rect`]. `input`/`in2` name the
+/// source image (`SourceGraphic`, `SourceAlpha`, a prior primitive's
+/// `result`, or empty = previous primitive's output). `result` (when set)
+/// publishes this primitive's output under a name for later primitives.
+#[derive(Clone, Debug, PartialEq)]
+pub enum SvgFePrimitive {
+    /// `feGaussianBlur stdDeviation=...` — real Gaussian (3-box approx).
+    GaussianBlur {
+        input: String,
+        std_dev: f32,
+        result: Option<String>,
+    },
+    /// `feColorMatrix` — full 5×4 matrix (20 values, row-major, the last
+    /// column is the +bias term ×255) on non-premultiplied RGBA.
+    ColorMatrix {
+        input: String,
+        matrix: [f32; 20],
+        result: Option<String>,
+    },
+    /// `feOffset dx dy` — translate the input image.
+    Offset {
+        input: String,
+        dx: i32,
+        dy: i32,
+        result: Option<String>,
+    },
+    /// `feFlood flood-color` — fill the region with a solid colour.
+    Flood {
+        color: Color,
+        result: Option<String>,
+    },
+    /// `feComposite` — Porter-Duff combine of `input` and `in2`.
+    Composite {
+        input: String,
+        in2: String,
+        op: FeCompositeOp,
+        result: Option<String>,
+    },
+    /// `feBlend` — (normal-mode) source-over combine of `input`/`in2`.
+    Blend {
+        input: String,
+        in2: String,
+        result: Option<String>,
+    },
+    /// `feMerge` — stack a list of inputs source-over, bottom to top.
+    Merge {
+        inputs: Vec<String>,
+        result: Option<String>,
+    },
+}
+
+impl SvgFePrimitive {
+    fn result_name(&self) -> Option<&str> {
+        match self {
+            SvgFePrimitive::GaussianBlur { result, .. }
+            | SvgFePrimitive::ColorMatrix { result, .. }
+            | SvgFePrimitive::Offset { result, .. }
+            | SvgFePrimitive::Flood { result, .. }
+            | SvgFePrimitive::Composite { result, .. }
+            | SvgFePrimitive::Blend { result, .. }
+            | SvgFePrimitive::Merge { result, .. } => result.as_deref(),
+        }
+    }
+}
+
+/// Build the canonical `feColorMatrix type="saturate"` 5×4 matrix for a
+/// saturation value `s` (Filter Effects 1 §8.4). Helper for callers that
+/// translate CSS filter functions into SVG primitives.
+pub fn fe_saturate_matrix(s: f32) -> [f32; 20] {
+    [
+        0.213 + 0.787 * s, 0.715 - 0.715 * s, 0.072 - 0.072 * s, 0.0, 0.0,
+        0.213 - 0.213 * s, 0.715 + 0.285 * s, 0.072 - 0.072 * s, 0.0, 0.0,
+        0.213 - 0.213 * s, 0.715 - 0.715 * s, 0.072 + 0.928 * s, 0.0, 0.0,
+        0.0, 0.0, 0.0, 1.0, 0.0,
+    ]
+}
+
+/// `feGaussianBlur` over an RGBA8 sub-image buffer (0xAARRGGBB), in place.
+/// Uses the same spec 3-box approximation as `FilterOp::Blur`.
+fn fe_gaussian_blur(buf: &mut [u32], w: usize, h: usize, std_dev: f32) {
+    if std_dev <= 0.0 || w == 0 || h == 0 {
+        return;
+    }
+    let s = std_dev.clamp(0.0, 200.0);
+    let d = (s * 3.0 * (2.0 * std::f32::consts::PI).sqrt() / 4.0 + 0.5).floor() as i32;
+    if d < 1 {
+        return;
+    }
+    // Premultiplied f32 planes.
+    let mut work = vec![0f32; w * h * 4];
+    for i in 0..w * h {
+        let p = buf[i];
+        let a = ((p >> 24) & 0xFF) as f32;
+        let af = a / 255.0;
+        work[i * 4] = a;
+        work[i * 4 + 1] = ((p >> 16) & 0xFF) as f32 * af;
+        work[i * 4 + 2] = ((p >> 8) & 0xFF) as f32 * af;
+        work[i * 4 + 3] = (p & 0xFF) as f32 * af;
+    }
+    let mut tmp = vec![0f32; w * h * 4];
+    let r = d / 2;
+    if d % 2 == 1 {
+        box_blur_h(&mut work, &mut tmp, w, h, r, r);
+        box_blur_h(&mut work, &mut tmp, w, h, r, r);
+        box_blur_h(&mut work, &mut tmp, w, h, r, r);
+        box_blur_v(&mut work, &mut tmp, w, h, r, r);
+        box_blur_v(&mut work, &mut tmp, w, h, r, r);
+        box_blur_v(&mut work, &mut tmp, w, h, r, r);
+    } else {
+        box_blur_h(&mut work, &mut tmp, w, h, r, r - 1);
+        box_blur_h(&mut work, &mut tmp, w, h, r - 1, r);
+        box_blur_h(&mut work, &mut tmp, w, h, r, r);
+        box_blur_v(&mut work, &mut tmp, w, h, r, r - 1);
+        box_blur_v(&mut work, &mut tmp, w, h, r - 1, r);
+        box_blur_v(&mut work, &mut tmp, w, h, r, r);
+    }
+    for i in 0..w * h {
+        let a = work[i * 4].clamp(0.0, 255.0);
+        let (rr, gg, bb) = if a > 0.0 {
+            let inv = 255.0 / a;
+            (
+                (work[i * 4 + 1] * inv).clamp(0.0, 255.0),
+                (work[i * 4 + 2] * inv).clamp(0.0, 255.0),
+                (work[i * 4 + 3] * inv).clamp(0.0, 255.0),
+            )
+        } else {
+            (0.0, 0.0, 0.0)
+        };
+        buf[i] = ((a.round() as u32) << 24)
+            | ((rr.round() as u32) << 16)
+            | ((gg.round() as u32) << 8)
+            | (bb.round() as u32);
+    }
+}
+
+/// `feColorMatrix` — apply a 5×4 matrix to non-premultiplied RGBA
+/// (Filter Effects 1 §15.10). Column 5 of each row is a bias added as a
+/// fraction of full intensity (×255).
+fn fe_color_matrix(buf: &[u32], m: &[f32; 20]) -> Vec<u32> {
+    buf.iter()
+        .map(|&p| {
+            let a = ((p >> 24) & 0xFF) as f32 / 255.0;
+            let r = ((p >> 16) & 0xFF) as f32 / 255.0;
+            let g = ((p >> 8) & 0xFF) as f32 / 255.0;
+            let b = (p & 0xFF) as f32 / 255.0;
+            let nr = (m[0] * r + m[1] * g + m[2] * b + m[3] * a + m[4]).clamp(0.0, 1.0);
+            let ng = (m[5] * r + m[6] * g + m[7] * b + m[8] * a + m[9]).clamp(0.0, 1.0);
+            let nb = (m[10] * r + m[11] * g + m[12] * b + m[13] * a + m[14]).clamp(0.0, 1.0);
+            let na = (m[15] * r + m[16] * g + m[17] * b + m[18] * a + m[19]).clamp(0.0, 1.0);
+            ((((na * 255.0).round()) as u32) << 24)
+                | ((((nr * 255.0).round()) as u32) << 16)
+                | ((((ng * 255.0).round()) as u32) << 8)
+                | (((nb * 255.0).round()) as u32)
+        })
+        .collect()
+}
+
+/// `feOffset` — translate the input image by (dx, dy); exposed area is
+/// transparent.
+fn fe_offset(buf: &[u32], w: usize, h: usize, dx: i32, dy: i32) -> Vec<u32> {
+    let mut out = vec![0u32; w * h];
+    for ry in 0..h as i32 {
+        let sy = ry - dy;
+        if sy < 0 || sy >= h as i32 {
+            continue;
+        }
+        for rx in 0..w as i32 {
+            let sx = rx - dx;
+            if sx < 0 || sx >= w as i32 {
+                continue;
+            }
+            out[ry as usize * w + rx as usize] = buf[sy as usize * w + sx as usize];
+        }
+    }
+    out
+}
+
+/// `feComposite` — Porter-Duff / arithmetic combine of two RGBA8 images.
+fn fe_composite(a: &[u32], b: &[u32], op: FeCompositeOp) -> Vec<u32> {
+    a.iter()
+        .zip(b.iter())
+        .map(|(&pa, &pb)| {
+            let (aa, ar, ag, ab) = unpack_f(pa);
+            let (ba, br, bg, bb) = unpack_f(pb);
+            let (fa, fb) = match op {
+                FeCompositeOp::Over => (1.0, 1.0 - aa),
+                FeCompositeOp::In => (ba, 0.0),
+                FeCompositeOp::Out => (1.0 - ba, 0.0),
+                FeCompositeOp::Atop => (ba, 1.0 - aa),
+                FeCompositeOp::Xor => (1.0 - ba, 1.0 - aa),
+                FeCompositeOp::Arithmetic { .. } => (0.0, 0.0),
+            };
+            if let FeCompositeOp::Arithmetic { k1, k2, k3, k4 } = op {
+                // result = k1*i1*i2 + k2*i1 + k3*i2 + k4, channel-wise on
+                // PREMULTIPLIED values (Filter Effects 1 §15.10).
+                let comp = |i1: f32, i2: f32| (k1 * i1 * i2 + k2 * i1 + k3 * i2 + k4).clamp(0.0, 1.0);
+                let ra = comp(aa, ba);
+                let rr = comp(ar * aa, br * ba);
+                let rg = comp(ag * aa, bg * ba);
+                let rb = comp(ab * aa, bb * ba);
+                return pack_premul(ra, rr, rg, rb);
+            }
+            // Premultiplied source-over family.
+            let ra = aa * fa + ba * fb;
+            let rr = (ar * aa) * fa + (br * ba) * fb;
+            let rg = (ag * aa) * fa + (bg * ba) * fb;
+            let rb = (ab * aa) * fa + (bb * ba) * fb;
+            pack_premul(ra, rr, rg, rb)
+        })
+        .collect()
+}
+
+#[inline]
+fn unpack_f(p: u32) -> (f32, f32, f32, f32) {
+    (
+        ((p >> 24) & 0xFF) as f32 / 255.0,
+        ((p >> 16) & 0xFF) as f32 / 255.0,
+        ((p >> 8) & 0xFF) as f32 / 255.0,
+        (p & 0xFF) as f32 / 255.0,
+    )
+}
+
+/// Pack a premultiplied (alpha, premul-r/g/b) tuple back to straight-alpha
+/// 0xAARRGGBB.
+#[inline]
+fn pack_premul(a: f32, pr: f32, pg: f32, pb: f32) -> u32 {
+    let a = a.clamp(0.0, 1.0);
+    let (r, g, b) = if a > 0.0 {
+        ((pr / a).clamp(0.0, 1.0), (pg / a).clamp(0.0, 1.0), (pb / a).clamp(0.0, 1.0))
+    } else {
+        (0.0, 0.0, 0.0)
+    };
+    (((a * 255.0).round() as u32) << 24)
+        | (((r * 255.0).round() as u32) << 16)
+        | (((g * 255.0).round() as u32) << 8)
+        | ((b * 255.0).round() as u32)
+}
+
+/// Straight-alpha source-over of one 0xAARRGGBB pixel onto another.
+#[inline]
+fn src_over_u32(src: u32, dst: u32) -> u32 {
+    let (sa, sr, sg, sb) = unpack_f(src);
+    let (da, dr, dg, db) = unpack_f(dst);
+    let oa = sa + da * (1.0 - sa);
+    if oa <= 0.0 {
+        return 0;
+    }
+    let or = (sr * sa + dr * da * (1.0 - sa)) / oa;
+    let og = (sg * sa + dg * da * (1.0 - sa)) / oa;
+    let ob = (sb * sa + db * da * (1.0 - sa)) / oa;
+    (((oa * 255.0).round() as u32) << 24)
+        | (((or * 255.0).round() as u32) << 16)
+        | (((og * 255.0).round() as u32) << 8)
+        | ((ob * 255.0).round() as u32)
+}
+
 /// Apply `f(r,g,b)` to every pixel in the rect, preserving alpha.
 fn color_per_pixel(
     bmp: &mut Bitmap,
@@ -1846,59 +2291,140 @@ fn color_per_pixel(
     }
 }
 
-/// Horizontal box blur over the rect. Mean of (2r+1) pixels in each
-/// row, clipped at the rect edges (no edge wrap / mirror).
-fn blur_h(bmp: &mut Bitmap, x0: i32, y0: i32, x1: i32, y1: i32, r: i32) {
+/// True Gaussian blur over the rect, approximated by three successive
+/// box blurs per axis (the `feGaussianBlur` reference algorithm,
+/// SVG 1.1 §15.17 / Filter Effects 1 §9.14). For box size `d`:
+///   - odd  d: three centred box blurs of width d.
+///   - even d: a box blur of width d offset half a pixel left, one
+///             offset half a pixel right, and one centred box of d+1.
+///
+/// All passes run on PREMULTIPLIED colour so transparent edges feather
+/// to transparent without the dark fringe a straight-alpha average
+/// produces — this is what Chrome/Skia do and is required for
+/// drop-shadow and blurred soft edges to read correctly.
+fn gaussian_box3(bmp: &mut Bitmap, x0: i32, y0: i32, x1: i32, y1: i32, d: i32) {
     let w = (x1 - x0) as usize;
-    let mut row = vec![0u32; w];
-    for py in y0..y1 {
-        for px_ in x0..x1 {
-            row[(px_ - x0) as usize] =
-                bmp.pixels[(py as usize) * (bmp.width as usize) + px_ as usize];
+    let h = (y1 - y0) as usize;
+    if w == 0 || h == 0 {
+        return;
+    }
+    // Lift the rect into a premultiplied f32 scratch buffer (RGBA planes
+    // interleaved as [a, r, g, b] premultiplied: rgb already * a/255).
+    let mut buf = vec![0f32; w * h * 4];
+    for ry in 0..h {
+        let srow = (y0 as usize + ry) * bmp.width as usize + x0 as usize;
+        for rx in 0..w {
+            let p = bmp.pixels[srow + rx];
+            let a = ((p >> 24) & 0xFF) as f32;
+            let af = a / 255.0;
+            let i = (ry * w + rx) * 4;
+            buf[i] = a;
+            buf[i + 1] = ((p >> 16) & 0xFF) as f32 * af;
+            buf[i + 2] = ((p >> 8) & 0xFF) as f32 * af;
+            buf[i + 3] = (p & 0xFF) as f32 * af;
         }
-        for ix in 0..w {
-            let lo = ix.saturating_sub(r as usize);
-            let hi = (ix + r as usize + 1).min(w);
-            let n = (hi - lo) as u32;
-            let (mut sa, mut sr, mut sg, mut sb) = (0u32, 0u32, 0u32, 0u32);
-            for k in lo..hi {
-                let p = row[k];
-                sa += (p >> 24) & 0xFF;
-                sr += (p >> 16) & 0xFF;
-                sg += (p >> 8) & 0xFF;
-                sb += p & 0xFF;
-            }
-            bmp.pixels[(py as usize) * (bmp.width as usize) + (x0 as usize + ix)] =
-                ((sa / n) << 24) | ((sr / n) << 16) | ((sg / n) << 8) | (sb / n);
+    }
+    let mut tmp = vec![0f32; w * h * 4];
+    // Horizontal passes.
+    if d % 2 == 1 {
+        let r = d / 2;
+        box_blur_h(&mut buf, &mut tmp, w, h, r, r);
+        box_blur_h(&mut buf, &mut tmp, w, h, r, r);
+        box_blur_h(&mut buf, &mut tmp, w, h, r, r);
+    } else {
+        let r = d / 2;
+        // Two width-d boxes offset left/right, then a centred width-(d+1).
+        box_blur_h(&mut buf, &mut tmp, w, h, r, r - 1);
+        box_blur_h(&mut buf, &mut tmp, w, h, r - 1, r);
+        box_blur_h(&mut buf, &mut tmp, w, h, r, r);
+    }
+    // Vertical passes.
+    if d % 2 == 1 {
+        let r = d / 2;
+        box_blur_v(&mut buf, &mut tmp, w, h, r, r);
+        box_blur_v(&mut buf, &mut tmp, w, h, r, r);
+        box_blur_v(&mut buf, &mut tmp, w, h, r, r);
+    } else {
+        let r = d / 2;
+        box_blur_v(&mut buf, &mut tmp, w, h, r, r - 1);
+        box_blur_v(&mut buf, &mut tmp, w, h, r - 1, r);
+        box_blur_v(&mut buf, &mut tmp, w, h, r, r);
+    }
+    // Un-premultiply and write back.
+    for ry in 0..h {
+        let drow = (y0 as usize + ry) * bmp.width as usize + x0 as usize;
+        for rx in 0..w {
+            let i = (ry * w + rx) * 4;
+            let a = buf[i].clamp(0.0, 255.0);
+            let (r, g, b) = if a > 0.0 {
+                let inv = 255.0 / a;
+                (
+                    (buf[i + 1] * inv).clamp(0.0, 255.0),
+                    (buf[i + 2] * inv).clamp(0.0, 255.0),
+                    (buf[i + 3] * inv).clamp(0.0, 255.0),
+                )
+            } else {
+                (0.0, 0.0, 0.0)
+            };
+            bmp.pixels[drow + rx] = ((a.round() as u32) << 24)
+                | ((r.round() as u32) << 16)
+                | ((g.round() as u32) << 8)
+                | (b.round() as u32);
         }
     }
 }
 
-/// Vertical box blur — same idea over columns.
-fn blur_v(bmp: &mut Bitmap, x0: i32, y0: i32, x1: i32, y1: i32, r: i32) {
-    let h = (y1 - y0) as usize;
-    let mut col = vec![0u32; h];
-    for px_ in x0..x1 {
-        for py in y0..y1 {
-            col[(py - y0) as usize] =
-                bmp.pixels[(py as usize) * (bmp.width as usize) + px_ as usize];
-        }
-        for iy in 0..h {
-            let lo = iy.saturating_sub(r as usize);
-            let hi = (iy + r as usize + 1).min(h);
-            let n = (hi - lo) as u32;
-            let (mut sa, mut sr, mut sg, mut sb) = (0u32, 0u32, 0u32, 0u32);
-            for k in lo..hi {
-                let p = col[k];
-                sa += (p >> 24) & 0xFF;
-                sr += (p >> 16) & 0xFF;
-                sg += (p >> 8) & 0xFF;
-                sb += p & 0xFF;
+/// One horizontal box-blur pass: each output pixel is the mean of the
+/// window spanning `left` pixels to the left and `right` to the right
+/// (inclusive of self). Edge samples are clamped to the rect edge
+/// ("duplicate" border) so the rect interior darkens correctly toward a
+/// transparent surround. Operates on the premultiplied [a,r,g,b] buffer.
+fn box_blur_h(buf: &mut [f32], tmp: &mut [f32], w: usize, h: usize, left: i32, right: i32) {
+    let n = (left + right + 1) as f32;
+    for ry in 0..h {
+        let base = ry * w * 4;
+        for rx in 0..w as i32 {
+            let (mut sa, mut sr, mut sg, mut sb) = (0.0, 0.0, 0.0, 0.0);
+            for k in -left..=right {
+                let sx = (rx + k).clamp(0, w as i32 - 1) as usize;
+                let i = base + sx * 4;
+                sa += buf[i];
+                sr += buf[i + 1];
+                sg += buf[i + 2];
+                sb += buf[i + 3];
             }
-            bmp.pixels[((y0 as usize + iy) * bmp.width as usize) + px_ as usize] =
-                ((sa / n) << 24) | ((sr / n) << 16) | ((sg / n) << 8) | (sb / n);
+            let o = base + rx as usize * 4;
+            tmp[o] = sa / n;
+            tmp[o + 1] = sr / n;
+            tmp[o + 2] = sg / n;
+            tmp[o + 3] = sb / n;
         }
     }
+    buf.copy_from_slice(tmp);
+}
+
+/// One vertical box-blur pass — same as [`box_blur_h`] over columns.
+fn box_blur_v(buf: &mut [f32], tmp: &mut [f32], w: usize, h: usize, up: i32, down: i32) {
+    let n = (up + down + 1) as f32;
+    for rx in 0..w {
+        for ry in 0..h as i32 {
+            let (mut sa, mut sr, mut sg, mut sb) = (0.0, 0.0, 0.0, 0.0);
+            for k in -up..=down {
+                let sy = (ry + k).clamp(0, h as i32 - 1) as usize;
+                let i = (sy * w + rx) * 4;
+                sa += buf[i];
+                sr += buf[i + 1];
+                sg += buf[i + 2];
+                sb += buf[i + 3];
+            }
+            let o = (ry as usize * w + rx) * 4;
+            tmp[o] = sa / n;
+            tmp[o + 1] = sr / n;
+            tmp[o + 2] = sg / n;
+            tmp[o + 3] = sb / n;
+        }
+    }
+    buf.copy_from_slice(tmp);
 }
 
 pub(crate) fn blend_bgra(dst: u32, src: Color) -> u32 {
@@ -2883,5 +3409,225 @@ mod tests {
         // Red over white at 0.5: R stays ~255, G/B ~127 (pink), not 0 or 255.
         assert!(r > 200, "red channel high: {r}");
         assert!(g > 100 && g < 160, "green channel ~half (pink): {g}");
+    }
+
+    // ───────────────────────── CSS filter raster ─────────────────────────
+
+    fn opaque(r: u8, g: u8, b: u8) -> u32 {
+        Color { r, g, b, a: 255 }.to_bgra_u32()
+    }
+
+    /// `blur(r)` spreads a hard black/white edge into a falloff band: the
+    /// pixel one step into the white side picks up some black (and vice
+    /// versa), and the column right at the seam is a true mid-grey — proving
+    /// a real Gaussian, not a no-op passthrough.
+    #[test]
+    fn blur_spreads_hard_edge_into_falloff_band() {
+        let mut b = Bitmap::new(40, 8);
+        b.clear(Color::WHITE);
+        // Left half black, right half white.
+        b.fill_rect(0, 0, 20, 8, Color::BLACK);
+        // Sanity: hard edge before blur.
+        assert_eq!(at(&b, 18, 4).r, 0, "left is black pre-blur");
+        assert_eq!(at(&b, 21, 4).r, 255, "right is white pre-blur");
+        b.apply_filter_rect(0, 0, 40, 8, FilterOp::Blur(3.0));
+        // The seam column blends to a mid grey (strictly between 0 and 255).
+        let seam = at(&b, 19, 4).r;
+        assert!(seam > 30 && seam < 225, "seam is mid-grey, got {seam}");
+        // Falloff reaches several px past the seam into the white side.
+        let into_white = at(&b, 22, 4).r;
+        assert!(into_white < 255 && into_white > seam, "white side darkened: {into_white}");
+        // And the black side lightened.
+        let into_black = at(&b, 17, 4).r;
+        assert!(into_black > 0 && into_black < seam, "black side lightened: {into_black}");
+    }
+
+    /// `blur` of an opaque rect on a transparent canvas must NOT leave a dark
+    /// fringe (the classic straight-alpha bug). The feathered edge of a white
+    /// rect blurred over transparency stays neutral grey, not muddy/dark.
+    #[test]
+    fn blur_premultiplied_no_dark_fringe() {
+        let mut b = Bitmap::new(40, 40);
+        b.clear(Color::TRANSPARENT);
+        b.fill_rect(10, 10, 20, 20, Color::WHITE);
+        b.apply_filter_rect(0, 0, 40, 40, FilterOp::Blur(4.0));
+        // Sample a pixel just OUTSIDE the original rect edge — it's now
+        // partially covered by the feather. Its RGB (where alpha>0) must be
+        // ~white, never dark, because we blur premultiplied.
+        let p = at(&b, 8, 20);
+        assert!(p.a > 0 && p.a < 255, "feather is partial alpha: {:?}", p);
+        assert!(p.r > 200 && p.g > 200 && p.b > 200, "no dark fringe: {:?}", p);
+    }
+
+    /// `grayscale(1)` makes a coloured pixel grey: R==G==B at the luma value.
+    #[test]
+    fn grayscale_full_makes_gray_at_luma() {
+        let mut b = Bitmap::new(4, 4);
+        b.clear(Color { r: 200, g: 50, b: 50, a: 255 });
+        b.apply_filter_rect(0, 0, 4, 4, FilterOp::Grayscale(1.0));
+        let p = at(&b, 1, 1);
+        assert_eq!(p.r, p.g, "R==G after grayscale: {:?}", p);
+        assert_eq!(p.g, p.b, "G==B after grayscale: {:?}", p);
+        // luma = 0.2126*200 + 0.7152*50 + 0.0722*50 ≈ 81.
+        assert!((p.r as i32 - 81).abs() <= 2, "luma ≈81, got {}", p.r);
+    }
+
+    /// `brightness(2)` doubles RGB (clamped to 255).
+    #[test]
+    fn brightness_two_doubles_clamped() {
+        let mut b = Bitmap::new(4, 4);
+        b.clear(Color { r: 100, g: 200, b: 10, a: 255 });
+        b.apply_filter_rect(0, 0, 4, 4, FilterOp::Brightness(2.0));
+        let p = at(&b, 1, 1);
+        assert_eq!(p.r, 200, "100*2=200");
+        assert_eq!(p.g, 255, "200*2 clamps to 255");
+        assert_eq!(p.b, 20, "10*2=20");
+    }
+
+    /// `invert(1)` flips each channel: 0→255, 255→0, 40→215.
+    #[test]
+    fn invert_full_flips_channels() {
+        let mut b = Bitmap::new(4, 4);
+        b.clear(Color { r: 40, g: 0, b: 255, a: 255 });
+        b.apply_filter_rect(0, 0, 4, 4, FilterOp::Invert(1.0));
+        let p = at(&b, 1, 1);
+        assert_eq!((p.r, p.g, p.b), (215, 255, 0), "inverted: {:?}", p);
+    }
+
+    /// `saturate(0)` collapses a colour to its luma grey using the SPEC
+    /// matrix (0.213/0.715/0.072 weights), not the old Rec.709 weights.
+    #[test]
+    fn saturate_zero_is_spec_luma_gray() {
+        let mut b = Bitmap::new(4, 4);
+        b.clear(Color { r: 0, g: 255, b: 0, a: 255 });
+        b.apply_filter_rect(0, 0, 4, 4, FilterOp::Saturate(0.0));
+        let p = at(&b, 1, 1);
+        // s=0 → every output channel = 0.715*G = 182.
+        assert_eq!(p.r, p.g);
+        assert_eq!(p.g, p.b);
+        assert!((p.r as i32 - 182).abs() <= 1, "spec luma 0.715*255≈182, got {}", p.r);
+    }
+
+    /// `hue-rotate(180deg)` on pure red shifts it toward cyan-ish (G and B
+    /// rise, R drops) per the spec matrix.
+    #[test]
+    fn hue_rotate_180_shifts_red() {
+        let mut b = Bitmap::new(4, 4);
+        b.clear(Color { r: 255, g: 0, b: 0, a: 255 });
+        b.apply_filter_rect(0, 0, 4, 4, FilterOp::HueRotate(180.0));
+        let p = at(&b, 1, 1);
+        assert!(p.g > p.r && p.b > p.r, "red rotated toward cyan: {:?}", p);
+    }
+
+    /// SVG `feGaussianBlur` via `apply_svg_filter_rect` blurs a hard edge —
+    /// proving the `filter: url(#blur)` path runs a real blur primitive.
+    #[test]
+    fn svg_filter_fegaussianblur_blurs() {
+        let mut b = Bitmap::new(40, 8);
+        b.clear(Color::WHITE);
+        b.fill_rect(0, 0, 20, 8, Color::BLACK);
+        let prims = vec![SvgFePrimitive::GaussianBlur {
+            input: "SourceGraphic".into(),
+            std_dev: 3.0,
+            result: None,
+        }];
+        b.apply_svg_filter_rect(0, 0, 40, 8, &prims);
+        let seam = at(&b, 19, 4).r;
+        assert!(seam > 30 && seam < 225, "feGaussianBlur seam mid-grey, got {seam}");
+    }
+
+    /// SVG `feColorMatrix type="saturate" 0` desaturates to spec luma —
+    /// the colour-matrix primitive is real, not a passthrough.
+    #[test]
+    fn svg_filter_fecolormatrix_saturate_zero() {
+        let mut b = Bitmap::new(4, 4);
+        b.clear(Color { r: 0, g: 255, b: 0, a: 255 });
+        let prims = vec![SvgFePrimitive::ColorMatrix {
+            input: "SourceGraphic".into(),
+            matrix: fe_saturate_matrix(0.0),
+            result: None,
+        }];
+        b.apply_svg_filter_rect(0, 0, 4, 4, &prims);
+        let p = at(&b, 1, 1);
+        assert_eq!(p.r, p.g);
+        assert_eq!(p.g, p.b);
+        assert!((p.r as i32 - 182).abs() <= 1, "spec luma, got {}", p.r);
+    }
+
+    /// The canonical drop-shadow recipe expressed as SVG primitives:
+    /// SourceAlpha → blur → offset → flood-tint → merge SourceGraphic on top.
+    /// The shadow must appear OFFSET from the original opaque square, in the
+    /// flood colour, while the original is preserved on top.
+    #[test]
+    fn svg_filter_drop_shadow_recipe() {
+        let mut b = Bitmap::new(60, 60);
+        b.clear(Color::TRANSPARENT);
+        // Opaque red square at (10,10)-(30,30).
+        b.fill_rect(10, 10, 20, 20, Color { r: 255, g: 0, b: 0, a: 255 });
+        let prims = vec![
+            SvgFePrimitive::GaussianBlur {
+                input: "SourceAlpha".into(),
+                std_dev: 1.5,
+                result: Some("blur".into()),
+            },
+            SvgFePrimitive::Offset {
+                input: "blur".into(),
+                dx: 12,
+                dy: 12,
+                result: Some("off".into()),
+            },
+            // Tint the offset alpha to solid green using a color matrix that
+            // forces RGB=green and keeps alpha (feFlood+feComposite-in equiv).
+            SvgFePrimitive::ColorMatrix {
+                input: "off".into(),
+                matrix: [
+                    0.0, 0.0, 0.0, 0.0, 0.0,
+                    0.0, 0.0, 0.0, 0.0, 1.0,
+                    0.0, 0.0, 0.0, 0.0, 0.0,
+                    0.0, 0.0, 0.0, 1.0, 0.0,
+                ],
+                result: Some("shadow".into()),
+            },
+            SvgFePrimitive::Merge {
+                inputs: vec!["shadow".into(), "SourceGraphic".into()],
+                result: None,
+            },
+        ];
+        b.apply_svg_filter_rect(0, 0, 60, 60, &prims);
+        // Original red square preserved on top.
+        let orig = at(&b, 20, 20);
+        assert!(orig.r > 200 && orig.g < 40, "original red on top: {:?}", orig);
+        // Shadow appears offset by +12,+12 in green.
+        let shadow = at(&b, 32, 32);
+        assert!(shadow.a > 0, "shadow has coverage: {:?}", shadow);
+        assert!(shadow.g > 150 && shadow.r < 80, "shadow is green: {:?}", shadow);
+        // Area with neither original nor shadow stays transparent.
+        let empty = at(&b, 50, 5);
+        assert_eq!(empty.a, 0, "untouched stays transparent: {:?}", empty);
+    }
+
+    /// `feOffset` translates the image and leaves transparency behind.
+    #[test]
+    fn svg_filter_feoffset_translates() {
+        let mut b = Bitmap::new(40, 40);
+        b.clear(Color::TRANSPARENT);
+        b.fill_rect(0, 0, 10, 10, Color { r: 0, g: 0, b: 255, a: 255 });
+        let prims = vec![SvgFePrimitive::Offset {
+            input: "SourceGraphic".into(),
+            dx: 15,
+            dy: 15,
+            result: None,
+        }];
+        b.apply_svg_filter_rect(0, 0, 40, 40, &prims);
+        assert_eq!(at(&b, 3, 3).a, 0, "original location now empty");
+        let moved = at(&b, 18, 18);
+        assert!(moved.b > 200 && moved.a > 200, "moved to +15,+15: {:?}", moved);
+    }
+
+    // Keep the suppress-unused lint quiet for the opaque() helper if a future
+    // refactor drops its last user.
+    #[allow(dead_code)]
+    fn _use_opaque() -> u32 {
+        opaque(1, 2, 3)
     }
 }

@@ -1149,12 +1149,12 @@ fn generate_rec(
         let fh = border_rect.h as i32;
         if fw > 0 && fh > 0 {
             for fe in &b.filters {
-                match *fe {
+                match fe {
                     cv_layout::FilterEffect::DropShadow(sh) => {
-                        gen_drop_shadow(b, rec, &border_rect, sh, fw, fh);
+                        gen_drop_shadow(b, rec, &border_rect, *sh, fw, fh);
                     }
                     other => {
-                        if let Some(op) = filter_effect_to_op(&other) {
+                        if let Some(op) = filter_effect_to_op(other) {
                             rec.apply_filter_rect(fx, fy, fw, fh, op);
                         }
                     }
@@ -1312,17 +1312,21 @@ fn flatten_layer_ops(list: &RetainedDisplayList, ci: u32, out: &mut Vec<PaintOp>
 }
 
 fn filter_effect_to_op(fe: &cv_layout::FilterEffect) -> Option<FilterOp> {
-    match *fe {
-        cv_layout::FilterEffect::Blur(r) => Some(FilterOp::Blur(r)),
-        cv_layout::FilterEffect::Brightness(a) => Some(FilterOp::Brightness(a)),
-        cv_layout::FilterEffect::Contrast(a) => Some(FilterOp::Contrast(a)),
-        cv_layout::FilterEffect::Grayscale(a) => Some(FilterOp::Grayscale(a)),
-        cv_layout::FilterEffect::Invert(a) => Some(FilterOp::Invert(a)),
-        cv_layout::FilterEffect::Sepia(a) => Some(FilterOp::Sepia(a)),
-        cv_layout::FilterEffect::Saturate(a) => Some(FilterOp::Saturate(a)),
-        cv_layout::FilterEffect::HueRotate(d) => Some(FilterOp::HueRotate(d)),
-        cv_layout::FilterEffect::Opacity(a) => Some(FilterOp::Opacity(a)),
+    match fe {
+        cv_layout::FilterEffect::Blur(r) => Some(FilterOp::Blur(*r)),
+        cv_layout::FilterEffect::Brightness(a) => Some(FilterOp::Brightness(*a)),
+        cv_layout::FilterEffect::Contrast(a) => Some(FilterOp::Contrast(*a)),
+        cv_layout::FilterEffect::Grayscale(a) => Some(FilterOp::Grayscale(*a)),
+        cv_layout::FilterEffect::Invert(a) => Some(FilterOp::Invert(*a)),
+        cv_layout::FilterEffect::Sepia(a) => Some(FilterOp::Sepia(*a)),
+        cv_layout::FilterEffect::Saturate(a) => Some(FilterOp::Saturate(*a)),
+        cv_layout::FilterEffect::HueRotate(d) => Some(FilterOp::HueRotate(*d)),
+        cv_layout::FilterEffect::Opacity(a) => Some(FilterOp::Opacity(*a)),
+        // DropShadow and SVG `url(#id)` references are not single per-pixel
+        // FilterOps; the retained-DL fast path declines them (the full painter
+        // handles both). Returning None keeps this conservative.
         cv_layout::FilterEffect::DropShadow(_) => None,
+        cv_layout::FilterEffect::Reference(_) => None,
     }
 }
 
@@ -2177,6 +2181,10 @@ fn hash_filter(h: &mut Fnv, f: &cv_layout::FilterEffect) {
             h.f32(sh.spread_px);
             h.lcolor(sh.color);
             h.opt_tag(sh.inset);
+        }
+        cv_layout::FilterEffect::Reference(id) => {
+            h.byte(10);
+            h.str(id);
         }
     }
 }
