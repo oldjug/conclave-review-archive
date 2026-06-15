@@ -469,6 +469,14 @@ pub struct ComputedStyle {
     pub column_width: Option<f32>,
     /// CSS Multi-column Layout — `column-gap` (resolved px).
     pub multicol_gap: Option<f32>,
+    /// CSS Multi-column Layout — `column-rule-width` in CSS px.
+    pub column_rule_width: Option<f32>,
+    /// CSS Multi-column Layout — `column-rule-style`.
+    pub column_rule_style: Option<BorderStyle>,
+    /// CSS Multi-column Layout — `column-rule-color`.
+    pub column_rule_color: Option<Color>,
+    /// CSS Multi-column Layout — `column-span: all`.
+    pub column_span_all: bool,
     /// CSS Anchor Positioning — `anchor-name: --x`. Identifies this
     /// element as a potential anchor for `position-anchor` consumers.
     pub anchor_name: Option<String>,
@@ -2852,7 +2860,15 @@ fn parse_border_shorthand(toks: &[CssToken]) -> (Length, Color, Option<BorderSty
     let mut width: Option<Length> = None;
     let mut color: Option<Color> = None;
     let mut style: Option<BorderStyle> = None;
-    for t in toks {
+    // Index-based so a function colour (`rgb(0 128 0)` / `hsl(...)`) is parsed
+    // as a SINGLE component: we hand the whole `fn(...)` slice to
+    // `Color::from_tokens` and skip its inner tokens. Before this, the inner
+    // `Number` tokens of an `rgb()` leaked into the width arm (the last `0`
+    // clobbered a real `2px` width) — a latent bug that also affected
+    // `border: 2px solid rgb(...)`.
+    let mut i = 0;
+    while i < toks.len() {
+        let t = &toks[i];
         match t {
             CssToken::Dimension { .. } | CssToken::Number(_) => {
                 if let Some(l) = Length::from_tokens(std::slice::from_ref(t)) {
@@ -2863,9 +2879,7 @@ fn parse_border_shorthand(toks: &[CssToken]) -> (Length, Color, Option<BorderSty
                 // Style keywords take priority over colour names.
                 if let Some(bs) = BorderStyle::from_ident(s) {
                     style = Some(bs);
-                    continue;
-                }
-                if let Some(c) = Color::from_name(s) {
+                } else if let Some(c) = Color::from_name(s) {
                     color = Some(c);
                 }
             }
@@ -2875,12 +2889,18 @@ fn parse_border_shorthand(toks: &[CssToken]) -> (Length, Color, Option<BorderSty
                 }
             }
             CssToken::Function(_) => {
-                if let Some(c) = Color::from_tokens(std::slice::from_ref(t)) {
+                // Consume the whole `fn( ... )` group as one colour value so
+                // the inner numbers never reach the width/style arms.
+                let end = find_matching_paren_in_value(toks, i + 1).unwrap_or(toks.len() - 1);
+                if let Some(c) = Color::from_tokens(&toks[i..=end]) {
                     color = Some(c);
                 }
+                i = end + 1;
+                continue;
             }
             _ => {}
         }
+        i += 1;
     }
     // When style is None or Hidden the spec says width collapses to 0
     // (CSS §8.5.1 "If `border-style` is `none` or `hidden`, the border
@@ -2895,6 +2915,22 @@ fn parse_border_shorthand(toks: &[CssToken]) -> (Length, Color, Option<BorderSty
         color.unwrap_or(Color::BLACK),
         style,
     )
+}
+
+/// Resolve a [`Length`] to an approximate px value for *cosmetic* properties
+/// where the exact font/viewport context is unavailable at cascade time
+/// (e.g. `column-rule-width`, which never affects layout — CSS Multicol §6).
+/// `em`/`rem` use the 16px CSS default; `pt` converts at 96dpi; `%`/`auto`/
+/// `calc`/`clamp` collapse to their px term (0 for pure-percent).
+fn length_to_px_approx(l: Length) -> f32 {
+    match l {
+        Length::Px(v) => v,
+        Length::Em(v) | Length::Rem(v) => v * 16.0,
+        Length::Pt(v) => v * 96.0 / 72.0,
+        Length::Vw(_) | Length::Vh(_) | Length::Percent(_) | Length::Auto | Length::Zero => 0.0,
+        Length::Calc(c) => c.px,
+        Length::Clamp(c) => c.preferred.px,
+    }
 }
 
 fn add_lengths(a: Length, b: Length) -> Length {
@@ -4136,10 +4172,17 @@ fn apply_declaration(style: &mut ComputedStyle, d: &Declaration) {
             }
         }
         "column-gap" => {
+            // `column-gap` is ONE property shared by flex/grid (consumed via
+            // `style.column_gap`) and multicol (consumed via
+            // `style.multicol_gap`). Set both. `normal` (→ Length parse fails)
+            // leaves multicol_gap None so layout applies the 1em default.
             if let Some(v) = Length::from_tokens(toks) {
                 style.column_gap = Some(v);
                 if style.gap.is_none() {
                     style.gap = Some(v);
+                }
+                if let Length::Px(px) = v {
+                    style.multicol_gap = Some(px);
                 }
             }
         }
@@ -4258,6 +4301,65 @@ fn apply_declaration(style: &mut ComputedStyle, d: &Declaration) {
                         style.column_width = Some(*value as f32);
                     }
                     _ => {}
+                }
+            }
+        }
+        // CSS Multi-column §6 — the rule drawn between columns. Parsed like a
+        // border (`width style color`, any order). The rule does NOT affect
+        // layout; the painter draws it centred in the column gap.
+        "column-rule" => {
+            let (w, c, s) = parse_border_shorthand(toks);
+            style.column_rule_width = Some(length_to_px_approx(w));
+            style.column_rule_color = Some(c);
+            // `parse_border_shorthand` returns None style when only width/color
+            // was given; CSS Multicol initial column-rule-style is `none`, so a
+            // rule with no explicit style is invisible. Keep `Some(None-ish)`
+            // semantics by recording what was parsed; layout treats a missing
+            // style as None.
+            style.column_rule_style = s;
+        }
+        "column-rule-width" => {
+            // Keyword widths thin/medium/thick → 1/3/5px (CSS Backgrounds §4.3).
+            for t in toks {
+                if let CssToken::Ident(id) = t {
+                    let kw = match id.to_ascii_lowercase().as_str() {
+                        "thin" => Some(1.0),
+                        "medium" => Some(3.0),
+                        "thick" => Some(5.0),
+                        _ => None,
+                    };
+                    if let Some(px) = kw {
+                        style.column_rule_width = Some(px);
+                    }
+                }
+            }
+            if let Some(l) = Length::from_tokens(toks) {
+                style.column_rule_width = Some(length_to_px_approx(l));
+            }
+        }
+        "column-rule-style" => {
+            for t in toks {
+                if let CssToken::Ident(id) = t {
+                    if let Some(bs) = BorderStyle::from_ident(id) {
+                        style.column_rule_style = Some(bs);
+                    }
+                }
+            }
+        }
+        "column-rule-color" => {
+            if let Some(c) = Color::from_tokens(toks) {
+                style.column_rule_color = Some(c);
+            }
+        }
+        // CSS Multi-column §7 — `column-span: all | none`.
+        "column-span" => {
+            for t in toks {
+                if let CssToken::Ident(id) = t {
+                    match id.to_ascii_lowercase().as_str() {
+                        "all" => style.column_span_all = true,
+                        "none" => style.column_span_all = false,
+                        _ => {}
+                    }
                 }
             }
         }
@@ -4899,11 +5001,6 @@ fn apply_declaration(style: &mut ComputedStyle, d: &Declaration) {
         | "caption-side"
         | "empty-cells"
         | "table-layout"
-        | "column-rule"
-        | "column-rule-width"
-        | "column-rule-style"
-        | "column-rule-color"
-        | "column-span"
         | "column-fill"
         | "break-before"
         | "break-after"
@@ -9580,5 +9677,65 @@ mod tests {
         assert!(cs.transform_style_preserve_3d, "transform-style:preserve-3d parsed");
         assert_eq!(cs.perspective_px, Some(600.0), "perspective property px");
         assert!(cs.perspective_origin.is_some(), "perspective-origin parsed");
+    }
+
+    // ---- CSS Multi-column Layout parsing (Multicol 1) ----
+
+    #[test]
+    fn multicol_longhands_and_shorthands_parse() {
+        let ss = parse_stylesheet(
+            "div { column-count: 3; column-width: 240px; column-gap: 30px; }",
+        );
+        let el = Fake { tag: "div", id: None, classes: &[] };
+        let cs = compute(&[ss], el);
+        assert_eq!(cs.column_count, Some(3), "column-count:3");
+        assert_eq!(cs.column_width, Some(240.0), "column-width:240px");
+        // column-gap feeds BOTH the grid gap and the multicol gap.
+        assert_eq!(cs.multicol_gap, Some(30.0), "column-gap → multicol_gap px");
+    }
+
+    #[test]
+    fn multicol_columns_shorthand_parses_both() {
+        let ss = parse_stylesheet("div { columns: 200px 4; }");
+        let el = Fake { tag: "div", id: None, classes: &[] };
+        let cs = compute(&[ss], el);
+        assert_eq!(cs.column_width, Some(200.0), "columns shorthand width");
+        assert_eq!(cs.column_count, Some(4), "columns shorthand count");
+    }
+
+    #[test]
+    fn column_rule_shorthand_parses_width_style_color() {
+        let ss = parse_stylesheet("div { column-rule: 2px solid rgb(0, 128, 0); }");
+        let el = Fake { tag: "div", id: None, classes: &[] };
+        let cs = compute(&[ss], el);
+        assert_eq!(cs.column_rule_width, Some(2.0), "column-rule width 2px");
+        assert_eq!(cs.column_rule_style, Some(BorderStyle::Solid), "rule style solid");
+        let c = cs.column_rule_color.expect("rule color parsed");
+        assert_eq!((c.r, c.g, c.b), (0, 128, 0), "rule color green");
+    }
+
+    #[test]
+    fn column_rule_longhands_and_width_keywords() {
+        let ss = parse_stylesheet(
+            "div { column-rule-width: thick; column-rule-style: dashed; column-rule-color: #ff0000; }",
+        );
+        let el = Fake { tag: "div", id: None, classes: &[] };
+        let cs = compute(&[ss], el);
+        assert_eq!(cs.column_rule_width, Some(5.0), "thick → 5px");
+        assert_eq!(cs.column_rule_style, Some(BorderStyle::Dashed));
+        let c = cs.column_rule_color.expect("rule color");
+        assert_eq!((c.r, c.g, c.b), (255, 0, 0), "rule color red");
+    }
+
+    #[test]
+    fn column_span_all_parses() {
+        let ss = parse_stylesheet("h2 { column-span: all; }");
+        let el = Fake { tag: "h2", id: None, classes: &[] };
+        let cs = compute(&[ss], el);
+        assert!(cs.column_span_all, "column-span:all sets the flag");
+
+        let ss2 = parse_stylesheet("h2 { column-span: none; }");
+        let cs2 = compute(&[ss2], el);
+        assert!(!cs2.column_span_all, "column-span:none clears the flag");
     }
 }

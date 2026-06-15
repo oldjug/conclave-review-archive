@@ -43750,6 +43750,25 @@ fn lower_style(
         grid_row_span: cs.grid_row_span,
         table_col_span: cs.table_col_span,
         table_row_span: cs.table_row_span,
+        // CSS Multi-column Layout. `column-count`/`column-width` (auto = None)
+        // make this a multicol container; `column-gap` (resolved px) is the
+        // inter-column gap (None → layout's 1em default). Column-rule + span
+        // pass through; the rule is painted between columns, span:all is read
+        // off the spanning child in `place_multicol`.
+        multicol_count: cs.column_count,
+        multicol_width: cs.column_width,
+        multicol_gap: cs.multicol_gap,
+        column_rule_width: cs.column_rule_width,
+        column_rule_style: cs.column_rule_style.map(|s| match s {
+            cv_css::cascade::BorderStyle::None => cv_layout::BorderStyle::None,
+            cv_css::cascade::BorderStyle::Hidden => cv_layout::BorderStyle::Hidden,
+            cv_css::cascade::BorderStyle::Solid => cv_layout::BorderStyle::Solid,
+            cv_css::cascade::BorderStyle::Dashed => cv_layout::BorderStyle::Dashed,
+            cv_css::cascade::BorderStyle::Dotted => cv_layout::BorderStyle::Dotted,
+            cv_css::cascade::BorderStyle::Double => cv_layout::BorderStyle::Double,
+        }),
+        column_rule_color: cs.column_rule_color.map(to_gfx_color),
+        column_span_all: cs.column_span_all,
         opacity: effective_opacity,
         overflow_hidden,
         overflow_x,
@@ -49759,6 +49778,70 @@ fn paint_box_offset_t(
     if scroll_active {
         SCROLL_PAINT_DEPTH.with(|c| c.set(c.get() + 1));
     }
+    // ── CSS Multi-column §6 — column-rule ────────────────────────────────────
+    // Draw a vertical line centred in each inter-column gap of a multicol
+    // container. The rule occupies NO layout space (the gap stays
+    // `column-gap` wide); it is painted between the column boxes, spanning
+    // the container's content-box height. Painted BEFORE children so it sits
+    // behind content (it lives in the empty gap, so it never overlaps text).
+    if b.multicol_used_count > 1 && b.column_rule_width > 0.0 {
+        let style = b.column_rule_style;
+        if !style.is_none() {
+            // currentColor fallback: use the box's text color when no explicit
+            // column-rule-color was given (CSS Multicol §6.2 initial value).
+            let rule_c = b.column_rule_color.unwrap_or(b.text_color);
+            if rule_c.a > 0 {
+                let gc = cv_gfx::Color {
+                    r: rule_c.r,
+                    g: rule_c.g,
+                    b: rule_c.b,
+                    a: rule_c.a,
+                };
+                let content = b.content; // content-box (column boxes live here)
+                let w = b.multicol_used_width;
+                let cg = b.multicol_gap;
+                let rw = b.column_rule_width;
+                let ry = (content.y + off_y).round() as i32;
+                let rh = content.h.round().max(0.0) as i32;
+                let n = b.multicol_used_count;
+                for c in 0..(n - 1) {
+                    // Gap between column c and c+1: starts at the right edge of
+                    // column c, is `cg` wide; centre the rule in it.
+                    let gap_left = content.x + (c as f32) * (w + cg) + w;
+                    let rule_cx = gap_left + cg * 0.5;
+                    let rx = (rule_cx + off_x - rw * 0.5).round() as i32;
+                    let rwi = rw.round().max(1.0) as i32;
+                    if rh > 0 {
+                        match style {
+                            cv_layout::BorderStyle::Double => {
+                                // Double: two lines each 1/3 width at the edges.
+                                let third = (rwi / 3).max(1);
+                                bmp.fill_rect(rx, ry, third, rh, gc);
+                                bmp.fill_rect(rx + rwi - third, ry, third, rh, gc);
+                            }
+                            cv_layout::BorderStyle::Dashed => {
+                                // 3px dash, 3px gap.
+                                let mut yy = ry;
+                                while yy < ry + rh {
+                                    let seg = 3.min(ry + rh - yy);
+                                    bmp.fill_rect(rx, yy, rwi, seg, gc);
+                                    yy += 6;
+                                }
+                            }
+                            cv_layout::BorderStyle::Dotted => {
+                                let mut yy = ry;
+                                while yy < ry + rh {
+                                    bmp.fill_rect(rx, yy, rwi, rwi.min(ry + rh - yy), gc);
+                                    yy += rwi * 2;
+                                }
+                            }
+                            _ => bmp.fill_rect(rx, ry, rwi, rh, gc),
+                        }
+                    }
+                }
+            }
+        }
+    }
     // CSS Transforms 2 §6: if this box sets the `perspective` PROPERTY,
     // push its vanishing point so 3D-transformed descendants project
     // through it. Stored in PURE DOCUMENT coords (no paint offset): the
@@ -54105,6 +54188,16 @@ mod tests {
             table_col_span: None,
             table_row_span: None,
             grid_area_name: None,
+            is_multicol: false,
+            multicol_count: None,
+            multicol_width: None,
+            multicol_gap: 0.0,
+            column_rule_width: 0.0,
+            column_rule_style: cv_layout::BorderStyle::None,
+            column_rule_color: None,
+            column_span_all: false,
+            multicol_used_count: 0,
+            multicol_used_width: 0.0,
             overflow_hidden: false,
             overflow_x: cv_layout::Overflow::Visible,
             overflow_y: cv_layout::Overflow::Visible,
@@ -54630,6 +54723,16 @@ mod tests {
             grid_auto_columns: None,
             grid_template_areas: None,
             grid_area_name: None,
+            is_multicol: false,
+            multicol_count: None,
+            multicol_width: None,
+            multicol_gap: 0.0,
+            column_rule_width: 0.0,
+            column_rule_style: cv_layout::BorderStyle::None,
+            column_rule_color: None,
+            column_span_all: false,
+            multicol_used_count: 0,
+            multicol_used_width: 0.0,
             grid_column_start: None,
             grid_column_span: None,
             grid_row_start: None,
@@ -54774,6 +54877,16 @@ mod tests {
             grid_auto_columns: None,
             grid_template_areas: None,
             grid_area_name: None,
+            is_multicol: false,
+            multicol_count: None,
+            multicol_width: None,
+            multicol_gap: 0.0,
+            column_rule_width: 0.0,
+            column_rule_style: cv_layout::BorderStyle::None,
+            column_rule_color: None,
+            column_span_all: false,
+            multicol_used_count: 0,
+            multicol_used_width: 0.0,
             grid_column_start: None,
             grid_column_span: None,
             grid_row_start: None,
@@ -54943,6 +55056,16 @@ mod tests {
             grid_auto_columns: None,
             grid_template_areas: None,
             grid_area_name: None,
+            is_multicol: false,
+            multicol_count: None,
+            multicol_width: None,
+            multicol_gap: 0.0,
+            column_rule_width: 0.0,
+            column_rule_style: cv_layout::BorderStyle::None,
+            column_rule_color: None,
+            column_span_all: false,
+            multicol_used_count: 0,
+            multicol_used_width: 0.0,
             grid_column_start: None,
             grid_column_span: None,
             grid_row_start: None,
@@ -55094,6 +55217,16 @@ mod tests {
             grid_auto_columns: None,
             grid_template_areas: None,
             grid_area_name: None,
+            is_multicol: false,
+            multicol_count: None,
+            multicol_width: None,
+            multicol_gap: 0.0,
+            column_rule_width: 0.0,
+            column_rule_style: cv_layout::BorderStyle::None,
+            column_rule_color: None,
+            column_span_all: false,
+            multicol_used_count: 0,
+            multicol_used_width: 0.0,
             grid_column_start: None,
             grid_column_span: None,
             grid_row_start: None,
@@ -55253,6 +55386,16 @@ mod tests {
             grid_auto_columns: None,
             grid_template_areas: None,
             grid_area_name: None,
+            is_multicol: false,
+            multicol_count: None,
+            multicol_width: None,
+            multicol_gap: 0.0,
+            column_rule_width: 0.0,
+            column_rule_style: cv_layout::BorderStyle::None,
+            column_rule_color: None,
+            column_span_all: false,
+            multicol_used_count: 0,
+            multicol_used_width: 0.0,
             grid_column_start: None,
             grid_column_span: None,
             grid_row_start: None,
@@ -64573,5 +64716,107 @@ mod observer_tests {
                 .expect("render ok");
         let title = runtime.title_override().unwrap_or_default();
         assert_eq!(title, "n|n", "negative + far-out points → null");
+    }
+}
+
+#[cfg(test)]
+mod multicol_paint_tests {
+    use super::*;
+
+    /// Build a multicol container `LayoutBox` via the real layout pass, then
+    /// PAINT it and SAMPLE pixels to prove the column-rule renders in the gap
+    /// (CSS Multicol §6) — not a parse-only stub.
+    #[test]
+    fn column_rule_paints_red_in_the_gap_only() {
+        use cv_layout::{Display, LayoutConfig, LengthSpec, Style, StyledKind, StyledNode};
+        let child = |h: f32| StyledNode {
+            kind: StyledKind::Element { tag: "div".into() },
+            style: Style {
+                display: Some(Display::Block),
+                height: Some(LengthSpec::Px(h)),
+                ..Style::default()
+            },
+            children: vec![],
+        };
+        // 300px container, 2 columns, 20px gap, 4px SOLID RED rule.
+        // → used col width W = (300 - 20)/2 = 140; gap spans x∈[140,160),
+        //   rule centred at x=150 (4px → x∈[148,152)).
+        let container = StyledNode {
+            kind: StyledKind::Element { tag: "div".into() },
+            style: Style {
+                display: Some(Display::Block),
+                width: Some(LengthSpec::Px(300.0)),
+                height: Some(LengthSpec::Px(100.0)),
+                multicol_count: Some(2),
+                multicol_gap: Some(20.0),
+                column_rule_width: Some(4.0),
+                column_rule_style: Some(cv_layout::BorderStyle::Solid),
+                column_rule_color: Some(cv_layout::Color { r: 255, g: 0, b: 0, a: 255 }),
+                ..Style::default()
+            },
+            children: vec![child(50.0), child(50.0)],
+        };
+        let cfg = LayoutConfig {
+            viewport_w: 320.0,
+            viewport_h: 200.0,
+            ..LayoutConfig::default()
+        };
+        let lb = cv_layout::layout(&container, &cfg);
+        assert_eq!(lb.multicol_used_count, 2, "resolved 2 columns");
+        assert!((lb.multicol_used_width - 140.0).abs() < 1.0, "W≈140, got {}", lb.multicol_used_width);
+
+        let mut bmp = cv_gfx::Bitmap::new(320, 120);
+        bmp.clear(cv_gfx::Color { r: 255, g: 255, b: 255, a: 255 });
+        let mut texts: Vec<cv_ui::TextItem> = Vec::new();
+        paint_box(&lb, &mut bmp, &mut texts);
+
+        let sample = |x: i32, y: i32| -> (u8, u8, u8) {
+            let v = bmp.pixels[(y as usize) * (bmp.width as usize) + (x as usize)];
+            // BGRA u32: 0xAARRGGBB after to_bgra_u32? Decode via channels.
+            let b = (v & 0xFF) as u8;
+            let g = ((v >> 8) & 0xFF) as u8;
+            let r = ((v >> 16) & 0xFF) as u8;
+            (r, g, b)
+        };
+        // Gap centre (x≈150, y=30) must be RED.
+        let mid = sample(150, 30);
+        assert_eq!(mid, (255, 0, 0), "column-rule paints red in the gap centre, got {mid:?}");
+        // Column 0 centre (x≈70) must be the white background (NO rule there).
+        let col0 = sample(70, 30);
+        assert_eq!(col0, (255, 255, 255), "no rule in column 0 body, got {col0:?}");
+        // Column 1 centre (x≈230) must be white too.
+        let col1 = sample(230, 30);
+        assert_eq!(col1, (255, 255, 255), "no rule in column 1 body, got {col1:?}");
+    }
+
+    /// `column-rule-style: none` (or no style) must NOT paint, even with a
+    /// width set — CSS Multicol §6.1 initial column-rule-style is `none`.
+    #[test]
+    fn column_rule_none_style_does_not_paint() {
+        use cv_layout::{Display, LayoutConfig, LengthSpec, Style, StyledKind, StyledNode};
+        let container = StyledNode {
+            kind: StyledKind::Element { tag: "div".into() },
+            style: Style {
+                display: Some(Display::Block),
+                width: Some(LengthSpec::Px(300.0)),
+                height: Some(LengthSpec::Px(100.0)),
+                multicol_count: Some(2),
+                multicol_gap: Some(20.0),
+                column_rule_width: Some(4.0),
+                column_rule_style: None, // → treated as `none`
+                column_rule_color: Some(cv_layout::Color { r: 255, g: 0, b: 0, a: 255 }),
+                ..Style::default()
+            },
+            children: vec![],
+        };
+        let cfg = LayoutConfig { viewport_w: 320.0, viewport_h: 200.0, ..LayoutConfig::default() };
+        let lb = cv_layout::layout(&container, &cfg);
+        let mut bmp = cv_gfx::Bitmap::new(320, 120);
+        bmp.clear(cv_gfx::Color { r: 255, g: 255, b: 255, a: 255 });
+        let mut texts: Vec<cv_ui::TextItem> = Vec::new();
+        paint_box(&lb, &mut bmp, &mut texts);
+        let v = bmp.pixels[30 * 320 + 150];
+        let (r, g, b) = (((v >> 16) & 0xFF) as u8, ((v >> 8) & 0xFF) as u8, (v & 0xFF) as u8);
+        assert_eq!((r, g, b), (255, 255, 255), "rule-style none → gap stays white, got {:?}", (r, g, b));
     }
 }

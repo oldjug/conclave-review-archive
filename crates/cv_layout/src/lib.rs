@@ -677,6 +677,38 @@ pub struct LayoutBox {
     /// `grid_template_areas` at layout time. When present, overrides
     /// any explicit numeric `grid_*_start`/`_span` on this box.
     pub grid_area_name: Option<String>,
+    /// CSS Multi-column Layout — this box is a multicol *container*. True
+    /// when `column-count` or `column-width` is not `auto` (CSS Multicol §2:
+    /// an element becomes a multicol container when either is non-auto).
+    /// `place_multicol` fragments the in-flow block content into N balanced
+    /// column boxes instead of running the normal block-stacking pass.
+    pub is_multicol: bool,
+    /// `column-count` (the requested column count). `None` = `auto`.
+    pub multicol_count: Option<u32>,
+    /// `column-width` in px (the requested ideal column width). `None` = `auto`.
+    pub multicol_width: Option<f32>,
+    /// Used `column-gap` between adjacent column boxes (px). Default 1em
+    /// (`normal`), already resolved at lowering time.
+    pub multicol_gap: f32,
+    /// `column-rule-width` (px) — line painted between columns. Does NOT
+    /// affect layout (CSS Multicol §6: the rule is drawn in the middle of
+    /// the gap and column boxes do not change size).
+    pub column_rule_width: f32,
+    /// `column-rule-style`. `None`/`Hidden` collapses the rule (not painted).
+    pub column_rule_style: BorderStyle,
+    /// `column-rule-color`. `None` falls back to the box's current color.
+    pub column_rule_color: Option<Color>,
+    /// `column-span: all` — this *child* box spans across all columns of its
+    /// multicol-container parent (CSS Multicol §7). Content before it is
+    /// balanced into columns, the spanner occupies the full width, then
+    /// content after resumes in fresh column boxes below it.
+    pub column_span_all: bool,
+    /// Resolved (used) number of columns after running the §3.4 pseudo-
+    /// algorithm. Set by `place_multicol`; read by the painter to position
+    /// column rules. 0 when this box is not an active multicol container.
+    pub multicol_used_count: u32,
+    /// Resolved (used) column width in px after §3.4. Set by `place_multicol`.
+    pub multicol_used_width: f32,
     pub overflow_hidden: bool,
     /// Resolved per-axis overflow. `overflow_hidden` stays as the legacy
     /// "this box clips" flag (true whenever either axis clips); these two
@@ -1336,6 +1368,20 @@ pub struct Style {
     pub column_gap_px: Option<f32>,
     /// `row-gap` distinct from the column axis. None → fall back to `gap`.
     pub row_gap_px: Option<f32>,
+    /// CSS Multi-column — `column-count` (None = auto).
+    pub multicol_count: Option<u32>,
+    /// CSS Multi-column — `column-width` px (None = auto).
+    pub multicol_width: Option<f32>,
+    /// CSS Multi-column — used `column-gap` px (None = 1em default).
+    pub multicol_gap: Option<f32>,
+    /// `column-rule-width` px.
+    pub column_rule_width: Option<f32>,
+    /// `column-rule-style`.
+    pub column_rule_style: Option<BorderStyle>,
+    /// `column-rule-color`.
+    pub column_rule_color: Option<Color>,
+    /// `column-span: all`.
+    pub column_span_all: bool,
     pub overflow_hidden: bool,
     /// Per-axis overflow lowered from `cv_css`. Default `Visible`.
     pub overflow_x: Overflow,
@@ -3460,7 +3506,18 @@ fn build_box(node: &StyledNode, cfg: &LayoutConfig) -> LayoutBox {
     // so those children are never individually cached — mark them ineligible. The
     // container itself (a block-level box elsewhere) is still cacheable, and its
     // cached fragment captures the laid-out children.
-    if b.is_flex || b.is_grid || b.is_table || b.is_table_row || b.is_table_row_group {
+    // `is_multicol` is included: a multicol container fragments its children
+    // into balanced columns (their final x/y depend on the run's total height,
+    // a hidden input the per-child cache key can't capture), so direct
+    // children must be captured inside the container's fragment, not cached
+    // individually. Mirrors the flex/grid/table rule above.
+    if b.is_flex
+        || b.is_grid
+        || b.is_table
+        || b.is_table_row
+        || b.is_table_row_group
+        || b.is_multicol
+    {
         for k in &mut b.children {
             k.cache_ineligible = true;
         }
@@ -3585,6 +3642,26 @@ fn build_box_inner(node: &StyledNode, cfg: &LayoutConfig) -> LayoutBox {
                 grid_row_span: node.style.grid_row_span,
                 table_col_span: node.style.table_col_span,
                 table_row_span: node.style.table_row_span,
+                // CSS Multi-column container detection (CSS Multicol §2): an
+                // element with `column-count` or `column-width` not `auto`
+                // becomes a multicol container. The used count/width are
+                // resolved later in `place_multicol` (§3.4 pseudo-algorithm).
+                is_multicol: node.style.multicol_count.is_some()
+                    || node.style.multicol_width.is_some(),
+                multicol_count: node.style.multicol_count,
+                multicol_width: node.style.multicol_width,
+                // `column-gap: normal` → 1em (initial value, CSS Box Alignment
+                // §8). Resolve against this box's font-size, falling back to
+                // the parent's when unset.
+                multicol_gap: node.style.multicol_gap.unwrap_or_else(|| {
+                    node.style.font_size_px.unwrap_or(cfg.default_font_size_px)
+                }),
+                column_rule_width: node.style.column_rule_width.unwrap_or(0.0),
+                column_rule_style: node.style.column_rule_style.unwrap_or(BorderStyle::None),
+                column_rule_color: node.style.column_rule_color,
+                column_span_all: node.style.column_span_all,
+                multicol_used_count: 0,
+                multicol_used_width: 0.0,
                 overflow_hidden: node.style.overflow_hidden,
                 overflow_x: node.style.overflow_x,
                 overflow_y: node.style.overflow_y,
@@ -3725,6 +3802,16 @@ fn build_box_inner(node: &StyledNode, cfg: &LayoutConfig) -> LayoutBox {
             grid_row_span: None,
             table_col_span: None,
             table_row_span: None,
+            is_multicol: false,
+            multicol_count: None,
+            multicol_width: None,
+            multicol_gap: 0.0,
+            column_rule_width: 0.0,
+            column_rule_style: BorderStyle::None,
+            column_rule_color: None,
+            column_span_all: false,
+            multicol_used_count: 0,
+            multicol_used_width: 0.0,
             overflow_hidden: false,
             overflow_x: Overflow::Visible,
             overflow_y: Overflow::Visible,
@@ -4229,6 +4316,17 @@ fn place_inner(
             }
             if b.is_table {
                 place_table(b, content_x, content_y, content_w, child_container_h, ctx);
+                return;
+            }
+            // CSS Multi-column: a container whose `column-count`/`column-width`
+            // is non-auto fragments its in-flow block content into N balanced
+            // column boxes. `place_multicol` returns true when it took over;
+            // when the resolved column count is 1 it declines and we fall
+            // through to the normal block-stacking pass (a 1-column multicol
+            // is visually identical to a plain block, per §3.4).
+            if b.is_multicol
+                && place_multicol(b, content_x, content_y, content_w, container_h, ctx, parent_fs)
+            {
                 return;
             }
             if b.is_inline && inline_container_children_all_inline(b) {
@@ -5710,6 +5808,266 @@ fn compute_named_areas(
         }
     }
     out
+}
+
+/// Resolve the *used* number of columns `N` and *used* column width `W`
+/// for a multicol container, per CSS Multi-column Layout Level 1 §3.4
+/// "The Pseudo-algorithm".
+///
+/// Inputs (spec names): `U` = available content width, `CG` = used
+/// `column-gap`, `CW` = `column-width` (None = auto), `CC` =
+/// `column-count` (None = auto).
+///
+/// Branches (verbatim from §3.4):
+///   * CW = auto, CC ≠ auto  → N = CC
+///   * CW ≠ auto, CC = auto  → N = max(1, floor((U + CG) / (CW + CG)))
+///   * CW ≠ auto, CC ≠ auto  → N = min(CC, max(1, floor((U + CG) / (CW + CG))))
+///   * (CW = auto, CC = auto → not a multicol container; never reaches here)
+///
+/// In every case the used column width is then
+///   W = (U − (N − 1)·CG) / N
+/// so the columns + gaps exactly fill `U`.
+fn resolve_multicol(u: f32, cg: f32, cw: Option<f32>, cc: Option<u32>) -> (u32, f32) {
+    let u = u.max(0.0);
+    let cg = cg.max(0.0);
+    // floor((U + CG) / (CW + CG)) — how many CW-wide columns (each
+    // followed by a gap, with the trailing gap "shared" via the +CG on
+    // the numerator) fit into U. Guard CW+CG against zero.
+    let fit = |cw: f32| -> u32 {
+        let denom = cw + cg;
+        if denom <= 0.0 {
+            return 1;
+        }
+        (((u + cg) / denom).floor() as i64).max(1) as u32
+    };
+    let n = match (cw, cc) {
+        (None, Some(cc)) => cc.max(1),
+        (Some(cw), None) => fit(cw),
+        (Some(cw), Some(cc)) => fit(cw).min(cc.max(1)),
+        // Both auto can't happen — the caller only sets is_multicol when at
+        // least one is non-auto. Treat as a single column defensively.
+        (None, None) => 1,
+    };
+    let n = n.max(1);
+    let w = ((u - (n as f32 - 1.0) * cg) / n as f32).max(0.0);
+    (n, w)
+}
+
+/// CSS Multi-column Layout: fragment a multicol container's in-flow block
+/// content into `N` balanced column boxes side-by-side.
+///
+/// Returns `true` when this function took over placement of `b`; `false`
+/// when the resolved column count is 1 (a 1-column multicol is identical
+/// to a normal block, so the caller falls through to the block pass).
+///
+/// Model (CSS Multicol 1 §2, §3.4, §7):
+///   1. Resolve `N`/`W` via `resolve_multicol` (§3.4).
+///   2. Lay out every in-flow child stacked vertically at the *column
+///      width* `W` to learn each child's flowed height (this is the
+///      "flow thread" content measured in the inline size of a column).
+///   3. `column-span: all` children break the flow into runs: the content
+///      before a spanner is balanced across `N` columns; the spanner then
+///      occupies the full container width on its own line; content after
+///      resumes in a fresh row of `N` column boxes below it (§7).
+///   4. Within each run, balance (the default `column-fill: balance`) by
+///      filling columns to a common target height, then translate each
+///      child into its column box (x = run_left + col·(W+CG)).
+///   5. The container's content height is the max column bottom across all
+///      runs.
+#[allow(clippy::too_many_arguments)]
+fn place_multicol(
+    b: &mut LayoutBox,
+    content_x: f32,
+    content_y: f32,
+    content_w: f32,
+    container_h: f32,
+    ctx: &mut LayoutCtx<'_>,
+    parent_fs: f32,
+) -> bool {
+    let cg = b.multicol_gap.max(0.0);
+    let (n, w) = resolve_multicol(content_w, cg, b.multicol_width, b.multicol_count);
+    // A single resolved column is visually a plain block — decline so the
+    // normal block flow (which also handles inline runs, floats, etc.)
+    // runs instead. Record the resolution so paint sees count=1 (no rule).
+    if n <= 1 {
+        b.multicol_used_count = 1;
+        b.multicol_used_width = content_w;
+        return false;
+    }
+    b.multicol_used_count = n;
+    b.multicol_used_width = w;
+
+    // Partition the direct children into ordered "segments": a Spanner
+    // (column-span:all, in flow) is its own full-width segment; runs of
+    // ordinary in-flow children between spanners are Column segments to be
+    // balanced. Out-of-flow children (absolute/fixed) are positioned in a
+    // final pass against the container, exactly like the block path.
+    enum Seg {
+        Columns(Vec<usize>),
+        Spanner(usize),
+    }
+    let mut segs: Vec<Seg> = Vec::new();
+    let mut cur: Vec<usize> = Vec::new();
+    let mut out_of_flow: Vec<usize> = Vec::new();
+    for (i, c) in b.children.iter().enumerate() {
+        if !is_in_flow(c) {
+            out_of_flow.push(i);
+            continue;
+        }
+        if c.column_span_all {
+            if !cur.is_empty() {
+                segs.push(Seg::Columns(std::mem::take(&mut cur)));
+            }
+            segs.push(Seg::Spanner(i));
+        } else {
+            cur.push(i);
+        }
+    }
+    if !cur.is_empty() {
+        segs.push(Seg::Columns(cur));
+    }
+
+    let mut flow_y = content_y;
+    for seg in segs {
+        match seg {
+            Seg::Spanner(i) => {
+                // A spanner is laid out as a normal block across the FULL
+                // container width (CSS Multicol §7), starting below the
+                // previous run.
+                place(
+                    &mut b.children[i],
+                    content_x,
+                    flow_y,
+                    content_w,
+                    container_h,
+                    ctx,
+                    parent_fs,
+                );
+                flow_y += b.children[i].margin_rect().h;
+            }
+            Seg::Columns(indices) => {
+                flow_y = place_multicol_run(
+                    b, &indices, content_x, flow_y, w, cg, n, container_h, ctx, parent_fs,
+                );
+            }
+        }
+    }
+
+    let content_h =
+        resolve_content_height(b, (flow_y - content_y).max(0.0), content_w, container_h);
+    b.content = Rect {
+        x: content_x,
+        y: content_y,
+        w: content_w,
+        h: content_h,
+    };
+
+    // Out-of-flow second pass against the container's padding box, mirroring
+    // the normal block path.
+    if !out_of_flow.is_empty() {
+        let cb = b.padding_rect();
+        for &i in &out_of_flow {
+            place_absolute(&mut b.children[i], &cb, ctx, parent_fs);
+        }
+    }
+    true
+}
+
+/// Lay out one balanced run of multicol children (the `Seg::Columns` case
+/// of [`place_multicol`]). Children `indices` are stacked at column width
+/// `w`, balanced across `n` columns (`column-fill: balance`, the default),
+/// and translated into their column boxes. Returns the run's bottom y
+/// (the max column bottom) so the next segment starts below it.
+#[allow(clippy::too_many_arguments)]
+fn place_multicol_run(
+    b: &mut LayoutBox,
+    indices: &[usize],
+    run_left: f32,
+    run_top: f32,
+    w: f32,
+    cg: f32,
+    n: u32,
+    container_h: f32,
+    ctx: &mut LayoutCtx<'_>,
+    parent_fs: f32,
+) -> f32 {
+    if indices.is_empty() {
+        return run_top;
+    }
+    // ── Pass 1: flow every child vertically at the column width `w` so we
+    // learn its margin-box height. They are stacked starting at y=0 (local)
+    // so heights are independent of final column placement.
+    let mut heights: Vec<f32> = Vec::with_capacity(indices.len());
+    {
+        let mut y = 0.0f32;
+        let mut prev_mb: f32 = 0.0;
+        let mut had_prev = false;
+        for &i in indices {
+            place(&mut b.children[i], run_left, y, w, container_h, ctx, parent_fs);
+            let mt = b.children[i].margin.top;
+            let collapse = if had_prev { prev_mb.min(mt) } else { 0.0 };
+            let adv = (b.children[i].margin_rect().h - collapse).max(0.0);
+            heights.push(adv);
+            y += adv;
+            prev_mb = b.children[i].margin.bottom;
+            had_prev = true;
+        }
+    }
+    let total: f32 = heights.iter().sum();
+
+    // ── Balance (column-fill: balance, the default — CSS Multicol §3.3).
+    // Target column height = ceil(total / N). Greedily fill the current
+    // column until adding the next child would exceed the target; then
+    // move to the next column. A child taller than the target alone still
+    // occupies its own (overflowing) column — we never split a single box
+    // across columns (no in-block fragmentation in V1; matches Chrome's
+    // unbreakable-box behaviour for a monolithic child).
+    let target = if n > 0 {
+        (total / n as f32).max(0.0)
+    } else {
+        total
+    };
+    // assign[k] = column index for indices[k].
+    let mut assign: Vec<u32> = vec![0; indices.len()];
+    let mut col: u32 = 0;
+    let mut col_h: f32 = 0.0;
+    for k in 0..indices.len() {
+        let h = heights[k];
+        // Start a new column if this child won't fit in the remaining
+        // target budget AND the current column already has content AND we
+        // still have columns left. The "+ tiny epsilon" tolerates float
+        // round-off so an exactly-target fill doesn't spill.
+        if col + 1 < n && col_h > 0.0 && col_h + h > target + 0.01 {
+            col += 1;
+            col_h = 0.0;
+        }
+        assign[k] = col;
+        col_h += h;
+    }
+
+    // ── Pass 2: translate each child into its assigned column box. The
+    // column box left edge is run_left + col·(W + CG); content stacks from
+    // run_top within the column. Children were placed at (run_left, local
+    // stack y) in pass 1, so shift by (col·(W+CG), run_top − local_y).
+    let mut col_cursor: Vec<f32> = vec![0.0; n as usize];
+    let mut col_bottom: Vec<f32> = vec![run_top; n as usize];
+    for k in 0..indices.len() {
+        let i = indices[k];
+        let c = assign[k] as usize;
+        let target_x = run_left + c as f32 * (w + cg);
+        let target_y = run_top + col_cursor[c];
+        // Current placed origin (pass 1) is the child's margin-box top-left.
+        let cur = b.children[i].margin_rect();
+        let dx = target_x - cur.x;
+        let dy = target_y - cur.y;
+        shift_box(&mut b.children[i], dx, dy);
+        col_cursor[c] += heights[k];
+        let bot = run_top + col_cursor[c];
+        if bot > col_bottom[c] {
+            col_bottom[c] = bot;
+        }
+    }
+    col_bottom.into_iter().fold(run_top, f32::max)
 }
 
 fn place_grid(
@@ -10306,6 +10664,263 @@ mod tests {
             "perspective tilts the top edge: tl.y={} tr.y={}",
             tl.1,
             tr.1
+        );
+    }
+
+    // ====================================================================
+    // CSS Multi-column Layout (CSS Multicol 1 §3.4 pseudo-algorithm, §7
+    // column-span, §6 column-rule). Tests assert COLUMN COUNT, column box
+    // X-POSITIONS, BALANCED distribution, and span:all full width — real
+    // fragmentation geometry, not "doesn't panic".
+    // ====================================================================
+
+    /// A fixed-size block child for multicol fragmentation tests: explicit
+    /// height so column balancing is deterministic, no text measurement.
+    fn mc_item(h: f32) -> StyledNode {
+        block(
+            "div",
+            Style {
+                display: Some(Display::Block),
+                height: Some(LengthSpec::Px(h)),
+                ..Style::default()
+            },
+            vec![],
+        )
+    }
+
+    #[test]
+    fn multicol_pseudo_algorithm_count_auto_width_set() {
+        // §3.4 case "column-width != auto, column-count = auto":
+        // N = max(1, floor((U + CG)/(CW + CG))). U=320, CW=100, CG=0 → 3.
+        let (n, w) = resolve_multicol(320.0, 0.0, Some(100.0), None);
+        assert_eq!(n, 3, "320px / 100px columns (gap 0) → 3 columns");
+        // W = (320 - 2*0)/3 ≈ 106.67 — the columns WIDEN to fill U exactly.
+        assert!((w - 320.0 / 3.0).abs() < 0.01, "used width fills U: {w}");
+    }
+
+    #[test]
+    fn multicol_pseudo_algorithm_width_with_gap() {
+        // U=320, CW=100, CG=20: floor((320+20)/(100+20)) = floor(2.83) = 2.
+        let (n, w) = resolve_multicol(320.0, 20.0, Some(100.0), None);
+        assert_eq!(n, 2, "with 20px gap only 2 columns fit");
+        // W = (320 - 1*20)/2 = 150.
+        assert!((w - 150.0).abs() < 0.01, "used width = (U - CG)/2 = 150: {w}");
+    }
+
+    #[test]
+    fn multicol_pseudo_algorithm_count_set_width_auto() {
+        // §3.4 case "column-width = auto, column-count != auto": N = CC.
+        let (n, w) = resolve_multicol(300.0, 20.0, None, Some(3));
+        assert_eq!(n, 3);
+        // W = (300 - 2*20)/3 = 86.67.
+        assert!((w - (300.0 - 40.0) / 3.0).abs() < 0.01, "{w}");
+    }
+
+    #[test]
+    fn multicol_pseudo_algorithm_both_set_count_caps() {
+        // §3.4 "both not auto": N = min(CC, floor((U+CG)/(CW+CG))).
+        // U=1000, CW=100, CG=0 → fit=10, capped by CC=3 → 3.
+        let (n, _w) = resolve_multicol(1000.0, 0.0, Some(100.0), Some(3));
+        assert_eq!(n, 3, "column-count caps the fitting count");
+        // And the reverse: count higher than fits → fit wins.
+        let (n2, _) = resolve_multicol(250.0, 0.0, Some(100.0), Some(5));
+        assert_eq!(n2, 2, "only 2 columns fit despite column-count:5");
+    }
+
+    #[test]
+    fn multicol_column_count_two_splits_content_in_half_width() {
+        // column-count:2 in a 320px container, gap 20 → 2 columns of 150px
+        // each; column 0 at x=0, column 1 at x=170 (150+20).
+        let container = block(
+            "div",
+            Style {
+                display: Some(Display::Block),
+                width: Some(LengthSpec::Px(320.0)),
+                multicol_count: Some(2),
+                multicol_gap: Some(20.0),
+                ..Style::default()
+            },
+            vec![mc_item(100.0), mc_item(100.0)],
+        );
+        let root = layout(&container, &LayoutConfig::default());
+        assert_eq!(root.multicol_used_count, 2, "resolved 2 columns");
+        assert!(
+            (root.multicol_used_width - 150.0).abs() < 0.5,
+            "each column ~150px, got {}",
+            root.multicol_used_width
+        );
+        // Two equal-height items balance one-per-column.
+        let c0 = &root.children[0];
+        let c1 = &root.children[1];
+        assert!(c0.content.w <= 150.5, "child fills column width: {}", c0.content.w);
+        assert!(
+            c0.content.x.abs() < 0.5,
+            "first column at container left x=0, got {}",
+            c0.content.x
+        );
+        assert!(
+            (c1.content.x - 170.0).abs() < 0.5,
+            "second column at x = W + gap = 170, got {}",
+            c1.content.x
+        );
+        // Both columns start at the SAME top (balanced run, not stacked).
+        assert!(
+            (c0.content.y - c1.content.y).abs() < 0.5,
+            "balanced columns share a top: {} vs {}",
+            c0.content.y,
+            c1.content.y
+        );
+    }
+
+    #[test]
+    fn multicol_column_width_yields_three_columns() {
+        // column-width:100px in a 320px box (gap 0) → 3 columns (the prompt's
+        // headline test). Three equal items balance one per column.
+        let container = block(
+            "div",
+            Style {
+                display: Some(Display::Block),
+                width: Some(LengthSpec::Px(320.0)),
+                multicol_width: Some(100.0),
+                multicol_gap: Some(0.0),
+                ..Style::default()
+            },
+            vec![mc_item(50.0), mc_item(50.0), mc_item(50.0)],
+        );
+        let root = layout(&container, &LayoutConfig::default());
+        assert_eq!(root.multicol_used_count, 3, "100px columns in 320px → 3");
+        let w = root.multicol_used_width;
+        // Each of the 3 items lands in its own column at x = c*W.
+        let xs: Vec<f32> = root.children.iter().map(|c| c.content.x).collect();
+        assert!(xs[0].abs() < 0.5, "col0 x≈0: {}", xs[0]);
+        assert!((xs[1] - w).abs() < 0.5, "col1 x≈W: {} vs {}", xs[1], w);
+        assert!((xs[2] - 2.0 * w).abs() < 0.5, "col2 x≈2W: {} vs {}", xs[2], 2.0 * w);
+    }
+
+    #[test]
+    fn multicol_balances_content_roughly_evenly() {
+        // Six 100px items in a 2-column container should balance 3-per-column
+        // (column-fill: balance default), NOT 6 in column 0. Assert column 0
+        // and column 1 each get 3 items and the columns are ~equal height.
+        let kids: Vec<StyledNode> = (0..6).map(|_| mc_item(100.0)).collect();
+        let container = block(
+            "div",
+            Style {
+                display: Some(Display::Block),
+                width: Some(LengthSpec::Px(420.0)),
+                multicol_count: Some(2),
+                multicol_gap: Some(20.0),
+                ..Style::default()
+            },
+            kids,
+        );
+        let root = layout(&container, &LayoutConfig::default());
+        assert_eq!(root.multicol_used_count, 2);
+        let w = root.multicol_used_width;
+        let col1_x = w + 20.0;
+        let in_col0 = |c: &LayoutBox| c.content.x.abs() < 1.0;
+        let in_col1 = |c: &LayoutBox| (c.content.x - col1_x).abs() < 1.0;
+        let n0 = root.children.iter().filter(|c| in_col0(c)).count();
+        let n1 = root.children.iter().filter(|c| in_col1(c)).count();
+        assert_eq!(n0, 3, "column 0 should hold 3 of 6 balanced items, got {n0}");
+        assert_eq!(n1, 3, "column 1 should hold 3 of 6 balanced items, got {n1}");
+        // Balanced → container height ≈ 3 items tall (300), not 6 (600).
+        assert!(
+            root.content.h < 350.0 && root.content.h > 250.0,
+            "balanced height ~300 (3 rows), got {}",
+            root.content.h
+        );
+    }
+
+    #[test]
+    fn multicol_column_span_all_spans_full_width() {
+        // A column-span:all child breaks the flow: items before it balance
+        // into 2 columns, the spanner occupies the FULL container width on
+        // its own line, items after resume in fresh columns below it.
+        let container = block(
+            "div",
+            Style {
+                display: Some(Display::Block),
+                width: Some(LengthSpec::Px(320.0)),
+                multicol_count: Some(2),
+                multicol_gap: Some(20.0),
+                ..Style::default()
+            },
+            vec![
+                mc_item(100.0),
+                mc_item(100.0),
+                block(
+                    "h2",
+                    Style {
+                        display: Some(Display::Block),
+                        height: Some(LengthSpec::Px(40.0)),
+                        column_span_all: true,
+                        ..Style::default()
+                    },
+                    vec![],
+                ),
+                mc_item(100.0),
+            ],
+        );
+        let root = layout(&container, &LayoutConfig::default());
+        let spanner = &root.children[2];
+        // The spanner fills the whole container content width (320), NOT a
+        // single column width (~150).
+        assert!(
+            (spanner.content.w - 320.0).abs() < 1.0,
+            "column-span:all spans full container width 320, got {}",
+            spanner.content.w
+        );
+        // It sits below the first balanced run (the two 100px items, balanced
+        // one-per-column → run height 100). So spanner.y ≈ 100.
+        assert!(
+            (spanner.content.y - 100.0).abs() < 1.5,
+            "spanner below the first balanced run (y≈100), got {}",
+            spanner.content.y
+        );
+        // The trailing item resumes BELOW the spanner (y ≥ 100 + 40 = 140).
+        let after = &root.children[3];
+        assert!(
+            after.content.y >= 139.0,
+            "content after spanner resumes below it (y≈140), got {}",
+            after.content.y
+        );
+        assert!(
+            after.content.x.abs() < 1.0,
+            "trailing item starts a fresh column 0, got x={}",
+            after.content.x
+        );
+    }
+
+    #[test]
+    fn multicol_single_resolved_column_falls_back_to_block() {
+        // column-width:400px in a 320px box → only 1 column fits. The box
+        // must fall through to NORMAL block flow (children stack full-width),
+        // not a degenerate 1-column multicol.
+        let container = block(
+            "div",
+            Style {
+                display: Some(Display::Block),
+                width: Some(LengthSpec::Px(320.0)),
+                multicol_width: Some(400.0),
+                ..Style::default()
+            },
+            vec![mc_item(50.0), mc_item(50.0)],
+        );
+        let root = layout(&container, &LayoutConfig::default());
+        assert_eq!(root.multicol_used_count, 1, "only 1 column fits");
+        // Children stack vertically (block flow), both at x=0.
+        assert!(root.children[0].content.x.abs() < 0.5);
+        assert!(root.children[1].content.x.abs() < 0.5);
+        assert!(
+            root.children[1].content.y > root.children[0].content.y + 49.0,
+            "second child stacks below the first in block fallback"
+        );
+        // Each child fills the full 320px width (block, not column).
+        assert!(
+            (root.children[0].content.w - 320.0).abs() < 0.5,
+            "block-fallback child fills full width, got {}",
+            root.children[0].content.w
         );
     }
 }
