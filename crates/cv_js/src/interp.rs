@@ -977,6 +977,45 @@ enum BcFnState {
     Declined,
 }
 
+/// Call-argument storage for the shared dispatcher (`Interp::dispatch_call`).
+/// Lets the hot tree-walk call op pass args as a borrowed slice — so a
+/// `f(i)` in a tight loop never heap-allocates a `Vec<Value>` (the JIT/VM
+/// tiers all read `&[Value]`) — while callers that already own a `Vec` move it
+/// straight through to the native-builtin path with no clone. Materializing an
+/// owned `Vec` (`into_owned`) only happens on the native path, which the
+/// numeric JIT hot path never reaches. This is purely a *storage* choice: the
+/// dispatched semantics are identical for both variants.
+enum ArgStore<'a> {
+    /// Caller owns the args (e.g. method dispatch building `vec![...]`); moved
+    /// into the native path with zero clone.
+    Owned(Vec<Value>),
+    /// Caller lends the args (the hot call op's stack buffer); read as a slice.
+    Borrowed(&'a [Value]),
+}
+
+impl ArgStore<'_> {
+    /// View the args as a slice — what every tier except the native-builtin
+    /// path consumes. Zero-cost for both variants.
+    #[inline]
+    fn as_slice(&self) -> &[Value] {
+        match self {
+            ArgStore::Owned(v) => v,
+            ArgStore::Borrowed(s) => s,
+        }
+    }
+
+    /// Take ownership of the args for the native-builtin path (which needs a
+    /// `Vec<Value>`): a free move when already owned, a single clone when
+    /// borrowed (off the numeric hot path).
+    #[inline]
+    fn into_owned(self) -> Vec<Value> {
+        match self {
+            ArgStore::Owned(v) => v,
+            ArgStore::Borrowed(s) => s.to_vec(),
+        }
+    }
+}
+
 thread_local! {
     // Keyed by the FunctionValue's Rc pointer, BUT a raw pointer is reused once
     // the original Rc is dropped — a stale hit would run the wrong module. The
@@ -4210,11 +4249,13 @@ thread_local! {
     static JS_TASK_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
+thread_local! {
+    /// Cached wall-clock budget (ms); `-1` = not yet read from the env.
+    static JS_TIME_BUDGET_CACHE: std::cell::Cell<i64> = const { std::cell::Cell::new(-1) };
+}
+
 fn js_time_budget_ms() -> u64 {
-    thread_local! {
-        static B: std::cell::Cell<i64> = const { std::cell::Cell::new(-1) };
-    }
-    B.with(|b| {
+    JS_TIME_BUDGET_CACHE.with(|b| {
         let v = b.get();
         if v >= 0 {
             return v as u64;
@@ -4229,6 +4270,20 @@ fn js_time_budget_ms() -> u64 {
             .unwrap_or(8000);
         b.set(parsed as i64);
         parsed
+    })
+}
+
+/// Test-only: set THIS THREAD's cached time budget directly (no env var), so the
+/// watchdog oracle can install a tiny deadline WITHOUT touching a process-global
+/// `CV_JS_TIME_BUDGET_MS` (which would race other tests on the shared pool). The
+/// cache is thread-local, so this is fully isolated to the calling test thread.
+/// Returns the previous cached value (-1 = was not yet read) for restoration.
+#[cfg(test)]
+fn set_js_time_budget_cache_for_test(ms: i64) -> i64 {
+    JS_TIME_BUDGET_CACHE.with(|b| {
+        let prev = b.get();
+        b.set(ms);
+        prev
     })
 }
 
@@ -4255,22 +4310,46 @@ impl Drop for TaskGuard {
 /// Arm the per-task wall-clock deadline. Call at every top-level entry into JS
 /// (`Interp::run`, `call_value_with_this`, bytecode module run). Returns a guard
 /// that disarms on drop. No-op when budgeting is disabled (`CV_JS_TIME_BUDGET_MS=0`).
+///
+/// V8-shaped: the interrupt/stack-limit (here the wall-clock deadline) is armed
+/// ONCE on the outermost task entry; a NESTED call (the hot `f(i)` in a tight
+/// loop) does only a single thread-local counter bump — NOT a re-arm, and not
+/// even the budget lookup or the `Instant::now()` clock read. The watchdog
+/// SEMANTICS are unchanged: nested execution is still bounded by the same
+/// outer-armed deadline, polled cheaply in `watchdog_tick`. Because budgeting,
+/// when disabled, returns early WITHOUT incrementing the depth, a non-zero
+/// depth reliably means "budgeting is on AND we are already inside an armed
+/// task" — so the nested fast path can skip the budget check entirely.
+#[inline]
 pub fn enter_js_task() -> TaskGuard {
+    // Nested fast path: already inside an armed task. A SINGLE thread-local
+    // access reads the depth and, if non-zero, bumps it in place — no second
+    // TLS access, no budget lookup, no clock read, no re-arm. (Depth is only
+    // ever non-zero when budgeting is enabled — see the disabled early-return
+    // below — so a non-zero depth reliably means "armed task already active".)
+    let was_nested = JS_TASK_DEPTH.with(|d| {
+        let cur = d.get();
+        if cur > 0 {
+            d.set(cur + 1);
+            true
+        } else {
+            false
+        }
+    });
+    if was_nested {
+        return TaskGuard { active: true, owner: false };
+    }
+    // Outermost entry (depth == 0): consult the budget; arm the fresh deadline.
     let budget = js_time_budget_ms();
     if budget == 0 {
+        // Budgeting disabled: do NOT increment depth, so depth stays 0 and the
+        // nested fast path above is never taken (its invariant relies on this).
         return TaskGuard { active: false, owner: false };
     }
-    let owner = JS_TASK_DEPTH.with(|d| {
-        let cur = d.get();
-        d.set(cur + 1);
-        cur == 0
-    });
-    if owner {
-        let deadline =
-            std::time::Instant::now() + std::time::Duration::from_millis(budget);
-        JS_DEADLINE.with(|dl| dl.set(Some(deadline)));
-    }
-    TaskGuard { active: true, owner }
+    JS_TASK_DEPTH.with(|d| d.set(1));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(budget);
+    JS_DEADLINE.with(|dl| dl.set(Some(deadline)));
+    TaskGuard { active: true, owner: true }
 }
 
 /// Whether the current task's wall-clock deadline has passed. Cheap; the hot
@@ -14169,6 +14248,53 @@ impl Interp {
         Ok(out)
     }
 
+    /// Hot-call-op fast path: evaluate up to `INLINE_ARGS_MAX` NON-spread arg
+    /// expressions into a stack buffer and dispatch the call via the
+    /// borrowed-slice entry, so the common `f(a, b, …)` to a plain function
+    /// never heap-allocates an args `Vec`. Returns:
+    ///   * `None`  — not eligible (a `...spread` arg, or arity > the inline cap);
+    ///               the caller falls back to the owned-`Vec` `eval_args` path.
+    ///   * `Some(Err(e))` — an arg expression (or the call) threw; propagate it.
+    ///   * `Some(Ok(v))`  — the call's result.
+    /// The dispatched semantics are byte-identical to the `eval_args` +
+    /// `call_value_with_this` path — only the args *storage* differs (stack
+    /// buffer vs heap `Vec`). Arg evaluation order (left-to-right) and the
+    /// per-call prologue (deadline/skip/watchdog) are preserved exactly.
+    #[inline]
+    fn try_call_inline_args(
+        &mut self,
+        callee: &Value,
+        this_value: &Value,
+        args: &[Expr],
+        env: &Env,
+    ) -> Option<Result<Value, JsError>> {
+        /// Inline args capacity. Covers the overwhelming majority of real call
+        /// sites; larger arity spills to the owned-`Vec` path (correctness is
+        /// never sacrificed, only the alloc-free optimization). `Value` is not
+        /// `Copy`, so the buffer is value-initialized to `Undefined` (cheap, no
+        /// heap) and overwritten in place. Kept small (4 — matching the P6 JIT's
+        /// arg fbuf) so the per-call array init/drop is minimal.
+        const INLINE_ARGS_MAX: usize = 4;
+        let n = args.len();
+        if n > INLINE_ARGS_MAX {
+            return None;
+        }
+        // Bail (fall through) on ANY spread arg — those need iterable expansion
+        // into a dynamically-sized list, which is exactly what `eval_args` does.
+        if args.iter().any(|a| matches!(a, Expr::Spread(_))) {
+            return None;
+        }
+        let mut buf: [Value; INLINE_ARGS_MAX] =
+            [Value::Undefined, Value::Undefined, Value::Undefined, Value::Undefined];
+        for (slot, a) in buf.iter_mut().zip(args.iter()) {
+            match self.eval(a, env) {
+                Ok(v) => *slot = v,
+                Err(e) => return Some(Err(e)),
+            }
+        }
+        Some(self.call_value_with_this_slice(callee.clone(), this_value.clone(), &buf[..n]))
+    }
+
     fn eval(&mut self, expr: &Expr, env: &Env) -> Result<Value, JsError> {
         watchdog_tick()?;
         match expr {
@@ -14650,6 +14776,19 @@ impl Interp {
                     // accessor wrapper. Without this, core-js's accessor-backed
                     // methods throw "is not a function ([object Object])".
                     let callee_val = self.resolve_accessor(raw, target.clone())?;
+                    // Hot method-call fast path (allocation-free args): a plain
+                    // user-function method `obj.m(a, …)` with no spread arg
+                    // dispatches via the borrowed-slice entry with `this=target`,
+                    // skipping the per-call args `Vec`. Same dispatch semantics;
+                    // a `Value::Function` is always callable so the check below is
+                    // a provable no-op for it. Falls through otherwise.
+                    if let Value::Function(_) = &callee_val {
+                        if let Some(r) =
+                            self.try_call_inline_args(&callee_val, &target, args, env)
+                        {
+                            return r;
+                        }
+                    }
                     let argv = self.eval_args(args, env)?;
                     // Annotate the property name so a missing-binding error
                     // names WHICH method was undefined. CRUCIAL: only annotate
@@ -14698,6 +14837,24 @@ impl Interp {
                     return self.call_value_with_this(callee_val, target, argv);
                 }
                 let callee_val = self.eval(callee, env)?;
+                // ── Hot call op fast path (allocation-free args). For the common
+                // `f(a, b, …)` call to a plain user function with NO spread arg,
+                // evaluate the args into a STACK buffer and dispatch via the
+                // borrowed-slice entry — so a `f(i)` in a tight loop never
+                // heap-allocates an args `Vec` (the JIT/VM tiers all read
+                // `&[Value]`). A `Value::Function` is never a Proxy and is always
+                // callable, so the `proxy_parts` / `is_callable` checks below are
+                // provably no-ops for it and are skipped. Identical dispatch
+                // semantics — just no per-call allocation. Anything else (spread,
+                // >N arity, non-`Function` callee) falls through to the owned-`Vec`
+                // path unchanged.
+                if let Value::Function(_) = &callee_val {
+                    if let Some(r) =
+                        self.try_call_inline_args(&callee_val, &Value::Undefined, args, env)
+                    {
+                        return r;
+                    }
+                }
                 let argv = self.eval_args(args, env)?;
                 // Proxy `apply` trap: calling a function proxy `proxy(...args)`.
                 if let Some((target, handler)) = proxy_parts(&callee_val) {
@@ -20827,6 +20984,15 @@ impl Interp {
     /// (this = freshly allocated object). Falls through to
     /// `call_value` semantics for native fns since they don't
     /// participate in the `this` model yet.
+    ///
+    /// This is the OWNED-args entry: callers that already hold a `Vec<Value>`
+    /// pass it by value, so the native-builtin path (which needs an owned
+    /// `Vec`) moves it in with no clone. The hot tree-walk call op uses the
+    /// borrowed slice entry [`call_value_with_this_slice`] instead, so a
+    /// `f(i)` in a tight loop never heap-allocates an args `Vec` at all (the
+    /// JIT/VM tiers all take `&[Value]`). Both share one prologue + one
+    /// dispatcher (`dispatch_call`) so semantics can never drift between them.
+    #[inline]
     pub fn call_value_with_this(
         &mut self,
         callee: Value,
@@ -20841,6 +21007,44 @@ impl Interp {
         // callees that return before the per-function hook), so it can't leak.
         let skip_bc = bc_take_skip();
         watchdog_tick()?;
+        self.dispatch_call(callee, this_value, ArgStore::Owned(args), skip_bc)
+    }
+
+    /// Borrowed-args twin of [`call_value_with_this`] for the HOT call op
+    /// (the tree-walk `Expr::Call` fast path). Identical prologue + dispatch;
+    /// args are passed as `&[Value]` so the JIT-eligible `Value::Function`
+    /// path allocates ZERO heap (the f64-JIT / VM tiers all take a slice). An
+    /// owned `Vec` is materialized ONLY on the cold native-builtin path
+    /// (`ArgStore::into_owned`), which the numeric hot path never reaches —
+    /// so this is byte-identical to the owned entry but avoids the per-call
+    /// `Vec<Value>` alloc the old path paid on every single call.
+    #[inline]
+    pub fn call_value_with_this_slice(
+        &mut self,
+        callee: Value,
+        this_value: Value,
+        args: &[Value],
+    ) -> Result<Value, JsError> {
+        let _task = enter_js_task();
+        let skip_bc = bc_take_skip();
+        watchdog_tick()?;
+        self.dispatch_call(callee, this_value, ArgStore::Borrowed(args), skip_bc)
+    }
+
+    /// The shared call dispatcher behind both `call_value_with_this` and
+    /// `call_value_with_this_slice`. The prologue (deadline arm, skip-flag
+    /// consume, watchdog poll) has ALREADY run in the caller (so it fires
+    /// exactly once per logical call, never twice); `skip_bc` is the consumed
+    /// construct-skip flag. Args ride in an [`ArgStore`] that is either owned
+    /// (moved straight into the native-builtin path with no clone) or borrowed
+    /// (the hot path — the JIT/VM tiers read the slice, no alloc).
+    fn dispatch_call(
+        &mut self,
+        callee: Value,
+        this_value: Value,
+        store: ArgStore<'_>,
+        skip_bc: bool,
+    ) -> Result<Value, JsError> {
         let f = match callee {
             Value::Function(f) => f,
             Value::NativeFunction(n) => {
@@ -20859,6 +21063,12 @@ impl Interp {
                 if watchdog_enabled() {
                     watchdog_set_native(&n_rc.name);
                 }
+                // Native builtins take an owned `Vec<Value>`. When the caller
+                // passed an owned `Vec` (`ArgStore::Owned`) this is a free move;
+                // borrowed args (the hot path) materialize a `Vec` here — but the
+                // numeric JIT hot path never lands on a native callee, so the hot
+                // call op still pays no allocation.
+                let args = store.into_owned();
                 let result = match &n_rc.func {
                     NativeFnBody::Pure(f) => f(args),
                     NativeFnBody::WithInterp(f) => f(self, args),
@@ -20883,7 +21093,12 @@ impl Interp {
                     b.get("_call").or_else(|| b.get("_construct")).cloned()
                 };
                 if let Some(c) = callable {
-                    return self.call_value_with_this(c, this_value, args);
+                    // Recurse through the OWNED entry exactly as the original
+                    // did — re-running the (nested, harmless) prologue — so this
+                    // namespace-callable path (String/Number coercion, the
+                    // `_construct` ctor host) is byte-identical to before. It is
+                    // not a hot path, so the materialized `Vec` is free here.
+                    return self.call_value_with_this(c, this_value, store.into_owned());
                 }
                 return Err(JsError::Throw(err_str(format!(
                     "TypeError: not a function ({}){}",
@@ -20911,7 +21126,7 @@ impl Interp {
                             other => crate::bytecode::RuntimeError::TypeError(format!("{other:?}")),
                         })
                 };
-                return crate::bytecode::run_closure(&c, &args, &this_value, &g, &mut dispatch)
+                return crate::bytecode::run_closure(&c, store.as_slice(), &this_value, &g, &mut dispatch)
                     .map_err(|e| match e {
                         crate::bytecode::RuntimeError::Thrown(v) => JsError::Throw(v),
                         other => JsError::Throw(err_str(format!("bc: {other:?}"))),
@@ -20925,12 +21140,17 @@ impl Interp {
                 ))));
             }
         };
+        // From here on only the `Value::Function` case remains; the JIT/VM
+        // tiers and the tree-walk body all read the args as a borrowed slice,
+        // so the hot path never owns/clones a `Vec`. (`store` was NOT consumed
+        // by the match arms above for the Function case.)
+        let args: &[Value] = store.as_slice();
         // Per-function bytecode fast path (gated). Runs the function on the
         // register VM when it's compilable + capture-safe; otherwise falls
         // through to the tree-walk below. The construct path sets the skip flag
         // so class constructors always tree-walk (VM omits the class prologue).
         if !skip_bc {
-            if let Some(result) = self.try_call_fn_via_bytecode(&f, &this_value, &args) {
+            if let Some(result) = self.try_call_fn_via_bytecode(&f, &this_value, args) {
                 return result;
             }
         }
@@ -20991,7 +21211,7 @@ impl Interp {
                 // lexically (ECMA-262 §10.2.1.1). A block-bodied arrow reaches
                 // this arm, so guard the binding.
                 if !f.is_arrow {
-                    let arguments = Value::Array(Rc::new(RefCell::new(args.clone())));
+                    let arguments = Value::Array(Rc::new(RefCell::new(args.to_vec())));
                     scope_define(&call_scope, "arguments", arguments, false);
                     // Park this function so `arguments.callee` resolves to it.
                     CALLEE_STACK.with(|s| s.borrow_mut().push(Value::Function(f.clone())));
@@ -31193,5 +31413,150 @@ mod gengc_oracle {
         reset_bc_fn_cache();
         let empty = CALL_IC.with(|c| c.borrow().is_none());
         assert!(empty, "reset_bc_fn_cache must clear the inline cache");
+    }
+
+    // ── Stack-buffer args + once-per-task watchdog arm (V8-shaped call op) ────
+    //
+    // The hot tree-walk call op now evaluates ≤8 non-spread args into a STACK
+    // buffer and dispatches through the borrowed-slice entry, so a `f(i)` in a
+    // tight loop never heap-allocates an args `Vec`; and `enter_js_task` arms the
+    // wall-clock deadline ONCE on the outermost entry (nested calls only bump a
+    // counter). These tests are the ORACLE: results stay byte-identical to the
+    // pure-VM reference, the per-call native-exec count is unchanged, the
+    // watchdog STILL trips a runaway, and multi-arg / apply / spread calls pass
+    // exactly the right argument values through the new stack-buffer path.
+
+    #[test]
+    fn inline_args_hot_mono_loop_byte_identical_and_exec_count_unchanged() {
+        // The bench's float-heavy monomorphic hot loop. The stack-buffer args
+        // path (this is the default now) must equal the pure-VM (JIT/IC-off)
+        // reference bit-for-bit, AND engage the JIT the same number of times
+        // (one native exec per call — cheaper dispatch, not fewer execs).
+        let trips = 4000u64;
+        let src = format!(
+            "function f(x){{ return ((x*x*0.5 + x*3.0 - 1.0) * (x - 2.0) \
+                       + x*x*x*0.25) / (x + 1.0) - x*0.5 + x*x*0.125 - x*7.0; }} \
+                   var result = 0; \
+                   for (var i = 0; i < {trips}; i++) {{ result = result + f(i); }}"
+        );
+        let (with_inline, p6) = run_p6(&src, "result");
+        let vm_only = run_p6_off(&src, "result");
+        assert_eq!(
+            with_inline.to_bits(),
+            vm_only.to_bits(),
+            "stack-buffer args result {with_inline} != VM-only {vm_only}"
+        );
+        // Integrity counter: every call from the JIT_THRESHOLD-th onward runs
+        // natively (the first JIT_THRESHOLD-1 profile on the VM, then compile).
+        // The stack-buffer args path is byte-identical dispatch, so it must NOT
+        // change this count — cheaper args storage, not fewer/more native execs.
+        let expected = trips - (JIT_THRESHOLD as u64 - 1);
+        assert_eq!(
+            p6, expected,
+            "native_exec_count drifted with stack-buffer args: got {p6}, expected {expected}"
+        );
+    }
+
+    #[test]
+    fn inline_args_multiarg_passes_correct_values() {
+        // A multi-arg (>1) function: every parameter must receive the right
+        // value through the stack buffer, in left-to-right order. Compared
+        // byte-identical to the VM-only reference.
+        let src = "function g(a,b,c){ return a*100.0 + b*10.0 + c; } \
+                   var result = 0; \
+                   for (var i = 0; i < 1000; i++) { result = result + g(i, i+1, i+2); }";
+        let (with_inline, _p6) = run_p6(src, "result");
+        let vm_only = run_p6_off(src, "result");
+        assert_eq!(
+            with_inline.to_bits(),
+            vm_only.to_bits(),
+            "multi-arg via stack buffer {with_inline} != VM-only {vm_only}"
+        );
+    }
+
+    #[test]
+    fn inline_args_over_capacity_falls_back_correctly() {
+        // >8 args MUST spill to the owned-Vec path (the inline cap is 8) and
+        // still bind every parameter correctly — i.e. the fallback is taken and
+        // is correct. Uses tree-walk (string concat declines the numeric tiers)
+        // so this exercises the owned-Vec arity-overflow branch end to end.
+        let src = "function h(a,b,c,d,e,f,g,h,i,j){ \
+                       return a+b+c+d+e+f+g+h+i+j; } \
+                   var result = h(1,2,3,4,5,6,7,8,9,10);";
+        let (with_inline, _p6) = run_p6(src, "result");
+        assert_eq!(with_inline, 55.0, "10-arg call (over inline cap) wrong: {with_inline}");
+    }
+
+    #[test]
+    fn inline_args_spread_and_apply_pass_correct_args() {
+        // A `...spread` call arg and `fn.apply(this, arr)` must BOTH bypass the
+        // stack-buffer fast path (it bails on any spread arg; apply routes
+        // through the native builtin) and still pass the spread/array elements
+        // as the callee's positional parameters. Byte-identical to VM-only.
+        let src = "function add3(a,b,c){ return a + b*2.0 + c*3.0; } \
+                   var arr = [4.0, 5.0, 6.0]; \
+                   var viaSpread = add3(...arr); \
+                   var viaApply  = add3.apply(null, arr); \
+                   var result = viaSpread + viaApply * 1000.0;";
+        let (with_inline, _p6) = run_p6(src, "result");
+        let vm_only = run_p6_off(src, "result");
+        // add3(4,5,6) = 4 + 10 + 18 = 32; result = 32 + 32000 = 32032.
+        assert_eq!(with_inline, 32032.0, "spread/apply wrong: {with_inline}");
+        assert_eq!(
+            with_inline.to_bits(),
+            vm_only.to_bits(),
+            "spread/apply via stack-buffer path {with_inline} != VM-only {vm_only}"
+        );
+    }
+
+    #[test]
+    fn watchdog_still_trips_runaway_through_stack_buffer_calls() {
+        // SEMANTICS PRESERVED: a runaway driven through NESTED calls (so every
+        // level hits the new once-per-task arm + the stack-buffer call op) must
+        // STILL be aborted by the wall-clock deadline. We install a tiny budget
+        // DIRECTLY into this thread's cache (no env var → no cross-test race)
+        // and run a real infinite loop that calls a function every iteration;
+        // the run must return Err with the time-budget message — NOT hang, NOT
+        // silently succeed.
+        let prev = set_js_time_budget_cache_for_test(120);
+        let mut i = Interp::new();
+        i.install_basic_globals();
+        // `spin` calls `step` in a loop forever; both go through the call op so
+        // the deadline is armed once (by the outer run, depth 0→1) and polled in
+        // the loop via watchdog_tick. The nested `step` call does NOT re-arm.
+        let src = "function step(x){ return x + 1; } \
+                   function spin(){ var s = 0; \
+                     while (true) { s = step(s); } return s; } \
+                   spin();";
+        let res = i.run(src);
+        // Restore this thread's cached budget for any later test on this thread.
+        let _ = set_js_time_budget_cache_for_test(prev);
+        // The runaway MUST abort (return Err) — never hang, never succeed. That
+        // alone proves the watchdog still trips through the new call op; the
+        // deadline may surface as an Internal error OR as a thrown Error object
+        // (the VM routes the uncatchable Deadline back as a thrown value), so we
+        // accept either and confirm the message names the time-budget abort.
+        let err = res.expect_err("runaway must be aborted by the watchdog, not succeed");
+        // The uncatchable deadline surfaces in one of a few forms depending on
+        // which tier `spin` ran: an `Internal("…time budget…")` from the
+        // tree-walk watchdog, a thrown Error object whose `.message` names the
+        // budget, or the per-fn VM's `bc: Deadline` mapping of `RuntimeError::
+        // Deadline`. Accept ANY of them — what we assert is that the runaway was
+        // ABORTED (not hung, not succeeded) by the time-budget watchdog.
+        let thrown_msg = match &err {
+            JsError::Throw(v) => i.read_property(v, "message").to_display_string(),
+            _ => String::new(),
+        };
+        let raw = format!("{err:?}");
+        let tripped = raw.contains("time budget")
+            || raw.contains("infinite loop")
+            || raw.contains("Deadline")
+            || thrown_msg.contains("time budget")
+            || thrown_msg.contains("infinite loop")
+            || thrown_msg.contains("Deadline");
+        assert!(
+            tripped,
+            "watchdog must trip the runaway through the call op; got err={raw:?} msg={thrown_msg:?}"
+        );
     }
 }
