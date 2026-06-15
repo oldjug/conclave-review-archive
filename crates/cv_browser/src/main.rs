@@ -31160,6 +31160,155 @@ fn build_crypto_object() -> cv_js::Value {
         }
     }
 
+    // --- Asymmetric (RSA / EC) CryptoKey plumbing. ---------------------------
+    // A CryptoKey carries its raw key material in private `_*` fields so the
+    // sign/verify/encrypt/decrypt/exportKey handlers can recover it. EC private
+    // keys store the raw scalar `_ec_d` + uncompressed point `_ec_point`; RSA
+    // keys store big-endian magnitudes for each component.
+
+    /// Read a key object's byte field (stored as an ArrayBuffer) by name.
+    fn key_field_bytes(key: &cv_js::Value, field: &str) -> Option<Vec<u8>> {
+        if let cv_js::Value::Object(o) = key {
+            o.borrow().get(field).map(vec_from_array_arg)
+        } else {
+            None
+        }
+    }
+
+    /// Read a key object's string field by name.
+    fn key_field_str(key: &cv_js::Value, field: &str) -> Option<String> {
+        if let cv_js::Value::Object(o) = key {
+            o.borrow().get(field).map(|v| v.to_display_string())
+        } else {
+            None
+        }
+    }
+
+    /// Map a WebCrypto hash name to the cv_crypto RSA Hash enum.
+    fn rsa_hash(name: &str) -> Option<cv_crypto::rsa::Hash> {
+        match name.to_ascii_uppercase().as_str() {
+            "SHA-1" | "SHA1" => Some(cv_crypto::rsa::Hash::Sha1),
+            "SHA-256" | "SHA256" => Some(cv_crypto::rsa::Hash::Sha256),
+            "SHA-384" | "SHA384" => Some(cv_crypto::rsa::Hash::Sha384),
+            "SHA-512" | "SHA512" => Some(cv_crypto::rsa::Hash::Sha512),
+            _ => None,
+        }
+    }
+
+    /// Reconstruct an `RsaPrivateKey` from a private CryptoKey's stored fields.
+    fn rsa_private_from_key(key: &cv_js::Value) -> Option<cv_crypto::rsa::RsaPrivateKey> {
+        use cv_crypto::bigint::BigUint;
+        let n = key_field_bytes(key, "_rsa_n")?;
+        let e = key_field_bytes(key, "_rsa_e")?;
+        let d = key_field_bytes(key, "_rsa_d")?;
+        let p = key_field_bytes(key, "_rsa_p").unwrap_or_default();
+        let q = key_field_bytes(key, "_rsa_q").unwrap_or_default();
+        let dp = key_field_bytes(key, "_rsa_dp").unwrap_or_default();
+        let dq = key_field_bytes(key, "_rsa_dq").unwrap_or_default();
+        let qinv = key_field_bytes(key, "_rsa_qinv").unwrap_or_default();
+        // The stored modulus length (after trimming any single ASN.1 sign byte)
+        // is the canonical k used for I2OSP across sign/decrypt.
+        let n_int = BigUint::from_be_bytes(&n);
+        let n_byte_len = n_int.bit_len().div_ceil(8);
+        Some(cv_crypto::rsa::RsaPrivateKey {
+            n: n_int,
+            e: BigUint::from_be_bytes(&e),
+            d: BigUint::from_be_bytes(&d),
+            p: BigUint::from_be_bytes(&p),
+            q: BigUint::from_be_bytes(&q),
+            dp: BigUint::from_be_bytes(&dp),
+            dq: BigUint::from_be_bytes(&dq),
+            qinv: BigUint::from_be_bytes(&qinv),
+            n_byte_len,
+        })
+    }
+
+    /// Reconstruct an `RsaPublicKey` from a public (or private) CryptoKey.
+    fn rsa_public_from_key(key: &cv_js::Value) -> Option<cv_crypto::rsa::RsaPublicKey> {
+        let n = key_field_bytes(key, "_rsa_n")?;
+        let e = key_field_bytes(key, "_rsa_e")?;
+        Some(cv_crypto::rsa::RsaPublicKey::from_components(&n, &e))
+    }
+
+    /// Build an `{name, namedCurve}` algorithm object for an EC CryptoKey.
+    fn ec_alg_object(name: &str, curve: &str) -> cv_js::Value {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let mut a: HashMap<String, cv_js::Value> = HashMap::new();
+        a.insert("name".into(), cv_js::Value::str(name));
+        a.insert("namedCurve".into(), cv_js::Value::str(curve));
+        cv_js::Value::Object(Rc::new(RefCell::new(a)))
+    }
+
+    /// Build an `{name, hash, modulusLength, publicExponent}` algorithm object
+    /// for an RSA CryptoKey.
+    fn rsa_alg_object(name: &str, hash: &str, mod_bits: usize, e: &[u8]) -> cv_js::Value {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let mut hobj: HashMap<String, cv_js::Value> = HashMap::new();
+        hobj.insert("name".into(), cv_js::Value::str(hash));
+        let mut a: HashMap<String, cv_js::Value> = HashMap::new();
+        a.insert("name".into(), cv_js::Value::str(name));
+        a.insert("hash".into(), cv_js::Value::Object(Rc::new(RefCell::new(hobj))));
+        a.insert("modulusLength".into(), cv_js::Value::Number(mod_bits as f64));
+        a.insert("publicExponent".into(), make_array_buffer_value(e));
+        cv_js::Value::Object(Rc::new(RefCell::new(a)))
+    }
+
+    /// Build an EC public CryptoKey from the uncompressed point.
+    fn make_ec_public_key(
+        alg_name: &str,
+        curve: &str,
+        point: &[u8],
+        extractable: bool,
+        usages: cv_js::Value,
+    ) -> cv_js::Value {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let mut k: HashMap<String, cv_js::Value> = HashMap::new();
+        k.insert("type".into(), cv_js::Value::str("public"));
+        k.insert("extractable".into(), cv_js::Value::Bool(extractable));
+        k.insert("algorithm".into(), ec_alg_object(alg_name, curve));
+        k.insert("usages".into(), usages);
+        k.insert("_key_class".into(), cv_js::Value::str("EC"));
+        k.insert("_ec_curve".into(), cv_js::Value::str(curve));
+        k.insert("_ec_point".into(), make_array_buffer_value(point));
+        cv_js::Value::Object(Rc::new(RefCell::new(k)))
+    }
+
+    /// Build an EC private CryptoKey from the raw scalar `d` and public point.
+    fn make_ec_private_key(
+        alg_name: &str,
+        curve: &str,
+        d: &[u8],
+        point: &[u8],
+        extractable: bool,
+        usages: cv_js::Value,
+    ) -> cv_js::Value {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let mut k: HashMap<String, cv_js::Value> = HashMap::new();
+        k.insert("type".into(), cv_js::Value::str("private"));
+        k.insert("extractable".into(), cv_js::Value::Bool(extractable));
+        k.insert("algorithm".into(), ec_alg_object(alg_name, curve));
+        k.insert("usages".into(), usages);
+        k.insert("_key_class".into(), cv_js::Value::str("EC"));
+        k.insert("_ec_curve".into(), cv_js::Value::str(curve));
+        k.insert("_ec_d".into(), make_array_buffer_value(d));
+        k.insert("_ec_point".into(), make_array_buffer_value(point));
+        cv_js::Value::Object(Rc::new(RefCell::new(k)))
+    }
+
+    /// Pair `{publicKey, privateKey}` returned by asymmetric generateKey.
+    fn make_key_pair(public_key: cv_js::Value, private_key: cv_js::Value) -> cv_js::Value {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let mut p: HashMap<String, cv_js::Value> = HashMap::new();
+        p.insert("publicKey".into(), public_key);
+        p.insert("privateKey".into(), private_key);
+        cv_js::Value::Object(Rc::new(RefCell::new(p)))
+    }
+
     let mut subtle: HashMap<String, cv_js::Value> = HashMap::new();
     subtle.insert(
         "digest".into(),
@@ -31204,7 +31353,7 @@ fn build_crypto_object() -> cv_js::Value {
         cv_js::native_fn("sign", |args| {
             let alg_val = args.first().cloned().unwrap_or(cv_js::Value::Undefined);
             let alg = algorithm_name(&alg_val);
-            let key = vec_from_array_arg(args.get(1).unwrap_or(&cv_js::Value::Undefined));
+            let key_val = args.get(1).cloned().unwrap_or(cv_js::Value::Undefined);
             let data = vec_from_array_arg(args.get(2).unwrap_or(&cv_js::Value::Undefined));
             // Inspect optional hash sub-field (`{name:"HMAC", hash:"SHA-256"}`)
             // — defaults to SHA-256 if absent.
@@ -31215,6 +31364,99 @@ fn build_crypto_object() -> cv_js::Value {
                     .unwrap_or_else(|| "SHA-256".into())
             } else {
                 "SHA-256".into()
+            };
+            // Asymmetric signatures (ECDSA, RSASSA-PKCS1-v1_5, RSA-PSS) read
+            // their material from a real CryptoKey object, not raw bytes.
+            match alg.as_str() {
+                "ECDSA" => {
+                    let curve = key_field_str(&key_val, "_ec_curve").unwrap_or_default();
+                    let Some(d) = key_field_bytes(&key_val, "_ec_d") else {
+                        return Ok(cv_js::interp::make_settled_promise(
+                            false,
+                            cv_js::Value::str(
+                                "InvalidAccessError: ECDSA sign needs a private key".to_string(),
+                            ),
+                        ));
+                    };
+                    if curve != "P-256" || d.len() != 32 {
+                        return Ok(cv_js::interp::make_settled_promise(
+                            false,
+                            cv_js::Value::str(format!(
+                                "NotSupportedError: ECDSA sign curve {curve}"
+                            )),
+                        ));
+                    }
+                    let mut d32 = [0u8; 32];
+                    d32.copy_from_slice(&d);
+                    return match cv_crypto::p256::sign(&d32, &data) {
+                        Ok((r, s)) => {
+                            // WebCrypto ECDSA signature = r || s (raw, IEEE P1363).
+                            let mut sig = Vec::with_capacity(64);
+                            sig.extend_from_slice(&r);
+                            sig.extend_from_slice(&s);
+                            Ok(cv_js::interp::make_settled_promise(
+                                true,
+                                bytes_to_array_value(&sig),
+                            ))
+                        }
+                        Err(e) => Ok(cv_js::interp::make_settled_promise(
+                            false,
+                            cv_js::Value::str(format!("OperationError: ECDSA sign {e:?}")),
+                        )),
+                    };
+                }
+                "RSASSA-PKCS1-V1_5" | "RSA-PSS" => {
+                    let Some(priv_key) = rsa_private_from_key(&key_val) else {
+                        return Ok(cv_js::interp::make_settled_promise(
+                            false,
+                            cv_js::Value::str(
+                                "InvalidAccessError: RSA sign needs a private key".to_string(),
+                            ),
+                        ));
+                    };
+                    // Hash comes from the key's algorithm (RsaHashedKeyGenParams).
+                    let key_hash = key_field_str(&key_val, "_rsa_hash")
+                        .unwrap_or_else(|| hash_name.clone());
+                    let Some(h) = rsa_hash(&key_hash) else {
+                        return Ok(cv_js::interp::make_settled_promise(
+                            false,
+                            cv_js::Value::str(format!("NotSupportedError: RSA hash {key_hash}")),
+                        ));
+                    };
+                    let result = if alg == "RSA-PSS" {
+                        // Salt length per RsaPssParams.saltLength (default = hash len).
+                        let salt_len = if let cv_js::Value::Object(o) = &alg_val {
+                            o.borrow()
+                                .get("saltLength")
+                                .map(|v| v.to_number() as usize)
+                                .unwrap_or_else(|| h.digest_len())
+                        } else {
+                            h.digest_len()
+                        };
+                        let mut salt = vec![0u8; salt_len];
+                        getrandom_fill(&mut salt);
+                        cv_crypto::rsa::sign_pss(&priv_key, h, &data, &salt)
+                    } else {
+                        cv_crypto::rsa::sign_pkcs1_v15(&priv_key, h, &data)
+                    };
+                    return match result {
+                        Ok(sig) => Ok(cv_js::interp::make_settled_promise(
+                            true,
+                            bytes_to_array_value(&sig),
+                        )),
+                        Err(e) => Ok(cv_js::interp::make_settled_promise(
+                            false,
+                            cv_js::Value::str(format!("OperationError: RSA sign {e:?}")),
+                        )),
+                    };
+                }
+                _ => {}
+            }
+            // HMAC (symmetric) path: key material is raw bytes.
+            let key = if key_field_bytes(&key_val, "_raw").is_some() {
+                key_field_bytes(&key_val, "_raw").unwrap_or_default()
+            } else {
+                vec_from_array_arg(&key_val)
             };
             let mac = match (alg.as_str(), hash_name.as_str()) {
                 ("HMAC", "SHA-1" | "SHA1") => {
@@ -31249,7 +31491,7 @@ fn build_crypto_object() -> cv_js::Value {
         cv_js::native_fn("verify", |args| {
             let alg_val = args.first().cloned().unwrap_or(cv_js::Value::Undefined);
             let alg = algorithm_name(&alg_val);
-            let key = vec_from_array_arg(args.get(1).unwrap_or(&cv_js::Value::Undefined));
+            let key_val = args.get(1).cloned().unwrap_or(cv_js::Value::Undefined);
             let signature = vec_from_array_arg(args.get(2).unwrap_or(&cv_js::Value::Undefined));
             let data = vec_from_array_arg(args.get(3).unwrap_or(&cv_js::Value::Undefined));
             let hash_name = if let cv_js::Value::Object(o) = &alg_val {
@@ -31259,6 +31501,61 @@ fn build_crypto_object() -> cv_js::Value {
                     .unwrap_or_else(|| "SHA-256".into())
             } else {
                 "SHA-256".into()
+            };
+            // Asymmetric verification.
+            match alg.as_str() {
+                "ECDSA" => {
+                    let curve = key_field_str(&key_val, "_ec_curve").unwrap_or_default();
+                    let point = key_field_bytes(&key_val, "_ec_point").unwrap_or_default();
+                    // P-256 uncompressed point = 0x04 || X(32) || Y(32); sig = r||s.
+                    let ok = curve == "P-256"
+                        && point.len() == 65
+                        && point[0] == 0x04
+                        && signature.len() == 64
+                        && cv_crypto::p256::verify(
+                            &point[1..33],
+                            &point[33..65],
+                            &data,
+                            &signature[..32],
+                            &signature[32..],
+                        )
+                        .is_ok();
+                    return Ok(cv_js::interp::make_settled_promise(
+                        true,
+                        cv_js::Value::Bool(ok),
+                    ));
+                }
+                "RSASSA-PKCS1-V1_5" | "RSA-PSS" => {
+                    let Some(pub_key) = rsa_public_from_key(&key_val) else {
+                        return Ok(cv_js::interp::make_settled_promise(
+                            true,
+                            cv_js::Value::Bool(false),
+                        ));
+                    };
+                    let key_hash = key_field_str(&key_val, "_rsa_hash")
+                        .unwrap_or_else(|| hash_name.clone());
+                    let Some(h) = rsa_hash(&key_hash) else {
+                        return Ok(cv_js::interp::make_settled_promise(
+                            true,
+                            cv_js::Value::Bool(false),
+                        ));
+                    };
+                    let res = if alg == "RSA-PSS" {
+                        cv_crypto::rsa::verify_pss(&pub_key, h, &data, &signature)
+                    } else {
+                        cv_crypto::rsa::verify_pkcs1_v15(&pub_key, h, &data, &signature)
+                    };
+                    return Ok(cv_js::interp::make_settled_promise(
+                        true,
+                        cv_js::Value::Bool(res.is_ok()),
+                    ));
+                }
+                _ => {}
+            }
+            let key = if key_field_bytes(&key_val, "_raw").is_some() {
+                key_field_bytes(&key_val, "_raw").unwrap_or_default()
+            } else {
+                vec_from_array_arg(&key_val)
             };
             let want: Option<Vec<u8>> = match (alg.as_str(), hash_name.as_str()) {
                 ("HMAC", "SHA-1" | "SHA1") => {
@@ -31290,8 +31587,49 @@ fn build_crypto_object() -> cv_js::Value {
         cv_js::native_fn("encrypt", |args| {
             let alg_val = args.first().cloned().unwrap_or(cv_js::Value::Undefined);
             let alg = algorithm_name(&alg_val);
-            let key = vec_from_array_arg(args.get(1).unwrap_or(&cv_js::Value::Undefined));
+            let key_val = args.get(1).cloned().unwrap_or(cv_js::Value::Undefined);
             let data = vec_from_array_arg(args.get(2).unwrap_or(&cv_js::Value::Undefined));
+            // RSA-OAEP public-key encryption.
+            if alg == "RSA-OAEP" {
+                let Some(pub_key) = rsa_public_from_key(&key_val) else {
+                    return Ok(cv_js::interp::make_settled_promise(
+                        false,
+                        cv_js::Value::str(
+                            "InvalidAccessError: RSA-OAEP encrypt needs a public key".to_string(),
+                        ),
+                    ));
+                };
+                let key_hash =
+                    key_field_str(&key_val, "_rsa_hash").unwrap_or_else(|| "SHA-256".into());
+                let Some(h) = rsa_hash(&key_hash) else {
+                    return Ok(cv_js::interp::make_settled_promise(
+                        false,
+                        cv_js::Value::str(format!("NotSupportedError: RSA-OAEP hash {key_hash}")),
+                    ));
+                };
+                let label: Vec<u8> = if let cv_js::Value::Object(o) = &alg_val {
+                    o.borrow().get("label").map(vec_from_array_arg).unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+                let mut seed = vec![0u8; h.digest_len()];
+                getrandom_fill(&mut seed);
+                return match cv_crypto::rsa::encrypt_oaep(&pub_key, h, &data, &label, &seed) {
+                    Ok(ct) => Ok(cv_js::interp::make_settled_promise(
+                        true,
+                        bytes_to_array_value(&ct),
+                    )),
+                    Err(e) => Ok(cv_js::interp::make_settled_promise(
+                        false,
+                        cv_js::Value::str(format!("OperationError: RSA-OAEP encrypt {e:?}")),
+                    )),
+                };
+            }
+            let key = if key_field_bytes(&key_val, "_raw").is_some() {
+                key_field_bytes(&key_val, "_raw").unwrap_or_default()
+            } else {
+                vec_from_array_arg(&key_val)
+            };
             let ciphertext = match alg.as_str() {
                 "AES-GCM" if (key.len() == 32 || key.len() == 16) => {
                     let iv: Vec<u8> = if let cv_js::Value::Object(o) = &alg_val {
@@ -31346,8 +31684,47 @@ fn build_crypto_object() -> cv_js::Value {
         cv_js::native_fn("decrypt", |args| {
             let alg_val = args.first().cloned().unwrap_or(cv_js::Value::Undefined);
             let alg = algorithm_name(&alg_val);
-            let key = vec_from_array_arg(args.get(1).unwrap_or(&cv_js::Value::Undefined));
+            let key_val = args.get(1).cloned().unwrap_or(cv_js::Value::Undefined);
             let data = vec_from_array_arg(args.get(2).unwrap_or(&cv_js::Value::Undefined));
+            // RSA-OAEP private-key decryption.
+            if alg == "RSA-OAEP" {
+                let Some(priv_key) = rsa_private_from_key(&key_val) else {
+                    return Ok(cv_js::interp::make_settled_promise(
+                        false,
+                        cv_js::Value::str(
+                            "InvalidAccessError: RSA-OAEP decrypt needs a private key".to_string(),
+                        ),
+                    ));
+                };
+                let key_hash =
+                    key_field_str(&key_val, "_rsa_hash").unwrap_or_else(|| "SHA-256".into());
+                let Some(h) = rsa_hash(&key_hash) else {
+                    return Ok(cv_js::interp::make_settled_promise(
+                        false,
+                        cv_js::Value::str(format!("NotSupportedError: RSA-OAEP hash {key_hash}")),
+                    ));
+                };
+                let label: Vec<u8> = if let cv_js::Value::Object(o) = &alg_val {
+                    o.borrow().get("label").map(vec_from_array_arg).unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+                return match cv_crypto::rsa::decrypt_oaep(&priv_key, h, &data, &label) {
+                    Ok(pt) => Ok(cv_js::interp::make_settled_promise(
+                        true,
+                        bytes_to_array_value(&pt),
+                    )),
+                    Err(e) => Ok(cv_js::interp::make_settled_promise(
+                        false,
+                        cv_js::Value::str(format!("OperationError: RSA-OAEP decrypt {e:?}")),
+                    )),
+                };
+            }
+            let key = if key_field_bytes(&key_val, "_raw").is_some() {
+                key_field_bytes(&key_val, "_raw").unwrap_or_default()
+            } else {
+                vec_from_array_arg(&key_val)
+            };
             let plain = match alg.as_str() {
                 "AES-GCM" if (key.len() == 32 || key.len() == 16) => {
                     let iv: Vec<u8> = if let cv_js::Value::Object(o) = &alg_val {
@@ -31409,26 +31786,421 @@ fn build_crypto_object() -> cv_js::Value {
     subtle.insert(
         "importKey".into(),
         cv_js::native_fn("importKey", |args| {
-            // V1: just echo the raw bytes back as a tagged object so
-            // subsequent sign/verify/encrypt calls can read them out.
             let format = args
                 .first()
                 .map(|v| v.to_display_string())
                 .unwrap_or_default();
             let key_data = args.get(1).cloned().unwrap_or(cv_js::Value::Undefined);
             let algorithm = args.get(2).cloned().unwrap_or(cv_js::Value::Undefined);
+            let alg = algorithm_name(&algorithm);
             let extractable = args.get(3).map(|v| v.to_bool()).unwrap_or(false);
             let usages = args.get(4).cloned().unwrap_or(cv_js::Value::Undefined);
+
+            // Pull JWK fields out of a JS object's b64url string members.
+            let jwk_field = |name: &str| -> Option<Vec<u8>> {
+                if let cv_js::Value::Object(o) = &key_data {
+                    o.borrow()
+                        .get(name)
+                        .map(|v| v.to_display_string())
+                        .and_then(|s| cv_crypto::subtle_jwk::b64url_dec(&s))
+                } else {
+                    None
+                }
+            };
+            let jwk_str = |name: &str| -> Option<String> {
+                if let cv_js::Value::Object(o) = &key_data {
+                    o.borrow().get(name).map(|v| v.to_display_string())
+                } else {
+                    None
+                }
+            };
+            let raw_bytes = vec_from_array_arg(&key_data);
+
+            // --- ECDSA / ECDH key import. -----------------------------------
+            if alg == "ECDSA" || alg == "ECDH" {
+                let curve = if let cv_js::Value::Object(o) = &algorithm {
+                    o.borrow()
+                        .get("namedCurve")
+                        .map(|v| v.to_display_string())
+                        .unwrap_or_else(|| "P-256".into())
+                } else {
+                    "P-256".into()
+                };
+                match format.as_str() {
+                    "raw" => {
+                        // raw = uncompressed public point (0x04||X||Y).
+                        return Ok(cv_js::interp::make_settled_promise(
+                            true,
+                            make_ec_public_key(&alg, &curve, &raw_bytes, extractable, usages),
+                        ));
+                    }
+                    "jwk" => {
+                        let crv = jwk_str("crv").unwrap_or_else(|| curve.clone());
+                        let x = jwk_field("x").unwrap_or_default();
+                        let y = jwk_field("y").unwrap_or_default();
+                        let mut point = vec![0x04u8];
+                        point.extend_from_slice(&x);
+                        point.extend_from_slice(&y);
+                        if let Some(d) = jwk_field("d") {
+                            // Private JWK.
+                            let mut d32 = [0u8; 32];
+                            if d.len() == 32 {
+                                d32.copy_from_slice(&d);
+                            }
+                            // Recompute point if x/y absent.
+                            if point.len() != 65 {
+                                if let Ok(p) = cv_crypto::p256::public_key_uncompressed(&d32) {
+                                    point = p.to_vec();
+                                }
+                            }
+                            return Ok(cv_js::interp::make_settled_promise(
+                                true,
+                                make_ec_private_key(&alg, &crv, &d, &point, extractable, usages),
+                            ));
+                        }
+                        return Ok(cv_js::interp::make_settled_promise(
+                            true,
+                            make_ec_public_key(&alg, &crv, &point, extractable, usages),
+                        ));
+                    }
+                    "spki" => {
+                        if let Some((crv, point)) =
+                            cv_crypto::subtle_jwk::parse_ec_spki(&raw_bytes)
+                        {
+                            return Ok(cv_js::interp::make_settled_promise(
+                                true,
+                                make_ec_public_key(&alg, crv, &point, extractable, usages),
+                            ));
+                        }
+                    }
+                    "pkcs8" => {
+                        if let Some((crv, d)) =
+                            cv_crypto::subtle_jwk::parse_ec_pkcs8(&raw_bytes)
+                        {
+                            let mut d32 = [0u8; 32];
+                            if d.len() == 32 {
+                                d32.copy_from_slice(&d);
+                            }
+                            let point = cv_crypto::p256::public_key_uncompressed(&d32)
+                                .map(|p| p.to_vec())
+                                .unwrap_or_default();
+                            return Ok(cv_js::interp::make_settled_promise(
+                                true,
+                                make_ec_private_key(&alg, crv, &d, &point, extractable, usages),
+                            ));
+                        }
+                    }
+                    _ => {}
+                }
+                return Ok(cv_js::interp::make_settled_promise(
+                    false,
+                    cv_js::Value::str(format!("DataError: cannot import EC key format {format}")),
+                ));
+            }
+
+            // --- RSA key import. --------------------------------------------
+            if alg.starts_with("RSA") {
+                let hash = if let cv_js::Value::Object(o) = &algorithm {
+                    o.borrow()
+                        .get("hash")
+                        .map(algorithm_name)
+                        .unwrap_or_else(|| "SHA-256".into())
+                } else {
+                    "SHA-256".into()
+                };
+                let build_rsa = |is_private: bool,
+                                 n: Vec<u8>,
+                                 e: Vec<u8>,
+                                 d: Vec<u8>,
+                                 p: Vec<u8>,
+                                 q: Vec<u8>,
+                                 dp: Vec<u8>,
+                                 dq: Vec<u8>,
+                                 qinv: Vec<u8>|
+                 -> cv_js::Value {
+                    use std::cell::RefCell;
+                    use std::rc::Rc;
+                    let mut k: HashMap<String, cv_js::Value> = HashMap::new();
+                    k.insert(
+                        "type".into(),
+                        cv_js::Value::str(if is_private { "private" } else { "public" }),
+                    );
+                    k.insert("extractable".into(), cv_js::Value::Bool(extractable));
+                    k.insert("algorithm".into(), algorithm.clone());
+                    k.insert("usages".into(), usages.clone());
+                    k.insert("_key_class".into(), cv_js::Value::str("RSA"));
+                    k.insert("_rsa_hash".into(), cv_js::Value::str(&hash));
+                    k.insert("_rsa_n".into(), make_array_buffer_value(&n));
+                    k.insert("_rsa_e".into(), make_array_buffer_value(&e));
+                    if is_private {
+                        k.insert("_rsa_d".into(), make_array_buffer_value(&d));
+                        k.insert("_rsa_p".into(), make_array_buffer_value(&p));
+                        k.insert("_rsa_q".into(), make_array_buffer_value(&q));
+                        k.insert("_rsa_dp".into(), make_array_buffer_value(&dp));
+                        k.insert("_rsa_dq".into(), make_array_buffer_value(&dq));
+                        k.insert("_rsa_qinv".into(), make_array_buffer_value(&qinv));
+                    }
+                    cv_js::Value::Object(Rc::new(RefCell::new(k)))
+                };
+                match format.as_str() {
+                    "jwk" => {
+                        let n = jwk_field("n").unwrap_or_default();
+                        let e = jwk_field("e").unwrap_or_default();
+                        if let Some(d) = jwk_field("d") {
+                            return Ok(cv_js::interp::make_settled_promise(
+                                true,
+                                build_rsa(
+                                    true,
+                                    n,
+                                    e,
+                                    d,
+                                    jwk_field("p").unwrap_or_default(),
+                                    jwk_field("q").unwrap_or_default(),
+                                    jwk_field("dp").unwrap_or_default(),
+                                    jwk_field("dq").unwrap_or_default(),
+                                    jwk_field("qi").unwrap_or_default(),
+                                ),
+                            ));
+                        }
+                        return Ok(cv_js::interp::make_settled_promise(
+                            true,
+                            build_rsa(false, n, e, vec![], vec![], vec![], vec![], vec![], vec![]),
+                        ));
+                    }
+                    "spki" => {
+                        if let Some((n, e)) = cv_crypto::subtle_jwk::parse_rsa_spki(&raw_bytes) {
+                            return Ok(cv_js::interp::make_settled_promise(
+                                true,
+                                build_rsa(
+                                    false, n, e, vec![], vec![], vec![], vec![], vec![], vec![],
+                                ),
+                            ));
+                        }
+                    }
+                    "pkcs8" => {
+                        if let Some((n, e, d, p, q, dp, dq, qinv)) =
+                            cv_crypto::subtle_jwk::parse_rsa_pkcs8(&raw_bytes)
+                        {
+                            return Ok(cv_js::interp::make_settled_promise(
+                                true,
+                                build_rsa(true, n, e, d, p, q, dp, dq, qinv),
+                            ));
+                        }
+                    }
+                    _ => {}
+                }
+                return Ok(cv_js::interp::make_settled_promise(
+                    false,
+                    cv_js::Value::str(format!("DataError: cannot import RSA key format {format}")),
+                ));
+            }
+
+            // --- Symmetric (AES-*, HMAC, PBKDF2, HKDF) raw/jwk import. -------
+            // Material is stored as `_raw`; jwk 'oct' uses the k member.
+            let raw = if format == "jwk" {
+                jwk_field("k").map(|b| make_array_buffer_value(&b)).unwrap_or(key_data)
+            } else {
+                key_data
+            };
             let mut k: HashMap<String, cv_js::Value> = HashMap::new();
             k.insert("type".into(), cv_js::Value::String("secret".into()));
             k.insert("extractable".into(), cv_js::Value::Bool(extractable));
             k.insert("algorithm".into(), algorithm);
             k.insert("usages".into(), usages);
-            k.insert("_raw".into(), key_data);
+            k.insert("_key_class".into(), cv_js::Value::str("secret"));
+            k.insert("_raw".into(), raw);
             k.insert("_format".into(), cv_js::Value::str(format));
             Ok(cv_js::interp::make_settled_promise(
                 true,
                 cv_js::Value::Object(Rc::new(RefCell::new(k))),
+            ))
+        }),
+    );
+    subtle.insert(
+        "exportKey".into(),
+        cv_js::native_fn("exportKey", |args| {
+            let format = args
+                .first()
+                .map(|v| v.to_display_string())
+                .unwrap_or_default();
+            let key_val = args.get(1).cloned().unwrap_or(cv_js::Value::Undefined);
+            let key_class = key_field_str(&key_val, "_key_class").unwrap_or_default();
+            let key_type = key_field_str(&key_val, "type").unwrap_or_default();
+
+            // Build a JWK JS object from named (field, b64url) members.
+            let make_jwk = |members: &[(&str, &str)]| -> cv_js::Value {
+                use std::cell::RefCell;
+                use std::rc::Rc;
+                let mut o: HashMap<String, cv_js::Value> = HashMap::new();
+                for (k, v) in members {
+                    o.insert((*k).into(), cv_js::Value::str(*v));
+                }
+                o.insert("ext".into(), cv_js::Value::Bool(true));
+                cv_js::Value::Object(Rc::new(RefCell::new(o)))
+            };
+            let b64 = cv_crypto::subtle_jwk::b64url;
+
+            match key_class.as_str() {
+                "EC" => {
+                    let curve = key_field_str(&key_val, "_ec_curve").unwrap_or_default();
+                    let point = key_field_bytes(&key_val, "_ec_point").unwrap_or_default();
+                    let alg_name = if let cv_js::Value::Object(o) = &key_val {
+                        if let Some(cv_js::Value::Object(a)) = o.borrow().get("algorithm") {
+                            a.borrow()
+                                .get("name")
+                                .map(|v| v.to_display_string())
+                                .unwrap_or_else(|| "ECDSA".into())
+                        } else {
+                            "ECDSA".into()
+                        }
+                    } else {
+                        "ECDSA".into()
+                    };
+                    let curve_oid = cv_crypto::subtle_jwk::curve_oid(&curve).unwrap_or(&[]);
+                    match format.as_str() {
+                        "raw" => {
+                            // raw export = public uncompressed point.
+                            return Ok(cv_js::interp::make_settled_promise(
+                                true,
+                                bytes_to_array_value(&point),
+                            ));
+                        }
+                        "spki" => {
+                            let spki = cv_crypto::subtle_jwk::ec_spki(&point, curve_oid);
+                            return Ok(cv_js::interp::make_settled_promise(
+                                true,
+                                bytes_to_array_value(&spki),
+                            ));
+                        }
+                        "pkcs8" => {
+                            let d = key_field_bytes(&key_val, "_ec_d").unwrap_or_default();
+                            let pk8 = cv_crypto::subtle_jwk::ec_pkcs8(&d, &point, curve_oid);
+                            return Ok(cv_js::interp::make_settled_promise(
+                                true,
+                                bytes_to_array_value(&pk8),
+                            ));
+                        }
+                        "jwk" => {
+                            let (x, y) = if point.len() == 65 {
+                                (point[1..33].to_vec(), point[33..65].to_vec())
+                            } else {
+                                (vec![], vec![])
+                            };
+                            let crv_str = curve.clone();
+                            let x_b = b64(&x);
+                            let y_b = b64(&y);
+                            let _ = alg_name; // crv carries the curve; alg implied by use
+                            if key_type == "private" {
+                                let d = key_field_bytes(&key_val, "_ec_d").unwrap_or_default();
+                                let d_b = b64(&d);
+                                return Ok(cv_js::interp::make_settled_promise(
+                                    true,
+                                    make_jwk(&[
+                                        ("kty", "EC"),
+                                        ("crv", &crv_str),
+                                        ("x", &x_b),
+                                        ("y", &y_b),
+                                        ("d", &d_b),
+                                    ]),
+                                ));
+                            }
+                            return Ok(cv_js::interp::make_settled_promise(
+                                true,
+                                make_jwk(&[
+                                    ("kty", "EC"),
+                                    ("crv", &crv_str),
+                                    ("x", &x_b),
+                                    ("y", &y_b),
+                                ]),
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
+                "RSA" => {
+                    let n = key_field_bytes(&key_val, "_rsa_n").unwrap_or_default();
+                    let e = key_field_bytes(&key_val, "_rsa_e").unwrap_or_default();
+                    match format.as_str() {
+                        "spki" => {
+                            let spki = cv_crypto::subtle_jwk::rsa_spki(&n, &e);
+                            return Ok(cv_js::interp::make_settled_promise(
+                                true,
+                                bytes_to_array_value(&spki),
+                            ));
+                        }
+                        "pkcs8" => {
+                            let d = key_field_bytes(&key_val, "_rsa_d").unwrap_or_default();
+                            let p = key_field_bytes(&key_val, "_rsa_p").unwrap_or_default();
+                            let q = key_field_bytes(&key_val, "_rsa_q").unwrap_or_default();
+                            let dp = key_field_bytes(&key_val, "_rsa_dp").unwrap_or_default();
+                            let dq = key_field_bytes(&key_val, "_rsa_dq").unwrap_or_default();
+                            let qi = key_field_bytes(&key_val, "_rsa_qinv").unwrap_or_default();
+                            let pk8 =
+                                cv_crypto::subtle_jwk::rsa_pkcs8(&n, &e, &d, &p, &q, &dp, &dq, &qi);
+                            return Ok(cv_js::interp::make_settled_promise(
+                                true,
+                                bytes_to_array_value(&pk8),
+                            ));
+                        }
+                        "jwk" => {
+                            let n_b = b64(&n);
+                            let e_b = b64(&e);
+                            if key_type == "private" {
+                                let d_b = b64(&key_field_bytes(&key_val, "_rsa_d").unwrap_or_default());
+                                let p_b = b64(&key_field_bytes(&key_val, "_rsa_p").unwrap_or_default());
+                                let q_b = b64(&key_field_bytes(&key_val, "_rsa_q").unwrap_or_default());
+                                let dp_b = b64(&key_field_bytes(&key_val, "_rsa_dp").unwrap_or_default());
+                                let dq_b = b64(&key_field_bytes(&key_val, "_rsa_dq").unwrap_or_default());
+                                let qi_b = b64(&key_field_bytes(&key_val, "_rsa_qinv").unwrap_or_default());
+                                return Ok(cv_js::interp::make_settled_promise(
+                                    true,
+                                    make_jwk(&[
+                                        ("kty", "RSA"),
+                                        ("n", &n_b),
+                                        ("e", &e_b),
+                                        ("d", &d_b),
+                                        ("p", &p_b),
+                                        ("q", &q_b),
+                                        ("dp", &dp_b),
+                                        ("dq", &dq_b),
+                                        ("qi", &qi_b),
+                                    ]),
+                                ));
+                            }
+                            return Ok(cv_js::interp::make_settled_promise(
+                                true,
+                                make_jwk(&[("kty", "RSA"), ("n", &n_b), ("e", &e_b)]),
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {
+                    // Symmetric key: raw bytes or jwk 'oct'.
+                    let raw = key_field_bytes(&key_val, "_raw").unwrap_or_default();
+                    match format.as_str() {
+                        "raw" => {
+                            return Ok(cv_js::interp::make_settled_promise(
+                                true,
+                                bytes_to_array_value(&raw),
+                            ));
+                        }
+                        "jwk" => {
+                            let k_b = b64(&raw);
+                            return Ok(cv_js::interp::make_settled_promise(
+                                true,
+                                make_jwk(&[("kty", "oct"), ("k", &k_b)]),
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Ok(cv_js::interp::make_settled_promise(
+                false,
+                cv_js::Value::str(format!(
+                    "NotSupportedError: exportKey format {format} for {key_class}"
+                )),
             ))
         }),
     );
@@ -31450,6 +32222,44 @@ fn build_crypto_object() -> cv_js::Value {
             } else {
                 vec_from_array_arg(&key_val)
             };
+            // ECDH: deriveBits({name:"ECDH", public: <peerPubKey>}, privKey, lenBits)
+            // The shared secret is the X coordinate of d_priv * Q_peer (SEC1
+            // §3.3.1). WebCrypto returns the leftmost `lenBits` of that secret;
+            // a null/0 length returns the whole field element.
+            if alg == "ECDH" {
+                let curve = key_field_str(&key_val, "_ec_curve").unwrap_or_default();
+                let d = key_field_bytes(&key_val, "_ec_d").unwrap_or_default();
+                let peer = if let cv_js::Value::Object(o) = &alg_val {
+                    o.borrow().get("public").cloned().unwrap_or(cv_js::Value::Undefined)
+                } else {
+                    cv_js::Value::Undefined
+                };
+                let peer_point = key_field_bytes(&peer, "_ec_point").unwrap_or_default();
+                if curve != "P-256" || d.len() != 32 || peer_point.len() != 65 {
+                    return Ok(cv_js::interp::make_settled_promise(
+                        false,
+                        cv_js::Value::str(format!(
+                            "NotSupportedError: ECDH derive curve {curve}"
+                        )),
+                    ));
+                }
+                let mut d32 = [0u8; 32];
+                d32.copy_from_slice(&d);
+                return match cv_crypto::p256::ecdh_shared(&d32, &peer_point) {
+                    Ok(secret) => {
+                        // Length null/0 → full 32-byte secret; else leftmost bytes.
+                        let take = if len_bits == 0 { 32 } else { out_len.min(32) };
+                        Ok(cv_js::interp::make_settled_promise(
+                            true,
+                            bytes_to_array_value(&secret[..take]),
+                        ))
+                    }
+                    Err(e) => Ok(cv_js::interp::make_settled_promise(
+                        false,
+                        cv_js::Value::str(format!("OperationError: ECDH derive {e:?}")),
+                    )),
+                };
+            }
             let derived: Vec<u8> = match alg.as_str() {
                 "PBKDF2" => {
                     let (hash_name, salt, iters) = if let cv_js::Value::Object(o) = &alg_val {
@@ -31577,6 +32387,46 @@ fn build_crypto_object() -> cv_js::Value {
             } else {
                 256
             };
+            // ECDH deriveKey: compute the shared secret, then take the leftmost
+            // `derived_len_bits` as the new symmetric (AES/HMAC) key material.
+            if alg == "ECDH" {
+                let curve = key_field_str(&key_val, "_ec_curve").unwrap_or_default();
+                let d = key_field_bytes(&key_val, "_ec_d").unwrap_or_default();
+                let peer = if let cv_js::Value::Object(o) = &alg_val {
+                    o.borrow().get("public").cloned().unwrap_or(cv_js::Value::Undefined)
+                } else {
+                    cv_js::Value::Undefined
+                };
+                let peer_point = key_field_bytes(&peer, "_ec_point").unwrap_or_default();
+                if curve != "P-256" || d.len() != 32 || peer_point.len() != 65 {
+                    return Ok(cv_js::interp::make_settled_promise(
+                        false,
+                        cv_js::Value::str(format!("NotSupportedError: ECDH deriveKey curve {curve}")),
+                    ));
+                }
+                let mut d32 = [0u8; 32];
+                d32.copy_from_slice(&d);
+                return match cv_crypto::p256::ecdh_shared(&d32, &peer_point) {
+                    Ok(secret) => {
+                        let take = ((derived_len_bits + 7) / 8).min(32);
+                        let raw = secret[..take].to_vec();
+                        let mut k: HashMap<String, cv_js::Value> = HashMap::new();
+                        k.insert("type".into(), cv_js::Value::String("secret".into()));
+                        k.insert("extractable".into(), cv_js::Value::Bool(true));
+                        k.insert("algorithm".into(), cv_js::Value::str(derived_alg));
+                        k.insert("_key_class".into(), cv_js::Value::str("secret"));
+                        k.insert("_raw".into(), bytes_to_array_value(&raw));
+                        Ok(cv_js::interp::make_settled_promise(
+                            true,
+                            cv_js::Value::Object(Rc::new(RefCell::new(k))),
+                        ))
+                    }
+                    Err(e) => Ok(cv_js::interp::make_settled_promise(
+                        false,
+                        cv_js::Value::str(format!("OperationError: ECDH deriveKey {e:?}")),
+                    )),
+                };
+            }
             if alg != "PBKDF2" {
                 return Ok(cv_js::interp::make_settled_promise(
                     false,
@@ -31641,16 +32491,157 @@ fn build_crypto_object() -> cv_js::Value {
     subtle.insert(
         "generateKey".into(),
         cv_js::native_fn("generateKey", |args| {
-            let alg = algorithm_name(args.first().unwrap_or(&cv_js::Value::Undefined));
-            let len_bits =
-                if let cv_js::Value::Object(o) = args.first().unwrap_or(&cv_js::Value::Undefined) {
+            let alg_val = args.first().cloned().unwrap_or(cv_js::Value::Undefined);
+            let alg = algorithm_name(&alg_val);
+            let extractable = args.get(1).map(|v| v.to_bool()).unwrap_or(false);
+            let usages = args.get(2).cloned().unwrap_or(cv_js::Value::Undefined);
+
+            // --- ECDSA / ECDH: generate a P-256 key pair. -------------------
+            if alg == "ECDSA" || alg == "ECDH" {
+                let curve = if let cv_js::Value::Object(o) = &alg_val {
                     o.borrow()
-                        .get("length")
-                        .map(|v| v.to_number() as usize)
-                        .unwrap_or(256)
+                        .get("namedCurve")
+                        .map(|v| v.to_display_string())
+                        .unwrap_or_else(|| "P-256".into())
                 } else {
-                    256
+                    "P-256".into()
                 };
+                if curve != "P-256" {
+                    return Ok(cv_js::interp::make_settled_promise(
+                        false,
+                        cv_js::Value::str(format!("NotSupportedError: EC curve {curve}")),
+                    ));
+                }
+                let mut rng = |b: &mut [u8]| getrandom_fill(b);
+                let d = cv_crypto::p256::generate_private_scalar(&mut rng);
+                let point = match cv_crypto::p256::public_key_uncompressed(&d) {
+                    Ok(p) => p.to_vec(),
+                    Err(e) => {
+                        return Ok(cv_js::interp::make_settled_promise(
+                            false,
+                            cv_js::Value::str(format!("OperationError: EC keygen {e:?}")),
+                        ));
+                    }
+                };
+                let pub_key =
+                    make_ec_public_key(&alg, &curve, &point, true, usages.clone());
+                let priv_key =
+                    make_ec_private_key(&alg, &curve, &d, &point, extractable, usages);
+                return Ok(cv_js::interp::make_settled_promise(
+                    true,
+                    make_key_pair(pub_key, priv_key),
+                ));
+            }
+
+            // --- RSA (RSASSA-PKCS1-v1_5 / RSA-PSS / RSA-OAEP). --------------
+            if alg.starts_with("RSA") {
+                let (mod_bits, e_bytes, hash) = if let cv_js::Value::Object(o) = &alg_val {
+                    let b = o.borrow();
+                    let mb = b
+                        .get("modulusLength")
+                        .map(|v| v.to_number() as usize)
+                        .unwrap_or(2048);
+                    let e = b
+                        .get("publicExponent")
+                        .map(|v| vec_from_array_arg(v))
+                        .filter(|v| !v.is_empty())
+                        .unwrap_or_else(|| vec![0x01, 0x00, 0x01]); // 65537
+                    let h = b
+                        .get("hash")
+                        .map(algorithm_name)
+                        .unwrap_or_else(|| "SHA-256".into());
+                    (mb, e, h)
+                } else {
+                    (2048, vec![0x01, 0x00, 0x01], "SHA-256".into())
+                };
+                // Bound the modulus to keep the synchronous keygen from
+                // freezing the tab on a pathological request.
+                if !(512..=4096).contains(&mod_bits) {
+                    return Ok(cv_js::interp::make_settled_promise(
+                        false,
+                        cv_js::Value::str(format!(
+                            "NotSupportedError: RSA modulusLength {mod_bits}"
+                        )),
+                    ));
+                }
+                let e_u64 = e_bytes.iter().fold(0u64, |acc, &b| (acc << 8) | b as u64);
+                let mut rng = |b: &mut [u8]| getrandom_fill(b);
+                let priv_rsa =
+                    cv_crypto::rsa::generate_keypair(mod_bits, e_u64, &mut rng);
+                let pub_rsa = priv_rsa.public_key();
+                let n_be = pub_rsa.n.to_be_bytes(mod_bits / 8);
+                let e_be = pub_rsa.e.to_be_bytes(e_bytes.len().max(3));
+
+                // Public key.
+                let mut pubk: HashMap<String, cv_js::Value> = HashMap::new();
+                pubk.insert("type".into(), cv_js::Value::str("public"));
+                pubk.insert("extractable".into(), cv_js::Value::Bool(true));
+                pubk.insert(
+                    "algorithm".into(),
+                    rsa_alg_object(&alg, &hash, mod_bits, &e_be),
+                );
+                pubk.insert("usages".into(), usages.clone());
+                pubk.insert("_key_class".into(), cv_js::Value::str("RSA"));
+                pubk.insert("_rsa_hash".into(), cv_js::Value::str(&hash));
+                pubk.insert("_rsa_n".into(), make_array_buffer_value(&n_be));
+                pubk.insert("_rsa_e".into(), make_array_buffer_value(&e_be));
+
+                // Private key (carries the full CRT set).
+                let mut privk: HashMap<String, cv_js::Value> = HashMap::new();
+                privk.insert("type".into(), cv_js::Value::str("private"));
+                privk.insert("extractable".into(), cv_js::Value::Bool(extractable));
+                privk.insert(
+                    "algorithm".into(),
+                    rsa_alg_object(&alg, &hash, mod_bits, &e_be),
+                );
+                privk.insert("usages".into(), usages);
+                privk.insert("_key_class".into(), cv_js::Value::str("RSA"));
+                privk.insert("_rsa_hash".into(), cv_js::Value::str(&hash));
+                privk.insert("_rsa_n".into(), make_array_buffer_value(&n_be));
+                privk.insert("_rsa_e".into(), make_array_buffer_value(&e_be));
+                privk.insert(
+                    "_rsa_d".into(),
+                    make_array_buffer_value(&priv_rsa.d.to_be_bytes(mod_bits / 8)),
+                );
+                let plen = (mod_bits / 2).div_ceil(8);
+                privk.insert(
+                    "_rsa_p".into(),
+                    make_array_buffer_value(&priv_rsa.p.to_be_bytes(plen)),
+                );
+                privk.insert(
+                    "_rsa_q".into(),
+                    make_array_buffer_value(&priv_rsa.q.to_be_bytes(plen)),
+                );
+                privk.insert(
+                    "_rsa_dp".into(),
+                    make_array_buffer_value(&priv_rsa.dp.to_be_bytes(plen)),
+                );
+                privk.insert(
+                    "_rsa_dq".into(),
+                    make_array_buffer_value(&priv_rsa.dq.to_be_bytes(plen)),
+                );
+                privk.insert(
+                    "_rsa_qinv".into(),
+                    make_array_buffer_value(&priv_rsa.qinv.to_be_bytes(plen)),
+                );
+                return Ok(cv_js::interp::make_settled_promise(
+                    true,
+                    make_key_pair(
+                        cv_js::Value::Object(Rc::new(RefCell::new(pubk))),
+                        cv_js::Value::Object(Rc::new(RefCell::new(privk))),
+                    ),
+                ));
+            }
+
+            // --- Symmetric (AES-*, HMAC): single CryptoKey of random bytes. -
+            let len_bits = if let cv_js::Value::Object(o) = &alg_val {
+                o.borrow()
+                    .get("length")
+                    .map(|v| v.to_number() as usize)
+                    .unwrap_or(256)
+            } else {
+                256
+            };
             let bytes = (len_bits + 7) / 8;
             let mut raw = vec![0u8; bytes];
             getrandom_fill(&mut raw);
@@ -31658,6 +32649,7 @@ fn build_crypto_object() -> cv_js::Value {
             k.insert("type".into(), cv_js::Value::String("secret".into()));
             k.insert("extractable".into(), cv_js::Value::Bool(true));
             k.insert("algorithm".into(), cv_js::Value::str(alg));
+            k.insert("_key_class".into(), cv_js::Value::str("secret"));
             k.insert("_raw".into(), bytes_to_array_value(&raw));
             Ok(cv_js::interp::make_settled_promise(
                 true,
@@ -69171,6 +70163,537 @@ var el = document.getElementById('el');
         assert!(
             v.starts_with("self-msg|"),
             "window self postMessage must deliver data + origin, got {v:?}"
+        );
+    }
+
+    // ==================================================================
+    // SubtleCrypto asymmetric surface: ECDSA / ECDH / RSA-OAEP / RSA-PSS /
+    // RSASSA-PKCS1-v1_5 + importKey/exportKey, driven directly against the
+    // native handlers built by `build_crypto_object`. Real crypto via
+    // cv_crypto — these assert signatures verify, tamper fails, OAEP round-
+    // trips, and JWK import/export round-trips, not just "no panic".
+    // ==================================================================
+
+    /// Pull `crypto.subtle.<name>` as a callable native function.
+    fn subtle_method(name: &str) -> cv_js::Value {
+        let crypto = build_crypto_object();
+        let cv_js::Value::Object(co) = &crypto else {
+            panic!("crypto is not an object");
+        };
+        let subtle = co.borrow().get("subtle").cloned().expect("subtle");
+        let cv_js::Value::Object(so) = &subtle else {
+            panic!("subtle is not an object");
+        };
+        so.borrow().get(name).cloned().unwrap_or_else(|| panic!("subtle.{name}"))
+    }
+
+    /// Invoke a native function value with args.
+    fn call_native(f: &cv_js::Value, args: Vec<cv_js::Value>) -> cv_js::Value {
+        match f {
+            cv_js::Value::NativeFunction(nf) => match &nf.func {
+                cv_js::interp::NativeFnBody::Pure(body) => body(args).expect("native call"),
+                cv_js::interp::NativeFnBody::WithInterp(_) => {
+                    panic!("crypto handlers must be Pure")
+                }
+            },
+            _ => panic!("not a native function"),
+        }
+    }
+
+    /// Read a settled promise's (fulfilled, value). Panics if pending.
+    fn promise_result(p: &cv_js::Value) -> (bool, cv_js::Value) {
+        let cv_js::Value::Object(o) = p else {
+            panic!("not a promise object");
+        };
+        let m = o.borrow();
+        let state = m.get("_state").map(|v| v.to_display_string()).unwrap_or_default();
+        let value = m.get("_value").cloned().unwrap_or(cv_js::Value::Undefined);
+        match state.as_str() {
+            "fulfilled" => (true, value),
+            "rejected" => (false, value),
+            other => panic!("promise not settled: {other} ({})", value.to_display_string()),
+        }
+    }
+
+    /// The fulfilled value or a panic carrying the rejection reason.
+    fn unwrap_fulfilled(p: &cv_js::Value, ctx: &str) -> cv_js::Value {
+        let (ok, v) = promise_result(p);
+        assert!(ok, "{ctx}: rejected with {}", v.to_display_string());
+        v
+    }
+
+    /// Build a JS ArrayBuffer-shaped value from bytes (what callers pass in).
+    fn ab(bytes: &[u8]) -> cv_js::Value {
+        make_array_buffer_value(bytes)
+    }
+
+    /// Extract bytes from a result ArrayBuffer/array value.
+    fn ab_bytes(v: &cv_js::Value) -> Vec<u8> {
+        // Reuse the same reader the handlers use.
+        if let cv_js::Value::Object(o) = v {
+            if let Some(cv_js::Value::Array(a)) = o.borrow().get("_bytes") {
+                return a.borrow().iter().map(|x| x.to_number() as u8).collect();
+            }
+        }
+        Vec::new()
+    }
+
+    /// Build an algorithm `{name: ...}` JS object.
+    fn alg_obj(pairs: &[(&str, cv_js::Value)]) -> cv_js::Value {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let mut m: cv_js::OrderedMap<String, cv_js::Value> = cv_js::OrderedMap::new();
+        for (k, v) in pairs {
+            m.insert((*k).to_string(), v.clone());
+        }
+        cv_js::Value::Object(Rc::new(RefCell::new(m)))
+    }
+
+    /// Pull `.publicKey` / `.privateKey` from a generateKey key-pair result.
+    fn pair_member(pair: &cv_js::Value, name: &str) -> cv_js::Value {
+        if let cv_js::Value::Object(o) = pair {
+            o.borrow().get(name).cloned().unwrap_or(cv_js::Value::Undefined)
+        } else {
+            cv_js::Value::Undefined
+        }
+    }
+
+    #[test]
+    fn subtle_ecdsa_p256_generate_sign_verify_and_tamper() {
+        // generateKey(ECDSA P-256) → sign a message → verify true; tamper → false.
+        let gen_fn = subtle_method("generateKey");
+        let alg = alg_obj(&[
+            ("name", cv_js::Value::str("ECDSA")),
+            ("namedCurve", cv_js::Value::str("P-256")),
+        ]);
+        let pair = unwrap_fulfilled(
+            &call_native(&gen_fn, vec![alg.clone(), cv_js::Value::Bool(true), cv_js::Value::Undefined]),
+            "ECDSA generateKey",
+        );
+        let pubk = pair_member(&pair, "publicKey");
+        let privk = pair_member(&pair, "privateKey");
+
+        let sign_alg = alg_obj(&[
+            ("name", cv_js::Value::str("ECDSA")),
+            ("hash", cv_js::Value::str("SHA-256")),
+        ]);
+        let msg = ab(b"hello ecdsa world");
+        let sign = subtle_method("sign");
+        let sig = unwrap_fulfilled(
+            &call_native(&sign, vec![sign_alg.clone(), privk, msg.clone()]),
+            "ECDSA sign",
+        );
+        let sig_bytes = ab_bytes(&sig);
+        assert_eq!(sig_bytes.len(), 64, "P-256 r||s signature is 64 bytes");
+
+        let verify = subtle_method("verify");
+        let (ok, vres) = promise_result(&call_native(
+            &verify,
+            vec![sign_alg.clone(), pubk.clone(), sig.clone(), msg.clone()],
+        ));
+        assert!(ok);
+        assert!(
+            matches!(vres, cv_js::Value::Bool(true)),
+            "valid ECDSA signature must verify"
+        );
+
+        // Tamper the message → verify must be false.
+        let bad_msg = ab(b"hello ecdsa worle");
+        let (_, vbad) = promise_result(&call_native(
+            &verify,
+            vec![sign_alg, pubk, sig, bad_msg],
+        ));
+        assert!(
+            matches!(vbad, cv_js::Value::Bool(false)),
+            "tampered message must fail ECDSA verify"
+        );
+    }
+
+    #[test]
+    fn subtle_ecdsa_wrong_key_rejected() {
+        let gen_fn = subtle_method("generateKey");
+        let alg = alg_obj(&[
+            ("name", cv_js::Value::str("ECDSA")),
+            ("namedCurve", cv_js::Value::str("P-256")),
+        ]);
+        let pair_a = unwrap_fulfilled(
+            &call_native(&gen_fn, vec![alg.clone(), cv_js::Value::Bool(true), cv_js::Value::Undefined]),
+            "gen A",
+        );
+        let pair_b = unwrap_fulfilled(
+            &call_native(&gen_fn, vec![alg.clone(), cv_js::Value::Bool(true), cv_js::Value::Undefined]),
+            "gen B",
+        );
+        let sign_alg = alg_obj(&[
+            ("name", cv_js::Value::str("ECDSA")),
+            ("hash", cv_js::Value::str("SHA-256")),
+        ]);
+        let msg = ab(b"verify me under the right key only");
+        let sig = unwrap_fulfilled(
+            &call_native(
+                &subtle_method("sign"),
+                vec![sign_alg.clone(), pair_member(&pair_a, "privateKey"), msg.clone()],
+            ),
+            "sign A",
+        );
+        let verify = subtle_method("verify");
+        // Right key → true.
+        let (_, v_right) = promise_result(&call_native(
+            &verify,
+            vec![sign_alg.clone(), pair_member(&pair_a, "publicKey"), sig.clone(), msg.clone()],
+        ));
+        assert!(matches!(v_right, cv_js::Value::Bool(true)));
+        // Wrong key → false.
+        let (_, v_wrong) = promise_result(&call_native(
+            &verify,
+            vec![sign_alg, pair_member(&pair_b, "publicKey"), sig, msg],
+        ));
+        assert!(
+            matches!(v_wrong, cv_js::Value::Bool(false)),
+            "signature must NOT verify under a different public key"
+        );
+    }
+
+    #[test]
+    fn subtle_rsa_oaep_encrypt_decrypt_roundtrip() {
+        // generateKey(RSA-OAEP 1024) → encrypt with public → decrypt with private.
+        let gen_fn = subtle_method("generateKey");
+        let alg = alg_obj(&[
+            ("name", cv_js::Value::str("RSA-OAEP")),
+            ("modulusLength", cv_js::Value::Number(1024.0)),
+            ("hash", cv_js::Value::str("SHA-256")),
+        ]);
+        let pair = unwrap_fulfilled(
+            &call_native(&gen_fn, vec![alg, cv_js::Value::Bool(true), cv_js::Value::Undefined]),
+            "RSA-OAEP generateKey",
+        );
+        let pubk = pair_member(&pair, "publicKey");
+        let privk = pair_member(&pair, "privateKey");
+
+        let op_alg = alg_obj(&[("name", cv_js::Value::str("RSA-OAEP"))]);
+        let plaintext = b"attack at dawn";
+        let ct = unwrap_fulfilled(
+            &call_native(
+                &subtle_method("encrypt"),
+                vec![op_alg.clone(), pubk, ab(plaintext)],
+            ),
+            "RSA-OAEP encrypt",
+        );
+        assert_eq!(ab_bytes(&ct).len(), 128, "1024-bit ciphertext is 128 bytes");
+        let pt = unwrap_fulfilled(
+            &call_native(
+                &subtle_method("decrypt"),
+                vec![op_alg, privk, ct],
+            ),
+            "RSA-OAEP decrypt",
+        );
+        assert_eq!(ab_bytes(&pt), plaintext, "OAEP round-trip must recover plaintext");
+    }
+
+    #[test]
+    fn subtle_rsa_pss_sign_verify_and_pkcs1() {
+        // Both RSA signature schemes: sign with private, verify with public,
+        // tamper fails. One key pair, exercised under PSS then PKCS1.
+        let gen_fn = subtle_method("generateKey");
+        for scheme in ["RSA-PSS", "RSASSA-PKCS1-v1_5"] {
+            let alg = alg_obj(&[
+                ("name", cv_js::Value::str(scheme)),
+                ("modulusLength", cv_js::Value::Number(1024.0)),
+                ("hash", cv_js::Value::str("SHA-256")),
+            ]);
+            let pair = unwrap_fulfilled(
+                &call_native(&gen_fn, vec![alg, cv_js::Value::Bool(true), cv_js::Value::Undefined]),
+                "RSA generateKey",
+            );
+            let pubk = pair_member(&pair, "publicKey");
+            let privk = pair_member(&pair, "privateKey");
+            let op_alg = if scheme == "RSA-PSS" {
+                alg_obj(&[
+                    ("name", cv_js::Value::str("RSA-PSS")),
+                    ("saltLength", cv_js::Value::Number(32.0)),
+                ])
+            } else {
+                alg_obj(&[("name", cv_js::Value::str("RSASSA-PKCS1-v1_5"))])
+            };
+            let msg = ab(b"sign and verify this rsa message");
+            let sig = unwrap_fulfilled(
+                &call_native(&subtle_method("sign"), vec![op_alg.clone(), privk, msg.clone()]),
+                "RSA sign",
+            );
+            let verify = subtle_method("verify");
+            let (_, ok) = promise_result(&call_native(
+                &verify,
+                vec![op_alg.clone(), pubk.clone(), sig.clone(), msg.clone()],
+            ));
+            assert!(
+                matches!(ok, cv_js::Value::Bool(true)),
+                "{scheme}: valid signature must verify"
+            );
+            let bad = ab(b"sign and verify this rsa messagE");
+            let (_, no) = promise_result(&call_native(&verify, vec![op_alg, pubk, sig, bad]));
+            assert!(
+                matches!(no, cv_js::Value::Bool(false)),
+                "{scheme}: tampered message must fail verify"
+            );
+        }
+    }
+
+    #[test]
+    fn subtle_ecdh_p256_derive_bits_agree() {
+        // Two ECDH key pairs: A.deriveBits(B.public) == B.deriveBits(A.public).
+        let gen_fn = subtle_method("generateKey");
+        let alg = alg_obj(&[
+            ("name", cv_js::Value::str("ECDH")),
+            ("namedCurve", cv_js::Value::str("P-256")),
+        ]);
+        let a = unwrap_fulfilled(
+            &call_native(&gen_fn, vec![alg.clone(), cv_js::Value::Bool(true), cv_js::Value::Undefined]),
+            "ECDH gen A",
+        );
+        let b = unwrap_fulfilled(
+            &call_native(&gen_fn, vec![alg, cv_js::Value::Bool(true), cv_js::Value::Undefined]),
+            "ECDH gen B",
+        );
+        let derive = subtle_method("deriveBits");
+        let alg_ab = alg_obj(&[
+            ("name", cv_js::Value::str("ECDH")),
+            ("public", pair_member(&b, "publicKey")),
+        ]);
+        let secret_a = unwrap_fulfilled(
+            &call_native(
+                &derive,
+                vec![alg_ab, pair_member(&a, "privateKey"), cv_js::Value::Number(256.0)],
+            ),
+            "A derive",
+        );
+        let alg_ba = alg_obj(&[
+            ("name", cv_js::Value::str("ECDH")),
+            ("public", pair_member(&a, "publicKey")),
+        ]);
+        let secret_b = unwrap_fulfilled(
+            &call_native(
+                &derive,
+                vec![alg_ba, pair_member(&b, "privateKey"), cv_js::Value::Number(256.0)],
+            ),
+            "B derive",
+        );
+        assert_eq!(ab_bytes(&secret_a).len(), 32);
+        assert_eq!(
+            ab_bytes(&secret_a),
+            ab_bytes(&secret_b),
+            "ECDH shared secrets from both sides must agree"
+        );
+    }
+
+    #[test]
+    fn subtle_jwk_import_export_roundtrip_ec() {
+        // Generate EC key, export as JWK, re-import, export again → identical.
+        let gen_fn = subtle_method("generateKey");
+        let alg = alg_obj(&[
+            ("name", cv_js::Value::str("ECDSA")),
+            ("namedCurve", cv_js::Value::str("P-256")),
+        ]);
+        let pair = unwrap_fulfilled(
+            &call_native(&gen_fn, vec![alg.clone(), cv_js::Value::Bool(true), cv_js::Value::Undefined]),
+            "gen",
+        );
+        let privk = pair_member(&pair, "privateKey");
+        let export = subtle_method("exportKey");
+        let jwk1 = unwrap_fulfilled(
+            &call_native(&export, vec![cv_js::Value::str("jwk"), privk]),
+            "exportKey jwk",
+        );
+        // The JWK must carry the private scalar 'd' and coordinates.
+        let read = |o: &cv_js::Value, k: &str| -> String {
+            if let cv_js::Value::Object(m) = o {
+                m.borrow().get(k).map(|v| v.to_display_string()).unwrap_or_default()
+            } else {
+                String::new()
+            }
+        };
+        assert_eq!(read(&jwk1, "kty"), "EC");
+        assert_eq!(read(&jwk1, "crv"), "P-256");
+        assert!(!read(&jwk1, "d").is_empty(), "private JWK must include d");
+        assert!(!read(&jwk1, "x").is_empty());
+
+        let import = subtle_method("importKey");
+        let reimported = unwrap_fulfilled(
+            &call_native(
+                &import,
+                vec![
+                    cv_js::Value::str("jwk"),
+                    jwk1.clone(),
+                    alg,
+                    cv_js::Value::Bool(true),
+                    cv_js::Value::Undefined,
+                ],
+            ),
+            "importKey jwk",
+        );
+        let jwk2 = unwrap_fulfilled(
+            &call_native(&export, vec![cv_js::Value::str("jwk"), reimported]),
+            "re-exportKey jwk",
+        );
+        assert_eq!(read(&jwk1, "d"), read(&jwk2, "d"), "d must survive JWK round-trip");
+        assert_eq!(read(&jwk1, "x"), read(&jwk2, "x"), "x must survive JWK round-trip");
+        assert_eq!(read(&jwk1, "y"), read(&jwk2, "y"), "y must survive JWK round-trip");
+    }
+
+    #[test]
+    fn subtle_spki_pkcs8_roundtrip_ec_signs() {
+        // Export EC public→spki and private→pkcs8, re-import both, and confirm a
+        // signature from the re-imported private verifies under the re-imported
+        // public. This proves SPKI/PKCS8 carry real, usable key material.
+        let gen_fn = subtle_method("generateKey");
+        let alg = alg_obj(&[
+            ("name", cv_js::Value::str("ECDSA")),
+            ("namedCurve", cv_js::Value::str("P-256")),
+        ]);
+        let pair = unwrap_fulfilled(
+            &call_native(&gen_fn, vec![alg.clone(), cv_js::Value::Bool(true), cv_js::Value::Undefined]),
+            "gen",
+        );
+        let export = subtle_method("exportKey");
+        let import = subtle_method("importKey");
+
+        let spki = unwrap_fulfilled(
+            &call_native(&export, vec![cv_js::Value::str("spki"), pair_member(&pair, "publicKey")]),
+            "export spki",
+        );
+        let pkcs8 = unwrap_fulfilled(
+            &call_native(&export, vec![cv_js::Value::str("pkcs8"), pair_member(&pair, "privateKey")]),
+            "export pkcs8",
+        );
+        let pubk = unwrap_fulfilled(
+            &call_native(
+                &import,
+                vec![cv_js::Value::str("spki"), spki, alg.clone(), cv_js::Value::Bool(true), cv_js::Value::Undefined],
+            ),
+            "import spki",
+        );
+        let privk = unwrap_fulfilled(
+            &call_native(
+                &import,
+                vec![cv_js::Value::str("pkcs8"), pkcs8, alg, cv_js::Value::Bool(true), cv_js::Value::Undefined],
+            ),
+            "import pkcs8",
+        );
+        let sign_alg = alg_obj(&[
+            ("name", cv_js::Value::str("ECDSA")),
+            ("hash", cv_js::Value::str("SHA-256")),
+        ]);
+        let msg = ab(b"spki/pkcs8 reimport must produce a usable key");
+        let sig = unwrap_fulfilled(
+            &call_native(&subtle_method("sign"), vec![sign_alg.clone(), privk, msg.clone()]),
+            "sign with reimported pkcs8 key",
+        );
+        let (_, ok) = promise_result(&call_native(
+            &subtle_method("verify"),
+            vec![sign_alg, pubk, sig, msg],
+        ));
+        assert!(
+            matches!(ok, cv_js::Value::Bool(true)),
+            "signature from reimported PKCS8 key must verify under reimported SPKI key"
+        );
+    }
+
+    #[test]
+    fn subtle_aes_gcm_symmetric_still_works() {
+        // Regression: the symmetric encrypt/decrypt path (refactored to read the
+        // CryptoKey's `_raw` material) must still round-trip AES-256-GCM.
+        let import = subtle_method("importKey");
+        let key_bytes = [0x42u8; 32];
+        let key = unwrap_fulfilled(
+            &call_native(
+                &import,
+                vec![
+                    cv_js::Value::str("raw"),
+                    ab(&key_bytes),
+                    alg_obj(&[("name", cv_js::Value::str("AES-GCM"))]),
+                    cv_js::Value::Bool(true),
+                    cv_js::Value::Undefined,
+                ],
+            ),
+            "import AES key",
+        );
+        let iv = [0x07u8; 12];
+        let enc_alg = alg_obj(&[
+            ("name", cv_js::Value::str("AES-GCM")),
+            ("iv", ab(&iv)),
+        ]);
+        let pt = b"symmetric path regression check";
+        let ct = unwrap_fulfilled(
+            &call_native(&subtle_method("encrypt"), vec![enc_alg.clone(), key.clone(), ab(pt)]),
+            "AES-GCM encrypt",
+        );
+        let back = unwrap_fulfilled(
+            &call_native(&subtle_method("decrypt"), vec![enc_alg, key, ct]),
+            "AES-GCM decrypt",
+        );
+        assert_eq!(ab_bytes(&back), pt, "AES-GCM symmetric round-trip");
+    }
+
+    #[test]
+    fn subtle_jwk_import_export_roundtrip_rsa() {
+        // Generate RSA key, export private as JWK, re-import, sign+verify works.
+        let gen_fn = subtle_method("generateKey");
+        let alg = alg_obj(&[
+            ("name", cv_js::Value::str("RSASSA-PKCS1-v1_5")),
+            ("modulusLength", cv_js::Value::Number(1024.0)),
+            ("hash", cv_js::Value::str("SHA-256")),
+        ]);
+        let pair = unwrap_fulfilled(
+            &call_native(&gen_fn, vec![alg.clone(), cv_js::Value::Bool(true), cv_js::Value::Undefined]),
+            "RSA gen",
+        );
+        let export = subtle_method("exportKey");
+        let import = subtle_method("importKey");
+        let jwk_priv = unwrap_fulfilled(
+            &call_native(&export, vec![cv_js::Value::str("jwk"), pair_member(&pair, "privateKey")]),
+            "export RSA priv jwk",
+        );
+        let jwk_pub = unwrap_fulfilled(
+            &call_native(&export, vec![cv_js::Value::str("jwk"), pair_member(&pair, "publicKey")]),
+            "export RSA pub jwk",
+        );
+        let read = |o: &cv_js::Value, k: &str| -> String {
+            if let cv_js::Value::Object(m) = o {
+                m.borrow().get(k).map(|v| v.to_display_string()).unwrap_or_default()
+            } else {
+                String::new()
+            }
+        };
+        assert_eq!(read(&jwk_priv, "kty"), "RSA");
+        assert!(!read(&jwk_priv, "d").is_empty(), "RSA private JWK needs d");
+        assert!(!read(&jwk_priv, "n").is_empty());
+
+        let priv2 = unwrap_fulfilled(
+            &call_native(
+                &import,
+                vec![cv_js::Value::str("jwk"), jwk_priv, alg.clone(), cv_js::Value::Bool(true), cv_js::Value::Undefined],
+            ),
+            "import RSA priv jwk",
+        );
+        let pub2 = unwrap_fulfilled(
+            &call_native(
+                &import,
+                vec![cv_js::Value::str("jwk"), jwk_pub, alg.clone(), cv_js::Value::Bool(true), cv_js::Value::Undefined],
+            ),
+            "import RSA pub jwk",
+        );
+        let op_alg = alg_obj(&[("name", cv_js::Value::str("RSASSA-PKCS1-v1_5"))]);
+        let msg = ab(b"rsa jwk reimport must produce usable keys");
+        let sig = unwrap_fulfilled(
+            &call_native(&subtle_method("sign"), vec![op_alg.clone(), priv2, msg.clone()]),
+            "sign with reimported RSA priv",
+        );
+        let (_, ok) = promise_result(&call_native(
+            &subtle_method("verify"),
+            vec![op_alg, pub2, sig, msg],
+        ));
+        assert!(
+            matches!(ok, cv_js::Value::Bool(true)),
+            "RSA signature from reimported JWK private key must verify under reimported JWK public key"
         );
     }
 }

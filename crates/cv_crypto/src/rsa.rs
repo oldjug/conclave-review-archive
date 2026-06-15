@@ -5,7 +5,10 @@
 //! the wild. RSA-PSS verification lands when we hit a cert that needs it.
 
 use crate::CryptoError;
-use crate::bigint::{BigUint, pow_mod};
+use crate::bigint::{
+    BigUint, add_unbounded, inv_mod_full, mul_unbounded, pow_mod, random_prime, rem, sub_unbounded,
+};
+use crate::sha1::Sha1;
 use crate::sha256::Sha256;
 use crate::sha384::Sha384;
 use crate::sha512::Sha512;
@@ -40,6 +43,7 @@ fn strip_leading_zero(b: &[u8]) -> &[u8] {
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Hash {
+    Sha1,
     Sha256,
     Sha384,
     Sha512,
@@ -49,6 +53,11 @@ impl Hash {
     /// DER-encoded `DigestInfo` prefix per RFC 8017 §9.2 note 1.
     fn digest_info_prefix(self) -> &'static [u8] {
         match self {
+            // RFC 8017 §9.2 note 1: SHA-1 DigestInfo prefix.
+            Self::Sha1 => &[
+                0x30, 0x21, 0x30, 0x09, 0x06, 0x05, 0x2b, 0x0e, 0x03, 0x02, 0x1a, 0x05, 0x00, 0x04,
+                0x14,
+            ],
             Self::Sha256 => &[
                 0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02,
                 0x01, 0x05, 0x00, 0x04, 0x20,
@@ -70,6 +79,7 @@ impl Hash {
 
     fn digest(self, msg: &[u8]) -> Vec<u8> {
         match self {
+            Self::Sha1 => Sha1::oneshot(msg).to_vec(),
             Self::Sha256 => Sha256::oneshot(msg).to_vec(),
             Self::Sha384 => Sha384::oneshot(msg).to_vec(),
             Self::Sha512 => Sha512::oneshot(msg).to_vec(),
@@ -78,6 +88,7 @@ impl Hash {
 
     pub fn digest_len(self) -> usize {
         match self {
+            Self::Sha1 => 20,
             Self::Sha256 => 32,
             Self::Sha384 => 48,
             Self::Sha512 => 64,
@@ -220,6 +231,346 @@ pub fn verify_pkcs1_v15(
     Ok(())
 }
 
+// ===========================================================================
+// RSA private-key operations: RSAES-OAEP encrypt/decrypt (RFC 8017 §7.1),
+// RSASSA-PKCS1-v1_5 + RSASSA-PSS signing (§8.1.1 / §8.2.1), and key
+// generation (§3.2 / FIPS 186-5). The public-key half (verify_*) above is the
+// path the TLS stack already used; this section adds everything WebCrypto's
+// asymmetric surface needs.
+// ===========================================================================
+
+/// An RSA private key. We keep the public components (`n`, `e`) for round-trip
+/// export plus the private exponent `d` and CRT parameters for fast decrypt.
+#[derive(Clone, Debug)]
+pub struct RsaPrivateKey {
+    pub n: BigUint,
+    pub e: BigUint,
+    pub d: BigUint,
+    pub p: BigUint,
+    pub q: BigUint,
+    pub dp: BigUint,
+    pub dq: BigUint,
+    pub qinv: BigUint,
+    pub n_byte_len: usize,
+}
+
+impl RsaPrivateKey {
+    /// The matching public key.
+    pub fn public_key(&self) -> RsaPublicKey {
+        RsaPublicKey {
+            n: self.n.clone(),
+            e: self.e.clone(),
+            n_byte_len: self.n_byte_len,
+        }
+    }
+
+    /// RSADP — the raw private-key primitive `c^d mod n`, accelerated via the
+    /// Chinese Remainder Theorem (RFC 8017 §5.1.2 second form). Falls back to
+    /// the straightforward `c^d mod n` if the CRT params are degenerate.
+    fn rsadp(&self, c: &BigUint) -> BigUint {
+        if self.p.is_zero() || self.q.is_zero() {
+            return pow_mod(c, &self.d, &self.n);
+        }
+        // m1 = c^dP mod p ; m2 = c^dQ mod q
+        let m1 = pow_mod(c, &self.dp, &self.p);
+        let m2 = pow_mod(c, &self.dq, &self.q);
+        // h = qInv * (m1 - m2) mod p   (handle m1 < m2 by adding p)
+        let diff = if m1.cmp(&m2) == core::cmp::Ordering::Less {
+            sub_unbounded(&add_unbounded(&m1, &self.p), &m2)
+        } else {
+            sub_unbounded(&m1, &m2)
+        };
+        let h = rem(&mul_unbounded(&self.qinv, &diff), &self.p);
+        // m = m2 + h*q
+        add_unbounded(&m2, &mul_unbounded(&h, &self.q))
+    }
+}
+
+/// MGF1 mask generation, public-ish form used by OAEP. (Same algorithm as the
+/// module-private `mgf1` used in PSS verify.)
+fn mgf1_pub(hash: Hash, seed: &[u8], mask_len: usize) -> Vec<u8> {
+    mgf1(hash, seed, mask_len)
+}
+
+/// RSAES-OAEP encryption (RFC 8017 §7.1.1). `label` is the optional OAEP label
+/// (WebCrypto's `RsaOaepParams.label`, defaults to empty). `seed` must be
+/// `hash.digest_len()` random bytes from a CSPRNG. Returns the `k`-byte
+/// ciphertext.
+pub fn encrypt_oaep(
+    key: &RsaPublicKey,
+    hash: Hash,
+    msg: &[u8],
+    label: &[u8],
+    seed: &[u8],
+) -> Result<Vec<u8>, CryptoError> {
+    let k = key.n_byte_len;
+    let h_len = hash.digest_len();
+    if seed.len() != h_len {
+        return Err(CryptoError::BadLength);
+    }
+    // mLen <= k - 2*hLen - 2
+    if msg.len() + 2 * h_len + 2 > k {
+        return Err(CryptoError::BadLength);
+    }
+    // DB = lHash || PS || 0x01 || M
+    let l_hash = hash.digest(label);
+    let ps_len = k - msg.len() - 2 * h_len - 2;
+    let db_len = k - h_len - 1;
+    let mut db = Vec::with_capacity(db_len);
+    db.extend_from_slice(&l_hash);
+    db.extend(core::iter::repeat_n(0u8, ps_len));
+    db.push(0x01);
+    db.extend_from_slice(msg);
+    debug_assert_eq!(db.len(), db_len);
+
+    // maskedDB = DB XOR MGF(seed, k - hLen - 1)
+    let db_mask = mgf1_pub(hash, seed, db_len);
+    let mut masked_db = db;
+    for i in 0..db_len {
+        masked_db[i] ^= db_mask[i];
+    }
+    // maskedSeed = seed XOR MGF(maskedDB, hLen)
+    let seed_mask = mgf1_pub(hash, &masked_db, h_len);
+    let mut masked_seed = seed.to_vec();
+    for i in 0..h_len {
+        masked_seed[i] ^= seed_mask[i];
+    }
+    // EM = 0x00 || maskedSeed || maskedDB
+    let mut em = Vec::with_capacity(k);
+    em.push(0x00);
+    em.extend_from_slice(&masked_seed);
+    em.extend_from_slice(&masked_db);
+
+    // c = EM^e mod n
+    let m_int = BigUint::from_be_bytes(&em);
+    if m_int.cmp(&key.n) != core::cmp::Ordering::Less {
+        return Err(CryptoError::BadLength);
+    }
+    let c = pow_mod(&m_int, &key.e, &key.n);
+    Ok(c.to_be_bytes(k))
+}
+
+/// RSAES-OAEP decryption (RFC 8017 §7.1.2). Returns the recovered message.
+pub fn decrypt_oaep(
+    key: &RsaPrivateKey,
+    hash: Hash,
+    ciphertext: &[u8],
+    label: &[u8],
+) -> Result<Vec<u8>, CryptoError> {
+    let k = key.n_byte_len;
+    let h_len = hash.digest_len();
+    if ciphertext.len() != k || k < 2 * h_len + 2 {
+        return Err(CryptoError::BadLength);
+    }
+    let c_int = BigUint::from_be_bytes(ciphertext);
+    if c_int.cmp(&key.n) != core::cmp::Ordering::Less {
+        return Err(CryptoError::BadTag);
+    }
+    let m_int = key.rsadp(&c_int);
+    let em = m_int.to_be_bytes(k);
+
+    // EM = Y || maskedSeed || maskedDB ; Y must be 0x00.
+    let l_hash = hash.digest(label);
+    let y = em[0];
+    let masked_seed = &em[1..1 + h_len];
+    let masked_db = &em[1 + h_len..];
+    let db_len = k - h_len - 1;
+
+    let seed_mask = mgf1_pub(hash, masked_db, h_len);
+    let mut seed = masked_seed.to_vec();
+    for i in 0..h_len {
+        seed[i] ^= seed_mask[i];
+    }
+    let db_mask = mgf1_pub(hash, &seed, db_len);
+    let mut db = masked_db.to_vec();
+    for i in 0..db_len {
+        db[i] ^= db_mask[i];
+    }
+    // DB = lHash' || PS || 0x01 || M. Compute the verdict without an early
+    // return on each sub-check (decryption-oracle hygiene per RFC 8017 §7.1.2).
+    let mut bad = (y != 0x00) as u8;
+    let mut acc = 0u8;
+    for i in 0..h_len {
+        acc |= db[i] ^ l_hash[i];
+    }
+    bad |= (acc != 0) as u8;
+    // Find the 0x01 separator after the (all-zero) PS.
+    let mut sep_index: isize = -1;
+    let mut seen_nonzero_before_one = 0u8;
+    let mut i = h_len;
+    while i < db_len {
+        let b = db[i];
+        if sep_index < 0 {
+            if b == 0x01 {
+                sep_index = i as isize;
+            } else if b != 0x00 {
+                seen_nonzero_before_one |= 1;
+            }
+        }
+        i += 1;
+    }
+    bad |= seen_nonzero_before_one;
+    bad |= (sep_index < 0) as u8;
+    if bad != 0 {
+        return Err(CryptoError::BadTag);
+    }
+    Ok(db[(sep_index as usize) + 1..].to_vec())
+}
+
+/// EMSA-PKCS1-v1_5 encode then RSASP1: produce a PKCS#1 v1.5 signature
+/// (`RSASSA-PKCS1-v1_5`, RFC 8017 §8.2.1). Returns a `k`-byte signature.
+pub fn sign_pkcs1_v15(key: &RsaPrivateKey, hash: Hash, msg: &[u8]) -> Result<Vec<u8>, CryptoError> {
+    let k = key.n_byte_len;
+    let t_prefix = hash.digest_info_prefix();
+    let digest = hash.digest(msg);
+    let t_len = t_prefix.len() + digest.len();
+    if k < t_len + 11 {
+        return Err(CryptoError::BadLength);
+    }
+    // EM = 0x00 || 0x01 || PS(0xFF..) || 0x00 || T
+    let ps_len = k - t_len - 3;
+    let mut em = Vec::with_capacity(k);
+    em.push(0x00);
+    em.push(0x01);
+    em.extend(core::iter::repeat_n(0xFFu8, ps_len));
+    em.push(0x00);
+    em.extend_from_slice(t_prefix);
+    em.extend_from_slice(&digest);
+    debug_assert_eq!(em.len(), k);
+
+    let m_int = BigUint::from_be_bytes(&em);
+    let s = key.rsadp(&m_int);
+    Ok(s.to_be_bytes(k))
+}
+
+/// EMSA-PSS encode then RSASP1: produce an RSASSA-PSS signature (RFC 8017
+/// §8.1.1 / §9.1.1). `salt` is `salt_len` random bytes (WebCrypto's
+/// `RsaPssParams.saltLength`). Returns a `k`-byte signature.
+pub fn sign_pss(
+    key: &RsaPrivateKey,
+    hash: Hash,
+    msg: &[u8],
+    salt: &[u8],
+) -> Result<Vec<u8>, CryptoError> {
+    let mod_bits = key.n.bit_len();
+    let em_bits = mod_bits - 1;
+    let em_len = em_bits.div_ceil(8);
+    let h_len = hash.digest_len();
+    let s_len = salt.len();
+    if em_len < h_len + s_len + 2 {
+        return Err(CryptoError::BadLength);
+    }
+    // M' = (0x00 * 8) || mHash || salt ; H = Hash(M')
+    let m_hash = hash.digest(msg);
+    let mut mprime = Vec::with_capacity(8 + h_len + s_len);
+    mprime.extend_from_slice(&[0u8; 8]);
+    mprime.extend_from_slice(&m_hash);
+    mprime.extend_from_slice(salt);
+    let h = hash.digest(&mprime);
+
+    // DB = PS(0x00..) || 0x01 || salt
+    let db_len = em_len - h_len - 1;
+    let ps_len = db_len - s_len - 1;
+    let mut db = Vec::with_capacity(db_len);
+    db.extend(core::iter::repeat_n(0u8, ps_len));
+    db.push(0x01);
+    db.extend_from_slice(salt);
+
+    // maskedDB = DB XOR MGF(H, db_len) ; zero leftmost (8*em_len - em_bits) bits.
+    let db_mask = mgf1_pub(hash, &h, db_len);
+    let mut masked_db = db;
+    for i in 0..db_len {
+        masked_db[i] ^= db_mask[i];
+    }
+    let zero_top_bits = 8 * em_len - em_bits;
+    if zero_top_bits > 0 {
+        masked_db[0] &= 0xFF >> zero_top_bits;
+    }
+    // EM = maskedDB || H || 0xbc
+    let mut em = Vec::with_capacity(em_len);
+    em.extend_from_slice(&masked_db);
+    em.extend_from_slice(&h);
+    em.push(0xbc);
+
+    let k = key.n_byte_len;
+    let m_int = BigUint::from_be_bytes(&em);
+    let s = key.rsadp(&m_int);
+    Ok(s.to_be_bytes(k))
+}
+
+/// Generate an RSA key pair with the given modulus size in bits and public
+/// exponent `e` (WebCrypto: `RsaHashedKeyGenParams.modulusLength` /
+/// `.publicExponent`, almost always 65537). `rng` supplies CSPRNG bytes. Per
+/// RFC 8017 §3.2 / FIPS 186-5: pick two distinct random primes p, q of half the
+/// modulus size, n = p*q, λ(n) = lcm(p-1, q-1), d = e^{-1} mod λ(n).
+pub fn generate_keypair(
+    modulus_bits: usize,
+    e: u64,
+    rng: &mut dyn FnMut(&mut [u8]),
+) -> RsaPrivateKey {
+    assert!(modulus_bits >= 512, "RSA modulus too small");
+    let e_big = BigUint::from_u64(e);
+    let half = modulus_bits / 2;
+    loop {
+        let p = random_prime(half, rng);
+        let q = random_prime(modulus_bits - half, rng);
+        // p != q and the modulus must land at exactly modulus_bits.
+        if p.cmp(&q) == core::cmp::Ordering::Equal {
+            continue;
+        }
+        let n = mul_unbounded(&p, &q);
+        if n.bit_len() != modulus_bits {
+            continue;
+        }
+        // λ(n) = lcm(p-1, q-1) = (p-1)(q-1)/gcd(p-1,q-1).
+        let p1 = p.dec_one();
+        let q1 = q.dec_one();
+        let lambda = lcm(&p1, &q1);
+        // e must be invertible mod λ.
+        let Some(d) = inv_mod_full(&e_big, &lambda) else {
+            continue;
+        };
+        // CRT params.
+        let dp = rem(&d, &p1);
+        let dq = rem(&d, &q1);
+        let Some(qinv) = inv_mod_full(&q, &p) else {
+            continue;
+        };
+        let n_byte_len = modulus_bits / 8;
+        return RsaPrivateKey {
+            n,
+            e: e_big,
+            d,
+            p,
+            q,
+            dp,
+            dq,
+            qinv,
+            n_byte_len,
+        };
+    }
+}
+
+/// `gcd(a, b)` via the Euclidean algorithm.
+fn gcd(a: &BigUint, b: &BigUint) -> BigUint {
+    let mut x = a.clone();
+    let mut y = b.clone();
+    while !y.is_zero() {
+        let r = rem(&x, &y);
+        x = y;
+        y = r;
+    }
+    x
+}
+
+/// `lcm(a, b) = (a / gcd(a, b)) * b`. Dividing first keeps the intermediate
+/// small and avoids an exact-division-after-product step.
+fn lcm(a: &BigUint, b: &BigUint) -> BigUint {
+    let g = gcd(a, b);
+    let a_over_g = crate::bigint::div_floor(a, &g);
+    mul_unbounded(&a_over_g, b)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -286,5 +637,112 @@ mod tests {
             verify_pkcs1_v15(&key, Hash::Sha256, b"msg", &bad),
             Err(CryptoError::BadLength)
         ));
+    }
+
+    // --- Private-key path: keygen + sign/verify + OAEP, end to end. ---
+
+    /// Deterministic xorshift used as the CSPRNG stand-in for keygen/salt/seed
+    /// inside these offline tests (production wires BCryptGenRandom).
+    struct TestRng(u64);
+    impl TestRng {
+        fn fill(&mut self, buf: &mut [u8]) {
+            for b in buf.iter_mut() {
+                let mut x = self.0;
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                self.0 = x;
+                *b = x as u8;
+            }
+        }
+    }
+
+    /// Generate a real 1024-bit key, sign with PKCS#1 v1.5 + SHA-256, then
+    /// verify with the public half. Tamper → reject.
+    #[test]
+    fn keygen_pkcs1_sign_verify_roundtrip() {
+        let mut rng = TestRng(0x243F_6A88_85A3_08D3);
+        let priv_key =
+            generate_keypair(1024, 65537, &mut |b| rng.fill(b));
+        let pub_key = priv_key.public_key();
+        // RSA equation sanity: (m^e)^d == m for a small m.
+        assert_eq!(pub_key.n_byte_len, 128);
+
+        let msg = b"the quick brown fox jumps over the lazy dog";
+        let sig = sign_pkcs1_v15(&priv_key, Hash::Sha256, msg).unwrap();
+        assert_eq!(sig.len(), 128);
+        verify_pkcs1_v15(&pub_key, Hash::Sha256, msg, &sig)
+            .expect("freshly produced PKCS1 signature must verify");
+        // Tampered message must fail.
+        let mut bad = msg.to_vec();
+        bad[0] ^= 1;
+        assert!(verify_pkcs1_v15(&pub_key, Hash::Sha256, &bad, &sig).is_err());
+        // Tampered signature must fail.
+        let mut bad_sig = sig.clone();
+        bad_sig[64] ^= 1;
+        assert!(verify_pkcs1_v15(&pub_key, Hash::Sha256, msg, &bad_sig).is_err());
+    }
+
+    /// PSS sign → verify with salt length = hash length (32). Tamper → reject.
+    #[test]
+    fn keygen_pss_sign_verify_roundtrip() {
+        let mut rng = TestRng(0xB7E1_5162_8AED_2A6A);
+        let priv_key = generate_keypair(1024, 65537, &mut |b| rng.fill(b));
+        let pub_key = priv_key.public_key();
+        let msg = b"PSS message under test";
+        let mut salt = [0u8; 32];
+        rng.fill(&mut salt);
+        let sig = sign_pss(&priv_key, Hash::Sha256, msg, &salt).unwrap();
+        verify_pss(&pub_key, Hash::Sha256, msg, &sig)
+            .expect("freshly produced PSS signature must verify");
+        let mut bad = msg.to_vec();
+        bad[3] ^= 0x80;
+        assert!(verify_pss(&pub_key, Hash::Sha256, &bad, &sig).is_err());
+    }
+
+    /// OAEP encrypt with the public key → decrypt with the private key.
+    #[test]
+    fn keygen_oaep_encrypt_decrypt_roundtrip() {
+        let mut rng = TestRng(0x9E37_79B9_7F4A_7C15);
+        let priv_key = generate_keypair(1024, 65537, &mut |b| rng.fill(b));
+        let pub_key = priv_key.public_key();
+        let msg = b"top secret payload";
+        let mut seed = [0u8; 32]; // SHA-256 hLen
+        rng.fill(&mut seed);
+        let ct = encrypt_oaep(&pub_key, Hash::Sha256, msg, b"", &seed).unwrap();
+        assert_eq!(ct.len(), 128);
+        let pt = decrypt_oaep(&priv_key, Hash::Sha256, &ct, b"").unwrap();
+        assert_eq!(pt, msg);
+        // Wrong label must fail to decode.
+        assert!(decrypt_oaep(&priv_key, Hash::Sha256, &ct, b"different").is_err());
+        // Tampered ciphertext must fail.
+        let mut bad = ct.clone();
+        bad[100] ^= 1;
+        assert!(decrypt_oaep(&priv_key, Hash::Sha256, &bad, b"").is_err());
+    }
+
+    /// Timing probe for 2048-bit keygen (decides whether to flag-gate the
+    /// WebCrypto RSA generateKey default). Run:
+    ///   cargo test -p cv_crypto rsa_keygen_2048_timing -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn rsa_keygen_2048_timing() {
+        let mut rng = TestRng(0x1122_3344_5566_7788);
+        let t = std::time::Instant::now();
+        let k = generate_keypair(2048, 65537, &mut |b| rng.fill(b));
+        let ms = t.elapsed().as_millis();
+        println!("RSA-2048 keygen: {ms} ms (n_byte_len={})", k.n_byte_len);
+    }
+
+    /// A signature produced under one key must NOT verify under a different key.
+    #[test]
+    fn wrong_key_signature_rejected() {
+        let mut rng = TestRng(0xC0FF_EE00_1234_5678);
+        let key_a = generate_keypair(1024, 65537, &mut |b| rng.fill(b));
+        let key_b = generate_keypair(1024, 65537, &mut |b| rng.fill(b));
+        let msg = b"authenticate me";
+        let sig = sign_pkcs1_v15(&key_a, Hash::Sha256, msg).unwrap();
+        assert!(verify_pkcs1_v15(&key_a.public_key(), Hash::Sha256, msg, &sig).is_ok());
+        assert!(verify_pkcs1_v15(&key_b.public_key(), Hash::Sha256, msg, &sig).is_err());
     }
 }

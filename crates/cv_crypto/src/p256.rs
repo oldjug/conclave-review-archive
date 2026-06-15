@@ -412,6 +412,24 @@ fn verify_inner(
     }
 }
 
+/// Generate a fresh P-256 private scalar `d` in `[1, n-1]` from a CSPRNG
+/// (`rng` fills the supplied buffer with random bytes). Per FIPS 186-5
+/// Appendix A.2.1 (rejection sampling): draw 32 random bytes, reject if the
+/// value is zero or >= the group order `n`, retry. Returns the raw 32-byte
+/// big-endian private key — feed it to `public_key_uncompressed`, `sign`, or
+/// `ecdh_shared`.
+pub fn generate_private_scalar(rng: &mut dyn FnMut(&mut [u8])) -> [u8; 32] {
+    let n = order_n();
+    loop {
+        let mut d = [0u8; 32];
+        rng(&mut d);
+        let d_int = BigUint::from_be_bytes(&d);
+        if !d_int.is_zero() && d_int.cmp(&n) == core::cmp::Ordering::Less {
+            return d;
+        }
+    }
+}
+
 /// Sign `msg` with P-256 ECDSA using the deterministic `k` from RFC 6979 §3.2,
 /// returning raw 32-byte big-endian `(r, s)`. The private scalar `d` is
 /// raw 32-byte big-endian.

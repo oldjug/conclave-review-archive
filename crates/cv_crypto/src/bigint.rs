@@ -334,6 +334,11 @@ pub fn rem(a: &BigUint, n: &BigUint) -> BigUint {
     divmod(a, n).1
 }
 
+/// Floor division `a / n` (the quotient from Knuth Algorithm D).
+pub fn div_floor(a: &BigUint, n: &BigUint) -> BigUint {
+    divmod(a, n).0
+}
+
 /// `base^exp mod modulus` via left-to-right square-and-multiply.
 pub fn pow_mod(base: &BigUint, exp: &BigUint, modulus: &BigUint) -> BigUint {
     if modulus.is_zero() {
@@ -353,6 +358,266 @@ pub fn pow_mod(base: &BigUint, exp: &BigUint, modulus: &BigUint) -> BigUint {
         }
     }
     result
+}
+
+// ---------------------------------------------------------------------------
+// Number-theory primitives required for RSA private-key operations and key
+// generation (RFC 8017): unbounded add/sub, modular inverse via the extended
+// Euclidean algorithm, Miller–Rabin probabilistic primality, and random prime
+// generation. These are NOT constant-time; RSA key generation and signing in a
+// browser run on attacker-uncorrelated material, but we still use a CSPRNG for
+// every random draw (the caller supplies one). Verification/encryption use only
+// the public modulus and were already covered by `pow_mod`/`mul_mod` above.
+// ---------------------------------------------------------------------------
+
+/// Public unbounded addition `a + b` (no modulus).
+pub fn add_unbounded(a: &BigUint, b: &BigUint) -> BigUint {
+    add(a, b)
+}
+
+/// Public unbounded subtraction `a - b`. Caller must ensure `a >= b`.
+pub fn sub_unbounded(a: &BigUint, b: &BigUint) -> BigUint {
+    sub(a, b)
+}
+
+/// Public full product `a * b` (no modulus).
+pub fn mul_unbounded(a: &BigUint, b: &BigUint) -> BigUint {
+    mul_full(a, b)
+}
+
+impl BigUint {
+    /// Construct from a single small value (used for constants 0,1,2,e).
+    pub fn from_u64(v: u64) -> BigUint {
+        let mut b = BigUint { limbs: vec![v] };
+        b.normalize();
+        b
+    }
+
+    /// `true` iff the integer is exactly one.
+    pub fn is_one(&self) -> bool {
+        let sig = self.limbs.iter().rposition(|&l| l != 0);
+        matches!(sig, Some(0)) && self.limbs[0] == 1
+    }
+
+    /// Whether this is even (low bit clear). Zero counts as even.
+    pub fn is_even(&self) -> bool {
+        self.limbs.first().is_none_or(|&l| l & 1 == 0)
+    }
+
+    /// `self - 1`. Caller must ensure `self >= 1`.
+    pub fn dec_one(&self) -> BigUint {
+        sub(self, &BigUint::from_u64(1))
+    }
+}
+
+/// Signed big integer used internally by the extended Euclidean algorithm.
+/// Only needed transiently inside `inv_mod_full`.
+#[derive(Clone)]
+struct SignedBig {
+    neg: bool,
+    mag: BigUint,
+}
+
+impl SignedBig {
+    fn zero() -> Self {
+        Self { neg: false, mag: BigUint::zero() }
+    }
+    fn from_uint(m: BigUint) -> Self {
+        Self { neg: false, mag: m }
+    }
+    fn is_zero(&self) -> bool {
+        self.mag.is_zero()
+    }
+    /// `self - other` over the integers.
+    fn sub(&self, other: &SignedBig) -> SignedBig {
+        // a - b  with signs handled explicitly.
+        match (self.neg, other.neg) {
+            (false, false) => match self.mag.cmp(&other.mag) {
+                Ordering::Less => SignedBig { neg: true, mag: sub(&other.mag, &self.mag) },
+                _ => SignedBig { neg: false, mag: sub(&self.mag, &other.mag) },
+            },
+            (true, true) => match self.mag.cmp(&other.mag) {
+                Ordering::Less => SignedBig { neg: false, mag: sub(&other.mag, &self.mag) },
+                _ => SignedBig { neg: true, mag: sub(&self.mag, &other.mag) },
+            },
+            (false, true) => SignedBig { neg: false, mag: add(&self.mag, &other.mag) },
+            (true, false) => SignedBig { neg: true, mag: add(&self.mag, &other.mag) },
+        }
+    }
+    /// `self * (unsigned q)`.
+    fn mul_uint(&self, q: &BigUint) -> SignedBig {
+        let mag = mul_full(&self.mag, q);
+        SignedBig { neg: self.neg && !mag.is_zero(), mag }
+    }
+}
+
+/// Modular inverse `a^{-1} mod m` for an ARBITRARY (not necessarily prime)
+/// modulus, via the extended Euclidean algorithm. Returns `None` when the
+/// inverse does not exist (`gcd(a, m) != 1`). Needed for RSA: the private
+/// exponent `d = e^{-1} mod λ(n)`, and CRT coefficient `qInv = q^{-1} mod p`.
+pub fn inv_mod_full(a: &BigUint, m: &BigUint) -> Option<BigUint> {
+    if m.is_zero() || m.is_one() {
+        return None;
+    }
+    // Reduce a mod m first.
+    let a0 = rem(a, m);
+    if a0.is_zero() {
+        return None;
+    }
+    // Extended Euclid on (old_r, r) = (m, a) carrying Bézout t coefficients.
+    let mut old_r = m.clone();
+    let mut r = a0;
+    let mut old_t = SignedBig::zero();
+    let mut t = SignedBig::from_uint(BigUint::from_u64(1));
+    while !r.is_zero() {
+        let (q, rem_v) = divmod(&old_r, &r);
+        // (old_r, r) = (r, old_r - q*r)
+        old_r = r;
+        r = rem_v;
+        // (old_t, t) = (t, old_t - q*t)
+        let qt = t.mul_uint(&q);
+        let new_t = old_t.sub(&qt);
+        old_t = t;
+        t = new_t;
+    }
+    // gcd is old_r; invertible only if gcd == 1.
+    if !old_r.is_one() {
+        return None;
+    }
+    // old_t is the Bézout coefficient; bring it into [0, m).
+    let result = if old_t.neg {
+        // old_t mod m  =  m - ((-old_t) mod m)
+        let pos = rem(&old_t.mag, m);
+        if pos.is_zero() { pos } else { sub(m, &pos) }
+    } else {
+        rem(&old_t.mag, m)
+    };
+    Some(result)
+}
+
+/// Miller–Rabin probabilistic primality test with `rounds` random witnesses.
+/// `rng` must return uniformly random bytes (a CSPRNG in production). The
+/// standard error bound is 4^{-rounds}; RSA key generation uses ~40 rounds
+/// (FIPS 186-5 Appendix B / handbook of applied cryptography). Small primes
+/// are trial-divided first.
+pub fn is_probable_prime(n: &BigUint, rounds: usize, rng: &mut dyn FnMut(&mut [u8])) -> bool {
+    // 0,1 not prime; 2,3 prime.
+    if n.is_zero() || n.is_one() {
+        return false;
+    }
+    let two = BigUint::from_u64(2);
+    let three = BigUint::from_u64(3);
+    if n.cmp(&three) != Ordering::Greater {
+        // n == 2 or n == 3
+        return n.cmp(&two) == Ordering::Equal || n.cmp(&three) == Ordering::Equal;
+    }
+    if n.is_even() {
+        return false;
+    }
+    // Trial-divide by small primes to reject the obvious composites cheaply.
+    const SMALL: [u64; 25] = [
+        3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71, 73, 79, 83, 89,
+        97, 101,
+    ];
+    for &p in &SMALL {
+        let pb = BigUint::from_u64(p);
+        if n.cmp(&pb) == Ordering::Equal {
+            return true;
+        }
+        if rem(n, &pb).is_zero() {
+            return false;
+        }
+    }
+    // Write n-1 = 2^s * d with d odd.
+    let n_minus_1 = n.dec_one();
+    let mut d = n_minus_1.clone();
+    let mut s = 0usize;
+    while d.is_even() {
+        d = shr_one(&d);
+        s += 1;
+    }
+    let nbytes = n.bit_len().div_ceil(8);
+    'witness: for _ in 0..rounds {
+        // Random base a in [2, n-2].
+        let a = loop {
+            let mut buf = vec![0u8; nbytes];
+            rng(&mut buf);
+            let cand = rem(&BigUint::from_be_bytes(&buf), &n_minus_1.dec_one()); // in [0, n-3]
+            let a = add(&cand, &two); // in [2, n-1]
+            if a.cmp(&two) != Ordering::Less && a.cmp(&n_minus_1) == Ordering::Less {
+                break a;
+            }
+        };
+        let mut x = pow_mod(&a, &d, n);
+        if x.is_one() || x.cmp(&n_minus_1) == Ordering::Equal {
+            continue 'witness;
+        }
+        for _ in 0..s.saturating_sub(1) {
+            x = mul_mod(&x, &x, n);
+            if x.cmp(&n_minus_1) == Ordering::Equal {
+                continue 'witness;
+            }
+        }
+        return false; // composite
+    }
+    true
+}
+
+/// `n >> 1` (single-bit right shift).
+fn shr_one(n: &BigUint) -> BigUint {
+    let limbs = shr_limbs(&n.limbs, 1);
+    let mut b = BigUint { limbs };
+    b.normalize();
+    b
+}
+
+/// Generate a random probable prime of exactly `bits` bits, with the top two
+/// bits set (so a product of two such primes has the intended modulus size,
+/// per FIPS 186-5 / OpenSSL convention) and the low bit set (odd). `rng`
+/// supplies random bytes (CSPRNG). The Miller–Rabin witness count is 40.
+pub fn random_prime(bits: usize, rng: &mut dyn FnMut(&mut [u8])) -> BigUint {
+    assert!(bits >= 16, "RSA prime too small");
+    let nbytes = bits.div_ceil(8);
+    loop {
+        let mut buf = vec![0u8; nbytes];
+        rng(&mut buf);
+        // Force exact bit length: set the top bit of the most-significant byte,
+        // and the next bit, so p*q lands in the right modulus-size window.
+        let top_bit_pos = bits - 1; // 0-indexed
+        // Clear any bits above `bits`.
+        let excess = nbytes * 8 - bits;
+        if excess > 0 {
+            buf[0] &= 0xFF >> excess;
+        }
+        let mut cand = BigUint::from_be_bytes(&buf);
+        // Set the top two bits.
+        cand = set_bit(&cand, top_bit_pos);
+        if top_bit_pos >= 1 {
+            cand = set_bit(&cand, top_bit_pos - 1);
+        }
+        // Set the low bit (odd).
+        cand = set_bit(&cand, 0);
+        if cand.bit_len() != bits {
+            continue;
+        }
+        if is_probable_prime(&cand, 40, rng) {
+            return cand;
+        }
+    }
+}
+
+/// Return a copy of `n` with bit `idx` set.
+fn set_bit(n: &BigUint, idx: usize) -> BigUint {
+    let li = idx / 64;
+    let off = idx % 64;
+    let mut limbs = n.limbs.clone();
+    if limbs.len() <= li {
+        limbs.resize(li + 1, 0);
+    }
+    limbs[li] |= 1u64 << off;
+    let mut b = BigUint { limbs };
+    b.normalize();
+    b
 }
 
 #[cfg(test)]
@@ -539,5 +804,67 @@ mod tests {
         let (q, r) = divmod(&big, &div);
         assert_eq!(add(&mul_full(&q, &div), &r).cmp(&big), Ordering::Equal);
         assert_eq!(r.cmp(&div), Ordering::Less);
+    }
+
+    #[test]
+    fn inv_mod_full_small() {
+        // 3 * 4 = 12 ≡ 1 mod 11  → 3^{-1} mod 11 == 4.
+        let inv = inv_mod_full(&BigUint::from_u64(3), &BigUint::from_u64(11)).unwrap();
+        assert_eq!(inv.cmp(&BigUint::from_u64(4)), Ordering::Equal);
+        // 17^{-1} mod 3120 = 2753 (the classic RSA example d for e=17).
+        let inv = inv_mod_full(&BigUint::from_u64(17), &BigUint::from_u64(3120)).unwrap();
+        assert_eq!(inv.cmp(&BigUint::from_u64(2753)), Ordering::Equal);
+        // Non-invertible: gcd(6, 9) = 3 ≠ 1.
+        assert!(inv_mod_full(&BigUint::from_u64(6), &BigUint::from_u64(9)).is_none());
+    }
+
+    #[test]
+    fn inv_mod_full_roundtrip_random() {
+        // For random a and odd modulus m with gcd(a,m)=1: (a * a^{-1}) mod m == 1.
+        let mut rng = Rng(0xABCD_1234_5678_9012);
+        let mut checked = 0;
+        for _ in 0..400 {
+            let a = rng.big(3);
+            let mut m = rng.big(3);
+            if m.is_even() {
+                m = add(&m, &BigUint::from_u64(1));
+            }
+            if m.cmp(&BigUint::from_u64(3)) == Ordering::Less {
+                continue;
+            }
+            if let Some(inv) = inv_mod_full(&a, &m) {
+                let prod = mul_mod(&a, &inv, &m);
+                assert!(prod.is_one(), "a*a^-1 != 1 mod m");
+                checked += 1;
+            }
+        }
+        assert!(checked > 50, "too few invertible cases exercised");
+    }
+
+    #[test]
+    fn miller_rabin_known_primes_and_composites() {
+        let mut rng = Rng(0x1357_9BDF_2468_ACE0);
+        let mut fill = |buf: &mut [u8]| {
+            for b in buf.iter_mut() {
+                *b = rng.next() as u8;
+            }
+        };
+        // Known primes.
+        for &p in &[97u64, 101, 7919, 104729, 1_000_003] {
+            assert!(
+                is_probable_prime(&BigUint::from_u64(p), 20, &mut fill),
+                "{p} should be prime"
+            );
+        }
+        // Known composites.
+        for &c in &[1u64, 4, 9, 15, 91, 7917, 104730, 1_000_000] {
+            assert!(
+                !is_probable_prime(&BigUint::from_u64(c), 20, &mut fill),
+                "{c} should be composite"
+            );
+        }
+        // Carmichael number 561 = 3·11·17 must be caught (the reason we use MR
+        // not Fermat).
+        assert!(!is_probable_prime(&BigUint::from_u64(561), 20, &mut fill));
     }
 }
