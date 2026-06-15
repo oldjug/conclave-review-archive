@@ -148,6 +148,59 @@ pub const INITIAL_SALT_V1: [u8; 20] = [
     0xcc, 0xbb, 0x7f, 0x0a,
 ];
 
+/// HKDF-Expand-Label (RFC 8446 §7.1) over SHA-256 — the KDF QUIC v1
+/// Initial keys use (RFC 9001 §5.2). `label` is prefixed with `tls13 `.
+pub fn hkdf_expand_label(secret: &[u8], label: &[u8], context: &[u8], out_len: usize) -> Vec<u8> {
+    let mut info = Vec::with_capacity(4 + 6 + label.len() + context.len());
+    info.extend_from_slice(&(out_len as u16).to_be_bytes());
+    let full_label_len = 6 + label.len();
+    info.push(full_label_len as u8);
+    info.extend_from_slice(b"tls13 ");
+    info.extend_from_slice(label);
+    info.push(context.len() as u8);
+    info.extend_from_slice(context);
+    let mut out = vec![0u8; out_len];
+    cv_crypto::hkdf::expand(secret, &info, &mut out);
+    out
+}
+
+/// QUIC v1 Initial keys for one direction (RFC 9001 §5.2).
+#[derive(Debug, Clone)]
+pub struct InitialKeys {
+    /// AES-128-GCM key ("quic key").
+    pub key: [u8; 16],
+    /// AEAD IV ("quic iv").
+    pub iv: [u8; 12],
+    /// Header-protection key ("quic hp").
+    pub hp: [u8; 16],
+}
+
+/// Derive the client's Initial secret + keys from the client-chosen
+/// Destination Connection ID, per RFC 9001 §5.2:
+///
+///   initial_secret = HKDF-Extract(initial_salt, client_dst_connection_id)
+///   client_initial_secret = HKDF-Expand-Label(initial_secret, "client in", "", 32)
+///   key = HKDF-Expand-Label(client_initial_secret, "quic key", "", 16)
+///   iv  = HKDF-Expand-Label(client_initial_secret, "quic iv",  "", 12)
+///   hp  = HKDF-Expand-Label(client_initial_secret, "quic hp",  "", 16)
+pub fn derive_client_initial_keys(dcid: &[u8]) -> InitialKeys {
+    let initial_secret = cv_crypto::hkdf::extract(&INITIAL_SALT_V1, dcid);
+    let client_secret = hkdf_expand_label(&initial_secret, b"client in", b"", 32);
+    let key_v = hkdf_expand_label(&client_secret, b"quic key", b"", 16);
+    let iv_v = hkdf_expand_label(&client_secret, b"quic iv", b"", 12);
+    let hp_v = hkdf_expand_label(&client_secret, b"quic hp", b"", 16);
+    let mut key = [0u8; 16];
+    let mut iv = [0u8; 12];
+    let mut hp = [0u8; 16];
+    key.copy_from_slice(&key_v);
+    iv.copy_from_slice(&iv_v);
+    hp.copy_from_slice(&hp_v);
+    InitialKeys { key, iv, hp }
+}
+
+/// QUIC v1 version number (RFC 9000 §15).
+pub const QUIC_VERSION_1: u32 = 0x0000_0001;
+
 /// Build the AES-128-GCM nonce for a QUIC packet.  Per RFC 9001
 /// §5.3, the nonce is the IV XORed with the packet number expanded
 /// to a 12-byte big-endian field (right-aligned).
@@ -312,5 +365,39 @@ mod tests {
     fn short_header_rejects_long_header_byte() {
         let buf = [0xC0, 1, 2, 3];
         assert!(parse_short_header(&buf, 0).is_none());
+    }
+
+    fn hex(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn initial_keys_match_rfc9001_appendix_a1() {
+        // RFC 9001 §A.1 — the canonical worked example. Client DCID is
+        // 0x8394c8f03e515708; the derived client_initial key/iv/hp are
+        // fixed test vectors that any conforming implementation must
+        // reproduce. This is the real proof our HKDF-Expand-Label + salt
+        // are correct, not just self-consistent.
+        let dcid = hex("8394c8f03e515708");
+        let keys = derive_client_initial_keys(&dcid);
+        assert_eq!(keys.key.to_vec(), hex("1f369613dd76d5467730efcbe3b1a22d"));
+        assert_eq!(keys.iv.to_vec(), hex("fa044b2f42a3fd3b46fb255c"));
+        assert_eq!(keys.hp.to_vec(), hex("9f50449e04a0e810283a1e9933adedd2"));
+    }
+
+    #[test]
+    fn hkdf_expand_label_client_in_matches_rfc9001() {
+        // Intermediate vector: client_initial_secret from §A.1 is
+        // c00cf151ca5be075ed0ebfb5c80323c42d6b7db67881289af4008f1f6c357aea.
+        let dcid = hex("8394c8f03e515708");
+        let initial_secret = cv_crypto::hkdf::extract(&INITIAL_SALT_V1, &dcid);
+        let client_secret = hkdf_expand_label(&initial_secret, b"client in", b"", 32);
+        assert_eq!(
+            client_secret,
+            hex("c00cf151ca5be075ed0ebfb5c80323c42d6b7db67881289af4008f1f6c357aea")
+        );
     }
 }

@@ -23,7 +23,9 @@ pub const AF_UNSPEC: i32 = 0;
 pub const AF_INET: i32 = 2;
 pub const AF_INET6: i32 = 23;
 pub const SOCK_STREAM: i32 = 1;
+pub const SOCK_DGRAM: i32 = 2;
 pub const IPPROTO_TCP: i32 = 6;
+pub const IPPROTO_UDP: i32 = 17;
 /// Disable Nagle's algorithm. Critical for our TLS 1.3 client: BoringSSL
 /// servers (Cloudflare's edges) fire `unexpected_message` if our client
 /// Finished and first application data record arrive in the same TCP

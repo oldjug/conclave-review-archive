@@ -9636,6 +9636,7 @@ fn fetch_body_for_url(url: &Url, timeout_ms: u32) -> Result<Vec<u8>, String> {
         // state so stale values from a previous https nav don't leak into
         // this file:// page (wrong-frame block / wrong SAB gating).
         DOCUMENT_CSP.with(|c| *c.borrow_mut() = None);
+        DOCUMENT_PERMISSIONS_POLICY.with(|p| *p.borrow_mut() = None);
         DOCUMENT_ORIGIN_STR.with(|o| *o.borrow_mut() = url.to_string());
         DOCUMENT_IS_HTTPS.with(|c| c.set(false));
         DOCUMENT_CROSS_ORIGIN_ISOLATED.with(|c| c.set(default_cross_origin_isolated()));
@@ -9681,6 +9682,25 @@ fn fetch_body_for_url(url: &Url, timeout_ms: u32) -> Result<Vec<u8>, String> {
             .find(|(k, _)| k.eq_ignore_ascii_case("content-security-policy"))
             .map(|(_, v)| v.clone());
         DOCUMENT_CSP.with(|c| *c.borrow_mut() = csp);
+        // Capture the Permissions-Policy header(s) (W3C Permissions Policy).
+        // A response may carry several `Permissions-Policy` fields; parse +
+        // merge them all (later directives win). Read by getUserMedia to gate
+        // powerful features per the page's policy.
+        let mut pp: Option<cv_net::PermissionsPolicy> = None;
+        for (k, v) in &resp.headers {
+            if k.eq_ignore_ascii_case("permissions-policy") {
+                let parsed = cv_net::PermissionsPolicy::parse(v);
+                match &mut pp {
+                    Some(existing) => existing.merge(parsed),
+                    None => pp = Some(parsed),
+                }
+            }
+        }
+        DOCUMENT_PERMISSIONS_POLICY.with(|c| *c.borrow_mut() = pp);
+        // Network Error Logging: cache the NEL policy + reporting endpoints
+        // keyed by this document's origin (W3C NEL). Resolvable later for
+        // error reporting; ingest is side-effect-only and never blocks.
+        cv_net::nel::ingest(&url_origin_string(url), &resp.headers);
         DOCUMENT_ORIGIN_STR.with(|o| *o.borrow_mut() = url_origin_string(url));
         // M9.1: capture mixed-content + cross-origin-isolation state from the
         // top-level navigation response (the only place we hold the full HTTP
@@ -10303,6 +10323,14 @@ thread_local! {
     /// came from a file:// URL.  Read by `fetch_fn` and XHR `send` to
     /// enforce connect-src before touching the network.
     static DOCUMENT_CSP: std::cell::RefCell<Option<String>> =
+        std::cell::RefCell::new(None);
+    /// Parsed `Permissions-Policy` header from the most recently loaded
+    /// top-level page response (W3C Permissions Policy). Set/cleared by
+    /// `fetch_body_for_url` on every navigation. Read by getUserMedia /
+    /// getDisplayMedia (and any other gated API) to block a feature the
+    /// page disallowed (e.g. `camera=()` → getUserMedia rejects with
+    /// NotAllowedError, no prompt). `None` ⇒ no header ⇒ default allowlist.
+    static DOCUMENT_PERMISSIONS_POLICY: std::cell::RefCell<Option<cv_net::PermissionsPolicy>> =
         std::cell::RefCell::new(None);
     /// Origin string of the most recently loaded page (e.g.
     /// "https://example.com").  Updated alongside DOCUMENT_CSP on every
@@ -24955,6 +24983,33 @@ fn make_navigator_media_devices(origin: String) -> cv_js::Value {
             return Ok(cv_js::interp::make_settled_promise(
                 false,
                 make_dom_exception_like("TypeError", "At least one of audio/video required"),
+            ));
+        }
+        // Permissions-Policy gate (W3C Permissions Policy). A page that
+        // declares `camera=()` / `microphone=()` disables the feature for
+        // ALL origins — getUserMedia must reject with NotAllowedError and
+        // the user is never prompted. We check each requested device's
+        // feature against the document's parsed policy.
+        let pp_blocked = DOCUMENT_PERMISSIONS_POLICY.with(|p| {
+            let p = p.borrow();
+            let Some(policy) = p.as_ref() else {
+                return None;
+            };
+            if want_video && !policy.allows("camera", &gum_origin) {
+                return Some("camera");
+            }
+            if want_audio && !policy.allows("microphone", &gum_origin) {
+                return Some("microphone");
+            }
+            None
+        });
+        if let Some(feature) = pp_blocked {
+            return Ok(cv_js::interp::make_settled_promise(
+                false,
+                make_dom_exception_like(
+                    "NotAllowedError",
+                    &format!("{feature} disabled by Permissions-Policy"),
+                ),
             ));
         }
         // Permission gate (per origin). Default = Prompt → we GRANT here
@@ -58022,6 +58077,50 @@ mod tests {
             "[globalThis.__n >= 2, globalThis.__hasVideo].join('|')",
         );
         assert_eq!(out, "true|true");
+    }
+
+    #[test]
+    fn permissions_policy_camera_empty_blocks_get_user_media() {
+        // W3C Permissions Policy: a page served with `Permissions-Policy:
+        // camera=()` disables the camera for ALL origins → getUserMedia
+        // must reject with NotAllowedError (the user is never prompted).
+        // We install the parsed policy the way the navigation path does and
+        // confirm the real enforcement in getUserMedia fires. Clean up the
+        // thread-local afterwards so other tests are unaffected.
+        DOCUMENT_PERMISSIONS_POLICY
+            .with(|p| *p.borrow_mut() = Some(cv_net::PermissionsPolicy::parse("camera=()")));
+        let out = run_and_read(
+            "<html><body></body></html>",
+            "navigator.mediaDevices.getUserMedia({video:true}).then(function(){\
+                 globalThis.__r = 'resolved';\
+             }).catch(function(e){ globalThis.__r = 'rejected:' + (e.name||e); });",
+            "globalThis.__r",
+        );
+        DOCUMENT_PERMISSIONS_POLICY.with(|p| *p.borrow_mut() = None);
+        assert_eq!(
+            out, "rejected:NotAllowedError",
+            "camera=() must block getUserMedia with NotAllowedError, got {out}"
+        );
+    }
+
+    #[test]
+    fn permissions_policy_microphone_allowed_audio_only_succeeds() {
+        // `camera=()` blocks video but NOT audio: an audio-only getUserMedia
+        // still resolves (microphone defaults to allowed).
+        DOCUMENT_PERMISSIONS_POLICY
+            .with(|p| *p.borrow_mut() = Some(cv_net::PermissionsPolicy::parse("camera=()")));
+        let out = run_and_read(
+            "<html><body></body></html>",
+            "navigator.mediaDevices.getUserMedia({audio:true}).then(function(stream){\
+                 globalThis.__r = 'resolved:' + stream.getTracks().length;\
+             }).catch(function(e){ globalThis.__r = 'rejected:' + (e.name||e); });",
+            "globalThis.__r",
+        );
+        DOCUMENT_PERMISSIONS_POLICY.with(|p| *p.borrow_mut() = None);
+        assert_eq!(
+            out, "resolved:1",
+            "camera=() must NOT block audio-only getUserMedia, got {out}"
+        );
     }
 
     #[test]

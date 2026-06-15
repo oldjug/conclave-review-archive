@@ -74,6 +74,46 @@ impl From<io::Error> for TlsError {
     }
 }
 
+/// Wall-clock time in Unix milliseconds (0 if the clock predates the epoch).
+fn unix_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Certificate Transparency policy in force, or `None` when CT enforcement
+/// is disabled (the default — we do not bundle Chrome's full CT log list, so
+/// requiring SCTs would break every real site). Enabled with
+/// `CV_CT_ENFORCE=1`; `CV_CT_MIN_SCTS` overrides the SCT count (default 2,
+/// matching Chrome's policy for certs valid < 180 days). Cached per process.
+///
+/// When enabled WITHOUT a bundled trusted-log list, the policy rejects any
+/// cert (an SCT from an unknown log → UntrustedLog; zero SCTs →
+/// NotEnoughScts) — that is the correct fail-closed behaviour and exactly
+/// why this stays default-off until a real log list ships.
+fn ct_policy() -> Option<cv_crypto::ct::CtPolicy> {
+    use std::sync::OnceLock;
+    static P: OnceLock<Option<cv_crypto::ct::CtPolicy>> = OnceLock::new();
+    P.get_or_init(|| {
+        let enabled = std::env::var("CV_CT_ENFORCE")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        if !enabled {
+            return None;
+        }
+        let min_scts = std::env::var("CV_CT_MIN_SCTS")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(2);
+        Some(cv_crypto::ct::CtPolicy {
+            logs: Vec::new(),
+            min_scts,
+        })
+    })
+    .clone()
+}
+
 /// Convenience: a 32-byte random buffer drawn from the OS RNG.
 fn rand_bytes(len: usize) -> Vec<u8> {
     // Pulled from `BCryptGenRandom` via `RtlGenRandom` (BCRYPT_USE_SYSTEM_PREFERRED_RNG).
@@ -794,6 +834,15 @@ struct HandshakeDriver {
 
     // Captured during handshake.
     server_certs: Vec<Vec<u8>>,
+    /// Stapled OCSP response (DER `OCSPResponse`) captured from the leaf
+    /// CertificateEntry's `status_request` extension (TLS 1.3) or the
+    /// CertificateStatus handshake message (TLS 1.2). Empty when the
+    /// server did not staple a response.
+    ocsp_staple: Vec<u8>,
+    /// SignedCertificateTimestamps parsed from the leaf CertificateEntry's
+    /// `signed_certificate_timestamp` extension (TLS 1.3) or ServerHello
+    /// (TLS 1.2). Used for Certificate Transparency enforcement.
+    scts: Vec<cv_crypto::ct::SignedCertificateTimestamp>,
     cert_verify_done: bool,
     server_finished_done: bool,
     /// Set when the server sent CertificateRequest during the handshake.
@@ -897,6 +946,8 @@ impl HandshakeDriver {
             client_handshake_secret: Vec::new(),
             server_handshake_secret: Vec::new(),
             server_certs: Vec::new(),
+            ocsp_staple: Vec::new(),
+            scts: Vec::new(),
             cert_verify_done: false,
             server_finished_done: false,
             cert_request_seen: false,
@@ -1229,19 +1280,95 @@ impl HandshakeDriver {
             .vec_u24()
             .map_err(|e| TlsError::Decode(format!("cert list: {e}")))?;
         let mut entries = Decoder::new(cert_list);
+        let mut entry_index = 0usize;
         while !entries.is_empty() {
             let cert = entries
                 .vec_u24()
                 .map_err(|e| TlsError::Decode(format!("cert entry: {e}")))?;
-            let _ext = entries
+            let ext = entries
                 .vec_u16()
                 .map_err(|e| TlsError::Decode(format!("cert ext: {e}")))?;
+            // RFC 8446 §4.4.2: the FIRST CertificateEntry is the leaf, and
+            // its per-entry extensions carry the OCSP staple
+            // (status_request, type 5) and the embedded SCT list
+            // (signed_certificate_timestamp, type 18).
+            if entry_index == 0 {
+                self.capture_leaf_entry_extensions(ext);
+            }
             self.server_certs.push(cert.to_vec());
+            entry_index += 1;
         }
         if self.server_certs.is_empty() {
             return Err(TlsError::NoCertificate);
         }
         Ok(())
+    }
+
+    /// Walk a TLS 1.3 leaf CertificateEntry extension block
+    /// (`Extension extensions<2..>` = repeated `<u16 type><u16 len><body>`)
+    /// and capture the OCSP staple + SCT list.
+    fn capture_leaf_entry_extensions(&mut self, ext: &[u8]) {
+        let mut i = 0usize;
+        while i + 4 <= ext.len() {
+            let ty = u16::from_be_bytes([ext[i], ext[i + 1]]);
+            let len = u16::from_be_bytes([ext[i + 2], ext[i + 3]]) as usize;
+            if i + 4 + len > ext.len() {
+                break;
+            }
+            let body = &ext[i + 4..i + 4 + len];
+            match ty {
+                // status_request (RFC 6066) — CertificateStatus structure:
+                //   status_type(1) | u24 OCSP response length | DER OCSPResponse
+                5 => {
+                    if body.len() >= 4 && body[0] == 1 {
+                        let n = ((body[1] as usize) << 16)
+                            | ((body[2] as usize) << 8)
+                            | body[3] as usize;
+                        if 4 + n <= body.len() {
+                            self.ocsp_staple = body[4..4 + n].to_vec();
+                        }
+                    }
+                }
+                // signed_certificate_timestamp (RFC 6962 §3.3.1) — the
+                // extension body IS a SignedCertificateTimestampList.
+                18 => {
+                    let mut parsed = cv_crypto::ct::parse_sct_list(body);
+                    self.scts.append(&mut parsed);
+                }
+                _ => {}
+            }
+            i += 4 + len;
+        }
+    }
+
+    /// Validate the captured OCSP staple (RFC 6960 §4.2.1) and, when the
+    /// responder says the leaf is REVOKED inside the validity window, reject
+    /// the connection. A missing or soft-failing staple does NOT block —
+    /// that mirrors Chrome's soft-fail revocation posture (the Windows chain
+    /// engine in `chain_validate` is the authoritative path). Returns the
+    /// CT decision so the caller can enforce SCT requirements separately.
+    fn enforce_ocsp_staple(&self) -> Result<(), TlsError> {
+        if self.ocsp_staple.is_empty() {
+            return Ok(());
+        }
+        let resp = match cv_crypto::ocsp::parse_basic_response(&self.ocsp_staple) {
+            Ok(r) => r,
+            // A malformed staple is not, by itself, a revocation — soft-fail.
+            Err(_) => return Ok(()),
+        };
+        let now_ms = unix_now_ms();
+        if cv_crypto::ocsp::evaluate(&resp, now_ms) == cv_crypto::ocsp::OcspDecision::Block {
+            return Err(TlsError::ChainInvalid(
+                "stapled OCSP response: certificate REVOKED".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Number of SCTs parsed from the leaf (used for CT enforcement +
+    /// diagnostics). Public so the connect path can apply a policy.
+    fn sct_count(&self) -> usize {
+        self.scts.len()
     }
 
     fn verify_certificate_verify(&mut self, body: &[u8]) -> Result<(), TlsError> {
@@ -1259,6 +1386,34 @@ impl HandshakeDriver {
         // transcript, because the leaf itself is untrusted.
         chain_validate::verify_chain(&self.server_certs, &self.host)
             .map_err(|e| TlsError::ChainInvalid(e.to_string()))?;
+
+        // Stapled-OCSP hard-fail: if the server stapled an OCSP response
+        // saying the leaf is REVOKED, reject regardless of what the Windows
+        // chain engine cached. (RFC 6960; Chrome treats a stapled "revoked"
+        // as authoritative.) A missing/soft staple does not block.
+        self.enforce_ocsp_staple()?;
+
+        // Certificate Transparency: when a CT policy is configured (default
+        // OFF — no bundled log list), require the policy's SCT count from
+        // trusted logs. Default-off keeps real sites loading; turning it on
+        // makes a cert with too few SCTs fail. (RFC 6962.)
+        if let Some(policy) = ct_policy() {
+            match cv_crypto::ct::evaluate(&policy, &self.scts) {
+                cv_crypto::ct::CtDecision::Compliant => {}
+                cv_crypto::ct::CtDecision::NotEnoughScts => {
+                    return Err(TlsError::ChainInvalid(format!(
+                        "Certificate Transparency: only {} SCT(s), policy requires {}",
+                        self.scts.len(),
+                        policy.min_scts
+                    )));
+                }
+                cv_crypto::ct::CtDecision::UntrustedLog => {
+                    return Err(TlsError::ChainInvalid(
+                        "Certificate Transparency: SCT from an untrusted log".into(),
+                    ));
+                }
+            }
+        }
 
         // Transcript hash UP TO BUT NOT INCLUDING this CertVerify message.
         // self.transcript currently does not include this message yet.
@@ -1584,5 +1739,120 @@ mod tests {
         assert_eq!(hs.client_pub.len(), 32);
         // Random bytes should not be zero (statistically safe).
         assert!(hs.client_random.iter().any(|&b| b != 0));
+    }
+
+    // --- DER helpers for synthesizing a revoked OCSP staple ---
+
+    fn der_len(n: usize, out: &mut Vec<u8>) {
+        if n < 0x80 {
+            out.push(n as u8);
+        } else {
+            let mut buf = [0u8; 8];
+            let mut i = 0;
+            let mut x = n;
+            while x > 0 {
+                buf[i] = (x & 0xFF) as u8;
+                i += 1;
+                x >>= 8;
+            }
+            out.push(0x80 | i as u8);
+            for j in (0..i).rev() {
+                out.push(buf[j]);
+            }
+        }
+    }
+    fn tlv(tag: u8, v: &[u8]) -> Vec<u8> {
+        let mut o = vec![tag];
+        der_len(v.len(), &mut o);
+        o.extend_from_slice(v);
+        o
+    }
+
+    /// Build a DER OCSPResponse whose single response is REVOKED.
+    fn revoked_ocsp_der() -> Vec<u8> {
+        let alg = tlv(0x30, &[0x06, 0x05, 0x2B, 0x0E, 0x03, 0x02, 0x1A]);
+        let cert_id = tlv(
+            0x30,
+            &[alg, tlv(0x04, &[0u8; 20]), tlv(0x04, &[0u8; 20]), tlv(0x02, &[0x01])].concat(),
+        );
+        // [1] revoked RevokedInfo { revocationTime GeneralizedTime }.
+        let revoked = tlv(0xA1, &tlv(0x18, b"20200101000000Z"));
+        let this_update = tlv(0x18, b"20200101000000Z");
+        let next_update = tlv(0xA0, &tlv(0x18, b"20990101000000Z"));
+        let single = tlv(
+            0x30,
+            &[cert_id, revoked, this_update, next_update].concat(),
+        );
+        let responses = tlv(0x30, &single);
+        let responder_id = tlv(0xA1, &tlv(0x04, &[0xAB; 20]));
+        let produced_at = tlv(0x18, b"20200101000000Z");
+        let response_data = tlv(0x30, &[responder_id, produced_at, responses].concat());
+        let sig_alg = tlv(0x30, &[0x06, 0x05, 0x2B, 0x0E, 0x03, 0x02, 0x1A]);
+        let signature = tlv(0x03, &[0x00, 0xDE]);
+        let basic = tlv(0x30, &[response_data, sig_alg, signature].concat());
+        let response_type = tlv(0x06, &[0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x01, 0x01]);
+        let response_octet = tlv(0x04, &basic);
+        let response_bytes = tlv(0x30, &[response_type, response_octet].concat());
+        let rb_explicit = tlv(0xA0, &response_bytes);
+        let status = tlv(0x0A, &[0x00]);
+        tlv(0x30, &[status, rb_explicit].concat())
+    }
+
+    #[test]
+    fn revoked_ocsp_staple_is_rejected() {
+        // Synthesize a leaf CertificateEntry extension block carrying a
+        // revoked OCSP staple in the status_request (type 5) extension, run
+        // it through the real capture+enforce path, and confirm the
+        // connection is rejected.
+        let mut hs = HandshakeDriver::new("example.com").unwrap();
+        let ocsp = revoked_ocsp_der();
+        // CertificateStatus body: status_type(1) | u24 len | OCSPResponse.
+        let mut status_body = vec![1u8];
+        let n = ocsp.len();
+        status_body.push((n >> 16) as u8);
+        status_body.push((n >> 8) as u8);
+        status_body.push(n as u8);
+        status_body.extend_from_slice(&ocsp);
+        // One extension: type 5 (status_request).
+        let mut ext = Vec::new();
+        ext.extend_from_slice(&5u16.to_be_bytes());
+        ext.extend_from_slice(&(status_body.len() as u16).to_be_bytes());
+        ext.extend_from_slice(&status_body);
+
+        hs.capture_leaf_entry_extensions(&ext);
+        assert!(!hs.ocsp_staple.is_empty(), "staple captured");
+        let err = hs.enforce_ocsp_staple().unwrap_err();
+        match err {
+            TlsError::ChainInvalid(m) => assert!(m.contains("REVOKED"), "got {m}"),
+            other => panic!("expected ChainInvalid REVOKED, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn good_staple_passes_and_scts_are_captured() {
+        let mut hs = HandshakeDriver::new("example.com").unwrap();
+        // SCT extension (type 18): a SignedCertificateTimestampList with one SCT.
+        let mut sct_body = Vec::new();
+        sct_body.push(0u8); // version
+        sct_body.extend_from_slice(&[0x11; 32]); // log id
+        sct_body.extend_from_slice(&123u64.to_be_bytes()); // timestamp
+        sct_body.extend_from_slice(&[0x00, 0x00]); // extensions
+        sct_body.extend_from_slice(&[0x04, 0x03, 0x00, 0x01, 0x00]); // signature
+        let mut serialized = Vec::new();
+        serialized.extend_from_slice(&(sct_body.len() as u16).to_be_bytes());
+        serialized.extend_from_slice(&sct_body);
+        let mut list = Vec::new();
+        list.extend_from_slice(&(serialized.len() as u16).to_be_bytes());
+        list.extend_from_slice(&serialized);
+        let mut ext = Vec::new();
+        ext.extend_from_slice(&18u16.to_be_bytes());
+        ext.extend_from_slice(&(list.len() as u16).to_be_bytes());
+        ext.extend_from_slice(&list);
+
+        hs.capture_leaf_entry_extensions(&ext);
+        assert_eq!(hs.sct_count(), 1, "one SCT captured from the TLS extension");
+        assert_eq!(hs.scts[0].timestamp_ms, 123);
+        // No OCSP staple → enforcement is a no-op (soft-fail, not block).
+        assert!(hs.enforce_ocsp_staple().is_ok());
     }
 }

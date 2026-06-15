@@ -62,6 +62,26 @@ pub enum SameSite {
     Unset,
 }
 
+/// Compute a CHIPS partition key from the top-level site's host (and
+/// scheme). Per the CHIPS spec the partition key is the *site* — scheme +
+/// registrable domain — of the top-level URL the browser was visiting when
+/// the cookie was set. Subdomains of the same registrable domain share a
+/// partition (so `support.shoppy.example` and `shoppy.example` are one
+/// partition), but unrelated top-level sites do not.
+///
+/// `top_level_host` is the top-level document's host; `is_https` selects the
+/// scheme. Returns e.g. `https://shoppy.example`.
+pub fn partition_key_for_site(top_level_host: &str, is_https: bool) -> String {
+    let scheme = if is_https { "https" } else { "http" };
+    let reg = crate::psl::registrable_domain(&top_level_host.to_ascii_lowercase());
+    let site = if reg.is_empty() {
+        top_level_host.to_ascii_lowercase()
+    } else {
+        reg
+    };
+    format!("{scheme}://{site}")
+}
+
 #[derive(Debug, Clone)]
 struct StoredCookie {
     name: String,
@@ -85,6 +105,13 @@ struct StoredCookie {
     secure: bool,
     http_only: bool,
     same_site: SameSite,
+    /// CHIPS (Cookies Having Independent Partitioned State): when the
+    /// `Partitioned` attribute was present, the cookie is double-keyed by
+    /// `partition_key` (the scheme + registrable domain of the TOP-LEVEL
+    /// site active when it was set). It is only sent on requests whose
+    /// top-level site yields the same partition key — blocking cross-site
+    /// tracking. `None` ⇒ an unpartitioned (legacy) cookie.
+    partition_key: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -176,6 +203,84 @@ impl CookieJar {
         }
         sweep_expired(&mut store);
         flush_to_disk(&store);
+    }
+
+    /// CHIPS-aware `absorb`: ingest `Set-Cookie` headers with the TOP-LEVEL
+    /// site partition key in scope, so a cookie carrying the `Partitioned`
+    /// attribute is double-keyed by `top_level_partition_key` (compute it
+    /// with [`partition_key_for_site`]). Non-partitioned cookies behave
+    /// exactly as [`Self::absorb`].
+    pub fn absorb_partitioned(
+        &self,
+        response_headers: &[(String, String)],
+        host: &str,
+        path: &str,
+        is_https: bool,
+        top_level_partition_key: &str,
+    ) {
+        let mut store = self.inner.lock().unwrap();
+        for (k, v) in response_headers {
+            if !k.eq_ignore_ascii_case("set-cookie") {
+                continue;
+            }
+            if let Some(c) = parse_set_cookie_partitioned(
+                v,
+                host,
+                path,
+                is_https,
+                Some(top_level_partition_key),
+            ) {
+                upsert(&mut store, c);
+            }
+        }
+        sweep_expired(&mut store);
+        flush_to_disk(&store);
+    }
+
+    /// CHIPS-aware cookie header: emit cookies for this request, including
+    /// partitioned cookies ONLY when their partition key equals
+    /// `top_level_partition_key`. A partitioned cookie set under a different
+    /// top-level site is never sent here — that is the cross-site-tracking
+    /// block CHIPS provides. Unpartitioned cookies are sent regardless of
+    /// partition (subject to the usual domain/path/secure/SameSite rules).
+    pub fn cookie_header_partitioned(
+        &self,
+        host: &str,
+        path: &str,
+        is_https: bool,
+        site: RequestSite,
+        is_top_level_nav: bool,
+        top_level_partition_key: &str,
+    ) -> Option<String> {
+        let mut store = self.inner.lock().unwrap();
+        sweep_expired(&mut store);
+        let host_lc = host.to_ascii_lowercase();
+        let mut matches: Vec<&StoredCookie> = store
+            .cookies
+            .iter()
+            .filter(|c| cookie_applies(c, &host_lc, path, is_https))
+            .filter(|c| same_site_permits(c.same_site, site, is_top_level_nav, is_https))
+            .filter(|c| match &c.partition_key {
+                // Unpartitioned cookie: always eligible.
+                None => true,
+                // Partitioned: only when the partition keys match.
+                Some(pk) => pk == top_level_partition_key,
+            })
+            .collect();
+        matches.sort_by(|a, b| b.path.len().cmp(&a.path.len()));
+        if matches.is_empty() {
+            return None;
+        }
+        let mut out = String::new();
+        for (i, c) in matches.iter().enumerate() {
+            if i > 0 {
+                out.push_str("; ");
+            }
+            out.push_str(&c.name);
+            out.push('=');
+            out.push_str(&c.value);
+        }
+        Some(out)
     }
 
     /// Build the value of the `Cookie:` request header for this URL. Returns
@@ -276,12 +381,15 @@ impl CookieJar {
 }
 
 fn upsert(store: &mut CookieStore, c: StoredCookie) {
-    // (name, domain, path) is the unique identity per RFC 6265 §5.3.
-    if let Some(existing) = store
-        .cookies
-        .iter_mut()
-        .find(|e| e.name == c.name && e.domain == c.domain && e.path == c.path)
-    {
+    // (name, domain, path) is the unique identity per RFC 6265 §5.3; CHIPS
+    // adds the partition key so a partitioned cookie in one top-level site
+    // does not overwrite the same-named cookie in another partition.
+    if let Some(existing) = store.cookies.iter_mut().find(|e| {
+        e.name == c.name
+            && e.domain == c.domain
+            && e.path == c.path
+            && e.partition_key == c.partition_key
+    }) {
         *existing = c;
     } else {
         store.cookies.push(c);
@@ -369,7 +477,7 @@ fn unescape_field(s: &str) -> String {
 fn serialize_cookie(c: &StoredCookie) -> Option<String> {
     let exp = c.expires_unix?; // session cookie → not persisted
     Some(format!(
-        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
         escape_field(&c.name),
         escape_field(&c.value),
         escape_field(&c.domain),
@@ -379,6 +487,9 @@ fn serialize_cookie(c: &StoredCookie) -> Option<String> {
         if c.secure { 1 } else { 0 },
         if c.http_only { 1 } else { 0 },
         same_site_to_str(c.same_site),
+        // CHIPS partition key (empty field = unpartitioned). Appended as a
+        // 10th column so legacy 9-column rows still load (partition_key None).
+        escape_field(c.partition_key.as_deref().unwrap_or("")),
     ))
 }
 
@@ -396,6 +507,11 @@ fn deserialize_cookie(line: &str, now_unix: u64) -> Option<StoredCookie> {
     let secure = f.next()? == "1";
     let http_only = f.next()? == "1";
     let same_site = same_site_from_str(f.next()?);
+    // CHIPS partition key — 10th column, optional for legacy 9-column rows.
+    let partition_key = match f.next() {
+        Some(s) if !s.is_empty() => Some(unescape_field(s)),
+        _ => None,
+    };
     if name.is_empty() {
         return None;
     }
@@ -416,6 +532,7 @@ fn deserialize_cookie(line: &str, now_unix: u64) -> Option<StoredCookie> {
         secure,
         http_only,
         same_site,
+        partition_key,
     })
 }
 
@@ -540,6 +657,24 @@ fn parse_set_cookie(
     request_path: &str,
     is_https: bool,
 ) -> Option<StoredCookie> {
+    parse_set_cookie_partitioned(value, request_host, request_path, is_https, None)
+}
+
+/// `parse_set_cookie`, but aware of the CHIPS partition key. When the
+/// `Partitioned` attribute is present, `top_level_partition_key` (the
+/// scheme + registrable domain of the top-level site) becomes the cookie's
+/// partition key. A `Partitioned` cookie MUST also be `Secure` and have
+/// `Path=/` (CHIPS spec); a violation drops the partition (the cookie is
+/// stored unpartitioned only if it independently satisfies the rest — but
+/// per Chrome a Partitioned cookie that fails the requirements is rejected
+/// outright, which is what we do).
+fn parse_set_cookie_partitioned(
+    value: &str,
+    request_host: &str,
+    request_path: &str,
+    is_https: bool,
+    top_level_partition_key: Option<&str>,
+) -> Option<StoredCookie> {
     let mut parts = value.split(';');
     let nv = parts.next()?.trim();
     let (name, val) = nv.split_once('=')?;
@@ -556,6 +691,7 @@ fn parse_set_cookie(
     let mut secure = false;
     let mut http_only = false;
     let mut same_site = SameSite::Unset;
+    let mut partitioned = false;
 
     for attr in parts {
         let attr = attr.trim();
@@ -602,6 +738,7 @@ fn parse_set_cookie(
             }
             "secure" => secure = true,
             "httponly" => http_only = true,
+            "partitioned" => partitioned = true,
             "samesite" => {
                 if let Some(v) = v {
                     same_site = match v.to_ascii_lowercase().as_str() {
@@ -687,6 +824,26 @@ fn parse_set_cookie(
         }
     }
 
+    // CHIPS (Partitioned attribute). Requirements per the CHIPS spec:
+    //   * MUST be Secure (and therefore set over https).
+    //   * MUST have Path=/ (resolved path exactly "/").
+    // A Partitioned cookie that violates these is rejected outright
+    // (Chrome's net::CookieBase::IsPartitioned validity check). When valid,
+    // the cookie is double-keyed by the top-level site's partition key.
+    let partition_key = if partitioned {
+        if !secure || path != "/" {
+            return None;
+        }
+        // A Partitioned cookie set without a top-level-site context (e.g. a
+        // top-level navigation that IS the partition) keys to its own site.
+        match top_level_partition_key {
+            Some(k) => Some(k.to_string()),
+            None => Some(partition_key_for_site(&domain, is_https)),
+        }
+    } else {
+        None
+    };
+
     // Expiry: Max-Age wins over Expires per spec. A negative or zero
     // Max-Age means "expire immediately". We compute the relative
     // `Instant` (drives the in-memory sweep) and the absolute Unix-second
@@ -738,6 +895,7 @@ fn parse_set_cookie(
         secure,
         http_only,
         same_site,
+        partition_key,
     })
 }
 
@@ -1534,5 +1692,192 @@ mod tests {
         let c = parse_set_cookie("x__Host-=1", "example.com", "/", true)
             .expect("name not starting with __Host- is unaffected");
         assert_eq!(c.name, "x__Host-");
+    }
+
+    // --- CHIPS partitioned cookies (Partitioned attribute) ---
+
+    #[test]
+    fn partition_key_uses_scheme_and_registrable_domain() {
+        // Subdomains of the same registrable domain share a partition.
+        assert_eq!(
+            partition_key_for_site("support.shoppy.example", true),
+            "https://shoppy.example"
+        );
+        assert_eq!(
+            partition_key_for_site("shoppy.example", true),
+            "https://shoppy.example"
+        );
+        // Scheme is part of the key.
+        assert_eq!(
+            partition_key_for_site("shoppy.example", false),
+            "http://shoppy.example"
+        );
+    }
+
+    #[test]
+    fn partitioned_cookie_requires_secure_and_root_path() {
+        // Missing Secure → rejected.
+        assert!(
+            parse_set_cookie_partitioned(
+                "__Host-x=1; Path=/; Partitioned",
+                "3rd.example",
+                "/",
+                true,
+                Some("https://site-a.example"),
+            )
+            .is_none(),
+            "Partitioned without Secure must be rejected"
+        );
+        // Non-root path → rejected.
+        assert!(
+            parse_set_cookie_partitioned(
+                "id=1; Secure; Path=/sub; Partitioned",
+                "3rd.example",
+                "/sub",
+                true,
+                Some("https://site-a.example"),
+            )
+            .is_none(),
+            "Partitioned with Path!=/ must be rejected"
+        );
+        // Valid → keyed to the top-level partition.
+        let c = parse_set_cookie_partitioned(
+            "__Host-id=1; Secure; Path=/; SameSite=None; Partitioned",
+            "3rd.example",
+            "/",
+            true,
+            Some("https://site-a.example"),
+        )
+        .expect("valid Partitioned cookie accepted");
+        assert_eq!(c.partition_key.as_deref(), Some("https://site-a.example"));
+    }
+
+    #[test]
+    fn partitioned_cookie_not_sent_cross_partition() {
+        // The CHIPS spec scenario: 3rd-party.example sets a Partitioned
+        // cookie while embedded under site-a.example. Visiting site-b.example
+        // (which also embeds 3rd-party.example) must NOT see the cookie.
+        let jar = CookieJar::new();
+        let site_a = partition_key_for_site("site-a.example", true);
+        jar.absorb_partitioned(
+            &[(
+                "Set-Cookie".into(),
+                "__Host-pc=abc; Secure; Path=/; SameSite=None; Partitioned".into(),
+            )],
+            "3rd-party.example",
+            "/",
+            true,
+            &site_a,
+        );
+
+        // Under site-a (the partition that set it) → sent.
+        let h_a = jar.cookie_header_partitioned(
+            "3rd-party.example",
+            "/",
+            true,
+            RequestSite::CrossSite,
+            false,
+            &site_a,
+        );
+        assert_eq!(h_a.as_deref(), Some("__Host-pc=abc"));
+
+        // Under site-b (a different partition) → NOT sent.
+        let site_b = partition_key_for_site("site-b.example", true);
+        let h_b = jar.cookie_header_partitioned(
+            "3rd-party.example",
+            "/",
+            true,
+            RequestSite::CrossSite,
+            false,
+            &site_b,
+        );
+        assert!(
+            h_b.is_none(),
+            "partitioned cookie must not leak to a different top-level site"
+        );
+    }
+
+    #[test]
+    fn partitioned_and_unpartitioned_same_name_coexist() {
+        // A partitioned and an unpartitioned cookie with the same name are
+        // distinct entries (partition key is part of the identity).
+        let jar = CookieJar::new();
+        let site_a = partition_key_for_site("site-a.example", true);
+        jar.absorb(
+            &[("Set-Cookie".into(), "id=plain; Secure; Path=/".into())],
+            "3rd.example",
+            "/",
+            true,
+        );
+        jar.absorb_partitioned(
+            &[(
+                "Set-Cookie".into(),
+                "id=part; Secure; Path=/; SameSite=None; Partitioned".into(),
+            )],
+            "3rd.example",
+            "/",
+            true,
+            &site_a,
+        );
+        assert_eq!(jar.len(), 2, "both coexist");
+        // Under site-a both are eligible; the unpartitioned one is always
+        // sent, the partitioned one matches its partition.
+        let h = jar
+            .cookie_header_partitioned(
+                "3rd.example",
+                "/",
+                true,
+                RequestSite::SameSite,
+                true,
+                &site_a,
+            )
+            .unwrap();
+        assert!(h.contains("id=plain"));
+        assert!(h.contains("id=part"));
+    }
+
+    #[test]
+    fn partitioned_cookie_persists_with_partition_key() {
+        let path = temp_cookie_path("chips");
+        let site_a = partition_key_for_site("site-a.example", true);
+        {
+            let jar = CookieJar::with_persistence(path.clone());
+            jar.absorb_partitioned(
+                &[(
+                    "Set-Cookie".into(),
+                    "__Host-pc=v; Secure; Path=/; SameSite=None; Max-Age=86400; Partitioned".into(),
+                )],
+                "3rd.example",
+                "/",
+                true,
+                &site_a,
+            );
+        }
+        // A new jar over the same file rehydrates the partition key.
+        let jar2 = CookieJar::with_persistence(path.clone());
+        // Sent under the right partition, withheld under another.
+        let h_a = jar2.cookie_header_partitioned(
+            "3rd.example",
+            "/",
+            true,
+            RequestSite::CrossSite,
+            false,
+            &site_a,
+        );
+        assert_eq!(h_a.as_deref(), Some("__Host-pc=v"));
+        let site_b = partition_key_for_site("site-b.example", true);
+        assert!(
+            jar2.cookie_header_partitioned(
+                "3rd.example",
+                "/",
+                true,
+                RequestSite::CrossSite,
+                false,
+                &site_b,
+            )
+            .is_none(),
+            "partition key survives reload and still blocks cross-partition"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 }

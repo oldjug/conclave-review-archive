@@ -321,3 +321,122 @@ impl Drop for Socket {
         }
     }
 }
+
+/// A connected UDP datagram socket — the transport QUIC (HTTP/3) rides on.
+/// Unlike TCP there is no handshake; `connect` only fixes the default peer
+/// so `send`/`recv` can be used without per-call addresses. Datagram
+/// boundaries are preserved (one `send` ⇒ one UDP packet), which QUIC packet
+/// framing relies on.
+#[derive(Debug)]
+pub struct UdpSocket {
+    s: sys::SOCKET,
+}
+
+impl UdpSocket {
+    /// Create a UDP socket and `connect` it to `addr` (sets the peer; no
+    /// packets are sent). `timeout_ms` becomes the recv/send timeout.
+    pub fn connect(addr: &ResolvedAddr, timeout_ms: u32) -> Result<Self, SocketError> {
+        ensure_wsa_started();
+        let family = match addr.ip {
+            IpAddr::V4(_) => sys::AF_INET,
+            IpAddr::V6(_) => sys::AF_INET6,
+        };
+        let s = unsafe { sys::socket(family, sys::SOCK_DGRAM, sys::IPPROTO_UDP) };
+        if s == sys::INVALID_SOCKET {
+            return Err(SocketError::SocketFailed(unsafe { sys::WSAGetLastError() }));
+        }
+        let sock = Self { s };
+        let to_bytes = timeout_ms.to_le_bytes();
+        unsafe {
+            sys::setsockopt(s, sys::SOL_SOCKET, sys::SO_RCVTIMEO, to_bytes.as_ptr(), 4);
+            sys::setsockopt(s, sys::SOL_SOCKET, sys::SO_SNDTIMEO, to_bytes.as_ptr(), 4);
+        }
+        let rc = match addr.ip {
+            IpAddr::V4(ip) => {
+                let sa = sys::sockaddr_in {
+                    sin_family: sys::AF_INET as u16,
+                    sin_port: addr.port.to_be(),
+                    sin_addr: ip,
+                    sin_zero: [0; 8],
+                };
+                unsafe {
+                    sys::connect(
+                        s,
+                        (&raw const sa).cast::<sys::sockaddr>(),
+                        std::mem::size_of::<sys::sockaddr_in>() as i32,
+                    )
+                }
+            }
+            IpAddr::V6(ip) => {
+                let sa = sys::sockaddr_in6 {
+                    sin6_family: sys::AF_INET6 as u16,
+                    sin6_port: addr.port.to_be(),
+                    sin6_flowinfo: 0,
+                    sin6_addr: ip,
+                    sin6_scope_id: 0,
+                };
+                unsafe {
+                    sys::connect(
+                        s,
+                        (&raw const sa).cast::<sys::sockaddr>(),
+                        std::mem::size_of::<sys::sockaddr_in6>() as i32,
+                    )
+                }
+            }
+        };
+        // UDP connect is a local operation; it does not block, so any
+        // non-zero result is a real error.
+        if rc == sys::SOCKET_ERROR {
+            return Err(SocketError::ConnectFailed(unsafe { sys::WSAGetLastError() }));
+        }
+        Ok(sock)
+    }
+
+    /// Send one datagram. Returns the number of bytes written (a short send
+    /// is not possible for UDP — the whole datagram goes or it errors).
+    pub fn send(&self, data: &[u8]) -> Result<usize, SocketError> {
+        let n = unsafe {
+            sys::send(
+                self.s,
+                data.as_ptr(),
+                data.len().min(i32::MAX as usize) as i32,
+                0,
+            )
+        };
+        if n == sys::SOCKET_ERROR {
+            return Err(SocketError::SendFailed(unsafe { sys::WSAGetLastError() }));
+        }
+        Ok(n as usize)
+    }
+
+    /// Receive one datagram into `buf`. Returns 0 on timeout.
+    pub fn recv(&self, buf: &mut [u8]) -> Result<usize, SocketError> {
+        let n = unsafe {
+            sys::recv(
+                self.s,
+                buf.as_mut_ptr(),
+                buf.len().min(i32::MAX as usize) as i32,
+                0,
+            )
+        };
+        if n == sys::SOCKET_ERROR {
+            let err = unsafe { sys::WSAGetLastError() };
+            // WSAETIMEDOUT (10060) on a datagram recv ⇒ no packet arrived.
+            if err == 10060 || err == sys::WSAEWOULDBLOCK {
+                return Ok(0);
+            }
+            return Err(SocketError::RecvFailed(err));
+        }
+        Ok(n as usize)
+    }
+}
+
+impl Drop for UdpSocket {
+    fn drop(&mut self) {
+        if self.s != sys::INVALID_SOCKET {
+            unsafe {
+                sys::closesocket(self.s);
+            }
+        }
+    }
+}

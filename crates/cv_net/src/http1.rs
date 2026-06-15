@@ -388,6 +388,27 @@ fn h2_pool_enabled() -> bool {
     })
 }
 
+/// Capture any `Alt-Svc` header on a response into the process-wide cache
+/// (RFC 7838 §3), keyed by the origin that sent it. This is what lets a
+/// later request to the same origin prefer HTTP/3 (see
+/// [`crate::h3::should_use_h3`]). `Alt-Svc: clear` empties the cache for the
+/// origin. Cheap and side-effect-only; safe to call on every response.
+fn note_alt_svc(resp: &Response, host: &str, port: u16) {
+    for (k, v) in &resp.headers {
+        if !k.eq_ignore_ascii_case("alt-svc") {
+            continue;
+        }
+        if v.trim().eq_ignore_ascii_case("clear") {
+            crate::altsvc::store(host, port, Vec::new());
+            continue;
+        }
+        let entries = crate::altsvc::parse(v);
+        if !entries.is_empty() {
+            crate::altsvc::store(host, port, entries);
+        }
+    }
+}
+
 /// A long-lived, SHARED HTTP/2 connection living in the h2 pool. Unlike
 /// `PooledConn` (h1, checked-out exclusively) an `H2Conn` stays in the
 /// map while a request drives it — h2 multiplexes many streams over one
@@ -792,6 +813,25 @@ impl Client {
         // through to a fresh dial. The fresh path itself retries a couple
         // of times to ride out transient timeouts when many sub-resource
         // fetches dial the same host concurrently.
+        // HTTP/3 opportunistic upgrade (RFC 9114). If a prior response from
+        // this origin advertised `Alt-Svc: h3=...` AND `CV_HTTP3` is on, try
+        // a QUIC connection first. The QUIC handshake-completion path is a
+        // documented follow-up, so `attempt_connect` always returns an error
+        // today (HandshakeIncomplete) and we fall through to TCP — the page
+        // never fails because h3 is enabled. Default-OFF.
+        if is_https {
+            if let Some((h3_host, h3_port)) = crate::h3::should_use_h3(&host, port) {
+                // Use a real ClientHello body (fresh key shares + h3 ALPN)
+                // for the QUIC CRYPTO stream.
+                let ch = crate::h3::quic_client_hello_for(&h3_host);
+                if crate::h3::attempt_connect(&h3_host, h3_port, &ch).is_ok() {
+                    // (Unreachable until the handshake follow-up lands; kept
+                    // so the success path exists the moment it does.)
+                }
+                // else: fall through to TCP.
+            }
+        }
+
         if let Some(conn) = self.checkout(&host, port, is_https) {
             // A reused warm connection answers fast. Give its socket a
             // short receive timeout (not the full per-request budget): if a
@@ -806,7 +846,10 @@ impl Client {
             let leash = self.timeout_ms.min(REUSE_READ_TIMEOUT_MS);
             conn.set_read_timeout_ms(leash);
             match self.transact(conn, &req, &host, port, is_https) {
-                Ok(resp) => return Ok(resp),
+                Ok(resp) => {
+                    note_alt_svc(&resp, &host, port);
+                    return Ok(resp);
+                }
                 Err(e) if is_retriable_conn_error(&e) => { /* re-dial below */ }
                 Err(e) => return Err(e),
             }
@@ -823,7 +866,10 @@ impl Client {
                 Err(e) => return Err(e),
             };
             match self.transact(conn, &req, &host, port, is_https) {
-                Ok(resp) => return Ok(resp),
+                Ok(resp) => {
+                    note_alt_svc(&resp, &host, port);
+                    return Ok(resp);
+                }
                 Err(e) if is_retriable_conn_error(&e) => {
                     last_err = Some(e);
                     continue;
