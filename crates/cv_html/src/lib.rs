@@ -7,6 +7,7 @@
 //! incrementally as we test against more pages.
 
 pub mod entities;
+pub mod entities_table;
 pub mod fragment;
 pub mod token;
 pub mod tokenizer;

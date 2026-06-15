@@ -9,15 +9,19 @@
 //!   - Markup declaration (Doctype, comments, CDATA marker)
 //!   - Comment start / inside / end / end-bang
 //!   - Doctype (name, public/system keywords + identifiers)
-//!   - Numeric and named character references (limited table)
+//!   - Numeric and named character references (the FULL WHATWG named
+//!     table, ~2231 entries, with the §13.2.5.73 longest-match rule and
+//!     the §13.2.5.80 numeric remap)
 //!
-//! Edge cases of the full WHATWG state list (CDATA inside SVG/MathML,
-//! ambiguous ampersand, character-reference end with extra `;`) are
-//! tracked as TODOs but tolerated as best-effort.
+//! Edge cases of the full WHATWG state list (CDATA inside SVG/MathML)
+//! are tracked as TODOs but tolerated as best-effort. Character
+//! references implement the spec's longest-match, the historical
+//! semicolon-optional forms, and the attribute "ambiguous ampersand"
+//! carve-out.
 
 #![allow(clippy::too_many_lines)]
 
-use crate::entities::lookup_named;
+use crate::entities::longest_match;
 use crate::token::{Attribute, Token};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -829,20 +833,26 @@ impl<'a> Tokenizer<'a> {
     }
 
     fn tokenize_char_ref(&mut self) {
-        match self.read_char_ref() {
+        match self.read_char_ref(false) {
             Some(s) => self.text_run.push_str(&s),
             None => self.text_run.push('&'),
         }
     }
 
     fn tokenize_char_ref_into_attr(&mut self) {
-        match self.read_char_ref() {
+        match self.read_char_ref(true) {
             Some(s) => self.current_attr_value.push_str(&s),
             None => self.current_attr_value.push('&'),
         }
     }
 
-    fn read_char_ref(&mut self) -> Option<String> {
+    /// Read a character reference whose leading `&` the caller already
+    /// consumed. `in_attr` selects the attribute-value variant of the spec's
+    /// rules (the legacy semicolon-less "ambiguous ampersand" carve-out in
+    /// HTML §13.2.5.73). Returns the decoded text, or `None` to mean "emit a
+    /// literal `&`" (the unparsed name bytes are left for the state machine to
+    /// re-tokenize as ordinary text).
+    fn read_char_ref(&mut self, in_attr: bool) -> Option<String> {
         // Numeric: &#1234; &#xABCD;
         if self.peek() == Some(b'#') {
             self.consume();
@@ -896,39 +906,57 @@ impl<'a> Tokenizer<'a> {
             let ch = char::from_u32(v).unwrap_or('\u{FFFD}');
             return Some(ch.to_string());
         }
-        // Named.
-        let start = self.pos;
-        while let Some(c) = self.peek() {
-            if c.is_ascii_alphanumeric() {
-                self.consume();
-            } else {
-                break;
-            }
-        }
-        let name = std::str::from_utf8(&self.src[start..self.pos]).ok()?;
-        if name.is_empty() {
-            return None;
-        }
-        let semi = self.peek() == Some(b';');
-        if semi {
-            self.consume();
-        }
-        match lookup_named(name) {
-            Some(s) => Some(s.to_string()),
-            None => {
-                // Not a known reference. We've already consumed the `&`
-                // (in the caller) and the would-be name chars (in the
-                // loop above). Emit them as literal text — don't rewind
-                // self.pos, because the previous code did `pos = start-1`
-                // and then sliced `[start..pos]`, which panicked whenever
-                // `start > 0` because the range was reversed.
-                let mut out = String::with_capacity(1 + name.len() + 1);
-                out.push('&');
-                out.push_str(name);
-                if semi {
-                    out.push(';');
+        // Named character reference — HTML §13.2.5.73 (Named character
+        // reference state). The `&` was consumed by the caller. We perform the
+        // spec's *longest match*: consume the maximum run of bytes that forms
+        // a known reference name (the table holds both the `;`-terminated and
+        // the historical `;`-less forms as distinct entries). This is what
+        // makes `&notit;` resolve to `¬it;` — `&not` matches, then `it;` is
+        // left as ordinary text — and `&amp` (no semicolon) still resolve.
+        let rest = &self.src[self.pos..];
+        match longest_match(rest) {
+            Some((decoded, name_len)) => {
+                // The matched name spans `rest[..name_len]`; its last byte is a
+                // `;` iff the matched entry was a semicolon form.
+                let has_semi = rest[name_len - 1] == b';';
+
+                // Spec §13.2.5.73, attribute carve-out ("ambiguous ampersand"
+                // legacy compat): if the reference is being consumed as part of
+                // an attribute value, the matched name did NOT end in `;`, and
+                // the next input character is `=` or ASCII alphanumeric, then do
+                // NOT resolve — emit the characters literally (so URLs like
+                // `?foo&amp=bar` keep working). Outside attributes this rule
+                // does not apply.
+                if in_attr && !has_semi {
+                    let next = self.src.get(self.pos + name_len).copied();
+                    let blocks =
+                        matches!(next, Some(b'=')) || matches!(next, Some(c) if c.is_ascii_alphanumeric());
+                    if blocks {
+                        // Consume the name bytes and emit them literally, with
+                        // the leading `&` the caller would otherwise add.
+                        let raw = std::str::from_utf8(&rest[..name_len])
+                            .expect("reference names are ASCII");
+                        let mut out = String::with_capacity(1 + raw.len());
+                        out.push('&');
+                        out.push_str(raw);
+                        self.pos += name_len;
+                        return Some(out);
+                    }
                 }
-                Some(out)
+
+                // Normal resolution: consume the name and emit the decoded
+                // code point(s). (Per the spec a successful match without a
+                // trailing `;` is a parse error, but the characters are still
+                // resolved; we resolve silently.)
+                self.pos += name_len;
+                Some(decoded.to_string())
+            }
+            None => {
+                // No prefix of the input is a known reference. Emit a literal
+                // `&` (returned via `None` so the caller pushes it) and leave
+                // the following bytes for the state machine to re-tokenize as
+                // ordinary text. This is the "ambiguous ampersand" path.
+                None
             }
         }
     }
@@ -1009,6 +1037,78 @@ mod tests {
         assert_eq!(t[0], Token::Text("a & b <c>".into()));
     }
 
+    /// Full WHATWG named-reference table (HTML §13.5): entries beyond the old
+    /// ~85-entry subset must now resolve.
+    #[test]
+    fn full_named_table_resolves() {
+        // &copy; -> U+00A9
+        assert_eq!(toks("&copy;")[0], Token::Text("\u{00A9}".into()));
+        // A long name that was absent from the old subset.
+        assert_eq!(
+            toks("&CounterClockwiseContourIntegral;")[0],
+            Token::Text("\u{2233}".into())
+        );
+        // A multi-code-point reference.
+        assert_eq!(
+            toks("&NotEqualTilde;")[0],
+            Token::Text("\u{2242}\u{0338}".into())
+        );
+    }
+
+    /// HTML §13.2.5.73 longest-match boundary: `&notit;` resolves `&not`
+    /// (U+00AC NOT SIGN) and leaves `it;` as literal text.
+    #[test]
+    fn named_reference_longest_match_boundary() {
+        let t = toks("&notit;");
+        assert_eq!(t[0], Token::Text("\u{00AC}it;".into()));
+    }
+
+    /// HTML §13.2.5.73: legacy semicolon-less form. `&amp` with no semicolon
+    /// resolves to `&`.
+    #[test]
+    fn named_reference_legacy_no_semicolon() {
+        // In text content the no-semicolon form always resolves.
+        let t = toks("&amp more");
+        assert_eq!(t[0], Token::Text("& more".into()));
+        // &copy without semicolon (legacy) followed by space.
+        let t = toks("a&copy b");
+        assert_eq!(t[0], Token::Text("a\u{00A9} b".into()));
+    }
+
+    /// HTML §13.2.5.73 ambiguous-ampersand attribute carve-out: a
+    /// semicolon-less reference in an attribute value followed by `=` or an
+    /// alphanumeric is NOT decoded (keeps `?a&amp=b`-style query strings).
+    #[test]
+    fn ambiguous_ampersand_in_attribute() {
+        // Followed by '=' inside an attribute: stays literal.
+        let t = toks(r#"<a href="x?a&amp=b">y</a>"#);
+        let attrs = match &t[0] {
+            Token::StartTag { attrs, .. } => attrs,
+            _ => panic!("expected start tag"),
+        };
+        assert_eq!(attrs[0].value, "x?a&amp=b");
+        // The same `&amp` in text content DOES decode.
+        let t2 = toks("x?a&amp=b");
+        assert_eq!(t2[0], Token::Text("x?a&=b".into()));
+        // A semicolon form in an attribute always decodes.
+        let t3 = toks(r#"<a href="x?a&amp;b">y</a>"#);
+        let attrs3 = match &t3[0] {
+            Token::StartTag { attrs, .. } => attrs,
+            _ => panic!("expected start tag"),
+        };
+        assert_eq!(attrs3[0].value, "x?a&b");
+    }
+
+    /// An unknown ampersand sequence is emitted literally (ambiguous ampersand
+    /// with no match): `&` plus the following text survive verbatim.
+    #[test]
+    fn unknown_ampersand_is_literal() {
+        let t = toks("a & b");
+        assert_eq!(t[0], Token::Text("a & b".into()));
+        let t = toks("&zzznotareference;");
+        assert_eq!(t[0], Token::Text("&zzznotareference;".into()));
+    }
+
     #[test]
     fn numeric_entity() {
         let t = toks("&#65;&#x42;");
@@ -1050,6 +1150,26 @@ mod tests {
         let t = toks("&#8364;");
         // U+20AC (euro) is also 8364 decimal — should pass through as euro sign
         assert_eq!(t[0], Token::Text("\u{20AC}".into()), "&#8364; (decimal euro) must pass through");
+    }
+
+    /// HTML §13.2.5.80 (Numeric character reference end state): astral-plane
+    /// hex references resolve to the real code point (e.g. an emoji).
+    #[test]
+    fn numeric_entity_astral_emoji() {
+        let t = toks("&#x1F600;");
+        assert_eq!(t[0], Token::Text("\u{1F600}".into()), "&#x1F600; must be the grinning-face emoji");
+        // Uppercase X marker also accepted.
+        let t = toks("&#X1F600;");
+        assert_eq!(t[0], Token::Text("\u{1F600}".into()), "&#X1F600; (uppercase) must also resolve");
+    }
+
+    /// HTML §13.2.5.80: lone surrogate and out-of-range values become U+FFFD.
+    #[test]
+    fn numeric_entity_surrogate_and_overflow_fffd() {
+        // U+D800 is a lone surrogate -> U+FFFD.
+        assert_eq!(toks("&#xD800;")[0], Token::Text("\u{FFFD}".into()));
+        // 0x110000 is above the Unicode max -> U+FFFD.
+        assert_eq!(toks("&#x110000;")[0], Token::Text("\u{FFFD}".into()));
     }
 
     #[test]
