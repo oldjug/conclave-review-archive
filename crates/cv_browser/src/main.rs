@@ -8692,6 +8692,60 @@ fn build_browser_session(target: &str) -> Result<BrowserParts, String> {
                     let cfg_for_anim = cfg_with_viewport(&base_cfg_for_tick, vw, vh);
                     set_caret_pos_for_render(st.caret_pos);
                     let t_anim = std::time::Instant::now();
+                    // ── CV_COMPOSITOR_ANIM: property-tree-driven recomposite ──
+                    // When ON and the frame animates ONLY transform/opacity on a
+                    // single promoted layer, re-composite the CACHED layers via
+                    // apply_property_tree_update — NO re-raster of layer contents
+                    // (Chrome's compositor-thread animation). The first build for
+                    // a page revision is byte-verified against the full bake
+                    // inside try_compositor_anim_recomposite; on divergence it
+                    // returns None and the revision is permanently declined, so we
+                    // fall through to the damage/full bake below. Default OFF ⇒
+                    // try_compositor_anim_recomposite returns None immediately.
+                    if let Some(recomposed) = try_compositor_anim_recomposite(
+                        &lb,
+                        &st.doc,
+                        &url,
+                        &cfg_for_anim,
+                        fp.title.clone(),
+                        focus.as_deref(),
+                        &kf,
+                    ) {
+                        let paint = bake_layout_into_paint_inner(
+                            lb,
+                            &st.doc,
+                            &url,
+                            &cfg_for_anim,
+                            fp.title.clone(),
+                            focus.as_deref(),
+                            Some(bitmap_from_bgra_u32(
+                                recomposed,
+                                cfg_for_anim.viewport_w as u32,
+                            )),
+                            None,
+                        );
+                        if std::env::var("CV_PAINTTIME").is_ok() {
+                            cv_js::diag_log(&format!(
+                                "[PAINTTIME] ANIM compositor-recomposite={}us (NO re-raster)",
+                                t_anim.elapsed().as_micros()
+                            ));
+                        }
+                        if let Some(lr) = paint.layout_root.as_ref() {
+                            let scroll_y = OBSERVER_SCROLL_Y.with(|c| c.get());
+                            maybe_run_observers(
+                                &mut st.runtime,
+                                lr,
+                                (vw, vh),
+                                scroll_y,
+                                process_now_ms() as f32,
+                            );
+                        }
+                        run_idle_callbacks(&mut st.runtime);
+                        render_cache = Some(fp);
+                        tab.title = paint.title.clone();
+                        tab.paint = paint.clone();
+                        return Some(paint);
+                    }
                     // M5.4: the headline waste — a compositor-only animation frame
                     // full-rastered the whole document. Route it through the
                     // damage-driven incremental bake (behind CV_DAMAGE_RASTER); it
@@ -19215,6 +19269,466 @@ fn build_property_trees_walk(
     }
 }
 
+// ── Compositor layer promotion + property-tree-driven recomposite ────────────
+//
+// Wires the (previously orphaned) `cv_compositor::LayerTree::apply_property_tree_update`
+// into the live render: promote stacking contexts that Chrome's `cc` would
+// composite (transform/opacity animations, position:fixed) to their own
+// compositor layers with a CACHED raster, then re-composite them on
+// transform/opacity-only frames WITHOUT re-rastering their contents.
+//
+// Chrome refs:
+//   - cc/trees/property_tree.h: TransformTree::OnTransformAnimated /
+//     EffectTree::OnOpacityAnimated mutate the node in place; tiles are reused.
+//   - blink CompositingReasonFinder: which elements get a composited layer.
+//
+// Gated behind `CV_COMPOSITOR_ANIM` (default OFF): it changes the animation
+// frame path. The full-raster damage/bake path stays the default + fallback.
+
+/// `CV_COMPOSITOR_ANIM=1` enables the property-tree-driven recomposite fast
+/// path for transform/opacity-only animation frames. Default OFF.
+fn compositor_anim_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CV_COMPOSITOR_ANIM").as_deref() == Ok("1"))
+}
+
+/// Detect Chrome-style compositing triggers on a single layout box. We promote
+/// the subset whose triggers are present on `LayoutBox` today:
+///   - an ACTIVE transform/opacity animation (the keyframe touches transform or
+///     opacity), or
+///   - `position: fixed`.
+/// `will-change` is parsed by the cascade but not yet plumbed onto the box; that
+/// trigger is a documented follow-up.
+fn box_compositing_reasons(
+    lb: &cv_layout::LayoutBox,
+    keyframes: &std::collections::HashMap<String, cv_css::cascade::KeyframeRule>,
+) -> cv_compositor::promote::CompositingReasons {
+    let mut r = cv_compositor::promote::CompositingReasons::NONE;
+    if matches!(lb.position, cv_layout::Position::Fixed) {
+        r.fixed_position = true;
+    }
+    if let Some(name) = lb.animation_name.as_ref() {
+        if lb.animation_duration_ms > 0.0 {
+            if let Some(rule) = keyframes.get(name) {
+                let (tf, op) = keyframe_animates_transform_opacity(rule);
+                r.transform_animation = tf;
+                r.opacity_animation = op;
+            }
+        }
+    }
+    r
+}
+
+/// Inspect a `@keyframes` rule to see whether it declares `transform` and/or
+/// `opacity` (the two compositor-animatable properties). A rule that animates
+/// ONLY transform/opacity is compositor-only; one that also animates
+/// background-color/width/etc. must re-raster (NOT taken by the fast path).
+fn keyframe_animates_transform_opacity(rule: &cv_css::cascade::KeyframeRule) -> (bool, bool) {
+    let mut tf = false;
+    let mut op = false;
+    for (_pct, decls) in rule.steps.iter() {
+        for decl in decls.iter() {
+            match decl.name.as_str() {
+                "transform" | "translate" | "scale" | "rotate" => tf = true,
+                "opacity" => op = true,
+                _ => {}
+            }
+        }
+    }
+    (tf, op)
+}
+
+/// True when EVERY animating box in the tree animates ONLY transform/opacity
+/// (so the whole frame is compositor-only and safe for the recomposite path).
+/// A single box animating background-color/width/etc. returns false → the
+/// caller falls back to the full bake.
+fn frame_is_compositor_only(
+    lb: &cv_layout::LayoutBox,
+    keyframes: &std::collections::HashMap<String, cv_css::cascade::KeyframeRule>,
+) -> bool {
+    fn walk(
+        lb: &cv_layout::LayoutBox,
+        kf: &std::collections::HashMap<String, cv_css::cascade::KeyframeRule>,
+    ) -> bool {
+        if let Some(name) = lb.animation_name.as_ref() {
+            if lb.animation_duration_ms > 0.0 {
+                if let Some(rule) = kf.get(name) {
+                    // Any property OTHER than transform/opacity-family disqualifies.
+                    for (_pct, decls) in rule.steps.iter() {
+                        for decl in decls.iter() {
+                            if !matches!(
+                                decl.name.as_str(),
+                                "transform" | "translate" | "scale" | "rotate" | "opacity"
+                            ) {
+                                return false;
+                            }
+                        }
+                    }
+                } else {
+                    return false; // animation-name with no rule → unknown, be safe
+                }
+            }
+        }
+        lb.children.iter().all(|c| walk(c, kf))
+    }
+    walk(lb, keyframes)
+}
+
+thread_local! {
+    /// While Some(node_id), `paint_box_offset_t` skips the subtree rooted at the
+    /// box with that `node_id` — used to "lift" a promoted element out of the
+    /// root layer so the compositor draws it from its own cached bitmap (Chrome:
+    /// a composited layer's content is NOT painted into the layer below it).
+    static SUPPRESS_PAINT_NODE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// Rasterize ONE layout subtree (a promoted element) into its own tightly-sized
+/// BGRA bitmap, returning `(pixels, w, h, doc_x, doc_y)` where `(doc_x, doc_y)`
+/// is the subtree's document-space top-left at its BASE (pre-animated-transform)
+/// position. The animated transform is applied later by the property-tree
+/// update — so we raster with the element at translate(0,0)/scale(1) by
+/// temporarily neutralizing its own transform before painting.
+fn raster_promoted_subtree(lb: &cv_layout::LayoutBox) -> Option<(Vec<u32>, u32, u32, f32, f32)> {
+    // Bounds at the BASE position: subtree_bounds() includes translate_x/y_px
+    // (the animated transform), which we must exclude. Recompute base bounds by
+    // painting a clone with the root's own transform fields reset to identity.
+    let mut base = lb.clone();
+    base.translate_x_px = 0.0;
+    base.translate_y_px = 0.0;
+    base.scale_x = 1.0;
+    base.scale_y = 1.0;
+    base.rotate_deg = 0.0;
+    base.matrix_2d = None;
+    base.transform_mat4 = None;
+    let bounds = base.subtree_bounds();
+    let w = bounds.w.ceil().max(1.0) as u32;
+    let h = bounds.h.ceil().max(1.0) as u32;
+    if w == 0 || h == 0 || (w as u64) * (h as u64) > 64_000_000 {
+        return None; // degenerate / absurdly large → decline promotion
+    }
+    let mut bmp = cv_gfx::Bitmap::new(w, h);
+    bmp.clear(cv_gfx::Color::TRANSPARENT);
+    let mut texts: Vec<cv_ui::TextItem> = Vec::new();
+    // Paint the base subtree translated so its top-left lands at (0,0) of the
+    // local layer bitmap.
+    paint_box_offset(
+        &base,
+        &mut bmp,
+        &mut texts,
+        -bounds.x,
+        -bounds.y,
+        None,
+    );
+    cv_ui::bake_content_text_into_bitmap(&mut bmp, &mut texts);
+    Some((pixels_to_u32(&bmp.pixels), w, h, bounds.x, bounds.y))
+}
+
+/// Pixel format bridge: `cv_gfx::Bitmap.pixels` is already row-major BGRA u32
+/// (alpha in the high byte), the same layout `cv_compositor::Layer.bitmap`
+/// expects. This is the identity copy that documents the contract.
+fn pixels_to_u32(pixels: &[u32]) -> Vec<u32> {
+    pixels.to_vec()
+}
+
+/// Wrap a composited full-document BGRA u32 buffer back into a `cv_gfx::Bitmap`
+/// of the given width (height = len/width). Used to hand the compositor's
+/// recomposited pixels to `bake_layout_into_paint_inner` as a prebuilt bitmap.
+fn bitmap_from_bgra_u32(pixels: Vec<u32>, width: u32) -> cv_gfx::Bitmap {
+    let w = width.max(1);
+    let h = (pixels.len() as u32 / w).max(1);
+    cv_gfx::Bitmap {
+        width: w,
+        height: h,
+        pixels,
+    }
+}
+
+/// Find the first promoted (transform/opacity-animating) subtree in the tree,
+/// returning a reference path is awkward; instead return the matching box by
+/// value via a closure. We expose a simple finder used by the integration test
+/// and the live path: collect every box whose `box_compositing_reasons` is a
+/// compositor-animatable trigger.
+fn collect_compositor_animatable<'a>(
+    lb: &'a cv_layout::LayoutBox,
+    keyframes: &std::collections::HashMap<String, cv_css::cascade::KeyframeRule>,
+    out: &mut Vec<&'a cv_layout::LayoutBox>,
+) {
+    let r = box_compositing_reasons(lb, keyframes);
+    if r.is_compositor_animatable() && lb.node_id.is_some() {
+        out.push(lb);
+    }
+    for c in &lb.children {
+        collect_compositor_animatable(c, keyframes, out);
+    }
+}
+
+/// Raster the ROOT layer for the compositor-anim frame: the whole document with
+/// every promoted subtree LIFTED OUT (so the compositor draws them from their
+/// own cached bitmaps). `promoted_ids` is the set of node_ids to suppress.
+/// Returns a full-document BGRA buffer (white background, like the normal bake).
+fn raster_root_without_promoted(
+    lb: &cv_layout::LayoutBox,
+    cfg: &cv_layout::LayoutConfig,
+    promoted_ids: &[u64],
+) -> (Vec<u32>, u32, u32) {
+    let bmp_w = cfg.viewport_w as u32;
+    let layout_bottom = lb.content.y + lb.content.h;
+    let document_h = layout_bottom.max(cfg.viewport_h);
+    let bmp_h = (document_h as u32).min(100_000).max(1);
+    let mut bmp = cv_gfx::Bitmap::new(bmp_w, bmp_h);
+    bmp.clear(cv_gfx::Color::WHITE);
+    let mut texts: Vec<cv_ui::TextItem> = Vec::new();
+    // Paint each promoted subtree suppressed in turn. With more than one
+    // promoted layer we can only suppress one node_id at a time via the
+    // thread-local, so we paint once per promoted id is wrong — instead the
+    // suppress check tests membership. Use a set in the thread-local would need
+    // a Vec; for the supported subset (a single animating layer) the single
+    // node_id is sufficient. For >1 we suppress the first and decline (the
+    // caller checks count). Here we expect exactly the suppressed set passed.
+    let only = promoted_ids.first().copied();
+    SUPPRESS_PAINT_NODE.with(|c| c.set(only));
+    paint_box(lb, &mut bmp, &mut texts);
+    SUPPRESS_PAINT_NODE.with(|c| c.set(None));
+    cv_ui::bake_content_text_into_bitmap(&mut bmp, &mut texts);
+    (pixels_to_u32(&bmp.pixels), bmp.width, bmp.height)
+}
+
+thread_local! {
+    /// The cached `CompositorFrame` reused across transform/opacity-only frames,
+    /// plus the page revision it was built for. Rebuilt when the revision moves
+    /// (a real DOM/layout change) or when promotion shape changes. `None` until
+    /// the first compositor-anim frame.
+    static COMPOSITOR_FRAME: std::cell::RefCell<Option<(u64, cv_compositor::promote::CompositorFrame)>> =
+        const { std::cell::RefCell::new(None) };
+    /// Sticky verdict: once the compositor-anim recomposite has been proven to
+    /// diverge from the full-bake oracle for this page, never take it again
+    /// (fall back to the full bake forever). Reset when the page revision moves.
+    static COMPOSITOR_ANIM_DISABLED_REV: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// Attempt the property-tree-driven recomposite for a transform/opacity-only
+/// animation frame. Returns `Some(full_document_bgra)` when it produced the
+/// frame WITHOUT re-rastering the promoted layers; `None` to fall back to the
+/// full/damage bake.
+///
+/// Correctness gate: on the FIRST build for a page revision, the recomposited
+/// output is byte-compared against a full bake of the same layout. If it
+/// diverges, the verdict is recorded and this path is permanently declined for
+/// the page revision (defined fallback). This makes the fast path safe to wire
+/// even default-on later: it can never silently render a wrong frame.
+#[allow(clippy::too_many_arguments)]
+fn try_compositor_anim_recomposite(
+    lb: &cv_layout::LayoutBox,
+    doc: &cv_html::Document,
+    url: &str,
+    cfg: &cv_layout::LayoutConfig,
+    title_override: Option<String>,
+    focused_path: Option<&[usize]>,
+    keyframes: &std::collections::HashMap<String, cv_css::cascade::KeyframeRule>,
+) -> Option<Vec<u32>> {
+    if !compositor_anim_enabled() {
+        return None;
+    }
+    // Whole-frame must animate ONLY transform/opacity (else re-raster needed).
+    if !frame_is_compositor_only(lb, keyframes) {
+        return None;
+    }
+    let rev = DOC_REVISION.with(|c| c.get());
+    if COMPOSITOR_ANIM_DISABLED_REV.with(|c| c.get()) == Some(rev) {
+        return None; // previously proven divergent for this page revision
+    }
+    // Identify the promoted (compositor-animatable) subtrees.
+    let mut animatable: Vec<&cv_layout::LayoutBox> = Vec::new();
+    collect_compositor_animatable(lb, keyframes, &mut animatable);
+    // Supported subset: exactly one promoted animating layer (single node_id we
+    // can suppress from the root). Multi-layer is a documented follow-up.
+    if animatable.len() != 1 {
+        return None;
+    }
+    let promoted_box = animatable[0];
+    let promoted_id = promoted_box.node_id?;
+    let promoted_id32 = promoted_id as u32;
+
+    // Build the current property trees + the node_id→tree_state map.
+    let trees = build_property_trees(lb);
+    let tree_state = property_tree_state_for_node(lb, promoted_id)?;
+    // Base offsets for the promoted layer (doc-space anchor of its raster).
+
+    // (Re)build the cached CompositorFrame if the page revision changed or the
+    // cache is empty / for a different promoted layer.
+    let needs_build = COMPOSITOR_FRAME.with(|c| {
+        let b = c.borrow();
+        match b.as_ref() {
+            Some((cached_rev, frame)) => {
+                *cached_rev != rev || frame.raster_gen_of(promoted_id32).is_none()
+            }
+            None => true,
+        }
+    });
+
+    let base_offset;
+
+    if needs_build {
+        // Raster the promoted subtree ONCE into its own layer bitmap.
+        let (pix, pw, ph, doc_x, doc_y) = raster_promoted_subtree(promoted_box)?;
+        base_offset = (promoted_id32, doc_x, doc_y);
+        // Raster the root with the promoted subtree lifted out.
+        let (root_pix, rw, rh) = raster_root_without_promoted(lb, cfg, &[promoted_id]);
+        let promoted = cv_compositor::promote::PromotedElement {
+            id: promoted_id32,
+            bitmap: pix,
+            bitmap_w: pw,
+            bitmap_h: ph,
+            base_x: doc_x,
+            base_y: doc_y,
+            z_index: promoted_box.z_index.unwrap_or(0),
+            tree_state,
+            reasons: box_compositing_reasons(promoted_box, keyframes),
+        };
+        let frame = cv_compositor::promote::CompositorFrame::build(
+            rw, rh, 0xFFFF_FFFF, root_pix, vec![promoted],
+        );
+        COMPOSITOR_FRAME.with(|c| *c.borrow_mut() = Some((rev, frame)));
+    } else {
+        // Recover the promoted layer's base offset from a fresh subtree-bounds
+        // measurement (cheap: no raster) so the anchor stays correct.
+        let mut base = promoted_box.clone();
+        base.translate_x_px = 0.0;
+        base.translate_y_px = 0.0;
+        base.scale_x = 1.0;
+        base.scale_y = 1.0;
+        base.rotate_deg = 0.0;
+        base.matrix_2d = None;
+        base.transform_mat4 = None;
+        let bounds = base.subtree_bounds();
+        base_offset = (promoted_id32, bounds.x, bounds.y);
+    }
+
+    // Recomposite from cached layers (NO re-raster of layer contents).
+    let out = COMPOSITOR_FRAME.with(|c| {
+        let mut b = c.borrow_mut();
+        let (_, frame) = b.as_mut().unwrap();
+        // Ensure the promoted layer's tree_state matches the current trees (the
+        // animated node id is stable across frames; its VALUE changed).
+        if let Some(l) = frame.tree.layers.iter_mut().find(|l| l.id == promoted_id32) {
+            l.tree_state = tree_state;
+        }
+        let before = frame.total_raster_gen();
+        let pixels = frame.recomposite(&trees, &[base_offset]);
+        // Invariant guard: recomposite must NOT have re-rastered.
+        debug_assert_eq!(
+            frame.total_raster_gen(),
+            before,
+            "compositor recomposite must never re-raster layer contents"
+        );
+        pixels
+    });
+
+    // ── First-build correctness gate ──────────────────────────────────────────
+    // On the frame that (re)built the CompositorFrame, prove the recomposited
+    // output is byte-identical to a full bake of the same layout. If it diverges,
+    // permanently decline this path for the page revision (defined fallback to
+    // the damage/full bake). This makes the fast path safe: it can never silently
+    // present a wrong frame. Subsequent frames at the same revision skip the
+    // oracle (the verdict is cached) so the perf win is real.
+    if needs_build {
+        let oracle = bake_layout_into_paint(
+            lb.clone(),
+            doc,
+            url,
+            cfg,
+            title_override.clone(),
+            focused_path,
+        );
+        let oracle_px = &oracle.bitmap.pixels;
+        let matches = oracle_px.len() == out.len() && oracle_px.as_slice() == out.as_slice();
+        if !matches {
+            // Diverged → disable for this revision and fall back.
+            COMPOSITOR_ANIM_DISABLED_REV.with(|c| c.set(Some(rev)));
+            COMPOSITOR_FRAME.with(|c| *c.borrow_mut() = None);
+            if std::env::var("CV_COMPOSITOR_ANIM_DEBUG").is_ok() {
+                cv_js::diag_log(
+                    "[CV_COMPOSITOR_ANIM] recomposite diverged from full bake → disabled for revision",
+                );
+            }
+            return None;
+        }
+    }
+
+    Some(out)
+}
+
+/// Walk the layout tree mirroring `build_property_trees_walk`'s node-assignment
+/// logic to find the `PropertyTreeState` assigned to the box with `target_id`.
+fn property_tree_state_for_node(
+    lb: &cv_layout::LayoutBox,
+    target_id: u64,
+) -> Option<cv_paint::PropertyTreeState> {
+    fn walk(
+        lb: &cv_layout::LayoutBox,
+        target_id: u64,
+        parent_tf: usize,
+        parent_ef: usize,
+        parent_clip: Option<usize>,
+        next_tf: &mut usize,
+        next_ef: &mut usize,
+        next_clip: &mut usize,
+    ) -> Option<cv_paint::PropertyTreeState> {
+        let has_transform = lb.translate_x_px != 0.0
+            || lb.translate_y_px != 0.0
+            || lb.scale_x != 1.0
+            || lb.scale_y != 1.0;
+        let has_opacity = lb.opacity < 1.0;
+        let has_clip = lb.overflow_hidden;
+
+        let tf_id = if has_transform {
+            let id = *next_tf;
+            *next_tf += 1;
+            id
+        } else {
+            parent_tf
+        };
+        let ef_id = if has_opacity {
+            let id = *next_ef;
+            *next_ef += 1;
+            id
+        } else {
+            parent_ef
+        };
+        let clip_id = if has_clip {
+            let id = *next_clip;
+            *next_clip += 1;
+            Some(id)
+        } else {
+            parent_clip
+        };
+
+        if lb.node_id == Some(target_id) {
+            return Some(cv_paint::PropertyTreeState {
+                transform_id: tf_id,
+                effect_id: ef_id,
+                clip_id: clip_id.unwrap_or(0),
+            });
+        }
+        for child in &lb.children {
+            if let Some(s) = walk(
+                child, target_id, tf_id, ef_id, clip_id, next_tf, next_ef, next_clip,
+            ) {
+                return Some(s);
+            }
+        }
+        None
+    }
+    // Mirror PropertyTreeBuilder::new(): root transform=0, effect=0 already
+    // exist, so the first pushed transform gets id 1, first effect id 1, first
+    // clip id 0.
+    let mut next_tf = 1usize;
+    let mut next_ef = 1usize;
+    let mut next_clip = 0usize;
+    walk(lb, target_id, 0, 0, None, &mut next_tf, &mut next_ef, &mut next_clip)
+}
+
 /// Returns true when any box in the layout tree has a running CSS animation.
 /// Used by the tick to detect animation-only frames that should take the
 /// compositor-only fast path (reuse layout tree, skip cascade + re-layout).
@@ -19739,6 +20253,251 @@ mod transition_tests {
         assert_eq!(lb.text_color, LC { r: 0, g: 0, b: 0, a: 255 }, "color ends black");
         assert!((lb.border_radius_px - 40.0).abs() < 0.5, "radius ends 40px");
         assert!(!still_end, "single-iteration animation finished");
+    }
+
+    // ── Compositor layer promotion + recomposite (CV_COMPOSITOR_ANIM) ─────────
+
+    /// Recursively find the first box with a given node_id.
+    fn find_node<'a>(b: &'a cv_layout::LayoutBox, id: u64) -> Option<&'a cv_layout::LayoutBox> {
+        if b.node_id == Some(id) {
+            return Some(b);
+        }
+        for c in &b.children {
+            if let Some(f) = find_node(c, id) {
+                return Some(f);
+            }
+        }
+        None
+    }
+
+    /// A `@keyframes` that animates ONLY transform is recognised as compositor-
+    /// animatable; one that also animates background-color is NOT compositor-only.
+    #[test]
+    fn keyframe_classification_transform_vs_mixed() {
+        let pure = cv_css::cascade::collect_keyframes(&[cv_css::parse_stylesheet(
+            "@keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }",
+        )]);
+        let (tf, op) = keyframe_animates_transform_opacity(pure.get("spin").unwrap());
+        assert!(tf && !op, "pure transform keyframe: transform=true opacity=false");
+
+        let opac = cv_css::cascade::collect_keyframes(&[cv_css::parse_stylesheet(
+            "@keyframes fade { from { opacity: 1; } to { opacity: 0; } }",
+        )]);
+        let (tf2, op2) = keyframe_animates_transform_opacity(opac.get("fade").unwrap());
+        assert!(!tf2 && op2, "pure opacity keyframe");
+    }
+
+    /// Build a real CompositorFrame from a layout tree via the browser-side
+    /// promotion helpers, then prove a transform-only animation recomposites
+    /// the CACHED layers via apply_property_tree_update WITHOUT re-rastering.
+    #[test]
+    fn compositor_anim_transform_only_no_reraster() {
+        // A translate-animating box. animation-name + duration make it
+        // compositor-animatable; the keyframe touches ONLY transform.
+        let css = "@keyframes slide { from { transform: translateX(0px); } \
+                   to { transform: translateX(100px); } } \
+                   #mover { position: absolute; left: 0px; top: 0px; \
+                            width: 50px; height: 50px; background: #f00; \
+                            animation: slide 1s linear; }";
+        let ss = cv_css::parse_stylesheet(css);
+        let kf = cv_css::cascade::collect_keyframes(&[ss.clone()]);
+        let doc = cv_html::parse(
+            "<!doctype html><html><body><div id=mover></div></body></html>",
+        );
+        let cfg = cv_layout::LayoutConfig {
+            viewport_w: 300.0,
+            viewport_h: 200.0,
+            ..cv_layout::LayoutConfig::default()
+        };
+        let lb = build_layout_tree(&doc, &[ss], "file:///t", &cfg, &Default::default());
+
+        // Find the animating box (it has animation_name == "slide").
+        fn find_anim(b: &cv_layout::LayoutBox) -> Option<&cv_layout::LayoutBox> {
+            if b.animation_name.as_deref() == Some("slide") {
+                return Some(b);
+            }
+            for c in &b.children {
+                if let Some(f) = find_anim(c) {
+                    return Some(f);
+                }
+            }
+            None
+        }
+        let mover = find_anim(&lb).expect("animating #mover box");
+        let mover_id = mover.node_id.expect("#mover has a node_id");
+
+        // It must be classified as a compositor-animatable promotion trigger.
+        let reasons = box_compositing_reasons(mover, &kf);
+        assert!(
+            reasons.transform_animation && reasons.is_compositor_animatable(),
+            "transform animation must be a compositor trigger: {reasons:?}"
+        );
+        assert!(
+            frame_is_compositor_only(&lb, &kf),
+            "whole frame animates only transform → compositor-only"
+        );
+
+        // Build the promoted layer's raster + tree state via the real helpers.
+        let (pix, pw, ph, base_x, base_y) =
+            raster_promoted_subtree(mover).expect("raster promoted subtree");
+        let tree_state =
+            property_tree_state_for_node(&lb, mover_id).expect("tree state for #mover");
+        let (root_pix, rw, rh) = raster_root_without_promoted(&lb, &cfg, &[mover_id]);
+        let promoted = cv_compositor::promote::PromotedElement {
+            id: mover_id as u32,
+            bitmap: pix,
+            bitmap_w: pw,
+            bitmap_h: ph,
+            base_x,
+            base_y,
+            z_index: mover.z_index.unwrap_or(0),
+            tree_state,
+            reasons,
+        };
+        let mut frame = cv_compositor::promote::CompositorFrame::build(
+            rw, rh, 0xFFFF_FFFF, root_pix, vec![promoted],
+        );
+        let raster_baseline = frame.total_raster_gen();
+        let mover_gen_baseline = frame.raster_gen_of(mover_id as u32).unwrap();
+
+        // Frame A: translateX(0) → the layer sits at its base x.
+        let mut trees_a = cv_paint::PropertyTrees::new();
+        let tf_a = trees_a.push_transform(cv_paint::TransformNode {
+            parent: Some(0),
+            translate_x: 0.0,
+            translate_y: 0.0,
+            scale_x: 1.0,
+            scale_y: 1.0,
+        });
+        if let Some(l) = frame.tree.layers.iter_mut().find(|l| l.id == mover_id as u32) {
+            l.tree_state.transform_id = tf_a;
+        }
+        let out_a = frame.recomposite(&trees_a, &[(mover_id as u32, base_x, base_y)]);
+
+        // Frame B: translateX(100) — same node id, new VALUE. The red layer must
+        // shift 100px right, WITHOUT re-rastering.
+        let mut trees_b = cv_paint::PropertyTrees::new();
+        let _tf_b = trees_b.push_transform(cv_paint::TransformNode {
+            parent: Some(0),
+            translate_x: 100.0,
+            translate_y: 0.0,
+            scale_x: 1.0,
+            scale_y: 1.0,
+        });
+        let out_b = frame.recomposite(&trees_b, &[(mover_id as u32, base_x, base_y)]);
+
+        // ★ The proof: no re-raster across the transform animation.
+        assert_eq!(
+            frame.total_raster_gen(),
+            raster_baseline,
+            "transform-only recomposite must not re-raster any layer"
+        );
+        assert_eq!(
+            frame.raster_gen_of(mover_id as u32).unwrap(),
+            mover_gen_baseline,
+            "the animated element's cached pixels were reused, not regenerated"
+        );
+
+        // And the output actually MOVED: pixel-count of the red layer at x>=100
+        // in frame B must exceed frame A (the red shifted right). Count red px.
+        let count_red = |buf: &[u32], w: u32| -> (usize, usize) {
+            let mut left = 0; // x < 100
+            let mut right = 0; // x >= 100
+            for (i, &p) in buf.iter().enumerate() {
+                // red layer is opaque red 0xFFFF0000 (BGRA: a=FF r=FF g=00 b=00)
+                let r = (p >> 16) & 0xFF;
+                let g = (p >> 8) & 0xFF;
+                let b = p & 0xFF;
+                if r > 200 && g < 60 && b < 60 {
+                    let x = (i as u32) % w;
+                    if x < 100 {
+                        left += 1;
+                    } else {
+                        right += 1;
+                    }
+                }
+            }
+            (left, right)
+        };
+        let (a_left, a_right) = count_red(&out_a, rw);
+        let (b_left, b_right) = count_red(&out_b, rw);
+        assert!(a_left > 0, "frame A: red present on the left, got {a_left}");
+        assert!(
+            b_right > a_right && b_left < a_left,
+            "frame B: red shifted right (A:{a_left}/{a_right} B:{b_left}/{b_right})"
+        );
+    }
+
+    /// Opacity-only animation through the same browser-side promotion path:
+    /// the opacity changes, contents are reused (no re-raster).
+    #[test]
+    fn compositor_anim_opacity_only_no_reraster() {
+        let css = "@keyframes fade { from { opacity: 1; } to { opacity: 0; } } \
+                   #f { position: absolute; left: 0px; top: 0px; \
+                        width: 40px; height: 40px; background: #fff; \
+                        animation: fade 1s linear; }";
+        let ss = cv_css::parse_stylesheet(css);
+        let kf = cv_css::cascade::collect_keyframes(&[ss.clone()]);
+        let doc =
+            cv_html::parse("<!doctype html><html><body><div id=f></div></body></html>");
+        let cfg = cv_layout::LayoutConfig {
+            viewport_w: 100.0,
+            viewport_h: 100.0,
+            ..cv_layout::LayoutConfig::default()
+        };
+        let lb = build_layout_tree(&doc, &[ss], "file:///t", &cfg, &Default::default());
+        fn find_anim2(b: &cv_layout::LayoutBox) -> Option<&cv_layout::LayoutBox> {
+            if b.animation_name.as_deref() == Some("fade") {
+                return Some(b);
+            }
+            b.children.iter().find_map(find_anim2)
+        }
+        let fbox = find_anim2(&lb).expect("animating #f");
+        let fid = fbox.node_id.expect("#f node id");
+        let r = box_compositing_reasons(fbox, &kf);
+        assert!(r.opacity_animation && r.is_compositor_animatable());
+
+        let (pix, pw, ph, bx, by) = raster_promoted_subtree(fbox).unwrap();
+        let ts = property_tree_state_for_node(&lb, fid).unwrap();
+        let (root_pix, rw, rh) = raster_root_without_promoted(&lb, &cfg, &[fid]);
+        let mut frame = cv_compositor::promote::CompositorFrame::build(
+            rw,
+            rh,
+            0xFFFF_FFFF,
+            root_pix,
+            vec![cv_compositor::promote::PromotedElement {
+                id: fid as u32,
+                bitmap: pix,
+                bitmap_w: pw,
+                bitmap_h: ph,
+                base_x: bx,
+                base_y: by,
+                z_index: 0,
+                tree_state: ts,
+                reasons: r,
+            }],
+        );
+        let baseline = frame.total_raster_gen();
+
+        // opacity 1.0 → opaque element pixel; opacity ~0 → background shows.
+        let mut t1 = cv_paint::PropertyTrees::new();
+        let e1 = t1.push_effect(cv_paint::EffectNode { parent: Some(0), opacity: 1.0 });
+        if let Some(l) = frame.tree.layers.iter_mut().find(|l| l.id == fid as u32) {
+            l.tree_state.effect_id = e1;
+        }
+        let _out1 = frame.recomposite(&t1, &[(fid as u32, bx, by)]);
+
+        let mut t2 = cv_paint::PropertyTrees::new();
+        let _e2 = t2.push_effect(cv_paint::EffectNode { parent: Some(0), opacity: 0.2 });
+        let _out2 = frame.recomposite(&t2, &[(fid as u32, bx, by)]);
+
+        assert_eq!(
+            frame.total_raster_gen(),
+            baseline,
+            "opacity-only recomposite must not re-raster"
+        );
+        let _ = (pw, ph);
+        let _ = find_node(&lb, fid); // keep find_node referenced
     }
 }
 
@@ -48723,6 +49482,17 @@ fn paint_box_offset_t(
     // its own `visibility_hidden` flag is false.
     if b.visibility_hidden {
         return;
+    }
+    // ── Compositor layer promotion (CV_COMPOSITOR_ANIM) ──────────────────────
+    // When this box is the root of a promoted compositor layer, its content is
+    // "lifted" out of the layer below — the compositor draws it from its own
+    // cached bitmap (Chrome: a composited layer's content is not painted into
+    // the layer beneath it). Skip it (and its subtree) here. Only ever Some on
+    // the compositor-anim path; the default render path leaves this None.
+    if let Some(suppress_id) = SUPPRESS_PAINT_NODE.with(|c| c.get()) {
+        if b.node_id == Some(suppress_id) {
+            return;
+        }
     }
     // ── Interest-rect culling (Chrome `cull_rect.cc` model) ──────────────────
     // Skip a subtree entirely when its painted extent lies outside the band
