@@ -10195,7 +10195,12 @@ fn install_event_loop(interp: &cv_js::Interp, sched: SchedRef) {
     // empty here — for pure-JS leak verification; the renderer's idle pass passes
     // DOM/listener/timer roots.)
     let gc_collect_fn = cv_js::native_fn_with_interp("__tb_gc__", |interp, _args| {
-        Ok(cv_js::Value::Number(interp.gc_collect(&[]) as f64))
+        let cleared = interp.gc_collect(&[]);
+        // Deliver any FinalizationRegistry cleanup callbacks the collection
+        // enqueued (§9.9.3), so manual `__tb_gc__()` from a test/probe observes
+        // finalization in the same turn.
+        interp.run_finalization_cleanup();
+        Ok(cv_js::Value::Number(cleared as f64))
     });
     interp.define_global("__tb_gc__", gc_collect_fn);
     interp.define_global("queueMicrotask", queue_microtask);
@@ -14679,35 +14684,15 @@ fn install_fetch_inner(
     });
     interp.define_global("navigation", navigation);
 
-    // ----- WeakRef + FinalizationRegistry shapes (#400) --------------
-    // No real weakness without a moving GC; expose constructors that
-    // round-trip the held value so feature-tests succeed.
-    let weakref_ctor = cv_js::native_ctor_pure("WeakRef", 1, |args| {
-        let target = args.first().cloned().unwrap_or(cv_js::Value::Undefined);
-        let stored = Rc::new(RefCell::new(target));
-        let stored_for_deref = stored.clone();
-        Ok(obj_with(|m| {
-            m.insert(
-                "deref".into(),
-                cv_js::native_fn("deref", move |_| Ok(stored_for_deref.borrow().clone())),
-            );
-        }))
-    });
-    interp.define_global("WeakRef", weakref_ctor);
-    let finreg_ctor = cv_js::native_ctor_pure("FinalizationRegistry", 1, |args| {
-        let _cb = args.first().cloned().unwrap_or(cv_js::Value::Undefined);
-        Ok(obj_with(|m| {
-            m.insert(
-                "register".into(),
-                cv_js::native_fn("register", |_| Ok(cv_js::Value::Undefined)),
-            );
-            m.insert(
-                "unregister".into(),
-                cv_js::native_fn("unregister", |_| Ok(cv_js::Value::Bool(true))),
-            );
-        }))
-    });
-    interp.define_global("FinalizationRegistry", finreg_ctor);
+    // ----- WeakRef + FinalizationRegistry (#400) ---------------------
+    // Installed for REAL by `cv_js::weakref` via `install_basic_globals`
+    // (ECMA-262 §26.1, §26.2): WeakRef.deref is tied to GC reachability
+    // (returns the target until the tracing GC collects it, then undefined)
+    // and FinalizationRegistry enqueues held values for its cleanup callback
+    // after a target is collected. The host drives pending cleanup callbacks
+    // via `interp.run_finalization_cleanup()` after each GC pump (see
+    // `gc_collect_if_enabled`). The earlier round-tripping placeholder that used
+    // to live here is removed so it no longer shadows the real engine surface.
 
     // ----- OffscreenCanvas + Path2D + ImageBitmap (#428) -------------
     // Real OffscreenCanvas: getContext("2d") returns an actual CanvasContext2D
@@ -16035,6 +16020,11 @@ impl LiveInterp {
         }
         let roots = self.gc_roots();
         self.interp.gc_collect(&roots);
+        // ECMA-262 §9.9.3: a major collection may have determined some
+        // FinalizationRegistry targets unreachable, enqueuing their held values.
+        // Run the cleanup callbacks now (the host job that delivers them). No-op
+        // when nothing is pending.
+        self.interp.run_finalization_cleanup();
     }
 
     /// Run a generational MINOR collection (nursery scavenge). No-op unless both

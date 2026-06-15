@@ -67,6 +67,13 @@ pub mod shapes;
 /// UTC-offset core; named-IANA-zone DST + non-ISO calendars are documented
 /// followups (see module footer), not stubs.
 pub mod temporal;
+/// `WeakRef` + `FinalizationRegistry` (ECMA-262 §26.1, §26.2) — weak references
+/// backed by the real tracing GC. A WeakRef does not keep its target alive
+/// (`deref` returns `undefined` once the GC determines the target unreachable);
+/// a FinalizationRegistry enqueues held values for its cleanup callback after a
+/// target is collected, and `unregister` removes registrations. Always on
+/// (additive; only reachable via the `WeakRef`/`FinalizationRegistry` globals).
+pub mod weakref;
 /// T3 — the optimizing tier (B2 of PHASE B): bytecode → SSA-ish IR →
 /// conservative semantics-preserving passes → linear-scan regalloc → the proven
 /// T2-lite backend. Gated by `CV_T3` / `ForcedTier::T3`, DEFAULT OFF.

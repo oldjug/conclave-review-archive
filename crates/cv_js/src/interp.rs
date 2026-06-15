@@ -5053,8 +5053,14 @@ pub fn gc_collect_with_roots_for_test(roots: &[Value]) -> usize {
         arrs: std::collections::HashSet::new(),
         envs: std::collections::HashSet::new(),
     };
-    let work: Vec<GcWork> = roots.iter().map(|v| GcWork::Val(v.clone())).collect();
+    let mut work: Vec<GcWork> = roots.iter().map(|v| GcWork::Val(v.clone())).collect();
+    // Root pending FinalizationRegistry held values (§9.9) — same discipline as
+    // the real `gc_collect`, so this oracle path agrees on weak-ref behavior.
+    for r in crate::weakref::pending_held_value_roots() {
+        work.push(GcWork::Val(r));
+    }
     gc_mark(work, &mut m);
+    crate::weakref::process_after_mark(&m.objs, &m.arrs);
     let cleared = gc_sweep(&m);
     if gen_gc_enabled() {
         gen_gc_after_major();
@@ -12515,6 +12521,13 @@ impl Interp {
         // via the `Temporal` global, so installing it here is always-on with
         // zero risk to existing code.
         crate::temporal::install(self);
+
+        // `WeakRef` + `FinalizationRegistry` (ECMA-262 §26.1, §26.2) — weak
+        // references tied to the REAL tracing GC: a WeakRef does not root its
+        // target (deref → undefined once the GC finds it unreachable) and a
+        // FinalizationRegistry enqueues held values after target collection.
+        // Additive: only reachable via these globals.
+        crate::weakref::install(self);
     }
 
     /// Look up a value in the global scope. Used by the browser to read
@@ -12599,12 +12612,26 @@ impl Interp {
         for r in external_roots {
             work.push(GcWork::Val(r.clone()));
         }
+        // FinalizationRegistry held values are GC roots until their cleanup
+        // callback runs (ECMA-262 §9.9): a held value (and the registry's
+        // cleanup callback) must outlive the WEAK target. WeakRef/registry
+        // TARGETS are deliberately NOT rooted here — that is what makes them
+        // weak. No-op when no registries hold pending work.
+        for r in crate::weakref::pending_held_value_roots() {
+            work.push(GcWork::Val(r));
+        }
         // T2 Phase 2: seed the registered JIT register banks. Each pointer-lane
         // slot becomes a GC root so a bank-only-reachable heap value is marked
         // (NOT cleared by `gc_sweep`). Dormant until a future phase registers a
         // real bank; an empty registry makes this a no-op.
         gc_seed_jit_banks(&mut work);
         gc_mark(work, &mut m);
+        // WeakRef / FinalizationRegistry processing (§9.9): with the full
+        // marked-live set in hand (and BEFORE the sweep clears anything), flip
+        // `collected` on WeakRefs whose target is unreachable and enqueue
+        // finalizers for collected registry targets. Held values were rooted
+        // above, so they survive into the cleanup callback.
+        crate::weakref::process_after_mark(&m.objs, &m.arrs);
         let cleared = gc_sweep(&m);
         // B4: after a full (major) collection in generational mode, every survivor
         // is long-lived ⇒ promote all to OLD and reset the remembered set so the
