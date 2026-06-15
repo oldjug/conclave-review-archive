@@ -1,18 +1,16 @@
-//! WebP image format — V1 scaffolding.
+//! WebP image format.
 //!
-//! Full WebP decode requires VP8 (lossy) or VP8L (lossless), each
-//! ~3-5kLOC. V1 here parses just the RIFF container + VP8X header so
-//! we can:
+//! Parses the RIFF/WebP container (VP8 / VP8L / VP8X chunks) and decodes
+//! pixels:
+//!   - `VP8 ` (lossy)  → real intra-keyframe decode via [`crate::vp8_decode`]
+//!     (RFC 6386: boolean decoder, per-MB modes, coefficient tokens,
+//!     dequantization, intra prediction, IDCT/WHT, YUV→RGBA).
+//!   - `VP8L` (lossless) → entropy-coded ARGB decode (no-transform + color
+//!     cache form; predictor/cross-color transforms are a follow-up).
+//!   - `VP8X` (extended) → routes to the inner VP8/VP8L chunk.
 //!
-//!   - identify a WebP file confidently (so the host knows to apply
-//!     the right error message instead of silently rendering nothing),
-//!   - read the image dimensions from VP8X / VP8L / VP8 chunks,
-//!   - allow code that just needs the size (responsive layout hints)
-//!     to work without the full decoder.
-//!
-//! The actual pixel decode lands later — for now we return an error
-//! distinct from the "not a WebP" case so callers can fall back to
-//! a placeholder.
+//! `parse_webp_info` surfaces dimensions/alpha/animation flags without
+//! decoding, for layout hints.
 
 use crate::png::ImageError;
 
@@ -27,9 +25,8 @@ pub struct WebPInfo {
 }
 
 /// Sniff a buffer for WebP. Returns parsed dimensions if it's a WebP
-/// container, else `Err(ImageError::BadSignature)`. **Does not** decode
-/// pixels — that's `decode_webp` and currently errors with
-/// `Malformed("WebP: pixel decode not yet implemented")`.
+/// container, else `Err(ImageError::BadSignature)`. Does not decode pixels —
+/// use [`decode_webp`] for that.
 pub fn parse_webp_info(input: &[u8]) -> Result<WebPInfo, ImageError> {
     if input.len() < 30 {
         return Err(ImageError::BadSignature);
@@ -112,7 +109,9 @@ pub fn decode_webp(input: &[u8]) -> Result<crate::png::RgbaImage, ImageError> {
     let info = parse_webp_info(input)?;
     let chunk_id = &input[12..16];
     if chunk_id == b"VP8 " {
-        return crate::vp8::decode_i_frame_pixels(&input[20..]);
+        // Lossy WebP: a single VP8 keyframe. Decode real pixels via the
+        // full intra reconstruction path (RFC 6386).
+        return crate::vp8_decode::decode_keyframe(vp8_chunk_payload(input, 12)?);
     }
     if chunk_id != b"VP8L" {
         if chunk_id == b"VP8X" {
@@ -163,6 +162,25 @@ fn decode_vp8l_body(body: &[u8], _w: u32, _h: u32) -> Result<crate::png::RgbaIma
     decode_vp8l_pixels(&mut br, width, height)
 }
 
+/// Return the payload bytes of the first `VP8 ` (lossy) chunk. `start` is the
+/// offset of the first RIFF chunk header (12 for a plain file). Each chunk is
+/// a 4-byte tag + 4-byte LE length + payload (+1 byte pad if odd length).
+fn vp8_chunk_payload(input: &[u8], start: usize) -> Result<&[u8], ImageError> {
+    let mut i = start;
+    while i + 8 <= input.len() {
+        let tag = &input[i..i + 4];
+        let len =
+            u32::from_le_bytes([input[i + 4], input[i + 5], input[i + 6], input[i + 7]]) as usize;
+        let body_start = i + 8;
+        let body_end = body_start.saturating_add(len).min(input.len());
+        if tag == b"VP8 " {
+            return Ok(&input[body_start..body_end]);
+        }
+        i = body_end + (len & 1);
+    }
+    Err(ImageError::Malformed("WebP: no VP8 chunk"))
+}
+
 fn decode_vp8l_inside_extended(
     input: &[u8],
     info: &WebPInfo,
@@ -181,6 +199,10 @@ fn decode_vp8l_inside_extended(
         }
         if tag == b"VP8L" {
             return decode_vp8l_body(&input[body_start..body_end], info.width, info.height);
+        }
+        if tag == b"VP8 " {
+            // Extended container wrapping a lossy keyframe.
+            return crate::vp8_decode::decode_keyframe(&input[body_start..body_end]);
         }
         // Even-pad.
         i = body_end + (len & 1);

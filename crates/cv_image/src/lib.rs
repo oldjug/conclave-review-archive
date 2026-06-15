@@ -1,8 +1,11 @@
 //! `cv_image` — image decoders.
 //!
-//! Today: PNG decoder per the W3C PNG Specification. Supports 8-bit color
-//! types 0/2/3/4/6 and all five filter modes. Non-interlaced only.
-//! JPEG/WebP/AVIF/GIF land in M2+.
+//! Real pixel decode for: PNG (W3C PNG spec), JPEG (baseline), GIF (LZW),
+//! BMP, ICO, SVG, and WebP — both VP8L lossless and VP8 lossy (the lossy
+//! path is a full RFC 6386 intra-keyframe decoder in [`vp8_decode`]).
+//! AVIF/HEIC containers are parsed for dimensions; their AV1/HEVC-intra
+//! pixel decode is a documented follow-up (the host renders a sized
+//! placeholder, never a fake "decoded" image).
 
 #![allow(missing_debug_implementations, unused_assignments)]
 
@@ -19,6 +22,7 @@ pub mod svg;
 pub mod svg_extra;
 pub mod tiff;
 pub mod vp8;
+pub mod vp8_decode;
 pub mod webp;
 
 pub use avif::{AvifInfo, parse_avif_info};
@@ -31,4 +35,5 @@ pub use svg::{SvgError, rasterize_svg_attrs};
 pub use vp8::{
     decode_i_frame_pixels as decode_vp8_i_frame, parse_frame_header as parse_vp8_header,
 };
+pub use vp8_decode::decode_keyframe as decode_vp8_keyframe;
 pub use webp::{WebPInfo, decode_webp, parse_webp_info};

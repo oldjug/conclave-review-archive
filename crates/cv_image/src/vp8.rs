@@ -212,40 +212,13 @@ pub fn decode_setup_partition(bd: &mut BoolDecoder) {
     // Quantizer indices + deltas — caller can skip if it doesn't care.
 }
 
-/// Decode an I-frame to RGBA. V1 ships the boolean decoder + header
-/// parsing fully; macroblock-level intra-prediction + IDCT lands in
-/// a follow-up slice. Returns a placeholder gradient so the host's
-/// layout still gets a correctly-sized RGBA buffer.
+/// Decode a VP8 keyframe (intra frame) to RGBA — the full macroblock
+/// reconstruction lives in [`crate::vp8_decode::decode_keyframe`] (header,
+/// per-MB modes, coefficient tokens, dequantization, intra prediction, IDCT,
+/// WHT and YUV→RGBA). This is the entry point WebP-lossy decode routes
+/// through. Returns a real, pixel-accurate image (no placeholder).
 pub fn decode_i_frame_pixels(input: &[u8]) -> Result<RgbaImage, ImageError> {
-    let hdr = parse_frame_header(input)?;
-    if !hdr.key_frame {
-        return Err(ImageError::Malformed("VP8: not a key frame"));
-    }
-    let part_start = hdr.first_partition_off;
-    let part_end = (part_start + hdr.first_part_size as usize).min(input.len());
-    if part_end <= part_start {
-        return Err(ImageError::Truncated);
-    }
-    let mut bd = BoolDecoder::new(&input[part_start..part_end]);
-    decode_setup_partition(&mut bd);
-    // Pixel-data partition would be decoded with a per-macroblock loop
-    // using the prepped boolean decoder. Until that lands we return a
-    // sized gradient so the host's image pipeline still functions.
-    let w = hdr.width as u32;
-    let h = hdr.height as u32;
-    let n = (w as usize) * (h as usize);
-    let mut pixels: Vec<u32> = Vec::with_capacity(n);
-    for y in 0..h {
-        for x in 0..w {
-            let g = (((x + y) * 255 / (w + h).max(1)) & 0xFF) as u32;
-            pixels.push(0xFF00_0000 | (g << 16) | (g << 8) | g);
-        }
-    }
-    Ok(RgbaImage {
-        width: w,
-        height: h,
-        pixels,
-    })
+    crate::vp8_decode::decode_keyframe(input)
 }
 
 // ----------------------------------------------------------------------

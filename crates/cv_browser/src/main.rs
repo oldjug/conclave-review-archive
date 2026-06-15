@@ -50485,9 +50485,10 @@ fn decode_image_bytes(body: &[u8]) -> Option<cv_image::RgbaImage> {
         let (w, h) = clamp_placeholder_dims(info.width, info.height);
         Some(grey_sized_placeholder(w, h))
     } else if cv_image::parse_webp_info(body).is_ok() {
-        // Attempt a real decode first; fall back to a correctly-sized grey
-        // placeholder if the file uses a codec path not yet fully implemented
-        // (animated WebP, VP8 lossy with unsupported profile, etc.).
+        // Real WebP decode: VP8 lossy (intra keyframe → cv_image::vp8_decode)
+        // and VP8L lossless both produce true pixels. Falls back to a
+        // correctly-sized grey placeholder only for codec paths not yet
+        // implemented (animated WebP, VP8L predictor/cross-color transforms).
         match cv_image::decode_webp(body) {
             Ok(img) => {
                 // Clamp to the same safety limit as other decoders.
@@ -56206,6 +56207,26 @@ mod tests {
         let img = decode_image_bytes(&bytes).expect("webp placeholder");
         assert_eq!(img.width, 320);
         assert_eq!(img.height, 240);
+    }
+
+    /// An `<img src=foo.webp>` of a real lossy (VP8) WebP must decode to real
+    /// pixels through the shared `decode_image_bytes` path that paints into the
+    /// image box — not a flat grey placeholder. The fixture is a libwebp-
+    /// encoded 64x64 image with red / green / blue / white quadrants.
+    #[test]
+    fn decode_image_bytes_decodes_real_lossy_webp() {
+        const WEBP: &[u8] =
+            include_bytes!("../../cv_image/tests/test_lossy_quad.webp");
+        let img = decode_image_bytes(WEBP).expect("real lossy webp decode");
+        assert_eq!(img.width, 64);
+        assert_eq!(img.height, 64);
+        // Not a flat placeholder.
+        let p0 = img.pixels[0];
+        assert!(img.pixels.iter().any(|&p| p != p0), "image is flat");
+        // Top-left quadrant is red.
+        let p = img.pixels[16 * 64 + 16];
+        let (r, g, b) = ((p >> 16) & 0xFF, (p >> 8) & 0xFF, p & 0xFF);
+        assert!(r > 180 && r > g + 80 && r > b + 80, "TL not red: ({r},{g},{b})");
     }
 
     #[test]
