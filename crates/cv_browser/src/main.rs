@@ -13077,59 +13077,20 @@ fn install_fetch_inner(
         }
         interp.define_global("DOMException", dom_exc_global);
     }
-    // Range / Selection / TreeWalker / NodeIterator — V1 shapes.
+    // Range — WHATWG DOM §5.5, REAL boundary-point model (see make_range_js).
+    // `new Range()` seeds both boundaries at (the global document, 0) per spec.
     interp.define_global(
         "Range",
-        cv_js::native_fn("Range", |_| {
-            Ok(obj_with(|m| {
-                m.insert("collapsed".into(), cv_js::Value::Bool(true));
-                m.insert("startOffset".into(), cv_js::Value::Number(0.0));
-                m.insert("endOffset".into(), cv_js::Value::Number(0.0));
-                m.insert(
-                    "setStart".into(),
-                    cv_js::native_fn("setStart", |_| Ok(cv_js::Value::Undefined)),
-                );
-                m.insert(
-                    "setEnd".into(),
-                    cv_js::native_fn("setEnd", |_| Ok(cv_js::Value::Undefined)),
-                );
-                m.insert(
-                    "collapse".into(),
-                    cv_js::native_fn("collapse", |_| Ok(cv_js::Value::Undefined)),
-                );
-                m.insert(
-                    "selectNode".into(),
-                    cv_js::native_fn("selectNode", |_| Ok(cv_js::Value::Undefined)),
-                );
-                m.insert(
-                    "selectNodeContents".into(),
-                    cv_js::native_fn("selectNodeContents", |_| Ok(cv_js::Value::Undefined)),
-                );
-                m.insert(
-                    "getBoundingClientRect".into(),
-                    cv_js::native_fn("getBoundingClientRect", |_| {
-                        Ok(obj_with(|r| {
-                            for k in [
-                                "x", "y", "top", "left", "right", "bottom", "width", "height",
-                            ] {
-                                r.insert(k.into(), cv_js::Value::Number(0.0));
-                            }
-                        }))
-                    }),
-                );
-                m.insert(
-                    "cloneRange".into(),
-                    cv_js::native_fn("cloneRange", |_| Ok(empty_obj())),
-                );
-                m.insert(
-                    "toString".into(),
-                    cv_js::native_fn("toString", |_| Ok(cv_js::Value::str(String::new()))),
-                );
-            }))
+        cv_js::native_ctor("Range", 0, |interp, _args| {
+            let doc = interp
+                .get_global("document")
+                .unwrap_or(cv_js::Value::Null);
+            Ok(make_range_js(doc))
         }),
     );
-    // `document.createRange()` is added on document elsewhere; the
-    // Range global stays for `new Range()`.
+    // `document.createRange()` / `createTreeWalker` / `createNodeIterator`,
+    // `window.getSelection()`, and `document.elementFromPoint()` are installed
+    // on the document/window objects in install_dom_mutation_apis.
     // ----- Custom Elements (WHATWG HTML §4.13) -----------------------
     // `customElements.define(name, ctor, options?)` records a real
     // definition (ctor + observedAttributes), resolves any pending
@@ -19763,6 +19724,60 @@ fn clear_scroll_offsets() {
     SCROLL_OFFSETS.with(|c| c.borrow_mut().clear());
 }
 
+thread_local! {
+    /// Per-frame element hit-test table for `document.elementFromPoint` /
+    /// `elementsFromPoint` (CSSOM View §6.1). Published by
+    /// `populate_runtime_layout_metrics` after layout: each entry is the
+    /// element's viewport-relative border rect + its live JS wrapper, in
+    /// DOCUMENT ORDER. elementFromPoint scans for the LAST (deepest /
+    /// topmost-painted, since descendants follow ancestors in pre-order)
+    /// entry whose rect contains the point — Chrome returns the topmost
+    /// element under the point. Re-published every render so a re-laid-out
+    /// page hit-tests against current geometry.
+    static ELEMENT_HIT_ORDER: std::cell::RefCell<Vec<(cv_layout::Rect, cv_js::Value)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+
+    /// The page's singleton Selection object (Selection API): the SAME object is
+    /// returned by every `window.getSelection()` / `document.getSelection()`
+    /// call. Built once during global setup and re-used so a stored reference
+    /// survives across script runs within the page.
+    static CURRENT_SELECTION: std::cell::RefCell<Option<cv_js::Value>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Publish the post-layout element hit-test table (document order) for
+/// `elementFromPoint`. Replaces the previous frame's table.
+fn set_element_hit_order(entries: Vec<(cv_layout::Rect, cv_js::Value)>) {
+    ELEMENT_HIT_ORDER.with(|c| *c.borrow_mut() = entries);
+}
+
+/// CSSOM View `elementFromPoint`/`elementsFromPoint` core: return every element
+/// wrapper whose border rect contains the viewport point `(x, y)`, in
+/// topmost-first order (reverse document order, so deepest/last-painted first).
+/// A point outside the viewport or matching nothing yields an empty list (the
+/// caller maps that to `null` for the singular form, per spec: a negative or
+/// out-of-bounds coordinate returns null).
+fn elements_from_point(x: f64, y: f64) -> Vec<cv_js::Value> {
+    ELEMENT_HIT_ORDER.with(|c| {
+        let table = c.borrow();
+        let mut hits: Vec<cv_js::Value> = Vec::new();
+        // Walk in REVERSE document order so the topmost (deepest pre-order,
+        // therefore last-painted) element comes first.
+        for (rect, wrapper) in table.iter().rev() {
+            let xf = x as f32;
+            let yf = y as f32;
+            if xf >= rect.x
+                && xf < rect.x + rect.w
+                && yf >= rect.y
+                && yf < rect.y + rect.h
+            {
+                hits.push(wrapper.clone());
+            }
+        }
+        hits
+    })
+}
+
 /// CSSOM scroll geometry per element path: the padding-box (`client*`) and
 /// scrollable-overflow (`scroll*`) sizes, the current scroll offset, plus the
 /// stable arena id so JS `scrollTop`/`scrollLeft` writes can address the live
@@ -21243,10 +21258,14 @@ fn populate_runtime_layout_metrics(
         .max(cfg.viewport_w);
 
     let table = runtime.table.borrow();
+    // Element hit-test table for `document.elementFromPoint` — every element's
+    // viewport-relative border rect + its live wrapper, in document order.
+    let mut hit_order: Vec<(cv_layout::Rect, cv_js::Value)> = Vec::with_capacity(table.all.len());
     for rec in &table.all {
         let Some(rect) = metrics_by_path.get(&rec.path).copied() else {
             continue;
         };
+        hit_order.push((rect, rec.js.clone()));
         if let cv_js::Value::Object(o) = &rec.js {
             let rect_for_bcr = rect;
             let bcr = cv_js::native_fn("getBoundingClientRect", move |_args| {
@@ -21480,6 +21499,8 @@ fn populate_runtime_layout_metrics(
             }
         }
     }
+    // Publish this frame's element hit-test table for document.elementFromPoint.
+    set_element_hit_order(hit_order);
 }
 
 /// Subsequent call against an already-built runtime — used for click
@@ -23576,6 +23597,17 @@ fn install_minimal_dom_with_url(interp: &cv_js::Interp, initial_title: String, p
     window_map.insert("matchMedia".into(), match_media);
     window_map.insert("__cv_mql_reevaluate__".into(), mql_reevaluate);
     window_map.insert("getComputedStyle".into(), get_computed_style);
+
+    // window.getSelection() (Selection API) — returns the page's SINGLETON
+    // Selection object (the same object on every call, per spec). We build it
+    // once and stash it in a thread-local so document.getSelection() returns the
+    // identical object too.
+    {
+        let sel = make_selection_js();
+        CURRENT_SELECTION.with(|c| *c.borrow_mut() = Some(sel.clone()));
+        let get_selection = cv_js::native_fn("getSelection", move |_| Ok(sel.clone()));
+        window_map.insert("getSelection".into(), get_selection);
+    }
 
     // history — pushState / replaceState / popstate. The stack is
     // local to this page and survives across script runs because the
@@ -33174,6 +33206,1251 @@ fn install_chardata_methods(m: &mut cv_js::OrderedMap<String, cv_js::Value>) {
     );
 }
 
+// ============================================================================
+// Range / Selection / TreeWalker / NodeIterator  (WHATWG DOM §5 Ranges,
+// §6 Traversal; CSSOM View elementFromPoint; Selection API)
+//
+// These operate on the LIVE JS DOM object graph — the `cv_js::Value::Object`
+// tree the page scripts manipulate (`nodeType`, `data`/`nodeValue`,
+// `_children`/`children` arrays, `parentNode`). That IS our node tree; the
+// WHATWG algorithms are defined over the node tree, so we implement them
+// directly against it (cv_dom's NodeId arena is a SEPARATE, parse-time tree
+// that JS never sees — walking it would diverge from the DOM scripts mutate).
+// ============================================================================
+
+/// `nodeType` of a live JS DOM node (1 element, 3 text, 8 comment, 9 document,
+/// 11 fragment). Non-object / typeless → 0.
+fn js_node_type(v: &cv_js::Value) -> u32 {
+    if let cv_js::Value::Object(o) = v {
+        if let Some(cv_js::Value::Number(n)) = o.borrow().get("nodeType") {
+            return *n as u32;
+        }
+    }
+    0
+}
+
+fn js_node_is_text(v: &cv_js::Value) -> bool {
+    matches!(js_node_type(v), 3 | 4) // Text or CDATASection
+}
+
+fn js_node_is_element(v: &cv_js::Value) -> bool {
+    js_node_type(v) == 1
+}
+
+/// The `data` (character data) of a Text/Comment node as a Rust String.
+fn js_chardata(v: &cv_js::Value) -> String {
+    if let cv_js::Value::Object(o) = v {
+        let b = o.borrow();
+        return b
+            .get("data")
+            .or_else(|| b.get("nodeValue"))
+            .or_else(|| b.get("textContent"))
+            .map(|x| x.to_display_string())
+            .unwrap_or_default();
+    }
+    String::new()
+}
+
+/// Length of a node per WHATWG DOM "node length" (§4.4): for a Text/Comment
+/// node it's the data length in UTF-16 code units; for any other node it's the
+/// number of children.
+fn js_node_length(v: &cv_js::Value) -> usize {
+    if js_node_is_text(v) || js_node_type(v) == 8 {
+        return js_chardata(v).encode_utf16().count();
+    }
+    js_node_children(v).len()
+}
+
+/// A node's child list (the canonical `_children` array, falling back to
+/// `children`). Empty for leaf / text nodes.
+fn js_node_children(v: &cv_js::Value) -> Vec<cv_js::Value> {
+    if let cv_js::Value::Object(o) = v {
+        let b = o.borrow();
+        if let Some(cv_js::Value::Array(arr)) = b.get("_children").or_else(|| b.get("children")) {
+            return arr.borrow().clone();
+        }
+    }
+    Vec::new()
+}
+
+// (`js_node_parent` is defined above — returns Option<Value>, checking both
+// the live `_parent` and `parentNode` slots.)
+
+/// The index of `node` among its parent's children (its "index" per §4.4), or
+/// None if it has no parent or isn't found.
+fn js_node_index(node: &cv_js::Value) -> Option<usize> {
+    let parent = js_node_parent(node)?;
+    js_node_children(&parent)
+        .iter()
+        .position(|c| cv_js::Value::strict_eq(c, node))
+}
+
+/// Substring of a UTF-16 string by code-unit offsets `[start, end)`, lossily
+/// re-encoded to UTF-8 (Range/CharacterData offsets are UTF-16 code units).
+fn utf16_slice(s: &str, start: usize, end: usize) -> String {
+    let units: Vec<u16> = s.encode_utf16().collect();
+    let start = start.min(units.len());
+    let end = end.min(units.len()).max(start);
+    String::from_utf16_lossy(&units[start..end])
+}
+
+/// Collect every Text node that is fully or partially CONTAINED by the range
+/// (boundary points start..end), in tree order, walking the live DOM. A node is
+/// "contained" if it starts after the start boundary and ends before the end
+/// boundary (WHATWG §5.2 "contained"); for the stringifier we want all Text
+/// descendants strictly between the boundary container nodes, so we gather text
+/// nodes encountered in pre-order between start and end containers (exclusive of
+/// the partially-selected boundary text nodes, which the stringifier handles
+/// separately).
+fn range_contained_text_nodes(
+    start_node: &cv_js::Value,
+    end_node: &cv_js::Value,
+    root: &cv_js::Value,
+) -> Vec<cv_js::Value> {
+    // Pre-order DFS over the tree rooted at `root`, emitting text nodes that lie
+    // strictly between `start_node` and `end_node` (not equal to either).
+    let mut out: Vec<cv_js::Value> = Vec::new();
+    let mut started = false;
+    fn walk(
+        node: &cv_js::Value,
+        start_node: &cv_js::Value,
+        end_node: &cv_js::Value,
+        started: &mut bool,
+        out: &mut Vec<cv_js::Value>,
+    ) -> bool {
+        // Returns true if traversal should stop (end reached).
+        if cv_js::Value::strict_eq(node, end_node) {
+            return true;
+        }
+        if *started && js_node_is_text(node) {
+            out.push(node.clone());
+        }
+        if cv_js::Value::strict_eq(node, start_node) {
+            *started = true;
+        }
+        for child in js_node_children(node) {
+            if walk(&child, start_node, end_node, started, out) {
+                return true;
+            }
+        }
+        false
+    }
+    walk(root, start_node, end_node, &mut started, &mut out);
+    out
+}
+
+/// The root of a node (the topmost ancestor reachable via parentNode).
+fn js_node_root(node: &cv_js::Value) -> cv_js::Value {
+    let mut cur = node.clone();
+    while let Some(p) = js_node_parent(&cur) {
+        cur = p;
+    }
+    cur
+}
+
+/// Read a hidden boundary-point pair off a Range JS object: returns
+/// `(container, offset)` for the `start`/`end` side.
+fn range_boundary(range: &cv_js::Value, side: &str) -> (cv_js::Value, usize) {
+    if let cv_js::Value::Object(o) = range {
+        let b = o.borrow();
+        let container = b
+            .get(&format!("\u{1}{side}Container"))
+            .cloned()
+            .unwrap_or(cv_js::Value::Null);
+        let offset = match b.get(&format!("\u{1}{side}Offset")) {
+            Some(cv_js::Value::Number(n)) => *n as usize,
+            _ => 0,
+        };
+        return (container, offset);
+    }
+    (cv_js::Value::Null, 0)
+}
+
+/// Refresh the PUBLIC, spec-named boundary getters + `collapsed` on a Range
+/// object from its hidden `\u{1}start*`/`\u{1}end*` slots, after any boundary
+/// mutation. (WHATWG §5.2: startContainer/startOffset/endContainer/endOffset
+/// and collapsed are all derived from the two boundary points.)
+fn range_sync_public(range: &cv_js::Value) {
+    let (sc, so) = range_boundary(range, "start");
+    let (ec, eo) = range_boundary(range, "end");
+    let collapsed = cv_js::Value::strict_eq(&sc, &ec) && so == eo;
+    if let cv_js::Value::Object(o) = range {
+        let mut m = o.borrow_mut();
+        m.insert("startContainer".into(), sc.clone());
+        m.insert("startOffset".into(), cv_js::Value::Number(so as f64));
+        m.insert("endContainer".into(), ec.clone());
+        m.insert("endOffset".into(), cv_js::Value::Number(eo as f64));
+        m.insert("collapsed".into(), cv_js::Value::Bool(collapsed));
+        // commonAncestorContainer (§5.2): the deepest node that contains both
+        // boundary containers. Approximate with the start container when both
+        // share it, else the start container's root — sufficient for V1 reads.
+        let common = if cv_js::Value::strict_eq(&sc, &ec) {
+            sc.clone()
+        } else {
+            js_node_root(&sc)
+        };
+        m.insert("commonAncestorContainer".into(), common);
+    }
+}
+
+/// WHATWG §5.5 "set the start" / "set the end": write a boundary point. If this
+/// makes start come after end (same container, offset crossing), the spec
+/// collapses the OTHER boundary onto this one. We approximate the ordering check
+/// with the same-container offset comparison (the common case) plus a guard:
+/// setting start with no end yet seeds the end too.
+fn range_set_boundary(range: &cv_js::Value, side: &str, node: cv_js::Value, offset: usize) {
+    if let cv_js::Value::Object(o) = range {
+        {
+            let mut m = o.borrow_mut();
+            m.insert(format!("\u{1}{side}Container"), node.clone());
+            m.insert(
+                format!("\u{1}{side}Offset"),
+                cv_js::Value::Number(offset as f64),
+            );
+        }
+        // §5.5 steps 3-4: if the boundary points are now mis-ordered in the same
+        // container, collapse the other end onto the one just set.
+        let (sc, so) = range_boundary(range, "start");
+        let (ec, eo) = range_boundary(range, "end");
+        let same = cv_js::Value::strict_eq(&sc, &ec);
+        if same {
+            if side == "start" && so > eo {
+                let mut m = o.borrow_mut();
+                m.insert("\u{1}endContainer".into(), node.clone());
+                m.insert("\u{1}endOffset".into(), cv_js::Value::Number(offset as f64));
+            } else if side == "end" && eo < so {
+                let mut m = o.borrow_mut();
+                m.insert("\u{1}startContainer".into(), node.clone());
+                m.insert(
+                    "\u{1}startOffset".into(),
+                    cv_js::Value::Number(offset as f64),
+                );
+            }
+        }
+    }
+    range_sync_public(range);
+}
+
+/// The text between the range's boundary points — the WHATWG §5.5 Range
+/// stringifier (dom-range-stringifier):
+///   1. let s = "".
+///   2. if start node == end node and is Text: return data[startOffset..endOffset].
+///   3. if start node is Text: append data[startOffset..end].
+///   4. append data of all Text nodes contained in the range, in tree order.
+///   5. if end node is Text: append data[0..endOffset].
+///   6. return s.
+fn range_to_string(range: &cv_js::Value) -> String {
+    let (sc, so) = range_boundary(range, "start");
+    let (ec, eo) = range_boundary(range, "end");
+    if matches!(sc, cv_js::Value::Null) {
+        return String::new();
+    }
+    // Step 2: collapsed inside a single Text node.
+    if cv_js::Value::strict_eq(&sc, &ec) && js_node_is_text(&sc) {
+        return utf16_slice(&js_chardata(&sc), so, eo);
+    }
+    let mut s = String::new();
+    // Step 3: partial start text node.
+    if js_node_is_text(&sc) {
+        let data = js_chardata(&sc);
+        s.push_str(&utf16_slice(&data, so, data.encode_utf16().count()));
+    }
+    // Step 4: fully-contained text nodes between the boundaries, tree order.
+    let root = js_node_root(&sc);
+    for tn in range_contained_text_nodes(&sc, &ec, &root) {
+        s.push_str(&js_chardata(&tn));
+    }
+    // Step 5: partial end text node.
+    if js_node_is_text(&ec) {
+        let data = js_chardata(&ec);
+        s.push_str(&utf16_slice(&data, 0, eo));
+    }
+    s
+}
+
+/// The nearest ELEMENT ancestor (inclusive) of a node — used to resolve a
+/// Range/Selection boundary container (often a Text node) to an element whose
+/// laid-out geometry we can report from `getBoundingClientRect`.
+fn js_nearest_element(node: &cv_js::Value) -> Option<cv_js::Value> {
+    let mut cur = node.clone();
+    loop {
+        if js_node_is_element(&cur) {
+            return Some(cur);
+        }
+        cur = js_node_parent(&cur)?;
+    }
+}
+
+/// Read an element wrapper's installed per-element `getBoundingClientRect` and
+/// return `(x, y, w, h)`. The wrapper's bcr is populated by
+/// `populate_runtime_layout_metrics` after layout, so this reflects real
+/// geometry. Returns None if the element has no bcr yet (not laid out).
+fn element_rect_via_bcr(el: &cv_js::Value) -> Option<(f64, f64, f64, f64)> {
+    let cv_js::Value::Object(o) = el else {
+        return None;
+    };
+    let bcr = o.borrow().get("getBoundingClientRect").cloned()?;
+    let rect = call_pure_native_value(&bcr, vec![]).ok()?;
+    let cv_js::Value::Object(r) = rect else {
+        return None;
+    };
+    let rb = r.borrow();
+    let num = |k: &str| match rb.get(k) {
+        Some(cv_js::Value::Number(n)) => *n,
+        _ => 0.0,
+    };
+    Some((num("x"), num("y"), num("width"), num("height")))
+}
+
+/// Range.getBoundingClientRect (CSSOM View): the union of the bounding rects of
+/// the elements the range spans. For a range whose boundaries are inside one
+/// element (the common case — selecting text in a paragraph), this is that
+/// element's border rect; for a range spanning siblings it's their union. We
+/// resolve each boundary container to its nearest laid-out element and union the
+/// rects read from the live per-element bcr (real geometry).
+fn range_bounding_rect(range: &cv_js::Value) -> cv_js::Value {
+    let (sc, _) = range_boundary(range, "start");
+    let (ec, _) = range_boundary(range, "end");
+    let mut acc: Option<(f64, f64, f64, f64)> = None;
+    let add = |el: &cv_js::Value, acc: &mut Option<(f64, f64, f64, f64)>| {
+        if let Some((x, y, w, h)) = element_rect_via_bcr(el) {
+            match acc {
+                None => *acc = Some((x, y, w, h)),
+                Some((ax, ay, aw, ah)) => {
+                    let left = ax.min(x);
+                    let top = ay.min(y);
+                    let right = (*ax + *aw).max(x + w);
+                    let bottom = (*ay + *ah).max(y + h);
+                    *acc = Some((left, top, right - left, bottom - top));
+                }
+            }
+        }
+    };
+    if let Some(el) = js_nearest_element(&sc) {
+        add(&el, &mut acc);
+    }
+    if !cv_js::Value::strict_eq(&sc, &ec) {
+        if let Some(el) = js_nearest_element(&ec) {
+            add(&el, &mut acc);
+        }
+    }
+    let (x, y, w, h) = acc.unwrap_or((0.0, 0.0, 0.0, 0.0));
+    make_dom_rect(x as f32, y as f32, w as f32, h as f32)
+}
+
+/// Construct a real Range object (WHATWG DOM §5.5). Boundary points live in
+/// hidden `\u{1}start*`/`\u{1}end*` slots; the public getters + `collapsed` are
+/// kept in sync by `range_sync_public`. A fresh Range starts collapsed at the
+/// document (Chrome: `new Range()` → collapsed at offset 0, container = the
+/// global document) — but we leave the container Null until set, which a fresh
+/// Range's getters report as the WHATWG default (offset 0, collapsed true).
+fn make_range_js(initial_node: cv_js::Value) -> cv_js::Value {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use cv_js::OrderedMap as HashMap;
+
+    let mut m: HashMap<String, cv_js::Value> = HashMap::new();
+    m.insert("\u{1}isRange".into(), cv_js::Value::Bool(true));
+    // Seed both boundaries at (initial_node, 0).
+    m.insert("\u{1}startContainer".into(), initial_node.clone());
+    m.insert("\u{1}startOffset".into(), cv_js::Value::Number(0.0));
+    m.insert("\u{1}endContainer".into(), initial_node.clone());
+    m.insert("\u{1}endOffset".into(), cv_js::Value::Number(0.0));
+    // Range node-comparison constants (§5.5).
+    m.insert("START_TO_START".into(), cv_js::Value::Number(0.0));
+    m.insert("START_TO_END".into(), cv_js::Value::Number(1.0));
+    m.insert("END_TO_END".into(), cv_js::Value::Number(2.0));
+    m.insert("END_TO_START".into(), cv_js::Value::Number(3.0));
+
+    // setStart(node, offset) / setEnd(node, offset).
+    m.insert(
+        "setStart".into(),
+        cv_js::native_fn_with_interp("setStart", |_i, args| {
+            let range = cv_js::current_native_this();
+            let node = args.first().cloned().unwrap_or(cv_js::Value::Null);
+            let offset = args.get(1).map(|v| v.to_number() as usize).unwrap_or(0);
+            range_set_boundary(&range, "start", node, offset);
+            Ok(cv_js::Value::Undefined)
+        }),
+    );
+    m.insert(
+        "setEnd".into(),
+        cv_js::native_fn_with_interp("setEnd", |_i, args| {
+            let range = cv_js::current_native_this();
+            let node = args.first().cloned().unwrap_or(cv_js::Value::Null);
+            let offset = args.get(1).map(|v| v.to_number() as usize).unwrap_or(0);
+            range_set_boundary(&range, "end", node, offset);
+            Ok(cv_js::Value::Undefined)
+        }),
+    );
+    // setStartBefore/setStartAfter/setEndBefore/setEndAfter (§5.5): boundary at
+    // the node's parent, offset = node index (before) or index + 1 (after).
+    for (name, side, after) in [
+        ("setStartBefore", "start", false),
+        ("setStartAfter", "start", true),
+        ("setEndBefore", "end", false),
+        ("setEndAfter", "end", true),
+    ] {
+        m.insert(
+            name.into(),
+            cv_js::native_fn_with_interp(name, move |_i, args| {
+                let range = cv_js::current_native_this();
+                let node = args.first().cloned().unwrap_or(cv_js::Value::Null);
+                // §5.5: throw InvalidNodeTypeError if node has no parent.
+                let Some(parent) = js_node_parent(&node) else {
+                    return Err(cv_js::JsError::Throw(make_dom_exception(
+                        "InvalidNodeTypeError",
+                        9,
+                        "node has no parent",
+                    )));
+                };
+                let idx = js_node_index(&node).unwrap_or(0);
+                let offset = if after { idx + 1 } else { idx };
+                range_set_boundary(&range, side, parent, offset);
+                Ok(cv_js::Value::Undefined)
+            }),
+        );
+    }
+    // collapse(toStart): set BOTH boundaries to one end (§5.5).
+    m.insert(
+        "collapse".into(),
+        cv_js::native_fn_with_interp("collapse", |_i, args| {
+            let range = cv_js::current_native_this();
+            let to_start = args.first().map(|v| v.to_bool()).unwrap_or(false);
+            let (node, offset) = if to_start {
+                range_boundary(&range, "start")
+            } else {
+                range_boundary(&range, "end")
+            };
+            range_set_boundary(&range, "start", node.clone(), offset);
+            range_set_boundary(&range, "end", node, offset);
+            Ok(cv_js::Value::Undefined)
+        }),
+    );
+    // selectNode(node) (§5.5): boundaries are (parent, index) .. (parent, index+1).
+    m.insert(
+        "selectNode".into(),
+        cv_js::native_fn_with_interp("selectNode", |_i, args| {
+            let range = cv_js::current_native_this();
+            let node = args.first().cloned().unwrap_or(cv_js::Value::Null);
+            let Some(parent) = js_node_parent(&node) else {
+                return Err(cv_js::JsError::Throw(make_dom_exception(
+                    "InvalidNodeTypeError",
+                    9,
+                    "node has no parent",
+                )));
+            };
+            let idx = js_node_index(&node).unwrap_or(0);
+            range_set_boundary(&range, "start", parent.clone(), idx);
+            range_set_boundary(&range, "end", parent, idx + 1);
+            Ok(cv_js::Value::Undefined)
+        }),
+    );
+    // selectNodeContents(node) (§5.5): boundaries (node, 0) .. (node, length).
+    m.insert(
+        "selectNodeContents".into(),
+        cv_js::native_fn_with_interp("selectNodeContents", |_i, args| {
+            let range = cv_js::current_native_this();
+            let node = args.first().cloned().unwrap_or(cv_js::Value::Null);
+            let len = js_node_length(&node);
+            range_set_boundary(&range, "start", node.clone(), 0);
+            range_set_boundary(&range, "end", node, len);
+            Ok(cv_js::Value::Undefined)
+        }),
+    );
+    // getBoundingClientRect / getClientRects (CSSOM View).
+    m.insert(
+        "getBoundingClientRect".into(),
+        cv_js::native_fn_with_interp("getBoundingClientRect", |_i, _args| {
+            let range = cv_js::current_native_this();
+            Ok(range_bounding_rect(&range))
+        }),
+    );
+    m.insert(
+        "getClientRects".into(),
+        cv_js::native_fn_with_interp("getClientRects", |_i, _args| {
+            use std::cell::RefCell;
+            use std::rc::Rc;
+            let range = cv_js::current_native_this();
+            let r = range_bounding_rect(&range);
+            // Empty rect → empty list; otherwise a one-element list.
+            let is_empty = matches!(&r, cv_js::Value::Object(o)
+                if matches!(o.borrow().get("width"), Some(cv_js::Value::Number(n)) if *n == 0.0)
+                && matches!(o.borrow().get("height"), Some(cv_js::Value::Number(n)) if *n == 0.0));
+            let list = if is_empty { vec![] } else { vec![r] };
+            Ok(cv_js::Value::Array(Rc::new(RefCell::new(list))))
+        }),
+    );
+    // toString() — the stringifier.
+    m.insert(
+        "toString".into(),
+        cv_js::native_fn_with_interp("toString", |_i, _args| {
+            let range = cv_js::current_native_this();
+            Ok(cv_js::Value::str(range_to_string(&range)))
+        }),
+    );
+    // cloneRange() — a new Range with identical boundary points (§5.5).
+    m.insert(
+        "cloneRange".into(),
+        cv_js::native_fn_with_interp("cloneRange", |_i, _args| {
+            let range = cv_js::current_native_this();
+            let (sc, so) = range_boundary(&range, "start");
+            let (ec, eo) = range_boundary(&range, "end");
+            let clone = make_range_js(sc.clone());
+            range_set_boundary(&clone, "start", sc, so);
+            range_set_boundary(&clone, "end", ec, eo);
+            Ok(clone)
+        }),
+    );
+    // cloneContents() — a DocumentFragment of the range's contents. For text
+    // ranges this is a Text node of the stringified slice (the common idiom);
+    // a full tree extraction is deferred. This is REAL (not a no-op): it returns
+    // a fragment carrying the selected text as a child Text node.
+    m.insert(
+        "cloneContents".into(),
+        cv_js::native_fn_with_interp("cloneContents", |_i, _args| {
+            use std::cell::RefCell;
+            use std::rc::Rc;
+            use cv_js::OrderedMap as HashMap;
+            let range = cv_js::current_native_this();
+            let text = range_to_string(&range);
+            let mut frag: HashMap<String, cv_js::Value> = HashMap::new();
+            frag.insert("nodeType".into(), cv_js::Value::Number(11.0));
+            frag.insert(
+                "nodeName".into(),
+                cv_js::Value::String("#document-fragment".into()),
+            );
+            let kids: Vec<cv_js::Value> = if text.is_empty() {
+                vec![]
+            } else {
+                vec![make_text_node_js(&text)]
+            };
+            frag.insert(
+                "_children".into(),
+                cv_js::Value::Array(Rc::new(RefCell::new(kids.clone()))),
+            );
+            frag.insert(
+                "childNodes".into(),
+                cv_js::Value::Array(Rc::new(RefCell::new(kids))),
+            );
+            frag.insert(
+                "textContent".into(),
+                cv_js::Value::str(text),
+            );
+            Ok(cv_js::Value::Object(Rc::new(RefCell::new(frag))))
+        }),
+    );
+    // detach() — legacy no-op (§5.5: "The detach() method steps are to do
+    // nothing." Chrome keeps it for compat).
+    m.insert(
+        "detach".into(),
+        cv_js::native_fn("detach", |_| Ok(cv_js::Value::Undefined)),
+    );
+    // isPointInRange / comparePoint stubs deferred (rarely used); insertNode
+    // routed through the live tree if a richer model is needed later.
+
+    let range = cv_js::Value::Object(Rc::new(RefCell::new(m)));
+    range_sync_public(&range);
+    range
+}
+
+/// NodeFilter accept constants for the JS-exposed filter result.
+const NF_ACCEPT: f64 = 1.0;
+const NF_REJECT: f64 = 2.0;
+const NF_SKIP: f64 = 3.0;
+
+/// Does `node` pass `what_to_show` (a bitmask) for a TreeWalker/NodeIterator?
+/// Mirrors cv_dom::traversal::WhatToShow::matches over the JS node tree.
+fn node_matches_what_to_show(node: &cv_js::Value, what_to_show: u32) -> bool {
+    let bit = match js_node_type(node) {
+        1 => 0x1,        // ELEMENT
+        3 | 4 => 0x4,    // TEXT / CDATA
+        8 => 0x80,       // COMMENT
+        9 => 0x100,      // DOCUMENT
+        11 => 0x400,     // DOCUMENT_FRAGMENT
+        _ => 0,
+    };
+    (what_to_show & bit) != 0
+}
+
+/// Run a JS NodeFilter (an object with `acceptNode` or a bare function) against
+/// `node`. Returns the spec accept value (1 accept / 2 reject / 3 skip). With no
+/// filter, every what-to-show-matching node is ACCEPT.
+fn run_node_filter(
+    interp: &mut cv_js::Interp,
+    filter: &cv_js::Value,
+    node: &cv_js::Value,
+) -> f64 {
+    let callable = match filter {
+        // A NodeFilter object: call its `acceptNode` method.
+        cv_js::Value::Object(o) => o.borrow().get("acceptNode").cloned(),
+        // A bare function is itself the filter callback (legacy form).
+        cv_js::Value::Function(_)
+        | cv_js::Value::NativeFunction(_)
+        | cv_js::Value::BcClosure(_) => Some(filter.clone()),
+        _ => None,
+    };
+    let Some(cb) = callable else {
+        return NF_ACCEPT;
+    };
+    if matches!(cb, cv_js::Value::Null | cv_js::Value::Undefined) {
+        return NF_ACCEPT;
+    }
+    match interp.call_value(cb, vec![node.clone()]) {
+        Ok(v) => {
+            let n = v.to_number();
+            if n == NF_REJECT || n == NF_SKIP {
+                n
+            } else {
+                NF_ACCEPT
+            }
+        }
+        Err(_) => NF_ACCEPT,
+    }
+}
+
+/// The last descendant of `node` (deepest, last-child chain) — used to compute
+/// the pre-order predecessor.
+fn js_node_last_descendant(node: &cv_js::Value) -> cv_js::Value {
+    let mut cur = node.clone();
+    loop {
+        let kids = js_node_children(&cur);
+        match kids.into_iter().next_back() {
+            Some(last) => cur = last,
+            None => return cur,
+        }
+    }
+}
+
+/// Pre-order predecessor of `node` within the subtree rooted at `root` (the
+/// "preceding node" of a NodeIterator pre-order walk): the previous sibling's
+/// last descendant, else the parent. Returns None at `root`.
+fn js_node_preceding(node: &cv_js::Value, root: &cv_js::Value) -> Option<cv_js::Value> {
+    if cv_js::Value::strict_eq(node, root) {
+        return None;
+    }
+    let (idx, parent) = (js_node_index(node)?, js_node_parent(node)?);
+    if idx > 0 {
+        let siblings = js_node_children(&parent);
+        if let Some(prev) = siblings.get(idx - 1) {
+            return Some(js_node_last_descendant(prev));
+        }
+    }
+    // No previous sibling → the parent (unless we'd step above root).
+    if cv_js::Value::strict_eq(&parent, root) {
+        return None;
+    }
+    Some(parent)
+}
+
+/// Pre-order successor of `node` within the subtree rooted at `root` (the
+/// "following node" of a TreeWalker/NodeIterator pre-order walk): first child,
+/// else next sibling, else nearest ancestor's next sibling, stopping at `root`.
+fn js_node_following(node: &cv_js::Value, root: &cv_js::Value) -> Option<cv_js::Value> {
+    let kids = js_node_children(node);
+    if let Some(first) = kids.into_iter().next() {
+        return Some(first);
+    }
+    let mut cur = node.clone();
+    loop {
+        if cv_js::Value::strict_eq(&cur, root) {
+            return None;
+        }
+        let (Some(idx), Some(parent)) = (js_node_index(&cur), js_node_parent(&cur)) else {
+            return None;
+        };
+        let siblings = js_node_children(&parent);
+        if let Some(next) = siblings.get(idx + 1) {
+            return Some(next.clone());
+        }
+        cur = parent;
+    }
+}
+
+/// Build a TreeWalker (WHATWG DOM §6.1) over the live JS DOM rooted at `root`.
+/// Implements `currentNode`, `nextNode`, `firstChild`, `lastChild`,
+/// `parentNode`, `nextSibling`, `previousSibling`, `previousNode`, honoring
+/// `whatToShow` + an optional NodeFilter.
+fn make_tree_walker_js(root: cv_js::Value, what_to_show: u32, filter: cv_js::Value) -> cv_js::Value {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use cv_js::OrderedMap as HashMap;
+
+    let mut m: HashMap<String, cv_js::Value> = HashMap::new();
+    m.insert("root".into(), root.clone());
+    m.insert(
+        "whatToShow".into(),
+        cv_js::Value::Number(what_to_show as f64),
+    );
+    m.insert("filter".into(), filter);
+    m.insert("currentNode".into(), root);
+
+    // nextNode(): advance to the next ACCEPT node in pre-order from currentNode.
+    m.insert(
+        "nextNode".into(),
+        cv_js::native_fn_with_interp("nextNode", move |interp, _args| {
+            let walker = cv_js::current_native_this();
+            let cv_js::Value::Object(wo) = &walker else {
+                return Ok(cv_js::Value::Null);
+            };
+            let (root, what, filter, mut current) = {
+                let b = wo.borrow();
+                (
+                    b.get("root").cloned().unwrap_or(cv_js::Value::Null),
+                    match b.get("whatToShow") {
+                        Some(cv_js::Value::Number(n)) => *n as u32,
+                        _ => 0xFFFF_FFFF,
+                    },
+                    b.get("filter").cloned().unwrap_or(cv_js::Value::Null),
+                    b.get("currentNode").cloned().unwrap_or(cv_js::Value::Null),
+                )
+            };
+            loop {
+                let Some(next) = js_node_following(&current, &root) else {
+                    return Ok(cv_js::Value::Null);
+                };
+                current = next.clone();
+                if !node_matches_what_to_show(&next, what) {
+                    continue;
+                }
+                let verdict = run_node_filter(interp, &filter, &next);
+                if verdict == NF_ACCEPT {
+                    wo.borrow_mut().insert("currentNode".into(), next.clone());
+                    return Ok(next);
+                }
+                // REJECT and SKIP both continue in pre-order for nextNode
+                // (TreeWalker REJECT does NOT skip the subtree for next/previous
+                // *Node* the way it does for child navigation; the spec's
+                // traverse-children handles REJECT-prunes-subtree, but for
+                // nextNode/previousNode REJECT==SKIP).
+            }
+        }),
+    );
+    // firstChild(): first ACCEPT child of currentNode (descends).
+    m.insert(
+        "firstChild".into(),
+        cv_js::native_fn_with_interp("firstChild", move |interp, _args| {
+            let walker = cv_js::current_native_this();
+            let cv_js::Value::Object(wo) = &walker else {
+                return Ok(cv_js::Value::Null);
+            };
+            let (what, filter, current) = {
+                let b = wo.borrow();
+                (
+                    match b.get("whatToShow") {
+                        Some(cv_js::Value::Number(n)) => *n as u32,
+                        _ => 0xFFFF_FFFF,
+                    },
+                    b.get("filter").cloned().unwrap_or(cv_js::Value::Null),
+                    b.get("currentNode").cloned().unwrap_or(cv_js::Value::Null),
+                )
+            };
+            for child in js_node_children(&current) {
+                if node_matches_what_to_show(&child, what)
+                    && run_node_filter(interp, &filter, &child) == NF_ACCEPT
+                {
+                    wo.borrow_mut().insert("currentNode".into(), child.clone());
+                    return Ok(child);
+                }
+            }
+            Ok(cv_js::Value::Null)
+        }),
+    );
+    // parentNode(): nearest ACCEPT ancestor (not past root).
+    m.insert(
+        "parentNode".into(),
+        cv_js::native_fn_with_interp("parentNode", move |interp, _args| {
+            let walker = cv_js::current_native_this();
+            let cv_js::Value::Object(wo) = &walker else {
+                return Ok(cv_js::Value::Null);
+            };
+            let (root, what, filter, current) = {
+                let b = wo.borrow();
+                (
+                    b.get("root").cloned().unwrap_or(cv_js::Value::Null),
+                    match b.get("whatToShow") {
+                        Some(cv_js::Value::Number(n)) => *n as u32,
+                        _ => 0xFFFF_FFFF,
+                    },
+                    b.get("filter").cloned().unwrap_or(cv_js::Value::Null),
+                    b.get("currentNode").cloned().unwrap_or(cv_js::Value::Null),
+                )
+            };
+            let mut cur = current;
+            loop {
+                if cv_js::Value::strict_eq(&cur, &root) {
+                    return Ok(cv_js::Value::Null);
+                }
+                let Some(p) = js_node_parent(&cur) else {
+                    return Ok(cv_js::Value::Null);
+                };
+                if node_matches_what_to_show(&p, what)
+                    && run_node_filter(interp, &filter, &p) == NF_ACCEPT
+                {
+                    wo.borrow_mut().insert("currentNode".into(), p.clone());
+                    return Ok(p);
+                }
+                cur = p;
+            }
+        }),
+    );
+    // nextSibling()/previousSibling(): nearest ACCEPT sibling in that direction.
+    for (name, forward) in [("nextSibling", true), ("previousSibling", false)] {
+        m.insert(
+            name.into(),
+            cv_js::native_fn_with_interp(name, move |interp, _args| {
+                let walker = cv_js::current_native_this();
+                let cv_js::Value::Object(wo) = &walker else {
+                    return Ok(cv_js::Value::Null);
+                };
+                let (what, filter, current) = {
+                    let b = wo.borrow();
+                    (
+                        match b.get("whatToShow") {
+                            Some(cv_js::Value::Number(n)) => *n as u32,
+                            _ => 0xFFFF_FFFF,
+                        },
+                        b.get("filter").cloned().unwrap_or(cv_js::Value::Null),
+                        b.get("currentNode").cloned().unwrap_or(cv_js::Value::Null),
+                    )
+                };
+                let (Some(idx), Some(parent)) =
+                    (js_node_index(&current), js_node_parent(&current))
+                else {
+                    return Ok(cv_js::Value::Null);
+                };
+                let siblings = js_node_children(&parent);
+                let mut i = idx;
+                loop {
+                    let next_i = if forward {
+                        i.checked_add(1)
+                    } else {
+                        i.checked_sub(1)
+                    };
+                    let Some(ni) = next_i else {
+                        return Ok(cv_js::Value::Null);
+                    };
+                    let Some(sib) = siblings.get(ni) else {
+                        return Ok(cv_js::Value::Null);
+                    };
+                    i = ni;
+                    if node_matches_what_to_show(sib, what)
+                        && run_node_filter(interp, &filter, sib) == NF_ACCEPT
+                    {
+                        wo.borrow_mut().insert("currentNode".into(), sib.clone());
+                        return Ok(sib.clone());
+                    }
+                }
+            }),
+        );
+    }
+    // lastChild(): last ACCEPT child of currentNode (descends to the end).
+    m.insert(
+        "lastChild".into(),
+        cv_js::native_fn_with_interp("lastChild", move |interp, _args| {
+            let walker = cv_js::current_native_this();
+            let cv_js::Value::Object(wo) = &walker else {
+                return Ok(cv_js::Value::Null);
+            };
+            let (what, filter, current) = {
+                let b = wo.borrow();
+                (
+                    match b.get("whatToShow") {
+                        Some(cv_js::Value::Number(n)) => *n as u32,
+                        _ => 0xFFFF_FFFF,
+                    },
+                    b.get("filter").cloned().unwrap_or(cv_js::Value::Null),
+                    b.get("currentNode").cloned().unwrap_or(cv_js::Value::Null),
+                )
+            };
+            for child in js_node_children(&current).into_iter().rev() {
+                if node_matches_what_to_show(&child, what)
+                    && run_node_filter(interp, &filter, &child) == NF_ACCEPT
+                {
+                    wo.borrow_mut().insert("currentNode".into(), child.clone());
+                    return Ok(child);
+                }
+            }
+            Ok(cv_js::Value::Null)
+        }),
+    );
+    // previousNode(): the previous ACCEPT node in pre-order from currentNode
+    // (§6.1). Mirrors nextNode backward; REJECT==SKIP for previousNode.
+    m.insert(
+        "previousNode".into(),
+        cv_js::native_fn_with_interp("previousNode", move |interp, _args| {
+            let walker = cv_js::current_native_this();
+            let cv_js::Value::Object(wo) = &walker else {
+                return Ok(cv_js::Value::Null);
+            };
+            let (root, what, filter, mut current) = {
+                let b = wo.borrow();
+                (
+                    b.get("root").cloned().unwrap_or(cv_js::Value::Null),
+                    match b.get("whatToShow") {
+                        Some(cv_js::Value::Number(n)) => *n as u32,
+                        _ => 0xFFFF_FFFF,
+                    },
+                    b.get("filter").cloned().unwrap_or(cv_js::Value::Null),
+                    b.get("currentNode").cloned().unwrap_or(cv_js::Value::Null),
+                )
+            };
+            loop {
+                let Some(prev) = js_node_preceding(&current, &root) else {
+                    return Ok(cv_js::Value::Null);
+                };
+                current = prev.clone();
+                if node_matches_what_to_show(&prev, what)
+                    && run_node_filter(interp, &filter, &prev) == NF_ACCEPT
+                {
+                    wo.borrow_mut().insert("currentNode".into(), prev.clone());
+                    return Ok(prev);
+                }
+            }
+        }),
+    );
+
+    cv_js::Value::Object(Rc::new(RefCell::new(m)))
+}
+
+/// Build a NodeIterator (WHATWG DOM §6.1) over the live JS DOM rooted at
+/// `root`. Implements `nextNode`/`previousNode` over a pre-order traversal with
+/// a "reference node + pointer-before-reference" model (simplified: we keep the
+/// reference node and a `before` flag).
+fn make_node_iterator_js(
+    root: cv_js::Value,
+    what_to_show: u32,
+    filter: cv_js::Value,
+) -> cv_js::Value {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use cv_js::OrderedMap as HashMap;
+
+    let mut m: HashMap<String, cv_js::Value> = HashMap::new();
+    m.insert("root".into(), root.clone());
+    m.insert(
+        "whatToShow".into(),
+        cv_js::Value::Number(what_to_show as f64),
+    );
+    m.insert("filter".into(), filter);
+    m.insert("referenceNode".into(), root.clone());
+    m.insert("pointerBeforeReferenceNode".into(), cv_js::Value::Bool(true));
+
+    m.insert(
+        "nextNode".into(),
+        cv_js::native_fn_with_interp("nextNode", move |interp, _args| {
+            let it = cv_js::current_native_this();
+            let cv_js::Value::Object(io) = &it else {
+                return Ok(cv_js::Value::Null);
+            };
+            let (root, what, filter, reference, before) = {
+                let b = io.borrow();
+                (
+                    b.get("root").cloned().unwrap_or(cv_js::Value::Null),
+                    match b.get("whatToShow") {
+                        Some(cv_js::Value::Number(n)) => *n as u32,
+                        _ => 0xFFFF_FFFF,
+                    },
+                    b.get("filter").cloned().unwrap_or(cv_js::Value::Null),
+                    b.get("referenceNode").cloned().unwrap_or(cv_js::Value::Null),
+                    matches!(
+                        b.get("pointerBeforeReferenceNode"),
+                        Some(cv_js::Value::Bool(true))
+                    ),
+                )
+            };
+            // §6.1 "traverse": if pointer is before reference, the first
+            // candidate is the reference node itself; else the following node.
+            let mut candidate = if before {
+                reference.clone()
+            } else {
+                match js_node_following(&reference, &root) {
+                    Some(n) => n,
+                    None => return Ok(cv_js::Value::Null),
+                }
+            };
+            loop {
+                if node_matches_what_to_show(&candidate, what)
+                    && run_node_filter(interp, &filter, &candidate) == NF_ACCEPT
+                {
+                    let mut b = io.borrow_mut();
+                    b.insert("referenceNode".into(), candidate.clone());
+                    b.insert(
+                        "pointerBeforeReferenceNode".into(),
+                        cv_js::Value::Bool(false),
+                    );
+                    return Ok(candidate);
+                }
+                match js_node_following(&candidate, &root) {
+                    Some(n) => candidate = n,
+                    None => return Ok(cv_js::Value::Null),
+                }
+            }
+        }),
+    );
+    // previousNode(): the previous ACCEPT node in pre-order (§6.1 "traverse"
+    // backward). If the pointer is AFTER the reference, the first candidate is
+    // the reference node; else the preceding node.
+    m.insert(
+        "previousNode".into(),
+        cv_js::native_fn_with_interp("previousNode", move |interp, _args| {
+            let it = cv_js::current_native_this();
+            let cv_js::Value::Object(io) = &it else {
+                return Ok(cv_js::Value::Null);
+            };
+            let (root, what, filter, reference, before) = {
+                let b = io.borrow();
+                (
+                    b.get("root").cloned().unwrap_or(cv_js::Value::Null),
+                    match b.get("whatToShow") {
+                        Some(cv_js::Value::Number(n)) => *n as u32,
+                        _ => 0xFFFF_FFFF,
+                    },
+                    b.get("filter").cloned().unwrap_or(cv_js::Value::Null),
+                    b.get("referenceNode").cloned().unwrap_or(cv_js::Value::Null),
+                    matches!(
+                        b.get("pointerBeforeReferenceNode"),
+                        Some(cv_js::Value::Bool(true))
+                    ),
+                )
+            };
+            let mut candidate = if !before {
+                reference.clone()
+            } else {
+                match js_node_preceding(&reference, &root) {
+                    Some(n) => n,
+                    None => return Ok(cv_js::Value::Null),
+                }
+            };
+            loop {
+                if node_matches_what_to_show(&candidate, what)
+                    && run_node_filter(interp, &filter, &candidate) == NF_ACCEPT
+                {
+                    let mut b = io.borrow_mut();
+                    b.insert("referenceNode".into(), candidate.clone());
+                    b.insert(
+                        "pointerBeforeReferenceNode".into(),
+                        cv_js::Value::Bool(true),
+                    );
+                    return Ok(candidate);
+                }
+                match js_node_preceding(&candidate, &root) {
+                    Some(n) => candidate = n,
+                    None => return Ok(cv_js::Value::Null),
+                }
+            }
+        }),
+    );
+    m.insert(
+        "detach".into(),
+        cv_js::native_fn("detach", |_| Ok(cv_js::Value::Undefined)),
+    );
+
+    cv_js::Value::Object(Rc::new(RefCell::new(m)))
+}
+
+/// Build the singleton Selection object (Selection API). It holds an internal
+/// list of Ranges (shared `Rc<RefCell<Vec<Range>>>`) so reads (rangeCount,
+/// getRangeAt, anchorNode/focusNode, toString) reflect the live selection.
+/// Methods: getRangeAt, addRange, removeAllRanges, removeRange,
+/// collapse/collapseToStart/collapseToEnd, selectAllChildren, toString.
+/// (Selection API, https://w3c.github.io/selection-api/.)
+fn make_selection_js() -> cv_js::Value {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use cv_js::OrderedMap as HashMap;
+
+    let ranges: Rc<RefCell<Vec<cv_js::Value>>> = Rc::new(RefCell::new(Vec::new()));
+    let mut m: HashMap<String, cv_js::Value> = HashMap::new();
+    m.insert("\u{1}isSelection".into(), cv_js::Value::Bool(true));
+    m.insert("type".into(), cv_js::Value::String("None".into()));
+
+    // The Selection's anchor/focus + rangeCount are derived live from its range
+    // list; we recompute them on every mutation via the `refresh` helper below.
+    // rangeCount is read frequently; refresh it on every mutation. For reads
+    // before any mutation it's 0. We also publish anchorNode/focusNode/isCollapsed.
+    let refresh = move |sel_map: &Rc<RefCell<HashMap<String, cv_js::Value>>>,
+                        rs: &Rc<RefCell<Vec<cv_js::Value>>>| {
+        let rv = rs.borrow();
+        let count = rv.len();
+        let (anchor, anchor_off, focus, focus_off, collapsed) = if let Some(r0) = rv.first() {
+            let (sc, so) = range_boundary(r0, "start");
+            let (ec, eo) = range_boundary(r0, "end");
+            let coll = cv_js::Value::strict_eq(&sc, &ec) && so == eo;
+            (sc, so, ec, eo, coll)
+        } else {
+            (cv_js::Value::Null, 0, cv_js::Value::Null, 0, true)
+        };
+        let mut sm = sel_map.borrow_mut();
+        sm.insert("rangeCount".into(), cv_js::Value::Number(count as f64));
+        sm.insert("anchorNode".into(), anchor);
+        sm.insert("anchorOffset".into(), cv_js::Value::Number(anchor_off as f64));
+        sm.insert("focusNode".into(), focus);
+        sm.insert("focusOffset".into(), cv_js::Value::Number(focus_off as f64));
+        sm.insert("isCollapsed".into(), cv_js::Value::Bool(collapsed));
+        sm.insert(
+            "type".into(),
+            cv_js::Value::String(if count == 0 {
+                "None".into()
+            } else if collapsed {
+                "Caret".into()
+            } else {
+                "Range".into()
+            }),
+        );
+    };
+
+    // Seed the public fields.
+    m.insert("rangeCount".into(), cv_js::Value::Number(0.0));
+    m.insert("anchorNode".into(), cv_js::Value::Null);
+    m.insert("anchorOffset".into(), cv_js::Value::Number(0.0));
+    m.insert("focusNode".into(), cv_js::Value::Null);
+    m.insert("focusOffset".into(), cv_js::Value::Number(0.0));
+    m.insert("isCollapsed".into(), cv_js::Value::Bool(true));
+
+    let sel_rc: Rc<RefCell<HashMap<String, cv_js::Value>>> = Rc::new(RefCell::new(m));
+
+    // getRangeAt(index).
+    {
+        let rs = ranges.clone();
+        sel_rc.borrow_mut().insert(
+            "getRangeAt".into(),
+            cv_js::native_fn("getRangeAt", move |args| {
+                let idx = args.first().map(|v| v.to_number() as usize).unwrap_or(0);
+                match rs.borrow().get(idx).cloned() {
+                    Some(r) => Ok(r),
+                    None => Err(cv_js::JsError::Throw(make_dom_exception(
+                        "IndexSizeError",
+                        1,
+                        "getRangeAt: index out of range",
+                    ))),
+                }
+            }),
+        );
+    }
+    // addRange(range).
+    {
+        let rs = ranges.clone();
+        let sel = sel_rc.clone();
+        let refresh = refresh.clone();
+        sel_rc.borrow_mut().insert(
+            "addRange".into(),
+            cv_js::native_fn("addRange", move |args| {
+                if let Some(r) = args.first() {
+                    rs.borrow_mut().push(r.clone());
+                    refresh(&sel, &rs);
+                }
+                Ok(cv_js::Value::Undefined)
+            }),
+        );
+    }
+    // removeAllRanges() / empty().
+    {
+        let rs = ranges.clone();
+        let sel = sel_rc.clone();
+        let refresh = refresh.clone();
+        let clear = cv_js::native_fn("removeAllRanges", move |_| {
+            rs.borrow_mut().clear();
+            refresh(&sel, &rs);
+            Ok(cv_js::Value::Undefined)
+        });
+        sel_rc
+            .borrow_mut()
+            .insert("removeAllRanges".into(), clear.clone());
+        sel_rc.borrow_mut().insert("empty".into(), clear);
+    }
+    // removeRange(range).
+    {
+        let rs = ranges.clone();
+        let sel = sel_rc.clone();
+        let refresh = refresh.clone();
+        sel_rc.borrow_mut().insert(
+            "removeRange".into(),
+            cv_js::native_fn("removeRange", move |args| {
+                if let Some(target) = args.first() {
+                    rs.borrow_mut()
+                        .retain(|r| !cv_js::Value::strict_eq(r, target));
+                    refresh(&sel, &rs);
+                }
+                Ok(cv_js::Value::Undefined)
+            }),
+        );
+    }
+    // collapse(node, offset) — replace the selection with a collapsed range.
+    {
+        let rs = ranges.clone();
+        let sel = sel_rc.clone();
+        let refresh = refresh.clone();
+        sel_rc.borrow_mut().insert(
+            "collapse".into(),
+            cv_js::native_fn("collapse", move |args| {
+                let node = args.first().cloned().unwrap_or(cv_js::Value::Null);
+                let offset = args.get(1).map(|v| v.to_number() as usize).unwrap_or(0);
+                if matches!(node, cv_js::Value::Null) {
+                    rs.borrow_mut().clear();
+                } else {
+                    let r = make_range_js(node.clone());
+                    range_set_boundary(&r, "start", node.clone(), offset);
+                    range_set_boundary(&r, "end", node, offset);
+                    *rs.borrow_mut() = vec![r];
+                }
+                refresh(&sel, &rs);
+                Ok(cv_js::Value::Undefined)
+            }),
+        );
+    }
+    // selectAllChildren(node) — select node's contents.
+    {
+        let rs = ranges.clone();
+        let sel = sel_rc.clone();
+        let refresh = refresh.clone();
+        sel_rc.borrow_mut().insert(
+            "selectAllChildren".into(),
+            cv_js::native_fn("selectAllChildren", move |args| {
+                let node = args.first().cloned().unwrap_or(cv_js::Value::Null);
+                let len = js_node_length(&node);
+                let r = make_range_js(node.clone());
+                range_set_boundary(&r, "start", node.clone(), 0);
+                range_set_boundary(&r, "end", node, len);
+                *rs.borrow_mut() = vec![r];
+                refresh(&sel, &rs);
+                Ok(cv_js::Value::Undefined)
+            }),
+        );
+    }
+    // toString() — concatenated text of all ranges (Selection stringifier).
+    {
+        let rs = ranges.clone();
+        sel_rc.borrow_mut().insert(
+            "toString".into(),
+            cv_js::native_fn("toString", move |_| {
+                let text: String = rs.borrow().iter().map(range_to_string).collect();
+                Ok(cv_js::Value::str(text))
+            }),
+        );
+    }
+    // extend(node, offset) — move the focus boundary of the current range.
+    {
+        let rs = ranges.clone();
+        let sel = sel_rc.clone();
+        let refresh = refresh.clone();
+        sel_rc.borrow_mut().insert(
+            "extend".into(),
+            cv_js::native_fn("extend", move |args| {
+                let node = args.first().cloned().unwrap_or(cv_js::Value::Null);
+                let offset = args.get(1).map(|v| v.to_number() as usize).unwrap_or(0);
+                if let Some(r) = rs.borrow().first() {
+                    range_set_boundary(r, "end", node, offset);
+                }
+                refresh(&sel, &rs);
+                Ok(cv_js::Value::Undefined)
+            }),
+        );
+    }
+
+    cv_js::Value::Object(sel_rc)
+}
+
 fn make_text_node_js(text: &str) -> cv_js::Value {
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -36825,6 +38102,65 @@ fn install_dom_api(
         Ok(make_document_fragment_js(&pending_for_fragment))
     });
 
+    // document.createRange() — WHATWG DOM §5.5: a Range whose boundaries are
+    // (the document, 0). Real boundary-point model (make_range_js).
+    let doc_for_range = interp
+        .get_global("document")
+        .unwrap_or(cv_js::Value::Null);
+    let create_range = cv_js::native_fn("createRange", move |_args| {
+        Ok(make_range_js(doc_for_range.clone()))
+    });
+
+    // document.createTreeWalker(root, whatToShow?, filter?) — WHATWG DOM §6.1.
+    // Backed by the live JS DOM walk in make_tree_walker_js.
+    let create_tree_walker = cv_js::native_fn("createTreeWalker", move |args| {
+        let root = args.first().cloned().unwrap_or(cv_js::Value::Null);
+        let what_to_show = args
+            .get(1)
+            .map(|v| v.to_number() as u32)
+            .unwrap_or(0xFFFF_FFFF);
+        let filter = args.get(2).cloned().unwrap_or(cv_js::Value::Null);
+        Ok(make_tree_walker_js(root, what_to_show, filter))
+    });
+
+    // document.createNodeIterator(root, whatToShow?, filter?) — WHATWG DOM §6.1.
+    let create_node_iterator = cv_js::native_fn("createNodeIterator", move |args| {
+        let root = args.first().cloned().unwrap_or(cv_js::Value::Null);
+        let what_to_show = args
+            .get(1)
+            .map(|v| v.to_number() as u32)
+            .unwrap_or(0xFFFF_FFFF);
+        let filter = args.get(2).cloned().unwrap_or(cv_js::Value::Null);
+        Ok(make_node_iterator_js(root, what_to_show, filter))
+    });
+
+    // document.elementFromPoint(x, y) / elementsFromPoint(x, y) — CSSOM View.
+    // Hit-tests the post-layout element table (ELEMENT_HIT_ORDER), returning the
+    // topmost element (or null) under the viewport-relative point.
+    let element_from_point = cv_js::native_fn("elementFromPoint", move |args| {
+        let x = args.first().map(|v| v.to_number()).unwrap_or(f64::NAN);
+        let y = args.get(1).map(|v| v.to_number()).unwrap_or(f64::NAN);
+        if x.is_nan() || y.is_nan() {
+            return Ok(cv_js::Value::Null);
+        }
+        Ok(elements_from_point(x, y)
+            .into_iter()
+            .next()
+            .unwrap_or(cv_js::Value::Null))
+    });
+    let elements_from_point_fn = cv_js::native_fn("elementsFromPoint", move |args| {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let x = args.first().map(|v| v.to_number()).unwrap_or(f64::NAN);
+        let y = args.get(1).map(|v| v.to_number()).unwrap_or(f64::NAN);
+        let hits = if x.is_nan() || y.is_nan() {
+            Vec::new()
+        } else {
+            elements_from_point(x, y)
+        };
+        Ok(cv_js::Value::Array(Rc::new(RefCell::new(hits))))
+    });
+
     // Per-existing-element appendChild + setAttribute + getAttribute.
     {
         let document = interp
@@ -38571,6 +39907,20 @@ fn install_dom_api(
         m.insert("createElementNS".into(), create_element_ns);
         m.insert("createTextNode".into(), create_text_node);
         m.insert("createDocumentFragment".into(), create_document_fragment);
+        m.insert("createRange".into(), create_range);
+        m.insert("createTreeWalker".into(), create_tree_walker);
+        m.insert("createNodeIterator".into(), create_node_iterator);
+        m.insert("elementFromPoint".into(), element_from_point);
+        m.insert("elementsFromPoint".into(), elements_from_point_fn);
+        // document.getSelection() returns the SAME singleton as window.getSelection().
+        m.insert(
+            "getSelection".into(),
+            cv_js::native_fn("getSelection", |_| {
+                Ok(CURRENT_SELECTION
+                    .with(|c| c.borrow().clone())
+                    .unwrap_or(cv_js::Value::Null))
+            }),
+        );
 
         // document.write / document.writeln — HTML Standard §3.2.5.2. For an
         // OPEN document (during load), writes are inserted at the parser's
@@ -61163,6 +62513,19 @@ mod observer_tests {
     use cv_js::OrderedMap;
     use cv_js::Value;
 
+    /// Run `script` in a fresh LiveInterp against `html`, then evaluate
+    /// `read_expr` and return its display string. (Local twin of the helper in
+    /// `mod tests`, since that one is private to its module.)
+    fn run_and_read(html: &str, script: &str, read_expr: &str) -> String {
+        let doc = cv_html::parse(html);
+        let mut rt = LiveInterp::new(&doc, "https://dom.test/");
+        rt.run_script(script);
+        rt.interp
+            .run_completion_value(read_expr)
+            .map(|v| v.to_display_string())
+            .unwrap_or_else(|e| format!("<error: {e:?}>"))
+    }
+
     /// A minimal but VALID `LayoutBox` at a known document-space rect + path.
     /// Built by cloning a real layout-tree root (so every field is the genuine
     /// engine default) and overriding only `content`, `element_path`, padding,
@@ -61737,5 +63100,278 @@ mod observer_tests {
             other => panic!("{other:?}"),
         };
         assert!(r <= 50.0, "timeRemaining capped at 50ms, got {r}");
+    }
+
+    // ===================================================================
+    // Range / Selection / TreeWalker / NodeIterator / elementFromPoint
+    // (WHATWG DOM §5 + §6, Selection API, CSSOM View)
+    // ===================================================================
+
+    // setStart(t,2)/setEnd(t,5) over a Text node "Hello World" → toString() is
+    // the 3-char slice "llo", and collapsed === false. (DOM §5.5 stringifier:
+    // start==end Text node → data[startOffset..endOffset].)
+    #[test]
+    fn range_text_slice_and_collapsed() {
+        let out = run_and_read(
+            "<html><body><p id=t></p></body></html>",
+            "globalThis.__t = document.createTextNode('Hello World');\
+             document.getElementById('t').appendChild(globalThis.__t);\
+             globalThis.__r = document.createRange();\
+             globalThis.__r.setStart(globalThis.__t, 2);\
+             globalThis.__r.setEnd(globalThis.__t, 5);",
+            "[globalThis.__r.toString(), globalThis.__r.collapsed, \
+              globalThis.__r.startOffset, globalThis.__r.endOffset].join('|')",
+        );
+        assert_eq!(out, "llo|false|2|5", "Range slice/collapsed/offsets");
+    }
+
+    // selectNodeContents then collapse(true) → collapsed === true and
+    // start/end offsets equal (DOM §5.5 collapse).
+    #[test]
+    fn range_select_contents_then_collapse() {
+        let out = run_and_read(
+            "<html><body><p id=t></p></body></html>",
+            "globalThis.__t = document.createTextNode('abcdef');\
+             document.getElementById('t').appendChild(globalThis.__t);\
+             globalThis.__r = document.createRange();\
+             globalThis.__r.selectNodeContents(globalThis.__t);\
+             globalThis.__before = globalThis.__r.collapsed + ',' + globalThis.__r.endOffset;\
+             globalThis.__r.collapse(true);",
+            "[globalThis.__before, globalThis.__r.collapsed, \
+              (globalThis.__r.startOffset === globalThis.__r.endOffset)].join('|')",
+        );
+        // Before collapse: not collapsed, end offset = 6 (length). After: collapsed,
+        // offsets equal.
+        assert_eq!(out, "false,6|true|true", "selectNodeContents + collapse");
+    }
+
+    // cloneRange() produces an independent Range with identical boundaries +
+    // identical toString().
+    #[test]
+    fn range_clone_is_equivalent() {
+        let out = run_and_read(
+            "<html><body><p id=t></p></body></html>",
+            "globalThis.__t = document.createTextNode('Hello World');\
+             document.getElementById('t').appendChild(globalThis.__t);\
+             var r = document.createRange();\
+             r.setStart(globalThis.__t, 0); r.setEnd(globalThis.__t, 5);\
+             globalThis.__c = r.cloneRange();\
+             r.setEnd(globalThis.__t, 11);",
+            // The clone keeps its OWN end (5), unaffected by mutating the original.
+            "[globalThis.__c.toString(), globalThis.__c.endOffset].join('|')",
+        );
+        assert_eq!(out, "Hello|5", "cloneRange independent boundaries");
+    }
+
+    // new Range() works as a constructor and toString of an empty (collapsed)
+    // range is "".
+    #[test]
+    fn range_constructor_empty_tostring() {
+        let out = run_and_read(
+            "<html><body></body></html>",
+            "globalThis.__r = new Range();",
+            "[typeof globalThis.__r, globalThis.__r.collapsed, globalThis.__r.toString()].join('|')",
+        );
+        assert_eq!(out, "object|true|", "new Range() collapsed empty");
+    }
+
+    // createTreeWalker(root, SHOW_ELEMENT).nextNode walks ELEMENTS only,
+    // skipping text nodes (DOM §6.1, whatToShow ELEMENT = 0x1).
+    #[test]
+    fn tree_walker_show_element_walks_elements() {
+        let out = run_and_read(
+            "<html><body><div id=root><p>one</p>text<span>two</span></div></body></html>",
+            "var root = document.getElementById('root');\
+             var w = document.createTreeWalker(root, 1 /* SHOW_ELEMENT */, null);\
+             var names = [];\
+             var n;\
+             while ((n = w.nextNode())) { names.push(n.tagName || n.nodeName); }\
+             globalThis.__names = names.join(',').toUpperCase();",
+            "globalThis.__names",
+        );
+        assert_eq!(out, "P,SPAN", "TreeWalker SHOW_ELEMENT visits only elements");
+    }
+
+    // createTreeWalker firstChild / parentNode navigate the tree.
+    #[test]
+    fn tree_walker_first_child_and_parent() {
+        let out = run_and_read(
+            "<html><body><div id=root><p id=kid>x</p></div></body></html>",
+            "var root = document.getElementById('root');\
+             var w = document.createTreeWalker(root, 1, null);\
+             var fc = w.firstChild();\
+             var fcName = fc ? (fc.tagName||fc.nodeName) : 'null';\
+             var par = w.parentNode();\
+             var parIsRoot = (par === root);\
+             globalThis.__r = (fcName + '|' + parIsRoot).toUpperCase();",
+            "globalThis.__r",
+        );
+        assert_eq!(out, "P|TRUE", "firstChild=P, parentNode back to root");
+    }
+
+    // createNodeIterator(root, SHOW_TEXT).nextNode walks Text nodes.
+    #[test]
+    fn node_iterator_show_text_walks_text() {
+        let out = run_and_read(
+            "<html><body><div id=root><p>one</p>two</div></body></html>",
+            "var root = document.getElementById('root');\
+             var it = document.createNodeIterator(root, 4 /* SHOW_TEXT */, null);\
+             var texts = [];\
+             var n;\
+             while ((n = it.nextNode())) { texts.push(n.data || n.nodeValue); }\
+             globalThis.__t = texts.join('|');",
+            "globalThis.__t",
+        );
+        assert_eq!(out, "one|two", "NodeIterator SHOW_TEXT visits text nodes");
+    }
+
+    // NodeIterator nextNode then previousNode round-trips: after stepping to the
+    // first text node and back, previousNode returns null (we're at the start).
+    #[test]
+    fn node_iterator_previous_node_walks_back() {
+        let out = run_and_read(
+            "<html><body><div id=root><span>a</span><span>b</span></div></body></html>",
+            "var root = document.getElementById('root');\
+             var it = document.createNodeIterator(root, 1 /* SHOW_ELEMENT */, null);\
+             var first = it.nextNode();   /* root (matches ELEMENT) */\
+             var second = it.nextNode();  /* first span */\
+             var third = it.nextNode();   /* second span */\
+             var back = it.previousNode();/* second span again */\
+             globalThis.__r = [\
+               first === root,\
+               (back === third)\
+             ].join('|');",
+            "globalThis.__r",
+        );
+        assert_eq!(out, "true|true", "NodeIterator previousNode round-trip");
+    }
+
+    // TreeWalker lastChild() descends to the last accepting child.
+    #[test]
+    fn tree_walker_last_child() {
+        let out = run_and_read(
+            "<html><body><div id=root><p>a</p><span id=last>b</span></div></body></html>",
+            "var root = document.getElementById('root');\
+             var w = document.createTreeWalker(root, 1, null);\
+             var lc = w.lastChild();\
+             globalThis.__r = lc ? (lc.id || lc.tagName) : 'null';",
+            "globalThis.__r",
+        );
+        assert_eq!(out, "last", "TreeWalker lastChild = #last span");
+    }
+
+    // A NodeFilter object whose acceptNode REJECTs <p> elements is honored by
+    // the TreeWalker.
+    #[test]
+    fn tree_walker_node_filter_rejects() {
+        let out = run_and_read(
+            "<html><body><div id=root><p>a</p><span>b</span></div></body></html>",
+            "var root = document.getElementById('root');\
+             var w = document.createTreeWalker(root, 1, {\
+               acceptNode: function(node){\
+                 return (node.tagName||node.nodeName).toLowerCase()==='p' ? 2 /*REJECT*/ : 1 /*ACCEPT*/;\
+               }\
+             });\
+             var names=[]; var n;\
+             while ((n=w.nextNode())) names.push((n.tagName||n.nodeName).toUpperCase());\
+             globalThis.__n = names.join(',');",
+            "globalThis.__n",
+        );
+        assert_eq!(out, "SPAN", "NodeFilter REJECT drops <p>");
+    }
+
+    // window.getSelection() / document.getSelection() return the SAME singleton;
+    // addRange/rangeCount/getRangeAt/toString/removeAllRanges work.
+    #[test]
+    fn selection_singleton_addrange_tostring() {
+        let out = run_and_read(
+            "<html><body><p id=t></p></body></html>",
+            "globalThis.__same = (window.getSelection() === document.getSelection());\
+             var t = document.createTextNode('Hello World');\
+             document.getElementById('t').appendChild(t);\
+             var r = document.createRange(); r.setStart(t,0); r.setEnd(t,5);\
+             var sel = window.getSelection();\
+             sel.removeAllRanges();\
+             sel.addRange(r);\
+             globalThis.__count = sel.rangeCount;\
+             globalThis.__str = sel.toString();\
+             globalThis.__got = (sel.getRangeAt(0) === r);\
+             sel.removeAllRanges();\
+             globalThis.__after = sel.rangeCount;",
+            "[globalThis.__same, globalThis.__count, globalThis.__str, globalThis.__got, globalThis.__after].join('|')",
+        );
+        assert_eq!(
+            out, "true|1|Hello|true|0",
+            "Selection singleton + addRange/toString/getRangeAt/removeAllRanges"
+        );
+    }
+
+    // createRange().getBoundingClientRect() over a laid-out element returns a
+    // non-zero width when the element has size. Uses the full render pipeline so
+    // the per-element bcr metrics are populated.
+    #[test]
+    fn range_bounding_rect_nonzero_for_laid_out_element() {
+        let html = "<!doctype html><html><head><style>html,body{margin:0;padding:0}\
+                    #box{width:200px;height:50px}</style></head><body>\
+                    <div id=box>Hello World</div>\
+                    <script>\
+                      var box = document.getElementById('box');\
+                      var r = document.createRange();\
+                      r.selectNodeContents(box);\
+                      var rect = r.getBoundingClientRect();\
+                      document.title = [rect.width, rect.height].join('x');\
+                    </script></body></html>";
+        let cfg = cv_layout::LayoutConfig::default();
+        let (runtime, _doc, _sheets, _paint) =
+            build_runtime_and_first_paint(html, "https://example.com/", &cfg, "")
+                .expect("render ok");
+        let title = runtime.title_override().unwrap_or_default();
+        // The box is 200x50; the range over its contents must report that size
+        // (non-zero width is the load-bearing assertion).
+        let parts: Vec<&str> = title.split('x').collect();
+        assert_eq!(parts.len(), 2, "title = WxH, got {title:?}");
+        let w: f64 = parts[0].parse().unwrap_or(0.0);
+        let h: f64 = parts[1].parse().unwrap_or(0.0);
+        assert!(w >= 200.0, "range bcr width >= 200, got {w} (title {title:?})");
+        assert!(h >= 50.0, "range bcr height >= 50, got {h} (title {title:?})");
+    }
+
+    // document.elementFromPoint(x,y) over a known element returns THAT element.
+    #[test]
+    fn element_from_point_returns_topmost() {
+        let html = "<!doctype html><html><head><style>html,body{margin:0;padding:0}\
+                    #target{position:absolute;left:0;top:0;width:100px;height:100px}\
+                    </style></head><body>\
+                    <div id=target>hit me</div>\
+                    <script>\
+                      var el = document.elementFromPoint(10, 10);\
+                      document.title = el ? (el.id || el.tagName || 'noid') : 'null';\
+                    </script></body></html>";
+        let cfg = cv_layout::LayoutConfig::default();
+        let (runtime, _doc, _sheets, _paint) =
+            build_runtime_and_first_paint(html, "https://example.com/", &cfg, "")
+                .expect("render ok");
+        let title = runtime.title_override().unwrap_or_default();
+        assert_eq!(title, "target", "elementFromPoint(10,10) → #target");
+    }
+
+    // elementFromPoint with an out-of-bounds / negative coordinate returns null
+    // (CSSOM View: negative or out-of-viewport → null).
+    #[test]
+    fn element_from_point_out_of_bounds_null() {
+        let html = "<!doctype html><html><head><style>html,body{margin:0;padding:0}\
+                    #target{width:100px;height:100px}</style></head><body>\
+                    <div id=target>x</div>\
+                    <script>\
+                      var a = document.elementFromPoint(-5, -5);\
+                      var b = document.elementFromPoint(99999, 99999);\
+                      document.title = (a===null?'n':'?') + '|' + (b===null?'n':'?');\
+                    </script></body></html>";
+        let cfg = cv_layout::LayoutConfig::default();
+        let (runtime, _doc, _sheets, _paint) =
+            build_runtime_and_first_paint(html, "https://example.com/", &cfg, "")
+                .expect("render ok");
+        let title = runtime.title_override().unwrap_or_default();
+        assert_eq!(title, "n|n", "negative + far-out points → null");
     }
 }
