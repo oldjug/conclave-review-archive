@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Conclave bench — small static</title>
+<style>
+  body { margin: 0; padding: 16px; font-family: Arial, sans-serif; color: #222; background: #fff; }
+  h1 { font-size: 28px; margin: 0 0 12px; color: #0b5; }
+  h2 { font-size: 20px; margin: 18px 0 8px; }
+  p { font-size: 14px; line-height: 1.5; margin: 0 0 10px; max-width: 640px; }
+  .lead { font-weight: bold; color: #444; }
+  table { border-collapse: collapse; margin: 12px 0; }
+  th, td { border: 1px solid #ccc; padding: 4px 10px; font-size: 13px; text-align: left; }
+  th { background: #f3f3f3; }
+  .box { display: inline-block; width: 60px; height: 40px; margin: 4px; background: #cde; border: 1px solid #9ab; }
+</style>
+</head>
+<body>
+  <h1>Small Static Page</h1>
+  <p class="lead">A fixed ~30-node page exercising parse, cascade, layout, and bake with no JavaScript.</p>
+  <p>This input is the TTFP and repeat-load baseline. It must never change, because changing it would
+     invalidate the committed performance baseline. If it must change, bump the bench schema.</p>
+  <h2>A small table</h2>
+  <table>
+    <thead><tr><th>Metric</th><th>Unit</th><th>Axis</th></tr></thead>
+    <tbody>
+      <tr><td>TTFP</td><td>ms</td><td>first paint</td></tr>
+      <tr><td>Repeat load</td><td>ratio</td><td>skip-not-redo</td></tr>
+      <tr><td>Animation</td><td>ms</td><td>damage raster</td></tr>
+      <tr><td>JS exec</td><td>ms</td><td>JIT vs VM</td></tr>
+    </tbody>
+  </table>
+  <h2>A few boxes</h2>
+  <div>
+    <span class="box"></span><span class="box"></span><span class="box"></span>
+    <span class="box"></span><span class="box"></span><span class="box"></span>
+  </div>
+  <p>End of page.</p>
+</body>
+</html>

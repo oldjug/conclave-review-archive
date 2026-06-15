@@ -27,6 +27,7 @@ use cv_url::Url;
 
 mod scheduler;
 use scheduler::{SchedRef, Scheduler};
+mod bench;
 mod retained_dl;
 mod paint_cache;
 mod test262_driver;
@@ -613,9 +614,25 @@ fn main() -> ExitCode {
     handle.join().unwrap_or(ExitCode::from(70))
 }
 
+/// Process-start instant for the cold-startup bench metric. Set ONCE at the very
+/// top of `real_main()` so `--type bench` can measure `PROCESS_T0.elapsed()` at
+/// first-session-built and first-paint. This is a genuine cold-start sample (the
+/// OS/loader/static-init cost happens once per process), so it is reported with
+/// `samples: 1`; the orchestrator launches the bench process several times and
+/// averages across launches.
+static PROCESS_T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
 fn real_main() -> ExitCode {
+    let _ = PROCESS_T0.get_or_init(std::time::Instant::now);
     let cli = Cli::parse();
     match cli.flag("type").unwrap_or("browser") {
+        "bench" => match bench::run_bench(&cli) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("bench failed: {e}");
+                ExitCode::from(1)
+            }
+        },
         "fetch" => match run_fetch(&cli) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
@@ -49419,6 +49436,21 @@ thread_local! {
     /// (computed, reused) restyle counters for the last styled-tree build —
     /// exposed via CV_RESTYLE_STATS and asserted by tests.
     static RESTYLE_STATS: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// Reset the render thread-locals that persist across `render_with_existing_runtime`
+/// calls so a subsequent INDEPENDENT `build_runtime_and_first_paint` for an
+/// UNRELATED document starts cold — exactly as a fresh navigation does (the live
+/// browser never reuses one page's incremental style/layout cache for a different
+/// page; only `--type bench`, which builds several distinct documents back-to-back
+/// in one process, can observe the leftover thread-local and must clear it so each
+/// measured build is a true cold build, not one polluted by the prior document's
+/// node-id-keyed cache). Mirrors the per-build reset the live nav path gets from a
+/// fresh `LiveInterp` + arena rebuild.
+fn bench_reset_render_thread_locals() {
+    CURRENT_STYLE_CACHE.with(|c| *c.borrow_mut() = None);
+    CURRENT_RENDER_ARENA.with(|c| *c.borrow_mut() = None);
+    cv_layout::set_layout_cache(None, None, 0);
 }
 
 /// Cap on cached subtree entries; on overflow the cache is left as-is (new

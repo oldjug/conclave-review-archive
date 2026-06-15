@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Conclave bench — animation</title>
+<style>
+  body { margin: 0; padding: 0; background: #111; overflow: hidden; }
+  .stage { position: relative; width: 1200px; height: 600px; }
+  .box {
+    position: absolute;
+    width: 48px; height: 48px;
+    background: #4cf;
+    border-radius: 6px;
+  }
+  #b0 { top: 40px;  left: 0;   background: #f55; }
+  #b1 { top: 110px; left: 80px; }
+  #b2 { top: 180px; left: 80px; }
+  #b3 { top: 250px; left: 80px; }
+  #b4 { top: 320px; left: 80px; }
+  #b5 { top: 390px; left: 80px; }
+  #b6 { top: 460px; left: 80px; }
+  #b7 { top: 40px;  left: 200px; }
+  #b8 { top: 110px; left: 200px; }
+  #b9 { top: 180px; left: 200px; }
+</style>
+</head>
+<body>
+  <div class="stage">
+    <div class="box" id="b0"></div>
+    <div class="box" id="b1"></div>
+    <div class="box" id="b2"></div>
+    <div class="box" id="b3"></div>
+    <div class="box" id="b4"></div>
+    <div class="box" id="b5"></div>
+    <div class="box" id="b6"></div>
+    <div class="box" id="b7"></div>
+    <div class="box" id="b8"></div>
+    <div class="box" id="b9"></div>
+  </div>
+  <script>
+    // Single-node mutation per frame: resize only #b0's width. This is the
+    // damage-raster best case — exactly one box's geometry changes each frame,
+    // so the changed fraction of the document should be tiny. We animate `width`
+    // (a real layout-reaching property) rather than `left`/`transform` so the
+    // mutation genuinely flows through cascade -> layout -> paint and produces a
+    // real per-frame damage diff.
+    //
+    // Driven by requestAnimationFrame so EXACTLY one mutation happens per host
+    // frame tick: the bench ticks frames back-to-back with no real sleep, and a
+    // wall-clock setInterval would only fire when real time elapses, but a
+    // re-arming rAF advances exactly one frame per host tick — deterministic
+    // per-frame damage.
+    var b0 = document.getElementById('b0');
+    var w = 48;
+    function step() {
+      w = 40 + ((w - 40 + 3) % 80); // oscillate width in [40, 120)
+      b0.style.width = w + 'px';
+      requestAnimationFrame(step);
+    }
+    requestAnimationFrame(step);
+  </script>
+</body>
+</html>
