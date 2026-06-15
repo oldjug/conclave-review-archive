@@ -2924,6 +2924,8 @@ mod tests {
             text_shadow: None,
             filters: Vec::new(),
             backdrop_filters: Vec::new(),
+            mix_blend_mode: cv_layout::BlendMode::Normal,
+            background_blend_mode: cv_layout::BlendMode::Normal,
             animation_name: None,
             animation_duration_ms: 0.0,
             animation_delay_ms: 0.0,

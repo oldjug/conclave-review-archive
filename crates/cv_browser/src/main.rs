@@ -18354,6 +18354,13 @@ thread_local! {
     /// content. While this depth is > 0 the band cull is suppressed (the
     /// scroll container's own padding-box clip still bounds the work).
     static SCROLL_PAINT_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+
+    /// True while we are rasterizing a `mix-blend-mode` element's own subtree
+    /// into its isolation layer. The re-entrant `paint_box_offset_t` call for
+    /// the SAME box must then skip the blend block (it paints normally into the
+    /// transparent layer); the OUTER call composites that layer over the page
+    /// with the blend formula. Without this guard the box would recurse forever.
+    static MIX_BLEND_ROOT_DONE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Whether interest-rect (viewport-bounded) rastering is enabled. Default OFF
@@ -43679,6 +43686,16 @@ fn lower_style(
         text_shadow,
         filters,
         backdrop_filters,
+        mix_blend_mode: cs
+            .mix_blend_mode
+            .as_deref()
+            .map(cv_layout::BlendMode::from_str)
+            .unwrap_or(cv_layout::BlendMode::Normal),
+        background_blend_mode: cs
+            .background_blend_mode
+            .as_deref()
+            .map(cv_layout::BlendMode::from_str)
+            .unwrap_or(cv_layout::BlendMode::Normal),
         animation_name,
         animation_duration_ms,
         animation_delay_ms,
@@ -48017,6 +48034,29 @@ fn intersect_rect(a: &cv_layout::Rect, b: &cv_layout::Rect) -> Option<cv_layout:
     }
 }
 
+/// Map the layout crate's `BlendMode` (resolved at lower_style) to the gfx
+/// blend enum used by the rasterizer. CSS Compositing & Blending L1 §5/§6.
+fn blend_mode_to_gfx(m: cv_layout::BlendMode) -> cv_gfx::BlendMode {
+    match m {
+        cv_layout::BlendMode::Normal => cv_gfx::BlendMode::Normal,
+        cv_layout::BlendMode::Multiply => cv_gfx::BlendMode::Multiply,
+        cv_layout::BlendMode::Screen => cv_gfx::BlendMode::Screen,
+        cv_layout::BlendMode::Overlay => cv_gfx::BlendMode::Overlay,
+        cv_layout::BlendMode::Darken => cv_gfx::BlendMode::Darken,
+        cv_layout::BlendMode::Lighten => cv_gfx::BlendMode::Lighten,
+        cv_layout::BlendMode::ColorDodge => cv_gfx::BlendMode::ColorDodge,
+        cv_layout::BlendMode::ColorBurn => cv_gfx::BlendMode::ColorBurn,
+        cv_layout::BlendMode::HardLight => cv_gfx::BlendMode::HardLight,
+        cv_layout::BlendMode::SoftLight => cv_gfx::BlendMode::SoftLight,
+        cv_layout::BlendMode::Difference => cv_gfx::BlendMode::Difference,
+        cv_layout::BlendMode::Exclusion => cv_gfx::BlendMode::Exclusion,
+        cv_layout::BlendMode::Hue => cv_gfx::BlendMode::Hue,
+        cv_layout::BlendMode::Saturation => cv_gfx::BlendMode::Saturation,
+        cv_layout::BlendMode::Color => cv_gfx::BlendMode::Color,
+        cv_layout::BlendMode::Luminosity => cv_gfx::BlendMode::Luminosity,
+    }
+}
+
 fn paint_box_offset(
     b: &cv_layout::LayoutBox,
     bmp: &mut cv_gfx::Bitmap,
@@ -48121,6 +48161,72 @@ fn paint_box_offset_t(
     let opacity = b.opacity.clamp(0.0, 1.0);
     if opacity < 0.01 {
         return;
+    }
+    // ── CSS `mix-blend-mode` — element-vs-backdrop isolation layer ──────────
+    // Per CSS Compositing & Blending L1 §5, a non-`normal` mix-blend-mode
+    // blends the WHOLE element (its subtree, as a single group) with the
+    // backdrop content already painted beneath it. We rasterize the subtree
+    // into a transparent isolation layer at its document position, then
+    // composite that layer back over the page pixel-by-pixel using the W3C
+    // blend formula (`blit_layer_blend`). This mirrors the affine layer path.
+    //
+    // `MIX_BLEND_ROOT_DONE` guards the re-entrant paint of the SAME box: the
+    // inner call paints normally into the layer (blend already "claimed"), and
+    // only the outer call composites with the blend. Suppressed while painting
+    // into an affine layer (`suppress_self_transform`) — that layer composites
+    // straight, and applying the blend there would blend against the local
+    // transparent buffer instead of the page backdrop (wrong). A box with both
+    // a transform and a blend therefore blends here (outer) and the transform
+    // happens inside the layer rasterization.
+    if !suppress_self_transform
+        && !b.mix_blend_mode.is_normal()
+        && !MIX_BLEND_ROOT_DONE.with(|c| c.get())
+    {
+        // `subtree_bounds()` is in the box's own DOCUMENT space and already
+        // includes this box's `translate_*_px` (via `visual_bounds`). The
+        // on-screen layer origin therefore adds only the PARENT offset.
+        let bb = b.subtree_bounds();
+        let pad = 2.0f32;
+        let lx0_doc = bb.x - pad;
+        let ly0_doc = bb.y - pad;
+        let lw = (bb.w + pad * 2.0).ceil().max(1.0);
+        let lh = (bb.h + pad * 2.0).ceil().max(1.0);
+        const MAX_LAYER_DIM: f32 = 8192.0;
+        if lw <= MAX_LAYER_DIM && lh <= MAX_LAYER_DIM {
+            let mut layer = cv_gfx::Bitmap::new(lw as u32, lh as u32);
+            layer.clear(cv_gfx::Color { r: 0, g: 0, b: 0, a: 0 });
+            let mut layer_texts: Vec<cv_ui::TextItem> = Vec::new();
+            // Re-paint THIS box's subtree into the transparent layer. The
+            // re-entry adds `b.translate_*_px` itself, so passing `-lx0_doc`
+            // as the parent offset places a doc point P at layer-local
+            // `P - lx0_doc`. Don't collect affine layers (they'd escape to the
+            // page); mark the blend root handled so we don't recurse on this box.
+            let prev_collect = AFFINE_COLLECTING.with(|c| c.replace(false));
+            MIX_BLEND_ROOT_DONE.with(|c| c.set(true));
+            paint_box_offset_t(
+                b,
+                &mut layer,
+                &mut layer_texts,
+                -lx0_doc,
+                -ly0_doc,
+                None,
+                false,
+            );
+            MIX_BLEND_ROOT_DONE.with(|c| c.set(false));
+            AFFINE_COLLECTING.with(|c| c.set(prev_collect));
+            cv_ui::bake_content_text_into_bitmap(&mut layer, &mut layer_texts);
+            // Composite the isolation layer over the page with the blend mode at
+            // its on-screen origin (doc origin + parent offset). The subtree
+            // already multiplied each op's alpha by `opacity`, so composite the
+            // layer at full strength (no double-apply).
+            let mode = blend_mode_to_gfx(b.mix_blend_mode);
+            let screen_x = (lx0_doc + parent_off_x).round() as i32;
+            let screen_y = (ly0_doc + parent_off_y).round() as i32;
+            bmp.blit_layer_blend(screen_x, screen_y, &layer, mode, 1.0);
+            return;
+        }
+        // Oversized layer: fall through and paint normally (blend ignored)
+        // rather than allocate gigabytes — visually wrong but safe.
     }
     // ── CSS 2D transform: rotate()/matrix() — affine layer composite ──
     // scale()/translate() are handled cheaply (geometry-bake + offset),
@@ -48656,8 +48762,38 @@ fn paint_box_offset_t(
         // will fall back to a single natural-size paint via no-repeat.
         if let Some(img) = &b.background_image {
             if img.width > 0 && img.height > 0 {
-                let dx = r.x as i32 + ox;
-                let dy = r.y as i32 + oy;
+                // CSS `background-blend-mode` (CSS Compositing & Blending L1 §6)
+                // blends the background-IMAGE layer with the background
+                // color/gradient already painted beneath it (NOT with the page
+                // backdrop). When non-`normal` we render the image layer into a
+                // box-sized transparent buffer using the unchanged positioning
+                // logic, then composite it over the box region with the blend.
+                let bg_blend = blend_mode_to_gfx(b.background_blend_mode);
+                let box_screen_x = r.x as i32 + ox;
+                let box_screen_y = r.y as i32 + oy;
+                let bw = r.w.max(0.0) as u32;
+                let bh = r.h.max(0.0) as u32;
+                let use_bg_blend = !bg_blend.is_normal() && bw > 0 && bh > 0;
+                let mut blend_buf = if use_bg_blend {
+                    let mut t = cv_gfx::Bitmap::new(bw, bh);
+                    t.clear(cv_gfx::Color { r: 0, g: 0, b: 0, a: 0 });
+                    Some(t)
+                } else {
+                    None
+                };
+                // Inner scope so the `bmp` rebinding (to the local blend buffer)
+                // ends before we composite the buffer back onto the real page
+                // bitmap below. For the blend path the target origin is the box
+                // top-left, so dest coords subtract the box screen origin.
+                {
+                let (bmp, base_x, base_y): (&mut cv_gfx::Bitmap, i32, i32) =
+                    if let Some(t) = blend_buf.as_mut() {
+                        (t, box_screen_x, box_screen_y)
+                    } else {
+                        (bmp, 0, 0)
+                    };
+                let dx = r.x as i32 + ox - base_x;
+                let dy = r.y as i32 + oy - base_y;
                 let dw = r.w as i32;
                 let dh = r.h as i32;
                 if dw > 0 && dh > 0 {
@@ -48859,6 +48995,12 @@ fn paint_box_offset_t(
                         }
                     }
                     } // end else (not cover/contain)
+                }
+                } // end inner scope: `bmp` rebinding released
+                // Composite the background-image layer onto the page with the
+                // background-blend-mode against the color/gradient beneath it.
+                if let Some(layer) = blend_buf {
+                    bmp.blit_layer_blend(box_screen_x, box_screen_y, &layer, bg_blend, 1.0);
                 }
             }
         }
@@ -53788,6 +53930,8 @@ mod tests {
             text_shadow: None,
             filters: Vec::new(),
             backdrop_filters: Vec::new(),
+            mix_blend_mode: cv_layout::BlendMode::Normal,
+            background_blend_mode: cv_layout::BlendMode::Normal,
             animation_name: None,
             animation_duration_ms: 0.0,
             animation_delay_ms: 0.0,
@@ -54308,6 +54452,8 @@ mod tests {
             text_shadow: None,
             filters: Vec::new(),
             backdrop_filters: Vec::new(),
+            mix_blend_mode: cv_layout::BlendMode::Normal,
+            background_blend_mode: cv_layout::BlendMode::Normal,
             clip_shape: None,
             has_mask_url: false,
             mask_image_url: None,
@@ -54445,6 +54591,8 @@ mod tests {
             text_shadow: None,
             filters: Vec::new(),
             backdrop_filters: Vec::new(),
+            mix_blend_mode: cv_layout::BlendMode::Normal,
+            background_blend_mode: cv_layout::BlendMode::Normal,
             clip_shape: None,
             has_mask_url: false,
             mask_image_url: None,
@@ -54607,6 +54755,8 @@ mod tests {
             text_shadow: None,
             filters: Vec::new(),
             backdrop_filters: Vec::new(),
+            mix_blend_mode: cv_layout::BlendMode::Normal,
+            background_blend_mode: cv_layout::BlendMode::Normal,
             clip_shape: None,
             has_mask_url: false,
             mask_image_url: None,
@@ -54751,6 +54901,8 @@ mod tests {
             text_shadow: None,
             filters: Vec::new(),
             backdrop_filters: Vec::new(),
+            mix_blend_mode: cv_layout::BlendMode::Normal,
+            background_blend_mode: cv_layout::BlendMode::Normal,
             clip_shape: None,
             has_mask_url: false,
             mask_image_url: None,
@@ -54814,6 +54966,286 @@ mod tests {
             bmp.pixels.iter().all(|px| *px == 0xFFFFFFFF),
             "child paint should be clipped out"
         );
+    }
+
+    // ── CSS mix-blend-mode / background-blend-mode paint tests ──────────────
+    // These assert SAMPLED PIXELS after running the real `paint_box_offset`
+    // path, proving the blend formula is actually applied in compositing (not
+    // parsed-then-dropped). The template box is a solid `bg` rect with all
+    // other fields neutral.
+
+    fn blend_template_box(bg: cv_layout::Color, w: f32, h: f32) -> cv_layout::LayoutBox {
+        cv_layout::LayoutBox {
+            content: cv_layout::Rect { x: 0.0, y: 0.0, w, h },
+            padding: cv_layout::EdgeSizes::default(),
+            margin: cv_layout::EdgeSizes::default(),
+            margin_auto: cv_layout::EdgeAuto::default(),
+            border_width_px: 0.0,
+            border_color: None,
+            border_widths_per_side: [None; 4],
+            border_colors_per_side: [None; 4],
+            border_styles_per_side: [None; 4],
+            text_align: None,
+            font_weight_bold: false,
+            font_weight_num: 0,
+            font_style_italic: false,
+            font_family: None,
+            text_transform: None,
+            letter_spacing_px: 0.0,
+            text_decoration_underline: false,
+            text_decoration_line_through: false,
+            line_height_px: None,
+            preserve_whitespace: false,
+            box_sizing_border_box: false,
+            is_flex: false,
+            is_grid: false,
+            is_inline: false,
+            is_inline_block: false,
+            is_table: false,
+            is_table_row: false,
+            is_table_cell: false,
+            is_table_row_group: false,
+            is_list_item: false,
+            is_flow_root: false,
+            flex_direction: cv_layout::FlexDirection::Row,
+            flex_wrap: cv_layout::FlexWrap::NoWrap,
+            flex_grow: 0.0,
+            flex_shrink: 1.0,
+            flex_basis: None,
+            justify_content: cv_layout::JustifyContent::Start,
+            align_items: cv_layout::AlignItems::Stretch,
+            justify_items: None,
+            align_self: None,
+            justify_self: None,
+            gap_px: 0.0,
+            column_gap_px: 0.0,
+            row_gap_px: 0.0,
+            grid_template_columns: None,
+            grid_template_rows: None,
+            grid_auto_rows: None,
+            grid_auto_columns: None,
+            grid_template_areas: None,
+            grid_area_name: None,
+            grid_column_start: None,
+            grid_column_span: None,
+            grid_row_start: None,
+            grid_row_span: None,
+            table_col_span: None,
+            table_row_span: None,
+            overflow_hidden: false,
+            overflow_x: cv_layout::Overflow::Visible,
+            overflow_y: cv_layout::Overflow::Visible,
+            scroll_offset_x: 0.0,
+            scroll_offset_y: 0.0,
+            opacity: 1.0,
+            border_radius_px: 0.0,
+            border_radius_percent: None,
+            translate_x_px: 0.0,
+            translate_y_px: 0.0,
+            translate_x_percent: None,
+            translate_y_percent: None,
+            scale_x: 1.0,
+            scale_y: 1.0,
+            rotate_deg: 0.0,
+            matrix_2d: None,
+            transform_origin: None,
+            position: cv_layout::Position::Static,
+            z_index: None,
+            box_shadow: None,
+            text_shadow: None,
+            filters: Vec::new(),
+            backdrop_filters: Vec::new(),
+            mix_blend_mode: cv_layout::BlendMode::Normal,
+            background_blend_mode: cv_layout::BlendMode::Normal,
+            clip_shape: None,
+            has_mask_url: false,
+            mask_image_url: None,
+            visibility_hidden: false,
+            vertical_align: cv_layout::VerticalAlign::Baseline,
+            float_side: cv_layout::FloatSide::None,
+            clear: cv_layout::ClearMode::None,
+            animation_name: None,
+            animation_duration_ms: 0.0,
+            animation_delay_ms: 0.0,
+            animation_iteration_count: 1.0,
+            animation_timing: 3,
+            background_gradient: None,
+            background_radial_gradient: None,
+            background_gradient_full: None,
+            background_image_url: None,
+            background_repeat: cv_layout::BackgroundRepeat::default(),
+            top_px: None,
+            right_px: None,
+            bottom_px: None,
+            left_px: None,
+            explicit_width: None,
+            flex_override_width: None,
+            explicit_height: None,
+            flex_override_height: None,
+            aspect_ratio: None,
+            max_width: None,
+            max_height: None,
+            min_width: None,
+            min_height: None,
+            background: Some(bg),
+            text_color: cv_layout::Color { r: 0, g: 0, b: 0, a: 255 },
+            font_size_px: 16.0,
+            kind: cv_layout::BoxKind::Block { tag: "div".to_string() },
+            link_href: None,
+            embedded_image: None,
+            mask_image: None,
+            background_image: None,
+            background_size: None,
+            background_position: None,
+            object_fit: None,
+            object_position: None,
+            element_path: None,
+            node_id: None,
+            cache_ineligible: false,
+            children: Vec::new(),
+        }
+    }
+
+    fn px_at(bmp: &cv_gfx::Bitmap, x: u32, y: u32) -> (u8, u8, u8, u8) {
+        let p = bmp.pixels[(y * bmp.width + x) as usize];
+        (
+            ((p >> 16) & 0xFF) as u8, // r
+            ((p >> 8) & 0xFF) as u8,  // g
+            (p & 0xFF) as u8,         // b
+            ((p >> 24) & 0xFF) as u8, // a
+        )
+    }
+
+    /// mix-blend-mode:multiply — a mid-gray element over a mid-gray backdrop
+    /// must darken the covered region to 0.25 gray (~64), proving the blend
+    /// formula is applied against the PAGE backdrop in compositing.
+    #[test]
+    fn mix_blend_multiply_darkens_against_backdrop() {
+        let gray = cv_layout::Color { r: 128, g: 128, b: 128, a: 255 };
+        let mut bmp = cv_gfx::Bitmap::new(40, 40);
+        bmp.clear(cv_gfx::Color { r: 128, g: 128, b: 128, a: 255 }); // backdrop
+        let mut b = blend_template_box(gray, 20.0, 20.0);
+        b.mix_blend_mode = cv_layout::BlendMode::Multiply;
+        let mut texts = Vec::new();
+        paint_box_offset(&b, &mut bmp, &mut texts, 0.0, 0.0, None);
+        // Inside the 20x20 element: 128*128/255 ≈ 64.
+        let (r, g, bch, a) = px_at(&bmp, 5, 5);
+        assert_eq!(a, 255);
+        assert!((r as i32 - 64).abs() <= 2, "multiply over backdrop ~64 got {r}");
+        assert!((g as i32 - 64).abs() <= 2 && (bch as i32 - 64).abs() <= 2);
+        // Outside the element the backdrop is untouched (still 128).
+        let (or, _, _, _) = px_at(&bmp, 30, 30);
+        assert_eq!(or, 128, "uncovered backdrop unchanged");
+    }
+
+    /// mix-blend-mode:difference of an element equal to its backdrop = black.
+    #[test]
+    fn mix_blend_difference_equal_is_black() {
+        let c = cv_layout::Color { r: 200, g: 100, b: 50, a: 255 };
+        let mut bmp = cv_gfx::Bitmap::new(20, 20);
+        bmp.clear(cv_gfx::Color { r: 200, g: 100, b: 50, a: 255 });
+        let mut b = blend_template_box(c, 20.0, 20.0);
+        b.mix_blend_mode = cv_layout::BlendMode::Difference;
+        let mut texts = Vec::new();
+        paint_box_offset(&b, &mut bmp, &mut texts, 0.0, 0.0, None);
+        let (r, g, bch, _) = px_at(&bmp, 10, 10);
+        assert_eq!((r, g, bch), (0, 0, 0), "difference of equal = black");
+    }
+
+    /// mix-blend-mode:screen lightens (the inverse direction of multiply),
+    /// proving modes are distinct and not a normal-mode passthrough.
+    #[test]
+    fn mix_blend_screen_lightens() {
+        let gray = cv_layout::Color { r: 128, g: 128, b: 128, a: 255 };
+        let mut bmp = cv_gfx::Bitmap::new(20, 20);
+        bmp.clear(cv_gfx::Color { r: 128, g: 128, b: 128, a: 255 });
+        let mut b = blend_template_box(gray, 20.0, 20.0);
+        b.mix_blend_mode = cv_layout::BlendMode::Screen;
+        let mut texts = Vec::new();
+        paint_box_offset(&b, &mut bmp, &mut texts, 0.0, 0.0, None);
+        let (r, _, _, _) = px_at(&bmp, 10, 10);
+        // 0.5+0.5-0.25 = 0.75 -> ~191, strictly lighter than 128.
+        assert!(r > 128, "screen must lighten (got {r})");
+        assert!((r as i32 - 191).abs() <= 2, "screen ~191 got {r}");
+    }
+
+    /// mix-blend-mode:normal must be byte-identical to no blend (a plain
+    /// source-over fill) — the load-bearing don't-regress gate.
+    #[test]
+    fn mix_blend_normal_matches_plain_fill() {
+        let c = cv_layout::Color { r: 70, g: 140, b: 210, a: 255 };
+        let backdrop = cv_gfx::Color { r: 250, g: 250, b: 250, a: 255 };
+        // With normal blend.
+        let mut a_bmp = cv_gfx::Bitmap::new(20, 20);
+        a_bmp.clear(backdrop);
+        let mut a_box = blend_template_box(c, 20.0, 20.0);
+        a_box.mix_blend_mode = cv_layout::BlendMode::Normal;
+        let mut ta = Vec::new();
+        paint_box_offset(&a_box, &mut a_bmp, &mut ta, 0.0, 0.0, None);
+        // Without any blend field set (also normal).
+        let mut b_bmp = cv_gfx::Bitmap::new(20, 20);
+        b_bmp.clear(backdrop);
+        let b_box = blend_template_box(c, 20.0, 20.0);
+        let mut tb = Vec::new();
+        paint_box_offset(&b_box, &mut b_bmp, &mut tb, 0.0, 0.0, None);
+        assert_eq!(a_bmp.pixels, b_bmp.pixels, "normal blend must equal plain fill");
+    }
+
+    /// background-blend-mode:multiply blends the background IMAGE layer with
+    /// the background COLOR beneath it (not the page backdrop). A mid-gray
+    /// image over a mid-gray background color darkens to 0.25, while the page
+    /// backdrop OUTSIDE the box stays untouched.
+    #[test]
+    fn background_blend_image_over_color_multiplies() {
+        // Box has a mid-gray background color and a 20x20 fully mid-gray image.
+        let gray = cv_layout::Color { r: 128, g: 128, b: 128, a: 255 };
+        let img_pixels = vec![
+            cv_gfx::Color { r: 128, g: 128, b: 128, a: 255 }.to_bgra_u32();
+            20 * 20
+        ];
+        let mut b = blend_template_box(gray, 20.0, 20.0);
+        b.background_image = Some(std::sync::Arc::new(cv_layout::EmbeddedImage {
+            width: 20,
+            height: 20,
+            pixels: img_pixels,
+        }));
+        b.background_repeat = cv_layout::BackgroundRepeat::NoRepeat;
+        b.background_blend_mode = cv_layout::BlendMode::Multiply;
+        let mut bmp = cv_gfx::Bitmap::new(40, 40);
+        bmp.clear(cv_gfx::Color { r: 255, g: 255, b: 255, a: 255 }); // white page
+        let mut texts = Vec::new();
+        paint_box_offset(&b, &mut bmp, &mut texts, 0.0, 0.0, None);
+        // Inside the box: image (128) multiply background color (128) -> ~64.
+        let (r, _, _, _) = px_at(&bmp, 5, 5);
+        assert!((r as i32 - 64).abs() <= 2, "bg image multiply color ~64 got {r}");
+        // Outside the box: untouched white page (proves it blends with the
+        // background layer, NOT the page backdrop everywhere).
+        let (or, _, _, _) = px_at(&bmp, 30, 30);
+        assert_eq!(or, 255, "page backdrop outside the box stays white");
+    }
+
+    /// background-blend-mode default (normal) leaves the image as a plain
+    /// source-over over the background color — the regression gate.
+    #[test]
+    fn background_blend_normal_is_plain_over() {
+        let gray = cv_layout::Color { r: 128, g: 128, b: 128, a: 255 };
+        let red = cv_gfx::Color { r: 255, g: 0, b: 0, a: 255 };
+        let img_pixels = vec![red.to_bgra_u32(); 20 * 20];
+        let mut b = blend_template_box(gray, 20.0, 20.0);
+        b.background_image = Some(std::sync::Arc::new(cv_layout::EmbeddedImage {
+            width: 20,
+            height: 20,
+            pixels: img_pixels,
+        }));
+        b.background_repeat = cv_layout::BackgroundRepeat::NoRepeat;
+        // background_blend_mode stays Normal.
+        let mut bmp = cv_gfx::Bitmap::new(40, 40);
+        bmp.clear(cv_gfx::Color { r: 255, g: 255, b: 255, a: 255 });
+        let mut texts = Vec::new();
+        paint_box_offset(&b, &mut bmp, &mut texts, 0.0, 0.0, None);
+        // Opaque red image overwrites the gray color via source-over -> red.
+        let (r, g, bch, _) = px_at(&bmp, 5, 5);
+        assert_eq!((r, g, bch), (255, 0, 0), "normal bg image is opaque red");
     }
 
     #[test]

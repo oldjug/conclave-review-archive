@@ -261,6 +261,14 @@ pub struct ComputedStyle {
     /// `backdrop-filter` — same grammar as `filter`. Currently parsed
     /// but not rendered; reserved for a future compositor pass.
     pub backdrop_filters: Vec<FilterFn>,
+    /// `mix-blend-mode` keyword (normalized lowercase, e.g. "multiply").
+    /// `None` / "normal" → plain source-over. CSS Compositing & Blending L1 §5.
+    pub mix_blend_mode: Option<String>,
+    /// `background-blend-mode` — one keyword per background layer (we paint a
+    /// single background layer, so the first value is used). Blends the
+    /// element's background image against the color/gradient beneath it.
+    /// CSS Compositing & Blending L1 §6.
+    pub background_blend_mode: Option<String>,
     /// `animation-name` — looks up a @keyframes rule by name.
     pub animation_name: Option<String>,
     /// `animation-duration` in milliseconds (0 = no animation).
@@ -4491,6 +4499,25 @@ fn apply_declaration(style: &mut ComputedStyle, d: &Declaration) {
             // compositor pass implement it without re-parsing.
             style.backdrop_filters = parse_filter_chain(toks);
         }
+        "mix-blend-mode" => {
+            // A single blend-mode keyword. CSS Compositing & Blending L1 §5.
+            for t in toks {
+                if let CssToken::Ident(s) = t {
+                    style.mix_blend_mode = Some(s.to_ascii_lowercase());
+                    break;
+                }
+            }
+        }
+        "background-blend-mode" => {
+            // A comma-separated list (one per background layer). We paint one
+            // background layer, so take the first keyword. §6.
+            for t in toks {
+                if let CssToken::Ident(s) = t {
+                    style.background_blend_mode = Some(s.to_ascii_lowercase());
+                    break;
+                }
+            }
+        }
         "clip-path" => {
             style.clip_path = parse_clip_path(toks);
         }
@@ -4760,9 +4787,7 @@ fn apply_declaration(style: &mut ComputedStyle, d: &Declaration) {
         | "background-clip"
         | "background-origin"
         | "background-attachment"
-        | "background-blend-mode"
         | "isolation"
-        | "mix-blend-mode"
         | "image-rendering"
         | "paint-order"
         | "forced-color-adjust"
@@ -7059,6 +7084,44 @@ fn parse_margin_shorthand(toks: &[CssToken]) -> Option<([Option<Length>; 4], [bo
 mod tests {
     use super::*;
     use crate::parser::parse_stylesheet;
+
+    /// `mix-blend-mode` / `background-blend-mode` parse into their dedicated
+    /// style fields (NOT swallowed by the recognized-but-ignored catch-all),
+    /// so the painter can apply the W3C blend formula.
+    #[test]
+    fn blend_mode_properties_parse_into_style() {
+        let mut style = ComputedStyle::default();
+        apply_declaration(
+            &mut style,
+            &Declaration {
+                name: "mix-blend-mode".to_string(),
+                value: vec![CssToken::Ident("multiply".to_string())],
+                important: false,
+            },
+        );
+        apply_declaration(
+            &mut style,
+            &Declaration {
+                name: "background-blend-mode".to_string(),
+                value: vec![CssToken::Ident("luminosity".to_string())],
+                important: false,
+            },
+        );
+        assert_eq!(style.mix_blend_mode.as_deref(), Some("multiply"));
+        assert_eq!(style.background_blend_mode.as_deref(), Some("luminosity"));
+        // A `normal` mix-blend-mode is captured verbatim (the painter maps it
+        // to source-over) — it is NOT dropped to None.
+        let mut s2 = ComputedStyle::default();
+        apply_declaration(
+            &mut s2,
+            &Declaration {
+                name: "mix-blend-mode".to_string(),
+                value: vec![CssToken::Ident("normal".to_string())],
+                important: false,
+            },
+        );
+        assert_eq!(s2.mix_blend_mode.as_deref(), Some("normal"));
+    }
 
     #[test]
     fn parse_color_str_handles_hex_named_and_rgb() {

@@ -52,6 +52,102 @@ impl Color {
             | (u32::from(self.g) << 8)
             | u32::from(self.b)
     }
+
+    /// Unpack a packed BGRA u32 (Windows DIB layout) into a `Color`.
+    #[inline]
+    pub fn from_bgra_u32(p: u32) -> Self {
+        Self {
+            b: (p & 0xFF) as u8,
+            g: ((p >> 8) & 0xFF) as u8,
+            r: ((p >> 16) & 0xFF) as u8,
+            a: ((p >> 24) & 0xFF) as u8,
+        }
+    }
+}
+
+/// A CSS `mix-blend-mode` / `background-blend-mode` value (CSS Compositing &
+/// Blending Level 1 §5/§6). `Normal` is plain source-over; every other mode
+/// maps to the W3C separable / non-separable blend formula implemented in
+/// [`canvas::composite_pixel`] via [`CompositeOp`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BlendMode {
+    #[default]
+    Normal,
+    Multiply,
+    Screen,
+    Overlay,
+    Darken,
+    Lighten,
+    ColorDodge,
+    ColorBurn,
+    HardLight,
+    SoftLight,
+    Difference,
+    Exclusion,
+    Hue,
+    Saturation,
+    Color,
+    Luminosity,
+}
+
+impl BlendMode {
+    /// Parse a CSS blend-mode keyword. Unknown / `normal` → `Normal`.
+    pub fn from_str(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "multiply" => Self::Multiply,
+            "screen" => Self::Screen,
+            "overlay" => Self::Overlay,
+            "darken" => Self::Darken,
+            "lighten" => Self::Lighten,
+            "color-dodge" => Self::ColorDodge,
+            "color-burn" => Self::ColorBurn,
+            "hard-light" => Self::HardLight,
+            "soft-light" => Self::SoftLight,
+            "difference" => Self::Difference,
+            "exclusion" => Self::Exclusion,
+            "hue" => Self::Hue,
+            "saturation" => Self::Saturation,
+            "color" => Self::Color,
+            "luminosity" => Self::Luminosity,
+            _ => Self::Normal, // "normal" and any unknown
+        }
+    }
+
+    pub fn is_normal(self) -> bool {
+        matches!(self, Self::Normal)
+    }
+
+    /// Map to the canvas [`CompositeOp`] that carries the matching blend
+    /// formula. `Normal` maps to `SourceOver`.
+    fn to_composite_op(self) -> CompositeOp {
+        match self {
+            Self::Normal => CompositeOp::SourceOver,
+            Self::Multiply => CompositeOp::Multiply,
+            Self::Screen => CompositeOp::Screen,
+            Self::Overlay => CompositeOp::Overlay,
+            Self::Darken => CompositeOp::Darken,
+            Self::Lighten => CompositeOp::Lighten,
+            Self::ColorDodge => CompositeOp::ColorDodge,
+            Self::ColorBurn => CompositeOp::ColorBurn,
+            Self::HardLight => CompositeOp::HardLight,
+            Self::SoftLight => CompositeOp::SoftLight,
+            Self::Difference => CompositeOp::Difference,
+            Self::Exclusion => CompositeOp::Exclusion,
+            Self::Hue => CompositeOp::Hue,
+            Self::Saturation => CompositeOp::Saturation,
+            Self::Color => CompositeOp::Color,
+            Self::Luminosity => CompositeOp::Luminosity,
+        }
+    }
+}
+
+/// Composite a straight-alpha `src` over the packed BGRA backdrop pixel `dst`
+/// with a CSS [`BlendMode`]. This is the single entry point the page painter
+/// uses for `mix-blend-mode` / `background-blend-mode`. `Normal` is byte-
+/// identical to the legacy source-over (`blend_bgra`).
+#[inline]
+pub fn blend_mode_pixel(dst: u32, src: Color, mode: BlendMode) -> u32 {
+    canvas::composite_pixel(dst, src, mode.to_composite_op())
 }
 
 /// An abstract CSS gradient color stop, before position fix-up.
@@ -808,6 +904,48 @@ impl Bitmap {
                         a: final_a,
                     },
                 );
+            }
+        }
+    }
+
+    /// Composite a transparent `src` layer over `self` at `(x, y)` using a CSS
+    /// [`BlendMode`] and an additional `group_alpha`. This is the
+    /// `mix-blend-mode` element-vs-backdrop composite: `src` holds the element's
+    /// subtree painted into a transparent layer, and each non-transparent layer
+    /// pixel blends with the page pixel beneath it per the W3C blend formula.
+    /// `BlendMode::Normal` is byte-identical to `blit_with_group_alpha`.
+    pub fn blit_layer_blend(&mut self, x: i32, y: i32, src: &Bitmap, mode: BlendMode, group_alpha: f32) {
+        if group_alpha <= 0.0 {
+            return;
+        }
+        let ga = group_alpha.clamp(0.0, 1.0);
+        for sy in 0..src.height {
+            let dy = y + sy as i32;
+            if dy < 0 || dy >= self.height as i32 {
+                continue;
+            }
+            for sx in 0..src.width {
+                let dx = x + sx as i32;
+                if dx < 0 || dx >= self.width as i32 {
+                    continue;
+                }
+                let s = src.pixels[(sy as usize) * (src.width as usize) + sx as usize];
+                let sa = ((s >> 24) & 0xFF) as f32;
+                if sa == 0.0 {
+                    continue;
+                }
+                let final_a = (sa * ga).round() as u8;
+                if final_a == 0 {
+                    continue;
+                }
+                let color = Color {
+                    b: (s & 0xFF) as u8,
+                    g: ((s >> 8) & 0xFF) as u8,
+                    r: ((s >> 16) & 0xFF) as u8,
+                    a: final_a,
+                };
+                let di = (dy as usize) * (self.width as usize) + dx as usize;
+                self.pixels[di] = blend_mode_pixel(self.pixels[di], color, mode);
             }
         }
     }
@@ -2077,6 +2215,71 @@ mod tests {
         let bottom = unpack_bgra(b.pixels[16 * 20 + 10]);
         assert_eq!(top.a, 255, "top arc should be painted");
         assert_eq!(bottom.a, 0, "bottom half should be untouched");
+    }
+
+    // ───────────────────────── CSS blend modes ─────────────────────────────
+
+    /// `BlendMode::Normal` through `blend_mode_pixel` is byte-identical to the
+    /// legacy `blend_bgra` source-over — the load-bearing "don't regress" gate.
+    #[test]
+    fn blend_mode_normal_is_source_over() {
+        let dst = Color { r: 10, g: 20, b: 30, a: 200 }.to_bgra_u32();
+        for src in [
+            Color { r: 255, g: 0, b: 0, a: 255 },
+            Color { r: 100, g: 150, b: 200, a: 128 },
+        ] {
+            let via = blend_mode_pixel(dst, src, BlendMode::Normal);
+            let legacy = if src.a == 255 { src.to_bgra_u32() } else { blend_bgra(dst, src) };
+            assert_eq!(via, legacy, "Normal must equal source-over for {src:?}");
+        }
+    }
+
+    /// mix-blend-mode multiply: 0.5-gray element over 0.5-gray backdrop = 0.25.
+    #[test]
+    fn blend_mode_multiply_half_gray() {
+        let dst = Color { r: 128, g: 128, b: 128, a: 255 }.to_bgra_u32();
+        let src = Color { r: 128, g: 128, b: 128, a: 255 };
+        let out = Color::from_bgra_u32(blend_mode_pixel(dst, src, BlendMode::Multiply));
+        assert!((out.r as i32 - 64).abs() <= 1, "multiply 0.25 -> ~64 got {}", out.r);
+    }
+
+    /// `blit_layer_blend` composites an element layer over the backdrop with the
+    /// blend formula. A multiply layer of mid gray over a mid-gray page must
+    /// darken to ~0.25 where the layer is opaque, and leave transparent layer
+    /// pixels untouched.
+    #[test]
+    fn blit_layer_blend_multiply_darkens_only_covered() {
+        let mut page = Bitmap::new(4, 4);
+        page.clear(Color { r: 128, g: 128, b: 128, a: 255 });
+        // A 2x2 opaque mid-gray layer at (1,1), rest transparent.
+        let mut layer = Bitmap::new(4, 4);
+        layer.clear(Color::TRANSPARENT);
+        for yy in 1..3 {
+            for xx in 1..3 {
+                layer.pixels[yy * 4 + xx] =
+                    Color { r: 128, g: 128, b: 128, a: 255 }.to_bgra_u32();
+            }
+        }
+        page.blit_layer_blend(0, 0, &layer, BlendMode::Multiply, 1.0);
+        // Covered pixel darkened to ~64.
+        let covered = Color::from_bgra_u32(page.pixels[1 * 4 + 1]);
+        assert!((covered.r as i32 - 64).abs() <= 1, "covered multiply ~64 got {}", covered.r);
+        // Uncovered pixel unchanged at 128.
+        let uncovered = Color::from_bgra_u32(page.pixels[0]);
+        assert_eq!(uncovered.r, 128, "transparent layer pixel leaves backdrop");
+    }
+
+    /// difference of an element over an equal backdrop is black (the classic
+    /// "invert against identical content" check) through the layer path.
+    #[test]
+    fn blit_layer_blend_difference_equal_is_black() {
+        let mut page = Bitmap::new(2, 2);
+        page.clear(Color { r: 200, g: 100, b: 50, a: 255 });
+        let mut layer = Bitmap::new(2, 2);
+        layer.clear(Color { r: 200, g: 100, b: 50, a: 255 });
+        page.blit_layer_blend(0, 0, &layer, BlendMode::Difference, 1.0);
+        let out = Color::from_bgra_u32(page.pixels[0]);
+        assert_eq!((out.r, out.g, out.b), (0, 0, 0), "difference of equal = black");
     }
 
     // ───────────────────────── gradient rasterizer ─────────────────────────

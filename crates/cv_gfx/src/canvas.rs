@@ -467,6 +467,12 @@ pub enum CompositeOp {
     SoftLight,
     Difference,
     Exclusion,
+    // Non-separable blend modes (W3C Compositing & Blending Level 1 §10).
+    // These act on the whole color (not channel-by-channel) via SetLum/SetSat.
+    Hue,
+    Saturation,
+    Color,
+    Luminosity,
 }
 
 impl CompositeOp {
@@ -504,6 +510,10 @@ impl CompositeOp {
             "soft-light" => Self::SoftLight,
             "difference" => Self::Difference,
             "exclusion" => Self::Exclusion,
+            "hue" => Self::Hue,
+            "saturation" => Self::Saturation,
+            "color" => Self::Color,
+            "luminosity" => Self::Luminosity,
             _ => return None,
         })
     }
@@ -556,7 +566,7 @@ pub(crate) fn composite_pixel(dst: u32, src: Color, op: CompositeOp) -> u32 {
         _ => (1.0, 1.0 - sa),
     };
 
-    let separable = !matches!(
+    let is_porter_duff = matches!(
         op,
         CompositeOp::SourceOver
             | CompositeOp::SourceIn
@@ -570,28 +580,53 @@ pub(crate) fn composite_pixel(dst: u32, src: Color, op: CompositeOp) -> u32 {
             | CompositeOp::Xor
             | CompositeOp::Lighter
     );
+    let non_separable = matches!(
+        op,
+        CompositeOp::Hue
+            | CompositeOp::Saturation
+            | CompositeOp::Color
+            | CompositeOp::Luminosity
+    );
 
     let out_a = (sa * fa + da * fb).clamp(0.0, 1.0);
     if out_a <= 0.0 {
         return 0;
     }
 
-    // For each channel produce a straight-alpha output value.
-    let chan = |cs: f32, cb: f32| -> f32 {
-        let cs_eff = if separable {
-            // Per spec: Cs <- (1 - da)*Cs + da*B(Cb, Cs).
-            let blended = blend_separable(op, cb, cs);
-            (1.0 - da) * cs + da * blended
-        } else {
+    // Non-separable modes (hue/saturation/color/luminosity) operate on the
+    // whole RGB color via SetLum/SetSat, so the blended source triple is
+    // computed once (not per channel) — W3C Compositing & Blending L1 §10.
+    let nonsep_blend = if non_separable {
+        blend_nonseparable(op, (dr, dg, db), (sr, sg, sb))
+    } else {
+        (sr, sg, sb)
+    };
+
+    // For each channel produce a straight-alpha output value. `bidx` selects
+    // which component of the precomputed non-separable triple to read.
+    let chan = |cs: f32, cb: f32, bidx: usize| -> f32 {
+        let cs_eff = if is_porter_duff {
             cs
+        } else {
+            // Per spec: Cs <- (1 - da)*Cs + da*B(Cb, Cs).
+            let blended = if non_separable {
+                match bidx {
+                    0 => nonsep_blend.0,
+                    1 => nonsep_blend.1,
+                    _ => nonsep_blend.2,
+                }
+            } else {
+                blend_separable(op, cb, cs)
+            };
+            (1.0 - da) * cs + da * blended
         };
         // Composited premultiplied result, normalized by out_a to straight alpha.
         ((sa * fa * cs_eff) + (da * fb * cb)) / out_a
     };
 
-    let r = (chan(sr, dr).clamp(0.0, 1.0) * 255.0).round() as u32;
-    let g = (chan(sg, dg).clamp(0.0, 1.0) * 255.0).round() as u32;
-    let b = (chan(sb, db).clamp(0.0, 1.0) * 255.0).round() as u32;
+    let r = (chan(sr, dr, 0).clamp(0.0, 1.0) * 255.0).round() as u32;
+    let g = (chan(sg, dg, 1).clamp(0.0, 1.0) * 255.0).round() as u32;
+    let b = (chan(sb, db, 2).clamp(0.0, 1.0) * 255.0).round() as u32;
     let a = (out_a * 255.0).round() as u32;
     (a << 24) | (r << 16) | (g << 8) | b
 }
@@ -646,6 +681,101 @@ fn blend_separable(op: CompositeOp, cb: f32, cs: f32) -> f32 {
         CompositeOp::Difference => (cb - cs).abs(),
         CompositeOp::Exclusion => cb + cs - 2.0 * cb * cs,
         // Non-separable ops never reach here.
+        _ => cs,
+    }
+}
+
+// ── Non-separable blend helpers (W3C Compositing & Blending L1 §10) ──────────
+// These operate on a whole RGB triple in [0,1]. Lum is the ITU-R BT.601 luma
+// the spec mandates (0.3/0.59/0.11), NOT BT.709 — matching Skia's blend math.
+
+#[inline]
+fn lum(c: (f32, f32, f32)) -> f32 {
+    0.3 * c.0 + 0.59 * c.1 + 0.11 * c.2
+}
+
+/// `ClipColor(C)` — clamp the triple back into gamut by pulling toward its
+/// luminosity, preserving Lum and hue. Spec §10.
+#[inline]
+fn clip_color(c: (f32, f32, f32)) -> (f32, f32, f32) {
+    let l = lum(c);
+    let n = c.0.min(c.1).min(c.2);
+    let x = c.0.max(c.1).max(c.2);
+    let mut out = c;
+    if n < 0.0 {
+        let d = l - n;
+        if d != 0.0 {
+            out = (
+                l + (out.0 - l) * l / d,
+                l + (out.1 - l) * l / d,
+                l + (out.2 - l) * l / d,
+            );
+        }
+    }
+    if x > 1.0 {
+        let d = x - l;
+        if d != 0.0 {
+            out = (
+                l + (out.0 - l) * (1.0 - l) / d,
+                l + (out.1 - l) * (1.0 - l) / d,
+                l + (out.2 - l) * (1.0 - l) / d,
+            );
+        }
+    }
+    out
+}
+
+/// `SetLum(C, l)` — translate the triple so its luminosity equals `l`, then
+/// clip into gamut. Spec §10.
+#[inline]
+fn set_lum(c: (f32, f32, f32), l: f32) -> (f32, f32, f32) {
+    let d = l - lum(c);
+    clip_color((c.0 + d, c.1 + d, c.2 + d))
+}
+
+#[inline]
+fn sat(c: (f32, f32, f32)) -> f32 {
+    c.0.max(c.1).max(c.2) - c.0.min(c.1).min(c.2)
+}
+
+/// `SetSat(C, s)` — rescale the triple so its saturation (max-min) equals `s`,
+/// keeping the relative ordering of channels. The spec rewrites min/mid/max
+/// in place; we replicate that by sorting indices, mapping, and unsorting.
+#[inline]
+fn set_sat(c: (f32, f32, f32), s: f32) -> (f32, f32, f32) {
+    let mut idx = [0usize, 1, 2];
+    let arr = [c.0, c.1, c.2];
+    // Sort indices by channel value ascending: idx[0]=min, idx[1]=mid, idx[2]=max.
+    idx.sort_by(|&a, &b| arr[a].partial_cmp(&arr[b]).unwrap_or(std::cmp::Ordering::Equal));
+    let (i_min, i_mid, i_max) = (idx[0], idx[1], idx[2]);
+    let mut out = [0.0f32; 3];
+    if arr[i_max] > arr[i_min] {
+        out[i_mid] = (arr[i_mid] - arr[i_min]) * s / (arr[i_max] - arr[i_min]);
+        out[i_max] = s;
+    } else {
+        out[i_mid] = 0.0;
+        out[i_max] = 0.0;
+    }
+    out[i_min] = 0.0;
+    (out[0], out[1], out[2])
+}
+
+/// The non-separable blend function `B(Cb, Cs)` for hue/saturation/color/
+/// luminosity. Inputs/outputs are RGB triples in [0,1]. Spec §10.
+fn blend_nonseparable(
+    op: CompositeOp,
+    cb: (f32, f32, f32),
+    cs: (f32, f32, f32),
+) -> (f32, f32, f32) {
+    match op {
+        // Hue: source hue, backdrop saturation + luminosity.
+        CompositeOp::Hue => set_lum(set_sat(cs, sat(cb)), lum(cb)),
+        // Saturation: source saturation, backdrop hue + luminosity.
+        CompositeOp::Saturation => set_lum(set_sat(cb, sat(cs)), lum(cb)),
+        // Color: source hue + saturation, backdrop luminosity.
+        CompositeOp::Color => set_lum(cs, lum(cb)),
+        // Luminosity: source luminosity, backdrop hue + saturation.
+        CompositeOp::Luminosity => set_lum(cb, lum(cs)),
         _ => cs,
     }
 }
@@ -4155,6 +4285,84 @@ mod tests {
         // screen on the same inputs must be LIGHTER — proves they differ.
         let (sr, _, _, _) = comp(CompositeOp::Screen, dst, src);
         assert!(sr > 180, "screen must lighten (sr={sr} > 180)");
+    }
+
+    /// W3C separable formula spot checks at the prompt's known values:
+    /// multiply of 0.5-gray over 0.5-gray = 0.25-gray; screen = 0.75;
+    /// difference of equal colors = black.
+    #[test]
+    fn separable_half_gray_known_values() {
+        let g = Color { r: 128, g: 128, b: 128, a: 255 };
+        // multiply: 0.5*0.5 = 0.25 -> 64.
+        let (r, _, _, _) = comp(CompositeOp::Multiply, g, g);
+        assert!((r as i32 - 64).abs() <= 1, "multiply 0.5x0.5=0.25 -> ~64 got {r}");
+        // screen: 0.5+0.5-0.25 = 0.75 -> 191.
+        let (sr, _, _, _) = comp(CompositeOp::Screen, g, g);
+        assert!((sr as i32 - 191).abs() <= 1, "screen 0.75 -> ~191 got {sr}");
+        // difference of equal colors -> 0 (black).
+        let (dr, dg, db, _) = comp(CompositeOp::Difference, g, g);
+        assert_eq!((dr, dg, db), (0, 0, 0), "difference of equal = black");
+    }
+
+    /// Non-separable LUMINOSITY: result takes the BACKDROP hue+saturation with
+    /// the SOURCE luminosity. Verify against a hand-computed example and pin the
+    /// direction (a dark source over a colored backdrop darkens it but keeps hue).
+    #[test]
+    fn nonseparable_luminosity_keeps_backdrop_hue() {
+        // Backdrop pure red (Lum=0.3), source mid gray (Lum=0.5).
+        let cb = Color { r: 255, g: 0, b: 0, a: 255 };
+        let cs = Color { r: 128, g: 128, b: 128, a: 255 };
+        // B = SetLum(Cb, Lum(Cs)). Lum(Cb)=0.3. Lum(Cs)=0.502.
+        // d = 0.502-0.3 = 0.202 added to (1,0,0) -> (1.202, 0.202, 0.202),
+        // ClipColor pulls the >1 channel back toward L=0.502: stays reddish but
+        // lighter than the original red, and luminosity == source's 0.502.
+        let (r, g_, b, _) = comp(CompositeOp::Luminosity, cb, cs);
+        // The output luminosity must equal the SOURCE luminosity (~128).
+        let out_lum = 0.3 * r as f32 + 0.59 * g_ as f32 + 0.11 * b as f32;
+        assert!((out_lum - 128.0).abs() <= 2.0, "luminosity out-lum ~128 got {out_lum}");
+        // Hue stays red-dominant (backdrop hue): r is the max channel and g==b.
+        assert!(r > g_ && r > b, "red stays dominant (backdrop hue) r={r} g={g_} b={b}");
+        assert!((g_ as i32 - b as i32).abs() <= 1, "g≈b preserves red hue line");
+    }
+
+    /// Non-separable COLOR: source hue+saturation, backdrop luminosity. The
+    /// inverse pairing of luminosity — out luminosity == BACKDROP luminosity.
+    #[test]
+    fn nonseparable_color_keeps_backdrop_luminosity() {
+        let cb = Color { r: 128, g: 128, b: 128, a: 255 }; // gray, Lum~0.502
+        let cs = Color { r: 255, g: 0, b: 0, a: 255 };     // red hue/sat
+        let (r, g, b, _) = comp(CompositeOp::Color, cb, cs);
+        let out_lum = 0.3 * r as f32 + 0.59 * g as f32 + 0.11 * b as f32;
+        assert!((out_lum - 128.0).abs() <= 2.0, "color out-lum == backdrop ~128 got {out_lum}");
+        // Source hue (red) dominates.
+        assert!(r > g && r > b, "source red hue applied r={r} g={g} b={b}");
+    }
+
+    /// Non-separable HUE: applying a gray (zero-saturation) source yields a gray
+    /// result (Sat(Cs)=0 forces SetSat to flatten), at the backdrop luminosity.
+    #[test]
+    fn nonseparable_hue_with_gray_source_is_gray() {
+        let cb = Color { r: 200, g: 50, b: 50, a: 255 };
+        let cs = Color { r: 100, g: 100, b: 100, a: 255 }; // saturation 0
+        // B = SetLum(SetSat(Cs, Sat(Cb)), Lum(Cb)). SetSat of an all-equal Cs
+        // gives all-zero, then SetLum lifts to Lum(Cb) -> neutral gray.
+        let (r, g, b, _) = comp(CompositeOp::Hue, cb, cs);
+        assert!(r == g && g == b, "gray source via hue stays gray r={r} g={g} b={b}");
+        let lb = 0.3 * 200.0 + 0.59 * 50.0 + 0.11 * 50.0; // backdrop lum ~119.5
+        assert!((r as f32 - lb).abs() <= 2.0, "hue gray takes backdrop lum ~{lb} got {r}");
+    }
+
+    /// Non-separable SATURATION: result has SOURCE saturation, BACKDROP hue and
+    /// luminosity. A fully-desaturated (gray) source drives the saturation to 0.
+    #[test]
+    fn nonseparable_saturation_gray_source_flattens() {
+        let cb = Color { r: 200, g: 60, b: 60, a: 255 }; // red-ish hue
+        let cs = Color { r: 90, g: 90, b: 90, a: 255 };  // Sat(Cs)=0
+        let (r, g, b, _) = comp(CompositeOp::Saturation, cb, cs);
+        // SetSat(Cb, 0) collapses to a flat color -> SetLum -> neutral gray.
+        assert!(r == g && g == b, "saturation 0 -> gray r={r} g={g} b={b}");
+        let lb = 0.3 * 200.0 + 0.59 * 60.0 + 0.11 * 60.0;
+        assert!((r as f32 - lb).abs() <= 2.0, "keeps backdrop lum ~{lb} got {r}");
     }
 
     /// Porter-Duff: destination-out punches a transparent hole; copy replaces;

@@ -132,6 +132,59 @@ pub enum FilterEffect {
     DropShadow(BoxShadow),
 }
 
+/// A CSS `mix-blend-mode` / `background-blend-mode` value resolved at the
+/// `lower_style` stage (so this crate stays independent of cv_css / cv_gfx).
+/// cv_browser maps this to `cv_gfx::BlendMode` at paint time. CSS Compositing
+/// & Blending Level 1 §5/§6.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+pub enum BlendMode {
+    #[default]
+    Normal,
+    Multiply,
+    Screen,
+    Overlay,
+    Darken,
+    Lighten,
+    ColorDodge,
+    ColorBurn,
+    HardLight,
+    SoftLight,
+    Difference,
+    Exclusion,
+    Hue,
+    Saturation,
+    Color,
+    Luminosity,
+}
+
+impl BlendMode {
+    /// Parse a CSS blend-mode keyword. Unknown / `normal` → `Normal`.
+    pub fn from_str(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "multiply" => Self::Multiply,
+            "screen" => Self::Screen,
+            "overlay" => Self::Overlay,
+            "darken" => Self::Darken,
+            "lighten" => Self::Lighten,
+            "color-dodge" => Self::ColorDodge,
+            "color-burn" => Self::ColorBurn,
+            "hard-light" => Self::HardLight,
+            "soft-light" => Self::SoftLight,
+            "difference" => Self::Difference,
+            "exclusion" => Self::Exclusion,
+            "hue" => Self::Hue,
+            "saturation" => Self::Saturation,
+            "color" => Self::Color,
+            "luminosity" => Self::Luminosity,
+            _ => Self::Normal,
+        }
+    }
+
+    pub fn is_normal(self) -> bool {
+        matches!(self, Self::Normal)
+    }
+}
+
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct BoxShadow {
     pub offset_x_px: f32,
@@ -446,6 +499,12 @@ pub struct LayoutBox {
     /// painted backdrop under this box before the box's own background/border
     /// are drawn.
     pub backdrop_filters: Vec<FilterEffect>,
+    /// `mix-blend-mode` — blends this element (its whole subtree) with the page
+    /// backdrop beneath it. `Normal` = plain source-over.
+    pub mix_blend_mode: BlendMode,
+    /// `background-blend-mode` — blends this element's background image layer
+    /// with the background color/gradient painted beneath it. `Normal` = none.
+    pub background_blend_mode: BlendMode,
     pub animation_name: Option<String>,
     pub animation_duration_ms: f32,
     pub animation_delay_ms: f32,
@@ -1001,6 +1060,10 @@ pub struct Style {
     pub filters: Vec<FilterEffect>,
     /// Resolved `backdrop-filter:` chain. See LayoutBox::backdrop_filters.
     pub backdrop_filters: Vec<FilterEffect>,
+    /// Resolved `mix-blend-mode`. See LayoutBox::mix_blend_mode.
+    pub mix_blend_mode: BlendMode,
+    /// Resolved `background-blend-mode`. See LayoutBox::background_blend_mode.
+    pub background_blend_mode: BlendMode,
     /// Resolved animation-name (lookup into the keyframes table).
     pub animation_name: Option<String>,
     /// Animation duration in milliseconds.
@@ -3043,6 +3106,8 @@ fn build_box_inner(node: &StyledNode, cfg: &LayoutConfig) -> LayoutBox {
                 text_shadow: node.style.text_shadow,
                 filters: node.style.filters.clone(),
                 backdrop_filters: node.style.backdrop_filters.clone(),
+                mix_blend_mode: node.style.mix_blend_mode,
+                background_blend_mode: node.style.background_blend_mode,
                 animation_name: node.style.animation_name.clone(),
                 animation_duration_ms: node.style.animation_duration_ms,
                 animation_delay_ms: node.style.animation_delay_ms,
@@ -3176,6 +3241,8 @@ fn build_box_inner(node: &StyledNode, cfg: &LayoutConfig) -> LayoutBox {
             text_shadow: None,
             filters: Vec::new(),
             backdrop_filters: Vec::new(),
+            mix_blend_mode: BlendMode::Normal,
+            background_blend_mode: BlendMode::Normal,
             animation_name: None,
             animation_duration_ms: 0.0,
             animation_delay_ms: 0.0,
