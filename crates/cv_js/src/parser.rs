@@ -97,6 +97,21 @@ fn make_async(node: Expr) -> Expr {
 }
 
 /// Desugar an `async function NAME(){}` DECLARATION (kept hoisted as a decl).
+/// The bound names a declaration statement introduces, in source order. Used
+/// by `export const/let/var/function/class` to derive the live export entries.
+/// Handles function decls and `var`/`let`/`const` declarators (class decls
+/// desugar to a `var` declarator, so they are covered too).
+fn declared_names(stmt: &Stmt) -> Vec<String> {
+    match stmt {
+        Stmt::FunctionDecl { name, .. } => vec![name.clone()],
+        Stmt::VarDecl { decls, .. } => decls.iter().map(|d| d.name.clone()).collect(),
+        // `export default function name(){}` desugars to a Block of the decl +
+        // a `const *default* = name`; the linker handles `*default*` directly.
+        Stmt::Block(stmts) => stmts.iter().flat_map(declared_names).collect(),
+        _ => Vec::new(),
+    }
+}
+
 fn make_async_decl(node: Stmt) -> Stmt {
     match node {
         Stmt::FunctionDecl { name, params, body } => Stmt::FunctionDecl {
@@ -564,6 +579,13 @@ impl Parser {
         }
     }
 
+    /// Non-consuming check that the next significant token is the given
+    /// punctuator (skips leading line terminators, like `match_punct`).
+    fn peek_is_punct(&self, s: &str) -> bool {
+        matches!(self.peek_skip_lt().map(|t| &t.kind),
+            Some(TokenKind::Punct(p)) if p == s)
+    }
+
     fn match_keyword(&mut self, s: &str) -> bool {
         match self.peek_skip_lt() {
             Some(t) if matches!(&t.kind, TokenKind::Keyword(k) if k == s) => {
@@ -677,7 +699,29 @@ impl Parser {
                         }
                     }
                     "class" => self.parse_class_decl(),
-                    "import" => self.skip_module_directive(),
+                    "import" => {
+                        // `import(...)` (dynamic) and `import.meta` are
+                        // EXPRESSIONS even at statement start (e.g.
+                        // `import("x").then(...)`). A declaration `import …`
+                        // is followed by an identifier, `{`, `*`, or a string
+                        // specifier. Look one significant token past `import`.
+                        let next = {
+                            let mut j = self.i + 1;
+                            while matches!(
+                                self.toks.get(j).map(|t| &t.kind),
+                                Some(TokenKind::LineTerminator)
+                            ) {
+                                j += 1;
+                            }
+                            self.toks.get(j).map(|t| t.kind.clone())
+                        };
+                        match next {
+                            Some(TokenKind::Punct(p)) if p == "(" || p == "." => {
+                                self.parse_expr_stmt()
+                            }
+                            _ => self.parse_import_decl(),
+                        }
+                    }
                     "export" => self.parse_export(),
                     "yield" => {
                         // `yield expr;` — parse the expression so the
@@ -1745,67 +1789,439 @@ impl Parser {
         Ok((name, iife))
     }
 
-    /// `import ... from '...'` / `import '...'` / `export ...` —
-    /// consumed up to the next semicolon or line break so the script
-    /// can continue. Modules land later; for now this just stops
-    /// scripts with import statements from failing to parse.
-    /// `export const x = ...` / `export function f() {}` /
-    /// `export class C {}` / `export { a, b }` / `export default expr` /
-    /// `export * from "..."`. V1 strips the `export` keyword and parses
-    /// the inner declaration as a regular statement so the names land
-    /// in the script scope. We don't yet build an export-table for
-    /// cross-module linking — see `skip_module_directive` for the
-    /// import side.
+    /// `import …` static declaration (ECMA-262 §16.2.2). Produces a real
+    /// `Stmt::Import` carrying the module specifier + bound names so the
+    /// module-graph linker can fetch the dependency and wire LIVE bindings.
+    /// Forms handled:
+    ///   `import "m";`                      (side-effect only)
+    ///   `import d from "m";`               (default)
+    ///   `import * as ns from "m";`         (namespace)
+    ///   `import { a, b as c } from "m";`   (named)
+    ///   `import d, { a } from "m";`        (default + named)
+    ///   `import d, * as ns from "m";`      (default + namespace)
+    fn parse_import_decl(&mut self) -> Result<Stmt, ParseError> {
+        self.bump(); // consume "import"
+        while self.eat_lineterm() {}
+        let mut specifiers: Vec<ImportSpecifier> = Vec::new();
+
+        // `import "module";` — bare side-effect import.
+        if let Some(TokenKind::String(s)) = self.peek_skip_lt().map(|t| &t.kind) {
+            let module = s.clone();
+            while self.eat_lineterm() {}
+            self.bump();
+            self.consume_opt_semicolon();
+            return Ok(Stmt::Import {
+                module,
+                specifiers,
+            });
+        }
+
+        // Default binding: `import d` / `import d, …`.
+        if matches!(self.peek_skip_lt().map(|t| &t.kind), Some(TokenKind::Identifier(_)))
+            || self.peek_is_contextual_ident()
+        {
+            let local = self.expect_binding_name()?;
+            specifiers.push(ImportSpecifier::Default { local });
+            // Optional `, { … }` or `, * as ns`.
+            if self.match_punct(",") {
+                while self.eat_lineterm() {}
+            }
+        }
+
+        // Namespace: `* as ns`.
+        if self.peek_is_punct("*") {
+            self.match_punct("*");
+            while self.eat_lineterm() {}
+            // `as`
+            self.expect_contextual("as")?;
+            let local = self.expect_binding_name()?;
+            specifiers.push(ImportSpecifier::Namespace { local });
+        } else if self.peek_is_punct("{") {
+            // Named: `{ a, b as c }`.
+            self.match_punct("{");
+            loop {
+                while self.eat_lineterm() {}
+                if self.peek_is_punct("}") {
+                    break;
+                }
+                let imported = self.expect_module_export_name()?;
+                while self.eat_lineterm() {}
+                let local = if self.match_contextual("as") {
+                    self.expect_binding_name()?
+                } else {
+                    imported.clone()
+                };
+                specifiers.push(ImportSpecifier::Named { imported, local });
+                while self.eat_lineterm() {}
+                if !self.match_punct(",") {
+                    break;
+                }
+            }
+            self.expect_punct("}")?;
+        }
+
+        // `from "module"`.
+        while self.eat_lineterm() {}
+        self.expect_contextual("from")?;
+        while self.eat_lineterm() {}
+        let module = self.expect_string_literal()?;
+        self.consume_opt_semicolon();
+        Ok(Stmt::Import {
+            module,
+            specifiers,
+        })
+    }
+
+    /// `export …` static declaration (ECMA-262 §16.2.3). Produces a real
+    /// `Stmt::Export` whose `decl` (if any) executes locally and whose
+    /// `specifiers` tell the linker which local names become live exports.
     fn parse_export(&mut self) -> Result<Stmt, ParseError> {
         self.bump(); // consume "export"
         while self.eat_lineterm() {}
-        match self.peek().map(|t| &t.kind) {
-            Some(TokenKind::Keyword(k)) => match k.as_str() {
-                "const" => {
-                    self.bump();
-                    self.parse_var_decl_stmt(VarKind::Const)
-                }
-                "let" => {
-                    self.bump();
-                    self.parse_var_decl_stmt(VarKind::Let)
-                }
-                "var" => {
-                    self.bump();
-                    self.parse_var_decl_stmt(VarKind::Var)
-                }
-                "function" => self.parse_function_decl(),
-                "class" => self.parse_class_decl(),
-                "default" => {
-                    // `export default expr` — evaluate the rhs and
-                    // discard the binding; the value is unreachable
-                    // because we don't have a module record.
-                    self.bump();
-                    while self.eat_lineterm() {}
-                    if matches!(
-                        self.peek().map(|t| &t.kind),
-                        Some(TokenKind::Keyword(k)) if k == "function"
-                    ) {
-                        return self.parse_function_decl();
+        match self.peek_skip_lt().map(|t| &t.kind) {
+            Some(TokenKind::Keyword(k)) => {
+                let k = k.clone();
+                match k.as_str() {
+                    "const" | "let" | "var" => {
+                        let kind = match k.as_str() {
+                            "const" => VarKind::Const,
+                            "let" => VarKind::Let,
+                            _ => VarKind::Var,
+                        };
+                        // NOTE: `parse_var_decl_stmt` consumes the
+                        // `const`/`let`/`var` keyword itself, so we must NOT
+                        // bump it here (doing so skips the binding name).
+                        while self.eat_lineterm() {}
+                        let decl = self.parse_var_decl_stmt(kind)?;
+                        let names = declared_names(&decl);
+                        let specifiers = names
+                            .into_iter()
+                            .map(|n| ExportSpecifier::Named {
+                                local: n.clone(),
+                                exported: n,
+                            })
+                            .collect();
+                        Ok(Stmt::Export {
+                            decl: Some(Box::new(decl)),
+                            specifiers,
+                            is_default: false,
+                        })
                     }
-                    if matches!(
-                        self.peek().map(|t| &t.kind),
-                        Some(TokenKind::Keyword(k)) if k == "class"
-                    ) {
-                        return self.parse_class_decl();
+                    "function" | "class" => {
+                        let decl = if k == "function" {
+                            self.parse_function_decl()?
+                        } else {
+                            self.parse_class_decl()?
+                        };
+                        let names = declared_names(&decl);
+                        let specifiers = names
+                            .into_iter()
+                            .map(|n| ExportSpecifier::Named {
+                                local: n.clone(),
+                                exported: n,
+                            })
+                            .collect();
+                        Ok(Stmt::Export {
+                            decl: Some(Box::new(decl)),
+                            specifiers,
+                            is_default: false,
+                        })
                     }
-                    self.parse_expr_stmt()
+                    "default" => self.parse_export_default(),
+                    "async" => {
+                        // `export async function foo(){}` — desugar like a
+                        // top-level async function and export by name.
+                        while self.eat_lineterm() {}
+                        self.bump(); // async
+                        while self.eat_lineterm() {}
+                        // expect `function`
+                        if matches!(self.peek_skip_lt().map(|t| &t.kind),
+                            Some(TokenKind::Keyword(k)) if k == "function")
+                        {
+                            let raw = self.parse_function_decl()?;
+                            let decl = make_async_decl(raw);
+                            let names = declared_names(&decl);
+                            let specifiers = names
+                                .into_iter()
+                                .map(|n| ExportSpecifier::Named {
+                                    local: n.clone(),
+                                    exported: n,
+                                })
+                                .collect();
+                            Ok(Stmt::Export {
+                                decl: Some(Box::new(decl)),
+                                specifiers,
+                                is_default: false,
+                            })
+                        } else {
+                            self.skip_module_directive()
+                        }
+                    }
+                    _ => self.skip_module_directive(),
                 }
-                "async" => {
-                    // `export async function foo() {}`
-                    self.parse_expr_stmt()
-                }
-                _ => self.skip_module_directive(),
-            },
-            // `export { a, b }` or `export * from "x"` — just skip
-            // since we can't link.
-            Some(TokenKind::Punct(p)) if p == "{" || p == "*" => self.skip_module_directive(),
+            }
+            Some(TokenKind::Punct(p)) if p == "{" => self.parse_export_named_clause(),
+            Some(TokenKind::Punct(p)) if p == "*" => self.parse_export_star(),
             _ => self.skip_module_directive(),
         }
+    }
+
+    /// `export default expr|function|class` (§16.2.3). The default export is
+    /// a LOCAL binding under the synthetic name `*default*`, exported as
+    /// `"default"`.
+    fn parse_export_default(&mut self) -> Result<Stmt, ParseError> {
+        while self.eat_lineterm() {}
+        self.bump(); // consume "default"
+        while self.eat_lineterm() {}
+        const DEFAULT_LOCAL: &str = "*default*";
+        let specifiers = vec![ExportSpecifier::Named {
+            local: DEFAULT_LOCAL.to_string(),
+            exported: "default".to_string(),
+        }];
+        // `export default function name(){}` / `export default class C{}`:
+        // a NAMED function/class declaration introduces the name AND the
+        // default binding. An ANONYMOUS `function(){}` / `class{}` is a
+        // declaration-expression bound only to `*default*` — route it through
+        // the expression path below (so `parse_primary` handles the anonymous
+        // function/class expression). HoistableDeclaration vs expression is
+        // decided by whether a binding identifier follows the keyword.
+        let kw_is_fn_or_class = matches!(self.peek_skip_lt().map(|t| &t.kind),
+            Some(TokenKind::Keyword(k)) if k == "function" || k == "class");
+        let has_binding_name = if kw_is_fn_or_class {
+            // Scan past `function`/`class` (and a generator `*`) to see if the
+            // next significant token is a binding identifier.
+            let mut j = self.i;
+            // skip leading line terms
+            while matches!(self.toks.get(j).map(|t| &t.kind), Some(TokenKind::LineTerminator)) {
+                j += 1;
+            }
+            j += 1; // the function/class keyword
+            while matches!(self.toks.get(j).map(|t| &t.kind), Some(TokenKind::LineTerminator)) {
+                j += 1;
+            }
+            // optional generator star
+            if matches!(self.toks.get(j).map(|t| &t.kind), Some(TokenKind::Punct(p)) if p == "*") {
+                j += 1;
+                while matches!(self.toks.get(j).map(|t| &t.kind), Some(TokenKind::LineTerminator)) {
+                    j += 1;
+                }
+            }
+            matches!(self.toks.get(j).map(|t| &t.kind), Some(TokenKind::Identifier(_)))
+        } else {
+            false
+        };
+        if has_binding_name {
+            let is_class = matches!(self.peek_skip_lt().map(|t| &t.kind),
+                Some(TokenKind::Keyword(k)) if k == "class");
+            let decl = if is_class {
+                self.parse_class_decl()?
+            } else {
+                self.parse_function_decl()?
+            };
+            // Bind `*default*` = the declared name (if it has one). We wrap the
+            // declaration plus a `const *default* = name;` in a block so both
+            // bindings land in the module scope.
+            let decl_name = declared_names(&decl).into_iter().next();
+            let mut block = vec![decl];
+            if let Some(n) = decl_name {
+                block.push(Stmt::VarDecl {
+                    kind: VarKind::Const,
+                    decls: vec![VarDeclarator {
+                        name: DEFAULT_LOCAL.to_string(),
+                        init: Some(Expr::Identifier(n)),
+                    }],
+                });
+            }
+            Ok(Stmt::Export {
+                decl: Some(Box::new(Stmt::Block(block))),
+                specifiers,
+                is_default: true,
+            })
+        } else {
+            // `export default <expr>;` — bind `const *default* = <expr>;`.
+            let value = self.parse_assignment_expr()?;
+            self.consume_opt_semicolon();
+            let decl = Stmt::VarDecl {
+                kind: VarKind::Const,
+                decls: vec![VarDeclarator {
+                    name: DEFAULT_LOCAL.to_string(),
+                    init: Some(value),
+                }],
+            };
+            Ok(Stmt::Export {
+                decl: Some(Box::new(decl)),
+                specifiers,
+                is_default: true,
+            })
+        }
+    }
+
+    /// `export { a, b as c };` or `export { a } from "m";` (§16.2.3).
+    fn parse_export_named_clause(&mut self) -> Result<Stmt, ParseError> {
+        self.match_punct("{");
+        let mut pairs: Vec<(String, String)> = Vec::new();
+        loop {
+            while self.eat_lineterm() {}
+            if self.peek_is_punct("}") {
+                break;
+            }
+            let local = self.expect_module_export_name()?;
+            while self.eat_lineterm() {}
+            let exported = if self.match_contextual("as") {
+                self.expect_module_export_name()?
+            } else {
+                local.clone()
+            };
+            pairs.push((local, exported));
+            while self.eat_lineterm() {}
+            if !self.match_punct(",") {
+                break;
+            }
+        }
+        self.expect_punct("}")?;
+        while self.eat_lineterm() {}
+        // Optional `from "m"` makes every entry a RE-EXPORT.
+        let from_module = if self.match_contextual("from") {
+            while self.eat_lineterm() {}
+            Some(self.expect_string_literal()?)
+        } else {
+            None
+        };
+        self.consume_opt_semicolon();
+        let specifiers = pairs
+            .into_iter()
+            .map(|(local, exported)| match &from_module {
+                Some(m) => ExportSpecifier::ReexportNamed {
+                    module: m.clone(),
+                    imported: local,
+                    exported,
+                },
+                None => ExportSpecifier::Named { local, exported },
+            })
+            .collect();
+        Ok(Stmt::Export {
+            decl: None,
+            specifiers,
+            is_default: false,
+        })
+    }
+
+    /// `export * from "m";` or `export * as ns from "m";` (§16.2.3).
+    fn parse_export_star(&mut self) -> Result<Stmt, ParseError> {
+        self.match_punct("*");
+        while self.eat_lineterm() {}
+        let exported = if self.match_contextual("as") {
+            Some(self.expect_module_export_name()?)
+        } else {
+            None
+        };
+        while self.eat_lineterm() {}
+        self.expect_contextual("from")?;
+        while self.eat_lineterm() {}
+        let module = self.expect_string_literal()?;
+        self.consume_opt_semicolon();
+        let spec = match exported {
+            Some(name) => ExportSpecifier::ReexportNamespace {
+                module,
+                exported: name,
+            },
+            None => ExportSpecifier::ReexportAll { module },
+        };
+        Ok(Stmt::Export {
+            decl: None,
+            specifiers: vec![spec],
+            is_default: false,
+        })
+    }
+
+    /// A binding identifier (import local name). Accepts plain identifiers and
+    /// contextual keywords (which are not reserved).
+    fn expect_binding_name(&mut self) -> Result<String, ParseError> {
+        while self.eat_lineterm() {}
+        match self.bump() {
+            Some(t) => match t.kind {
+                TokenKind::Identifier(s) => Ok(s),
+                TokenKind::Keyword(k)
+                    if matches!(
+                        k.as_str(),
+                        "of" | "as" | "from" | "get" | "set" | "let" | "static" | "async_"
+                    ) =>
+                {
+                    Ok(k.as_str().to_string())
+                }
+                other => Err(ParseError(format!("expected binding name, got {other:?}"))),
+            },
+            None => Err(ParseError("expected binding name".into())),
+        }
+    }
+
+    /// A ModuleExportName (§16.2.3): an identifier or a string literal
+    /// (`export { x as "string name" }`). We return the textual name.
+    fn expect_module_export_name(&mut self) -> Result<String, ParseError> {
+        while self.eat_lineterm() {}
+        match self.bump() {
+            Some(t) => match t.kind {
+                TokenKind::Identifier(s) => Ok(s),
+                TokenKind::String(s) => Ok(s),
+                TokenKind::Keyword(k) => Ok(k.as_str().to_string()),
+                other => Err(ParseError(format!("expected export name, got {other:?}"))),
+            },
+            None => Err(ParseError("expected export name".into())),
+        }
+    }
+
+    fn expect_string_literal(&mut self) -> Result<String, ParseError> {
+        while self.eat_lineterm() {}
+        match self.bump() {
+            Some(Token {
+                kind: TokenKind::String(s),
+                ..
+            }) => Ok(s),
+            other => Err(ParseError(format!(
+                "expected module specifier string, got {other:?}"
+            ))),
+        }
+    }
+
+    /// Match a contextual keyword (`as`, `from`) which the lexer classifies as
+    /// either a Keyword or — defensively — an Identifier.
+    fn match_contextual(&mut self, word: &str) -> bool {
+        match self.peek_skip_lt().map(|t| &t.kind) {
+            Some(TokenKind::Keyword(k)) if k == word => {
+                while self.eat_lineterm() {}
+                self.i += 1;
+                true
+            }
+            Some(TokenKind::Identifier(s)) if s == word => {
+                while self.eat_lineterm() {}
+                self.i += 1;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn expect_contextual(&mut self, word: &str) -> Result<(), ParseError> {
+        if self.match_contextual(word) {
+            Ok(())
+        } else {
+            Err(ParseError(format!(
+                "expected '{word}', got {:?}",
+                self.peek_skip_lt().map(|t| &t.kind)
+            )))
+        }
+    }
+
+    fn peek_is_contextual_ident(&self) -> bool {
+        matches!(self.peek_skip_lt().map(|t| &t.kind),
+            Some(TokenKind::Keyword(k)) if matches!(
+                k.as_str(),
+                "of" | "as" | "from" | "get" | "set" | "let" | "static" | "async_"))
+    }
+
+    fn consume_opt_semicolon(&mut self) {
+        while self.eat_lineterm() {}
+        self.match_punct(";");
     }
 
     fn skip_module_directive(&mut self) -> Result<Stmt, ParseError> {
@@ -3326,6 +3742,58 @@ impl Parser {
                         Ok(make_generator_expr(name, params, body))
                     } else {
                         Ok(Expr::Function { name, params, body })
+                    }
+                }
+                // `import.meta` (meta-property, §13.3.12) or `import(spec)`
+                // (dynamic ImportCall, §13.3.10) in EXPRESSION position. The
+                // statement-level `import …` declaration is handled in
+                // `parse_import_decl`; this branch only fires when `import`
+                // appears where an expression is expected.
+                "import" => {
+                    while self.eat_lineterm() {}
+                    if self.match_punct(".") {
+                        while self.eat_lineterm() {}
+                        // `import.meta` — the only meta property of `import`.
+                        let prop = match self.bump() {
+                            Some(t) => match t.kind {
+                                TokenKind::Identifier(s) => s,
+                                TokenKind::Keyword(s) => s.as_str().to_string(),
+                                other => {
+                                    return Err(ParseError(format!(
+                                        "expected 'meta' after 'import.', got {other:?}"
+                                    )));
+                                }
+                            },
+                            None => {
+                                return Err(ParseError("expected 'meta' after 'import.'".into()));
+                            }
+                        };
+                        if prop != "meta" {
+                            return Err(ParseError(format!(
+                                "unexpected meta-property 'import.{prop}'"
+                            )));
+                        }
+                        Ok(Expr::ImportMeta)
+                    } else if self.match_punct("(") {
+                        // `import(specifier)` — dynamic import. The spec allows
+                        // an optional second `options` argument; we parse and
+                        // discard it (we don't yet support import attributes).
+                        while self.eat_lineterm() {}
+                        let spec = self.parse_assignment_expr()?;
+                        // Optional `, options` and a trailing comma.
+                        while self.match_punct(",") {
+                            while self.eat_lineterm() {}
+                            if self.peek_is_punct(")") {
+                                break;
+                            }
+                            let _ = self.parse_assignment_expr()?;
+                        }
+                        self.expect_punct(")")?;
+                        Ok(Expr::DynamicImport(Box::new(spec)))
+                    } else {
+                        Err(ParseError(
+                            "expected '(' or '.meta' after 'import' in expression".into(),
+                        ))
                     }
                 }
                 // Contextual keywords are NOT reserved words — sloppy-mode

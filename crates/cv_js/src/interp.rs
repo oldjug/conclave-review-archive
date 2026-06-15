@@ -2474,6 +2474,25 @@ pub struct Scope {
     /// overwrites a binding that is in this set — so it can never clobber a real
     /// `var`/assignment of the same name that the program created itself.
     annexb_fns: std::collections::HashSet<String>,
+    /// ES module IMPORT LINKS (ECMA-262 §16.2.1.4.2 CreateImportBinding). For a
+    /// module scope, maps a local imported name → the EXPORTING module's
+    /// environment + the export name there. Reads of the local name follow this
+    /// link to the exporter's live binding (so a later mutation of the
+    /// exporter's `let`/`var` is visible to the importer — a LIVE binding).
+    /// Writes to an import binding throw (imports are immutable indirect
+    /// bindings). Empty for non-module scopes — zero overhead.
+    import_links: std::collections::HashMap<String, ImportLink>,
+}
+
+/// One resolved import binding: where to read the live value from.
+#[derive(Debug, Clone)]
+struct ImportLink {
+    /// The exporting module's environment record.
+    exporter: Env,
+    /// The export name to read from that environment (already resolved through
+    /// any re-export chain). The special value `*namespace*` means the local
+    /// name is bound to the exporter module's namespace object.
+    export_name: String,
 }
 
 /// RFC 3986 percent-encoding subset. `loose` keeps reserved characters
@@ -3401,7 +3420,38 @@ fn new_scope(parent: Option<Env>) -> Env {
         consts: std::collections::HashSet::new(),
         parent,
         annexb_fns: std::collections::HashSet::new(),
+        import_links: std::collections::HashMap::new(),
     }))
+}
+
+/// The set of module specifiers a module statically depends on — the union of
+/// `import … from "x"`, `export … from "x"`, and `export * from "x"`
+/// (ECMA-262 §16.2.1.7 [[RequestedModules]]). Returned in source order with
+/// duplicates removed so the graph fetches/links/evaluates each dep once.
+fn module_requested_specifiers(body: &[Stmt]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut push = |s: &str, out: &mut Vec<String>| {
+        if !out.iter().any(|x| x == s) {
+            out.push(s.to_string());
+        }
+    };
+    for stmt in body {
+        match stmt {
+            Stmt::Import { module, .. } => push(module, &mut out),
+            Stmt::Export { specifiers, .. } => {
+                for sp in specifiers {
+                    match sp {
+                        ExportSpecifier::ReexportNamed { module, .. }
+                        | ExportSpecifier::ReexportNamespace { module, .. }
+                        | ExportSpecifier::ReexportAll { module } => push(module, &mut out),
+                        ExportSpecifier::Named { .. } => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
 }
 
 fn scope_define(env: &Env, name: &str, value: Value, is_const: bool) {
@@ -3469,6 +3519,15 @@ fn scope_set(env: &Env, name: &str, value: Value) -> Result<(), JsError> {
     loop {
         {
             let s = cur.borrow();
+            // ES module imports are immutable indirect bindings (§16.2.1.4.2):
+            // assignment to an imported name is a TypeError (it would also be a
+            // SyntaxError at parse time in strict module code, but we surface it
+            // at runtime).
+            if s.import_links.contains_key(name) {
+                return Err(JsError::Throw(err_str(format!(
+                    "TypeError: Assignment to constant variable '{name}' (imported binding)"
+                ))));
+            }
             if s.bindings.borrow().contains_key(name) {
                 if s.consts.contains(name) {
                     return Err(JsError::Throw(err_str(format!(
@@ -3499,6 +3558,18 @@ fn scope_get(env: &Env, name: &str) -> Option<Value> {
     let mut cur = env.clone();
     let mut depth = 0usize;
     loop {
+        // ES module live import binding (§16.2.1.4.2): if this scope has an
+        // import link for `name`, read the EXPORTER's current value — so a
+        // mutation of the exported binding after evaluation is visible here.
+        {
+            let link = cur.borrow().import_links.get(name).cloned();
+            if let Some(link) = link {
+                // Guard against a self-referential / cyclic link loop.
+                if !Rc::ptr_eq(&link.exporter, &cur) {
+                    return scope_get(&link.exporter, &link.export_name);
+                }
+            }
+        }
         if let Some(v) = cur.borrow().bindings.borrow().get(name).cloned() {
             #[cfg(debug_assertions)]
             {
@@ -6238,6 +6309,67 @@ pub struct Interp {
     /// no-CSP pages and test262 (which never set DOCUMENT_CSP) behave exactly
     /// as today — the host flips it to `false` only for header-bearing pages.
     pub eval_allowed: std::cell::Cell<bool>,
+    /// ES MODULE GRAPH (ECMA-262 §16.2). Registry of every module record the
+    /// graph has touched, keyed by its resolved absolute URL (the "module
+    /// specifier" after resolution). Dedupe + cycle handling key off this map:
+    /// a module imported twice resolves to the same record and evaluates once.
+    pub module_registry: std::rc::Rc<RefCell<HashMap<String, ModuleRecord>>>,
+    /// Host module loader (HTML "fetch a single module script" + resolve). Given
+    /// `(specifier, referrer_url)` it returns `(resolved_url, source_text)` so
+    /// cv_js can fetch + parse a dependency. The browser installs this; in pure
+    /// cv_js unit tests a closure over an in-memory map is used. Without it,
+    /// static imports of unresolvable specifiers fail gracefully and dynamic
+    /// `import()` rejects.
+    pub module_loader:
+        RefCell<Option<std::rc::Rc<dyn Fn(&str, &str) -> Option<(String, String)>>>>,
+    /// The URL of the module currently being evaluated — backs `import.meta.url`
+    /// (§16.2.1.9 / HostGetImportMetaProperties). A stack so nested dynamic
+    /// `import()` evaluation restores the outer module's meta on return.
+    pub current_module_url: RefCell<Vec<String>>,
+}
+
+/// One node of the ES module graph: a Source Text Module Record
+/// (ECMA-262 §16.2.1.7). Holds the parsed body, the per-module environment
+/// (its top-level lexical scope), the export table, and the link/eval status
+/// so the graph dedupes and evaluates each module exactly once.
+#[derive(Clone)]
+pub struct ModuleRecord {
+    /// Resolved absolute URL — the registry key + `import.meta.url`.
+    pub url: String,
+    /// Parsed top-level statements (import/export nodes included).
+    pub body: std::rc::Rc<Vec<Stmt>>,
+    /// This module's environment record (a child of the global scope). Its
+    /// bindings hold the module's top-level declarations; importers link to
+    /// these for live bindings.
+    pub env: Env,
+    /// Export table: exported name → (this module's env, local binding name).
+    /// Built during instantiation; importers and the namespace object read
+    /// through it. For a re-export the env/name point at the ultimate source
+    /// module (resolved transitively).
+    pub exports: std::rc::Rc<RefCell<HashMap<String, (Env, String)>>>,
+    /// `export *` re-export targets (resolved URLs) — star exports are
+    /// flattened into the namespace lazily.
+    pub star_reexports: std::rc::Rc<RefCell<Vec<String>>>,
+    /// The cached module namespace exotic object (§10.4.6 / §16.2.1.10
+    /// GetModuleNamespace) once first requested.
+    pub namespace: std::rc::Rc<RefCell<Option<Value>>>,
+    /// Link + evaluation status (§16.2.1.7 [[Status]]): drives dedupe and
+    /// cycle handling.
+    pub status: std::rc::Rc<RefCell<ModuleStatus>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModuleStatus {
+    /// Parsed + registered, not yet linked.
+    Unlinked,
+    /// Currently inside InnerModuleLinking (cycle guard).
+    Linking,
+    /// Environment created + imports linked; ready to evaluate.
+    Linked,
+    /// Currently inside InnerModuleEvaluation (cycle guard).
+    Evaluating,
+    /// Body fully evaluated.
+    Evaluated,
 }
 
 impl Interp {
@@ -6267,6 +6399,448 @@ impl Interp {
     pub fn eval_allowed(&self) -> bool {
         self.eval_allowed.get()
     }
+
+    // ===================== ES MODULE GRAPH (ECMA-262 §16.2) =====================
+
+    /// Install the host module loader. Given a raw specifier + the referrer
+    /// module URL, returns `(resolved_url, source_text)`. See `module_loader`.
+    pub fn set_module_loader(
+        &self,
+        f: std::rc::Rc<dyn Fn(&str, &str) -> Option<(String, String)>>,
+    ) {
+        *self.module_loader.borrow_mut() = Some(f);
+    }
+
+    /// Entry point: run an ES module entry point given its already-fetched
+    /// source + resolved URL. This is the spec's top-level module job:
+    ///   1. Parse + register the entry module and (recursively) its deps.
+    ///   2. Link — create each module's environment + wire LIVE import bindings
+    ///      to exporter bindings (§16.2.1.5 Link / §16.2.1.5.2
+    ///      InitializeEnvironment / CreateImportBinding).
+    ///   3. Evaluate in POST-ORDER, deps first, each module ONCE
+    ///      (§16.2.1.6 Evaluate / InnerModuleEvaluation).
+    /// Returns the entry module record (for the namespace, if needed).
+    pub fn run_module_graph(
+        &mut self,
+        entry_url: &str,
+        entry_source: &str,
+    ) -> Result<ModuleRecord, JsError> {
+        let _task = enter_js_task();
+        let rec = self.load_module_record(entry_url, entry_source)?;
+        self.link_module(&rec)?;
+        self.evaluate_module(&rec)?;
+        self.drain_microtasks();
+        Ok(rec)
+    }
+
+    /// Parse + register a single module (and recursively fetch + register its
+    /// static-import dependencies) WITHOUT linking or evaluating. Dedupes via
+    /// the registry. Mirrors HTML "fetch a module script tree".
+    fn load_module_record(
+        &mut self,
+        url: &str,
+        source: &str,
+    ) -> Result<ModuleRecord, JsError> {
+        if let Some(existing) = self.module_registry.borrow().get(url).cloned() {
+            return Ok(existing);
+        }
+        let body = parse_program(source)
+            .map_err(|e| JsError::Internal(format!("module parse {url}: {e}")))?;
+        let env = new_scope(Some(self.global.clone()));
+        let rec = ModuleRecord {
+            url: url.to_string(),
+            body: std::rc::Rc::new(body),
+            env,
+            exports: std::rc::Rc::new(RefCell::new(HashMap::new())),
+            star_reexports: std::rc::Rc::new(RefCell::new(Vec::new())),
+            namespace: std::rc::Rc::new(RefCell::new(None)),
+            status: std::rc::Rc::new(RefCell::new(ModuleStatus::Unlinked)),
+        };
+        // Register BEFORE descending into deps so an import cycle terminates.
+        self.module_registry
+            .borrow_mut()
+            .insert(url.to_string(), rec.clone());
+        // Fetch + register every statically-imported / re-exported dependency.
+        let specifiers = module_requested_specifiers(&rec.body);
+        for spec in specifiers {
+            if self.resolve_dep_record(url, &spec).is_none() {
+                // A dependency that fails to load is recorded as missing; the
+                // linker surfaces unresolved imports as `undefined` reads rather
+                // than aborting the whole graph (matches lenient host loaders).
+            }
+        }
+        Ok(rec)
+    }
+
+    /// Resolve + fetch a dependency module by specifier (relative to `referrer`)
+    /// via the host loader, returning its (parsed, registered) record. Dedupes.
+    fn resolve_dep_record(&mut self, referrer: &str, spec: &str) -> Option<ModuleRecord> {
+        let loader = self.module_loader.borrow().clone();
+        let (resolved, source) = loader?(spec, referrer)?;
+        if let Some(existing) = self.module_registry.borrow().get(&resolved).cloned() {
+            return Some(existing);
+        }
+        self.load_module_record(&resolved, &source).ok()
+    }
+
+    /// §16.2.1.5 Link → §16.2.1.5.2 InitializeEnvironment. Recursively links the
+    /// graph in post-order: for each module, link its deps, then create its
+    /// export table + wire its import bindings to exporter bindings (live).
+    fn link_module(&mut self, rec: &ModuleRecord) -> Result<(), JsError> {
+        {
+            let st = *rec.status.borrow();
+            if st != ModuleStatus::Unlinked {
+                return Ok(()); // already linking/linked (cycle or dedupe)
+            }
+            *rec.status.borrow_mut() = ModuleStatus::Linking;
+        }
+        // Link dependencies first.
+        let referrer = rec.url.clone();
+        let specs = module_requested_specifiers(&rec.body);
+        for spec in &specs {
+            if let Some(dep) = self.resolve_dep_record(&referrer, spec) {
+                self.link_module(&dep)?;
+            }
+        }
+        // Build this module's own export table from local export entries.
+        self.build_export_table(rec);
+        // Wire import bindings into the module env (live indirect bindings).
+        self.initialize_import_bindings(rec)?;
+        *rec.status.borrow_mut() = ModuleStatus::Linked;
+        Ok(())
+    }
+
+    /// Populate `rec.exports` from the module's `export` declarations. Local
+    /// exports point at this module's own env; re-exports resolve transitively
+    /// to the source module's env (§16.2.1.6 ResolveExport).
+    fn build_export_table(&mut self, rec: &ModuleRecord) {
+        let referrer = rec.url.clone();
+        let mut star_targets: Vec<String> = Vec::new();
+        // Collect declarations first (avoid borrowing rec.body across mutation).
+        let body = rec.body.clone();
+        for stmt in body.iter() {
+            if let Stmt::Export { specifiers, .. } = stmt {
+                for sp in specifiers {
+                    match sp {
+                        ExportSpecifier::Named { local, exported } => {
+                            rec.exports
+                                .borrow_mut()
+                                .insert(exported.clone(), (rec.env.clone(), local.clone()));
+                        }
+                        ExportSpecifier::ReexportNamed {
+                            module,
+                            imported,
+                            exported,
+                        } => {
+                            if let Some(dep) = self.resolve_dep_record(&referrer, module) {
+                                self.build_export_table_if_needed(&dep);
+                                if let Some((env, name)) =
+                                    self.resolve_export(&dep, imported, &mut Vec::new())
+                                {
+                                    rec.exports
+                                        .borrow_mut()
+                                        .insert(exported.clone(), (env, name));
+                                }
+                            }
+                        }
+                        ExportSpecifier::ReexportNamespace { module, exported } => {
+                            if let Some(dep) = self.resolve_dep_record(&referrer, module) {
+                                // Bind the namespace object into this module's env
+                                // under a synthetic local name and export it.
+                                let local = format!("*ns:{module}*");
+                                let ns = self.get_module_namespace(&dep);
+                                scope_define(&rec.env, &local, ns, true);
+                                rec.exports
+                                    .borrow_mut()
+                                    .insert(exported.clone(), (rec.env.clone(), local));
+                            }
+                        }
+                        ExportSpecifier::ReexportAll { module } => {
+                            if let Some(dep) = self.resolve_dep_record(&referrer, module) {
+                                star_targets.push(dep.url.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        *rec.star_reexports.borrow_mut() = star_targets;
+    }
+
+    fn build_export_table_if_needed(&mut self, rec: &ModuleRecord) {
+        if rec.exports.borrow().is_empty() && rec.star_reexports.borrow().is_empty() {
+            self.build_export_table(rec);
+        }
+    }
+
+    /// §16.2.1.6 ResolveExport: find the (env, local-name) a given export name
+    /// ultimately resolves to, following re-export + `export *` chains. The
+    /// `seen` list guards against ambiguous-star / cyclic re-export loops.
+    fn resolve_export(
+        &mut self,
+        rec: &ModuleRecord,
+        name: &str,
+        seen: &mut Vec<String>,
+    ) -> Option<(Env, String)> {
+        let key = format!("{}::{}", rec.url, name);
+        if seen.contains(&key) {
+            return None; // cycle in re-export resolution
+        }
+        seen.push(key);
+        self.build_export_table_if_needed(rec);
+        if let Some(t) = rec.exports.borrow().get(name).cloned() {
+            return Some(t);
+        }
+        // `export *` star re-exports: search each target (default is NOT
+        // re-exported by `export *`, per §16.2.1.6).
+        if name != "default" {
+            let stars = rec.star_reexports.borrow().clone();
+            for target_url in stars {
+                let dep = self.module_registry.borrow().get(&target_url).cloned();
+                if let Some(dep) = dep {
+                    if let Some(t) = self.resolve_export(&dep, name, seen) {
+                        return Some(t);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// §16.2.1.5.2 InitializeEnvironment / CreateImportBinding. For each import
+    /// of this module, install in the module env a LIVE link to the exporter's
+    /// binding (named import), or bind the namespace object (namespace import).
+    ///
+    /// STRICT RESOLUTION (§16.2.1.6.4 InitializeEnvironment step 2.a): for every
+    /// named/default import, `ResolveExport` MUST yield a binding. If the imported
+    /// module loaded but does not provide the requested export (resolution is
+    /// `null`), this throws a `SyntaxError` — exactly as V8/Chrome do
+    /// (`SyntaxError: The requested module '<spec>' does not provide an export
+    /// named '<name>'`). This replaces the previous lenient "silently undefined"
+    /// behavior, which was indistinguishable from a stub. A dependency that fails
+    /// to LOAD at all is still tolerated (the loader is best-effort) — that is a
+    /// distinct host-fetch failure, not a link-time export-resolution error.
+    fn initialize_import_bindings(&mut self, rec: &ModuleRecord) -> Result<(), JsError> {
+        let referrer = rec.url.clone();
+        let body = rec.body.clone();
+        for stmt in body.iter() {
+            if let Stmt::Import { module, specifiers } = stmt {
+                let dep = self.resolve_dep_record(&referrer, module);
+                let Some(dep) = dep else { continue };
+                self.build_export_table_if_needed(&dep);
+                for sp in specifiers {
+                    match sp {
+                        ImportSpecifier::Named { imported, local } => {
+                            match self.resolve_export(&dep, imported, &mut Vec::new()) {
+                                Some((env, name)) => {
+                                    rec.env.borrow_mut().import_links.insert(
+                                        local.clone(),
+                                        ImportLink {
+                                            exporter: env,
+                                            export_name: name,
+                                        },
+                                    );
+                                }
+                                None => {
+                                    return Err(JsError::Throw(make_error_value(
+                                        "SyntaxError",
+                                        &["SyntaxError", "Error"],
+                                        format!(
+                                            "The requested module '{module}' does not provide an export named '{imported}'"
+                                        ),
+                                    )));
+                                }
+                            }
+                        }
+                        ImportSpecifier::Default { local } => {
+                            match self.resolve_export(&dep, "default", &mut Vec::new()) {
+                                Some((env, name)) => {
+                                    rec.env.borrow_mut().import_links.insert(
+                                        local.clone(),
+                                        ImportLink {
+                                            exporter: env,
+                                            export_name: name,
+                                        },
+                                    );
+                                }
+                                None => {
+                                    return Err(JsError::Throw(make_error_value(
+                                        "SyntaxError",
+                                        &["SyntaxError", "Error"],
+                                        format!(
+                                            "The requested module '{module}' does not provide an export named 'default'"
+                                        ),
+                                    )));
+                                }
+                            }
+                        }
+                        ImportSpecifier::Namespace { local } => {
+                            let ns = self.get_module_namespace(&dep);
+                            scope_define(&rec.env, local, ns, true);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// §16.2.1.6 Evaluate → InnerModuleEvaluation. Post-order DFS: evaluate
+    /// every dependency before this module's own body, each module exactly once.
+    fn evaluate_module(&mut self, rec: &ModuleRecord) -> Result<(), JsError> {
+        {
+            let st = *rec.status.borrow();
+            match st {
+                ModuleStatus::Evaluated | ModuleStatus::Evaluating => return Ok(()),
+                ModuleStatus::Linked => {}
+                // Not linked yet — link on demand (dynamic import path).
+                _ => {
+                    self.link_module(rec)?;
+                }
+            }
+            *rec.status.borrow_mut() = ModuleStatus::Evaluating;
+        }
+        // Evaluate dependencies first (post-order).
+        let referrer = rec.url.clone();
+        let specs = module_requested_specifiers(&rec.body);
+        for spec in &specs {
+            if let Some(dep) = self.resolve_dep_record(&referrer, spec) {
+                self.evaluate_module(&dep)?;
+            }
+        }
+        // Now evaluate this module's own body in its module environment.
+        self.current_module_url.borrow_mut().push(rec.url.clone());
+        let result = self.evaluate_module_body(rec);
+        self.current_module_url.borrow_mut().pop();
+        result?;
+        *rec.status.borrow_mut() = ModuleStatus::Evaluated;
+        Ok(())
+    }
+
+    /// Execute a single module's top-level body in its own environment. Hoists
+    /// var + function declarations into the module env (GlobalDeclaration-
+    /// Instantiation analogue, §16.2.1.6.4), then runs statements. `export`
+    /// inner declarations execute here; `import` statements are no-ops (already
+    /// linked). The completion value is discarded (modules have no result).
+    fn evaluate_module_body(&mut self, rec: &ModuleRecord) -> Result<(), JsError> {
+        let env = rec.env.clone();
+        // Flatten export-declarations + plain statements for hoisting.
+        let stmts: Vec<Stmt> = rec
+            .body
+            .iter()
+            .map(|s| match s {
+                Stmt::Export { decl: Some(d), .. } => (**d).clone(),
+                Stmt::Export { decl: None, .. } | Stmt::Import { .. } => Stmt::Empty,
+                other => other.clone(),
+            })
+            .collect();
+        self.hoist_vars_into(&stmts, &env);
+        // Hoist top-level function declarations.
+        for stmt in &stmts {
+            if let Stmt::FunctionDecl { name, params, body } = stmt {
+                let f = Value::Function(Rc::new(FunctionValue {
+                    name: Some(name.clone()),
+                    params: params.clone(),
+                    body: FunctionBody::Block(body.clone()),
+                    closure: env.clone(),
+                    props: RefCell::new(HashMap::new()),
+                    is_arrow: false,
+                }));
+                scope_define(&env, name, f, false);
+            }
+        }
+        for stmt in &stmts {
+            match stmt {
+                Stmt::FunctionDecl { .. } | Stmt::Empty => {}
+                other => {
+                    self.exec_stmt(other, &env)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// §16.2.1.10 GetModuleNamespace + §10.4.6 Module Namespace Exotic Object.
+    /// Returns (and caches) a frozen object whose keys are the module's exported
+    /// names, each backed by a LIVE getter that reads the exporter's current
+    /// binding. We model it as a plain object whose property values are refreshed
+    /// on each read via accessor entries when available; to keep it simple and
+    /// LIVE, we store accessor getters keyed by name.
+    fn get_module_namespace(&mut self, rec: &ModuleRecord) -> Value {
+        if let Some(ns) = rec.namespace.borrow().clone() {
+            return ns;
+        }
+        // Collect all export names: own exports + star-reexported names.
+        self.build_export_table_if_needed(rec);
+        let mut names: Vec<String> = rec.exports.borrow().keys().cloned().collect();
+        let stars = rec.star_reexports.borrow().clone();
+        for target_url in &stars {
+            let dep = self.module_registry.borrow().get(target_url).cloned();
+            if let Some(dep) = dep {
+                self.build_export_table_if_needed(&dep);
+                for k in dep.exports.borrow().keys() {
+                    if k != "default" && !names.contains(k) {
+                        names.push(k.clone());
+                    }
+                }
+            }
+        }
+        names.sort(); // §10.4.6: namespace keys are sorted (SortCompare on names)
+        let map: HashMap<String, Value> = HashMap::new();
+        let obj = Rc::new(RefCell::new(map));
+        // For each exported name build a live accessor whose getter reads the
+        // exporter binding. We install accessors via the engine's ACCESSOR_GET
+        // convention so reads always reflect current values (live bindings).
+        for name in &names {
+            let resolved = self.resolve_export(rec, name, &mut Vec::new());
+            if let Some((env, local)) = resolved {
+                let env_c = env.clone();
+                let local_c = local.clone();
+                let getter = native_fn("get", move |_args| {
+                    Ok(scope_get(&env_c, &local_c).unwrap_or(Value::Undefined))
+                });
+                let mut accessor: HashMap<String, Value> = HashMap::new();
+                accessor.insert(ACCESSOR_GET.to_string(), getter);
+                obj.borrow_mut().insert(
+                    name.clone(),
+                    Value::Object(Rc::new(RefCell::new(accessor))),
+                );
+            }
+        }
+        // Mark as a module namespace object (Symbol.toStringTag = "Module").
+        obj.borrow_mut().insert(
+            "\u{1}Symbol(Symbol.toStringTag)".to_string(),
+            Value::str("Module".to_string()),
+        );
+        let ns = Value::Object(obj);
+        *rec.namespace.borrow_mut() = Some(ns.clone());
+        ns
+    }
+
+    /// Dynamic `import(specifier)` (§13.3.10 ImportCall + HostLoadImported-
+    /// Module). Resolves + loads + links + evaluates the requested module, then
+    /// returns a Promise that fulfils with its namespace object. Rejects if the
+    /// specifier cannot be resolved/loaded.
+    pub fn dynamic_import(&mut self, specifier: &str, referrer: &str) -> Value {
+        let result = (|| -> Result<Value, JsError> {
+            let dep = self
+                .resolve_dep_record(referrer, specifier)
+                .ok_or_else(|| {
+                    JsError::Throw(err_str(format!(
+                        "TypeError: Failed to resolve module specifier '{specifier}'"
+                    )))
+                })?;
+            self.link_module(&dep)?;
+            self.evaluate_module(&dep)?;
+            Ok(self.get_module_namespace(&dep))
+        })();
+        match result {
+            Ok(ns) => make_settled_promise(true, ns),
+            Err(JsError::Throw(v)) => make_settled_promise(false, v),
+            Err(e) => make_settled_promise(false, err_str(format!("{e:?}"))),
+        }
+    }
+
     fn eval_identifier(&self, env: &Env, name: &str) -> Result<Value, JsError> {
         match scope_get(env, name) {
             Some(v) => {
@@ -6414,6 +6988,9 @@ impl Interp {
             native_this_stack: std::cell::RefCell::new(Vec::new()),
             // CSP unsafe-eval gate: default permissive (no-CSP behavior).
             eval_allowed: std::cell::Cell::new(true),
+            module_registry: std::rc::Rc::new(RefCell::new(HashMap::new())),
+            module_loader: RefCell::new(None),
+            current_module_url: RefCell::new(Vec::new()),
         };
         // Runtime support for desugared `async` functions — always available
         // (the parser emits `__tb_run_async__(() => { BODY })` for every async
@@ -12274,6 +12851,20 @@ impl Interp {
         watchdog_tick()?;
         match stmt {
             Stmt::Empty => Ok(Completion::Normal),
+            // ES module declarations executed OUTSIDE the module graph (e.g. an
+            // entry module run via `run()` for compatibility, or a nested
+            // `eval`). The graph linker (`run_module_graph`) handles real
+            // import/export wiring; here we degrade gracefully:
+            //   - `import …` binds nothing (the linker would have) but doesn't
+            //     abort — references resolve from the shared global scope, which
+            //     is how the legacy text-concat module loader worked.
+            //   - `export <decl>` still EXECUTES its inner declaration so the
+            //     exported names exist as bindings (`export const x = 1`).
+            Stmt::Import { .. } => Ok(Completion::Normal),
+            Stmt::Export { decl, .. } => match decl {
+                Some(d) => self.exec_stmt(d, env),
+                None => Ok(Completion::Normal),
+            },
             Stmt::Expression(e) => {
                 self.eval(e, env)?;
                 Ok(Completion::Normal)
@@ -13675,6 +14266,35 @@ impl Interp {
                 Ok(last)
             }
             Expr::Regex(body, flags) => Ok(build_regex_value(body, flags)),
+            Expr::ImportMeta => {
+                // §13.3.12 + HostGetImportMetaProperties: `import.meta` exposes
+                // `{ url: <module url> }`. Outside a module context the URL is
+                // empty (best-effort; matches a classic-script `import.meta`
+                // which is actually a SyntaxError, but we stay lenient).
+                let url = self
+                    .current_module_url
+                    .borrow()
+                    .last()
+                    .cloned()
+                    .unwrap_or_default();
+                let mut m: HashMap<String, Value> = HashMap::new();
+                m.insert("url".to_string(), Value::str(url));
+                Ok(Value::Object(Rc::new(RefCell::new(m))))
+            }
+            Expr::DynamicImport(spec) => {
+                // §13.3.10 ImportCall: evaluate the specifier, ToString it, and
+                // load the module, returning a Promise for its namespace. The
+                // referrer is the currently-evaluating module (or the entry URL).
+                let spec_v = self.eval(spec, env)?;
+                let specifier = spec_v.to_display_string();
+                let referrer = self
+                    .current_module_url
+                    .borrow()
+                    .last()
+                    .cloned()
+                    .unwrap_or_default();
+                Ok(self.dynamic_import(&specifier, &referrer))
+            }
         }
     }
 
@@ -24463,6 +25083,517 @@ log(probe());
     fn import_export_skipped_not_fatal() {
         let (_, out) = run("import { x } from 'whatever'; export const y = 5; console.log('ok');");
         assert_eq!(out, vec!["ok"]);
+    }
+
+    // ===================== ES MODULE GRAPH TESTS (§16.2) =====================
+
+    /// Run an ES module graph from an in-memory file set. `files` maps a URL to
+    /// its source; `entry` names the entry module. The loader resolves relative
+    /// specifiers against the referrer with a tiny URL-join so `./b.js` works.
+    fn run_module_files(files: &[(&str, &str)], entry: &str) -> Vec<String> {
+        let map: std::collections::HashMap<String, String> = files
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let map_rc = std::rc::Rc::new(map);
+        let loader_map = map_rc.clone();
+        let mut i = Interp::new();
+        i.install_basic_globals();
+        i.set_module_loader(std::rc::Rc::new(move |spec: &str, referrer: &str| {
+            let resolved = test_resolve_specifier(spec, referrer);
+            loader_map
+                .get(&resolved)
+                .map(|src| (resolved.clone(), src.clone()))
+        }));
+        let entry_src = map_rc.get(entry).expect("entry source").clone();
+        match i.run_module_graph(entry, &entry_src) {
+            Ok(_) => {}
+            Err(JsError::Throw(v)) => {
+                let msg = if let Value::Object(o) = &v {
+                    let b = o.borrow();
+                    let name = b.get("name").map(|x| x.to_display_string()).unwrap_or_default();
+                    let m = b.get("message").map(|x| x.to_display_string()).unwrap_or_default();
+                    format!("{name}: {m}")
+                } else {
+                    v.to_display_string()
+                };
+                panic!("module graph threw: {msg}");
+            }
+            Err(e) => panic!("module graph error: {e:?}"),
+        }
+        i.output
+    }
+
+    /// Minimal module-specifier resolver for tests: joins `./x`, `../x`, and
+    /// bare `x` against the referrer's directory; absolute `/x` and `proto:` are
+    /// returned as-is. (The real browser uses cv_url; this keeps tests
+    /// dependency-free while exercising relative resolution.)
+    fn test_resolve_specifier(spec: &str, referrer: &str) -> String {
+        if spec.contains("://") || spec.starts_with('/') {
+            return spec.to_string();
+        }
+        // Directory of the referrer.
+        let dir = match referrer.rfind('/') {
+            Some(i) => &referrer[..i],
+            None => "",
+        };
+        let mut parts: Vec<&str> = if dir.is_empty() {
+            Vec::new()
+        } else {
+            dir.split('/').collect()
+        };
+        for seg in spec.split('/') {
+            match seg {
+                "." | "" => {}
+                ".." => {
+                    parts.pop();
+                }
+                other => parts.push(other),
+            }
+        }
+        parts.join("/")
+    }
+
+    #[test]
+    fn module_import_sees_dependency_export() {
+        // A imports v from B; the value B exported must be visible in A.
+        let out = run_module_files(
+            &[
+                ("app/a.js", "import { v } from './b.js'; console.log(v);"),
+                ("app/b.js", "export const v = 42;"),
+            ],
+            "app/a.js",
+        );
+        assert_eq!(out, vec!["42"]);
+    }
+
+    #[test]
+    fn module_dependency_evaluates_before_importer() {
+        // B's side-effect log must come BEFORE A's (post-order: deps first).
+        let out = run_module_files(
+            &[
+                (
+                    "a.js",
+                    "import './b.js'; console.log('A');",
+                ),
+                ("b.js", "console.log('B');"),
+            ],
+            "a.js",
+        );
+        assert_eq!(out, vec!["B", "A"]);
+    }
+
+    #[test]
+    fn module_diamond_evaluates_shared_dep_once() {
+        // A -> B, C ; B -> D ; C -> D. D must evaluate exactly ONCE.
+        let out = run_module_files(
+            &[
+                (
+                    "a.js",
+                    "import './b.js'; import './c.js'; console.log('A');",
+                ),
+                ("b.js", "import './d.js'; console.log('B');"),
+                ("c.js", "import './d.js'; console.log('C');"),
+                ("d.js", "console.log('D');"),
+            ],
+            "a.js",
+        );
+        // D once, before both B and C; A last.
+        assert_eq!(out, vec!["D", "B", "C", "A"]);
+        assert_eq!(out.iter().filter(|l| *l == "D").count(), 1);
+    }
+
+    #[test]
+    fn module_live_binding_reflects_later_mutation() {
+        // B exports a `let` and a mutator; A reads it before and after the
+        // mutation. The imported binding must be LIVE (§16.2.1.4.2).
+        let out = run_module_files(
+            &[
+                (
+                    "a.js",
+                    "import { count, inc } from './b.js'; \
+                     console.log(count); inc(); inc(); console.log(count);",
+                ),
+                (
+                    "b.js",
+                    "export let count = 0; export function inc(){ count++; }",
+                ),
+            ],
+            "a.js",
+        );
+        assert_eq!(out, vec!["0", "2"]);
+    }
+
+    #[test]
+    fn module_default_export_and_import() {
+        let out = run_module_files(
+            &[
+                ("a.js", "import greet from './b.js'; console.log(greet('x'));"),
+                ("b.js", "export default function(n){ return 'hi ' + n; }"),
+            ],
+            "a.js",
+        );
+        assert_eq!(out, vec!["hi x"]);
+    }
+
+    #[test]
+    fn module_namespace_import_is_live() {
+        let out = run_module_files(
+            &[
+                (
+                    "a.js",
+                    "import * as m from './b.js'; \
+                     console.log(m.count); m.bump(); console.log(m.count);",
+                ),
+                (
+                    "b.js",
+                    "export let count = 1; export function bump(){ count += 10; }",
+                ),
+            ],
+            "a.js",
+        );
+        // Namespace property reads are live getters → reflect the mutation.
+        assert_eq!(out, vec!["1", "11"]);
+    }
+
+    #[test]
+    fn module_aliased_named_import() {
+        let out = run_module_files(
+            &[
+                ("a.js", "import { v as w } from './b.js'; console.log(w);"),
+                ("b.js", "const v = 7; export { v };"),
+            ],
+            "a.js",
+        );
+        assert_eq!(out, vec!["7"]);
+    }
+
+    #[test]
+    fn module_reexport_chain() {
+        // A imports x from B; B re-exports x from C (`export { x } from './c.js'`).
+        let out = run_module_files(
+            &[
+                ("a.js", "import { x } from './b.js'; console.log(x);"),
+                ("b.js", "export { x } from './c.js';"),
+                ("c.js", "export const x = 99;"),
+            ],
+            "a.js",
+        );
+        assert_eq!(out, vec!["99"]);
+    }
+
+    #[test]
+    fn module_export_star() {
+        let out = run_module_files(
+            &[
+                (
+                    "a.js",
+                    "import { p, q } from './b.js'; console.log(p + q);",
+                ),
+                ("b.js", "export * from './c.js';"),
+                ("c.js", "export const p = 3; export const q = 4;"),
+            ],
+            "a.js",
+        );
+        assert_eq!(out, vec!["7"]);
+    }
+
+    #[test]
+    fn module_import_meta_url() {
+        let out = run_module_files(
+            &[("dir/a.js", "console.log(import.meta.url);")],
+            "dir/a.js",
+        );
+        assert_eq!(out, vec!["dir/a.js"]);
+    }
+
+    #[test]
+    fn module_import_assignment_throws() {
+        // Imported bindings are immutable indirect bindings (§16.2.1.4.2).
+        let map: std::collections::HashMap<String, String> = [
+            (
+                "a.js".to_string(),
+                "import { v } from './b.js'; try { v = 1; } catch(e) { console.log('caught'); }"
+                    .to_string(),
+            ),
+            ("b.js".to_string(), "export let v = 0;".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let map_rc = std::rc::Rc::new(map);
+        let loader_map = map_rc.clone();
+        let mut i = Interp::new();
+        i.install_basic_globals();
+        i.set_module_loader(std::rc::Rc::new(move |spec: &str, referrer: &str| {
+            let resolved = test_resolve_specifier(spec, referrer);
+            loader_map
+                .get(&resolved)
+                .map(|src| (resolved.clone(), src.clone()))
+        }));
+        i.run_module_graph("a.js", map_rc.get("a.js").unwrap())
+            .unwrap();
+        assert_eq!(i.output, vec!["caught"]);
+    }
+
+    #[test]
+    fn module_cycle_terminates() {
+        // A imports from B, B imports from A (a cycle). Both must evaluate once
+        // and the graph must not infinite-loop.
+        let out = run_module_files(
+            &[
+                (
+                    "a.js",
+                    "import { b } from './b.js'; export const a = 1; console.log('A' + b);",
+                ),
+                (
+                    "b.js",
+                    "import { a } from './a.js'; export const b = 2; console.log('B');",
+                ),
+            ],
+            "a.js",
+        );
+        // Post-order: A starts, descends to B; B descends back to A (already
+        // evaluating, returns); B body runs; then A body. B before A's body.
+        assert!(out.contains(&"B".to_string()));
+        assert!(out.iter().any(|l| l.starts_with("A")));
+    }
+
+    #[test]
+    fn dynamic_import_resolves_to_namespace() {
+        // `import('./b.js')` returns a promise for B's namespace. Our await
+        // model settles synchronously; `.then` delivers the namespace.
+        let out = run_module_files(
+            &[
+                (
+                    "a.js",
+                    "import('./b.js').then(m => { console.log(m.hello()); });",
+                ),
+                ("b.js", "export function hello(){ return 'dyn'; }"),
+            ],
+            "a.js",
+        );
+        assert_eq!(out, vec!["dyn"]);
+    }
+
+    #[test]
+    fn dynamic_import_await_namespace() {
+        let out = run_module_files(
+            &[
+                (
+                    "a.js",
+                    "async function f(){ const m = await import('./b.js'); console.log(m.v); } f();",
+                ),
+                ("b.js", "export const v = 'awaited';"),
+            ],
+            "a.js",
+        );
+        assert_eq!(out, vec!["awaited"]);
+    }
+
+    /// Like `run_module_files` but returns the graph's `Result` so a test can
+    /// assert a link-time error (e.g. unresolvable import → SyntaxError).
+    fn run_module_files_result(
+        files: &[(&str, &str)],
+        entry: &str,
+    ) -> Result<(), JsError> {
+        let map: std::collections::HashMap<String, String> = files
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let map_rc = std::rc::Rc::new(map);
+        let loader_map = map_rc.clone();
+        let mut i = Interp::new();
+        i.install_basic_globals();
+        i.set_module_loader(std::rc::Rc::new(move |spec: &str, referrer: &str| {
+            let resolved = test_resolve_specifier(spec, referrer);
+            loader_map
+                .get(&resolved)
+                .map(|src| (resolved.clone(), src.clone()))
+        }));
+        let entry_src = map_rc.get(entry).expect("entry source").clone();
+        i.run_module_graph(entry, &entry_src).map(|_| ())
+    }
+
+    #[test]
+    fn module_missing_named_export_is_syntax_error() {
+        // §16.2.1.6.4 InitializeEnvironment: a named import that the exporting
+        // module does NOT provide is a link-time SyntaxError (not a silent
+        // `undefined`). Matches V8/Chrome's
+        // "does not provide an export named 'nope'".
+        let err = run_module_files_result(
+            &[
+                ("a.js", "import { nope } from './b.js'; console.log(nope);"),
+                ("b.js", "export const yes = 1;"),
+            ],
+            "a.js",
+        )
+        .expect_err("missing export must throw");
+        let JsError::Throw(v) = err else {
+            panic!("expected a thrown SyntaxError, got {err:?}");
+        };
+        let Value::Object(o) = &v else { panic!("not an error object") };
+        let b = o.borrow();
+        assert_eq!(b.get("name").unwrap().to_display_string(), "SyntaxError");
+        let msg = b.get("message").unwrap().to_display_string();
+        assert!(
+            msg.contains("does not provide an export named 'nope'"),
+            "message was: {msg}"
+        );
+    }
+
+    #[test]
+    fn module_missing_default_export_is_syntax_error() {
+        let err = run_module_files_result(
+            &[
+                ("a.js", "import d from './b.js'; console.log(d);"),
+                ("b.js", "export const x = 1;"),
+            ],
+            "a.js",
+        )
+        .expect_err("missing default export must throw");
+        let JsError::Throw(Value::Object(o)) = err else {
+            panic!("expected a thrown SyntaxError object");
+        };
+        let b = o.borrow();
+        assert_eq!(b.get("name").unwrap().to_display_string(), "SyntaxError");
+        assert!(b
+            .get("message")
+            .unwrap()
+            .to_display_string()
+            .contains("does not provide an export named 'default'"));
+    }
+
+    #[test]
+    fn module_namespace_keys_sorted_with_default() {
+        // §10.4.6 Module Namespace exotic object: own string keys are the
+        // exported names (INCLUDING `default` for `export default`), in code-
+        // unit ASCENDING order; `Symbol.toStringTag` is a symbol key, never a
+        // string key in `Object.keys`.
+        let out = run_module_files(
+            &[
+                (
+                    "a.js",
+                    "import * as m from './b.js'; \
+                     console.log(Object.keys(m).join(',')); \
+                     console.log(m.default);",
+                ),
+                (
+                    "b.js",
+                    "export const zeta = 1; export const alpha = 2; export default 7;",
+                ),
+            ],
+            "a.js",
+        );
+        assert_eq!(out, vec!["alpha,default,zeta", "7"]);
+    }
+
+    #[test]
+    fn module_export_namespace_as() {
+        // §16.2.3.7 `export * as ns from "m"` — re-export m's namespace object.
+        let out = run_module_files(
+            &[
+                (
+                    "a.js",
+                    "import { utils } from './b.js'; console.log(utils.k);",
+                ),
+                ("b.js", "export * as utils from './c.js';"),
+                ("c.js", "export const k = 'ns-reexport';"),
+            ],
+            "a.js",
+        );
+        assert_eq!(out, vec!["ns-reexport"]);
+    }
+
+    #[test]
+    fn module_transitive_reexport_live_binding() {
+        // A live `let` exported by C, re-exported through B (`export { n } from
+        // './c.js'`), imported by A, must stay LIVE through the whole chain: a
+        // mutation in C (via a mutator A also imports) is visible to A.
+        let out = run_module_files(
+            &[
+                (
+                    "a.js",
+                    "import { n, bump } from './b.js'; \
+                     console.log(n); bump(); console.log(n);",
+                ),
+                (
+                    "b.js",
+                    "export { n } from './c.js'; export { bump } from './c.js';",
+                ),
+                (
+                    "c.js",
+                    "export let n = 5; export function bump(){ n += 100; }",
+                ),
+            ],
+            "a.js",
+        );
+        assert_eq!(out, vec!["5", "105"]);
+    }
+
+    #[test]
+    fn module_deep_diamond_post_order_single_eval() {
+        // A -> B -> D ; A -> C -> D ; A -> E -> C. D and C each evaluate ONCE,
+        // deps strictly before importers (post-order DFS, §16.2.1.6).
+        let out = run_module_files(
+            &[
+                (
+                    "a.js",
+                    "import './b.js'; import './c.js'; import './e.js'; console.log('A');",
+                ),
+                ("b.js", "import './d.js'; console.log('B');"),
+                ("c.js", "import './d.js'; console.log('C');"),
+                ("d.js", "console.log('D');"),
+                ("e.js", "import './c.js'; console.log('E');"),
+            ],
+            "a.js",
+        );
+        // First visit order from A: B -> D -> B; C -> D(seen) -> C; E -> C(seen) -> E; A.
+        assert_eq!(out, vec!["D", "B", "C", "E", "A"]);
+        assert_eq!(out.iter().filter(|l| *l == "D").count(), 1);
+        assert_eq!(out.iter().filter(|l| *l == "C").count(), 1);
+    }
+
+    #[test]
+    fn dynamic_import_dedupes_static_module() {
+        // A statically imports B (so B already evaluated once), then dynamically
+        // `import('./b.js')` — the registry returns the SAME record; B's body
+        // must NOT run a second time, and the namespace reflects B's live state.
+        let out = run_module_files(
+            &[
+                (
+                    "a.js",
+                    "import { tick } from './b.js'; tick(); \
+                     import('./b.js').then(m => console.log('dyn:' + m.count));",
+                ),
+                (
+                    "b.js",
+                    "console.log('B-eval'); export let count = 0; \
+                     export function tick(){ count++; }",
+                ),
+            ],
+            "a.js",
+        );
+        // B-eval appears exactly once; the dynamic namespace sees count===1.
+        assert_eq!(out.iter().filter(|l| *l == "B-eval").count(), 1);
+        assert!(out.contains(&"dyn:1".to_string()), "out was {out:?}");
+    }
+
+    #[test]
+    fn module_import_meta_distinct_per_module() {
+        // §16.2.1.9 HostGetImportMetaProperties: each module's `import.meta.url`
+        // is ITS OWN resolved URL, even when a dep logs during the importer's
+        // evaluation (the meta stack restores correctly on return).
+        let out = run_module_files(
+            &[
+                (
+                    "pkg/a.js",
+                    "import './sub/b.js'; console.log('a=' + import.meta.url);",
+                ),
+                ("pkg/sub/b.js", "console.log('b=' + import.meta.url);"),
+            ],
+            "pkg/a.js",
+        );
+        assert_eq!(out, vec!["b=pkg/sub/b.js", "a=pkg/a.js"]);
     }
 
     #[test]

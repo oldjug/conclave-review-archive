@@ -191,6 +191,10 @@ fn expr_has_await(e: &Expr) -> bool {
             expr_has_await(callee) || args.iter().any(expr_has_await)
         }
         Expr::Sequence(items) => items.iter().any(expr_has_await),
+        // `import.meta` has no sub-expressions; `import(spec)` may await in its
+        // specifier (`import(await urlFor(x))`).
+        Expr::ImportMeta => false,
+        Expr::DynamicImport(spec) => expr_has_await(spec),
         // Nested functions are their own async context — don't descend.
         Expr::Function { .. } | Expr::Arrow { .. } => false,
     }
@@ -203,6 +207,12 @@ fn opt_await(e: &Option<Expr>) -> bool {
 fn stmt_has_await(s: &Stmt) -> bool {
     match s {
         Stmt::Empty | Stmt::Break(_) | Stmt::Continue(_) | Stmt::FunctionDecl { .. } => false,
+        // Module declarations don't introduce await points relevant to async
+        // function lowering (top-level await is handled by the module graph,
+        // not the async-function lowerer). `export <decl>` could carry an
+        // initializer with await, so descend into the inner declaration.
+        Stmt::Import { .. } => false,
+        Stmt::Export { decl, .. } => decl.as_ref().is_some_and(|d| stmt_has_await(d)),
         Stmt::Expression(e) | Stmt::Throw(e) => expr_has_await(e),
         Stmt::Return(e) => opt_await(e),
         Stmt::VarDecl { decls, .. } => decls.iter().any(|d| opt_await(&d.init)),

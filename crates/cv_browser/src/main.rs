@@ -6179,6 +6179,13 @@ struct CollectedScript {
     /// trim or react-compat fix-up — the exact bytes CSP `'sha256-...'` hashes
     /// over (top_traps #1). Empty for external scripts.
     raw_body: String,
+    /// For a `module` script: the RESOLVED URL of the entry module (its
+    /// `import.meta.url`) and its ORIGINAL (un-concatenated) source. These feed
+    /// the real ES module-graph evaluator (`run_module_graph`) when
+    /// `CV_MODULE_GRAPH` is enabled — distinct from `code`, which holds the
+    /// legacy dependency-text-concatenated fallback body. Empty for non-modules.
+    module_entry_url: String,
+    module_entry_source: String,
 }
 
 fn collect_scripts(doc: &cv_html::Document, label: &str) -> Vec<CollectedScript> {
@@ -6238,6 +6245,8 @@ fn collect_scripts_rec(
                             is_inline: false,
                             nonce: None,
                             raw_body: String::new(),
+                            module_entry_url: String::new(),
+                            module_entry_source: String::new(),
                         });
                     }
                 }
@@ -6260,6 +6269,8 @@ fn collect_scripts_rec(
                         is_inline: true,
                         nonce,
                         raw_body: raw,
+                        module_entry_url: String::new(),
+                        module_entry_source: String::new(),
                     });
                 }
             }
@@ -6305,6 +6316,11 @@ fn collect_scripts_rec(
                                 is_inline: false,
                                 nonce: None,
                                 raw_body: String::new(),
+                                // Real module-graph entry: the resolved URL is
+                                // `import.meta.url`; the original (un-concatenated)
+                                // source is what the graph parses + links.
+                                module_entry_url: murl.to_string(),
+                                module_entry_source: entry,
                             });
                         }
                     }
@@ -6330,6 +6346,12 @@ fn collect_scripts_rec(
                         // CSP hashes the verbatim element text node, not the
                         // dependency-inlined output.
                         raw_body: raw,
+                        // Inline module: `import.meta.url` is the document URL; the
+                        // original inline text is the graph entry source.
+                        module_entry_url: base_url
+                            .map(|b| b.to_string())
+                            .unwrap_or_default(),
+                        module_entry_source: inline,
                     });
                 }
             }
@@ -6478,6 +6500,37 @@ fn fetch_url_text(url: &Url) -> Option<String> {
         },
         _ => None,
     }
+}
+
+/// ES module-graph loader callback (installed on the interp). Given a raw
+/// module specifier + the referrer module's resolved URL, resolve the specifier
+/// to an absolute URL and fetch its source text. Returns `(resolved_url,
+/// source)` or `None` if it can't be resolved/fetched. The `page_label` is the
+/// document's base URL — used when the referrer is empty (the entry module) so
+/// `import "./x.js"` from the entry resolves against the page.
+///
+/// ECMA-262 §16.2.1.7 (HostResolveImportedModule analogue) + HTML "resolve a
+/// module specifier" + "fetch a single module script".
+fn module_loader_resolve_fetch(
+    spec: &str,
+    referrer: &str,
+    page_label: &str,
+) -> Option<(String, String)> {
+    // The base against which to resolve: the referrer module URL if present,
+    // else the page's document URL (entry-module case).
+    let base_str = if referrer.is_empty() {
+        page_label
+    } else {
+        referrer
+    };
+    let base = Url::parse(base_str).ok();
+    // Resolve relative ("./x", "../x", "/x") and absolute ("https://…") spec.
+    let resolved = match &base {
+        Some(b) => b.resolve(spec).or_else(|_| Url::parse(spec)).ok()?,
+        None => Url::parse(spec).ok()?,
+    };
+    let source = fetch_url_text(&resolved)?;
+    Some((resolved.to_string(), source))
 }
 
 /// `<script type="module">` detection. The `type` attribute must be
@@ -16044,6 +16097,17 @@ impl LiveInterp {
         me.interp.set_host_pump(std::rc::Rc::new(
             move |interp: &mut cv_js::Interp| -> bool { Self::pump_host_once(interp, &pump_label) },
         ));
+        // ES module-graph loader (ECMA-262 §16.2 + HTML "fetch a single module
+        // script"): cv_js calls this to resolve + fetch a dependency module's
+        // source so it can build the real module record graph (live import
+        // bindings, post-order eval, `import.meta.url`, dynamic `import()`).
+        // Resolution uses the page's base URL when the referrer is empty (the
+        // entry module) and the referrer URL otherwise — both via cv_url.
+        let loader_label = me.label.clone();
+        me.interp
+            .set_module_loader(std::rc::Rc::new(move |spec: &str, referrer: &str| {
+                module_loader_resolve_fetch(spec, referrer, &loader_label)
+            }));
         me.flush_console();
         me
     }
@@ -21580,6 +21644,21 @@ fn tb_dom_render_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var("CV_DOM").as_deref() != Ok("0"))
 }
 
+/// ES module-graph evaluation for top-level `<script type=module>` (ECMA-262
+/// §16.2). DEFAULT-OFF for static module entry scripts: the legacy
+/// dependency-text-concatenation path (`build_module_source`) is heavily tuned
+/// for real webpack/Next.js bundles and stays the default until the real graph
+/// soaks on the corpus. `CV_MODULE_GRAPH=1` switches static module entries to
+/// the real record graph (live import bindings, post-order eval, per-module
+/// `import.meta.url`). NOTE: dynamic `import()` + `import.meta.url` ALWAYS use
+/// the real graph regardless of this flag — only the *static entry* path is
+/// gated, because that is the one with a battle-tested legacy fallback.
+fn cv_module_graph_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("CV_MODULE_GRAPH").as_deref() == Ok("1"))
+}
+
 /// Chrome-audit FIX 1 (gate, default OFF until A/B-oracle soak): precise
 /// pseudo-class style invalidation on a no-DOM-mutation frame, instead of the
 /// blanket `mark_all_style_dirty()` that defeats the style + layout caches for
@@ -23071,6 +23150,35 @@ fn build_runtime_and_first_paint(
                 );
                 continue;
             }
+            // Real ES module graph (ECMA-262 §16.2) for a `<script type=module>`
+            // entry, when `CV_MODULE_GRAPH` is enabled: build the record graph,
+            // link live import bindings, and evaluate deps-first. The legacy
+            // text-concat body (`script.code`) is the default + fallback.
+            if cv_module_graph_enabled()
+                && script.module
+                && !script.module_entry_source.is_empty()
+            {
+                match runtime.interp.run_module_graph(
+                    &script.module_entry_url,
+                    &script.module_entry_source,
+                ) {
+                    Ok(_) => {
+                        runtime.drain_injected_scripts();
+                        flush_local_storage();
+                        continue;
+                    }
+                    Err(e) => {
+                        // Graph evaluation failed — fall back to the legacy
+                        // dependency-text-concatenation path below so a partial
+                        // engine gap doesn't blank the page.
+                        eprintln!(
+                            "[module-graph][{}] {} — falling back to text-concat",
+                            script.source,
+                            describe_js_throw(&e)
+                        );
+                    }
+                }
+            }
             if std::env::var("CV_POLLLOG").is_ok() {
                 cv_js::diag_log(&format!(
                     "[DEFERRED] {} ({}B) poll={} interval={}",
@@ -23936,6 +24044,8 @@ fn render_html_string_with_extra_js(
             is_inline: false,
             nonce: None,
             raw_body: String::new(),
+            module_entry_url: String::new(),
+            module_entry_source: String::new(),
         });
     }
 
@@ -60044,6 +60154,63 @@ mod tests {
         assert!(scripts[0].code.contains("modRan"));
     }
 
+    /// End-to-end ES module graph through the BROWSER's real loader
+    /// (`module_loader_resolve_fetch` → `fetch_url_text` → `file:` read), not an
+    /// in-memory stub: an entry module imports a live binding from a dependency
+    /// resolved by relative URL, evaluates the dependency first (post-order), and
+    /// reads `import.meta.url`. This exercises the same path the page runner uses
+    /// under `CV_MODULE_GRAPH`. Offline (file:// only).
+    #[test]
+    fn browser_module_graph_links_live_binding_and_import_meta() {
+        let dir = std::env::temp_dir().join(format!("cv_modgraph_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let a_path = dir.join("a.js");
+        let b_path = dir.join("b.js");
+        std::fs::write(
+            &b_path,
+            "export let n = 1; export function bump(){ n += 4; }",
+        )
+        .unwrap();
+        std::fs::write(
+            &a_path,
+            "import { n, bump } from './b.js';\
+             console.log('meta=' + import.meta.url.endsWith('a.js'));\
+             console.log('before=' + n); bump(); console.log('after=' + n);",
+        )
+        .unwrap();
+
+        let entry_url = format!("file:///{}", a_path.display().to_string().replace('\\', "/"));
+        let entry_src = std::fs::read_to_string(&a_path).unwrap();
+
+        let mut interp = cv_js::Interp::new();
+        interp.install_basic_globals();
+        interp.set_module_loader(std::rc::Rc::new(
+            move |spec: &str, referrer: &str| -> Option<(String, String)> {
+                module_loader_resolve_fetch(spec, referrer, "")
+            },
+        ));
+        interp
+            .run_module_graph(&entry_url, &entry_src)
+            .expect("module graph");
+
+        assert!(
+            interp.output.iter().any(|l| l == "meta=true"),
+            "import.meta.url must be the module URL; got {:?}",
+            interp.output
+        );
+        assert!(interp.output.contains(&"before=1".to_string()));
+        // Live binding: A sees B's mutated `n` after calling bump().
+        assert!(
+            interp.output.contains(&"after=5".to_string()),
+            "live binding not reflected; got {:?}",
+            interp.output
+        );
+
+        let _ = std::fs::remove_file(&a_path);
+        let _ = std::fs::remove_file(&b_path);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
     #[test]
     fn scan_relative_import_specifiers_finds_relative_skips_bare() {
         // Drives the minimal module linker: relative specifiers are
@@ -60104,6 +60271,8 @@ mod tests {
                     is_inline: true,
                     nonce: None,
                     raw_body: "console.log('inline before');".to_string(),
+                    module_entry_url: String::new(),
+                    module_entry_source: String::new(),
                 },
                 CollectedScript {
                     code: "console.log('external script');".to_string(),
@@ -60113,6 +60282,8 @@ mod tests {
                     is_inline: false,
                     nonce: None,
                     raw_body: String::new(),
+                    module_entry_url: String::new(),
+                    module_entry_source: String::new(),
                 },
                 CollectedScript {
                     code: "console.log('inline after');".to_string(),
@@ -60122,6 +60293,8 @@ mod tests {
                     is_inline: true,
                     nonce: None,
                     raw_body: "console.log('inline after');".to_string(),
+                    module_entry_url: String::new(),
+                    module_entry_source: String::new(),
                 },
             ]
         );

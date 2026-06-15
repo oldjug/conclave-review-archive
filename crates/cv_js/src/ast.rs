@@ -376,6 +376,51 @@ pub enum Expr {
     /// `/pattern/flags` regex literal. The lexer recognises this via
     /// context. Evaluated to a runtime RegExp object.
     Regex(String, String),
+    /// `import.meta` — the meta-property exposing host metadata about the
+    /// current module (notably `import.meta.url`). ECMA-262 §13.3.12
+    /// (Meta Properties) + HTML "host-defined import.meta". Only valid in a
+    /// module context; we evaluate it to the per-module meta object.
+    ImportMeta,
+    /// `import(specifier)` — a dynamic import *call*. ECMA-262 §13.3.10
+    /// (ImportCall). Returns a Promise that resolves to the requested
+    /// module's namespace object. The argument is an arbitrary expression
+    /// (ToString'd to a module specifier at runtime).
+    DynamicImport(Box<Expr>),
+}
+
+/// One imported binding of a static `import` declaration. ECMA-262 §16.2.2
+/// (Imports) ImportEntry records.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ImportSpecifier {
+    /// `import { foo as bar } from "m"` — `imported`="foo", `local`="bar".
+    /// (`import { foo }` → both "foo".)
+    Named { imported: String, local: String },
+    /// `import def from "m"` — binds the module's default export to `local`.
+    Default { local: String },
+    /// `import * as ns from "m"` — binds the module namespace object to `local`.
+    Namespace { local: String },
+}
+
+/// One exported binding of a static `export` declaration. ECMA-262 §16.2.3
+/// (Exports) ExportEntry records.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ExportSpecifier {
+    /// `export { local as exported }` / `export const local = …` (where
+    /// exported==local). The exported name is bound to this module's local
+    /// binding `local` (a LIVE binding).
+    Named { local: String, exported: String },
+    /// `export { foo as bar } from "m"` — a re-export indirecting to module
+    /// `m`'s export `foo`, surfaced here as `bar`.
+    ReexportNamed {
+        module: String,
+        imported: String,
+        exported: String,
+    },
+    /// `export * from "m"` — re-export all of `m`'s named exports (not
+    /// `default`). ECMA-262 §16.2.3 star export entry.
+    ReexportAll { module: String },
+    /// `export * as ns from "m"` — re-export `m`'s namespace object as `ns`.
+    ReexportNamespace { module: String, exported: String },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -465,6 +510,26 @@ pub enum Stmt {
         discriminant: Expr,
         cases: Vec<SwitchCase>,
         default_index: Option<usize>,
+    },
+    /// A static `import` declaration. ECMA-262 §16.2.2. `module` is the raw
+    /// module specifier string (e.g. `"./dep.js"`); `specifiers` are the
+    /// bound names. An empty `specifiers` list is a side-effect-only import
+    /// (`import "m";`). When run as a plain statement (outside the module
+    /// graph) this is a no-op — the graph linker installs the bindings.
+    Import {
+        module: String,
+        specifiers: Vec<ImportSpecifier>,
+    },
+    /// A static `export` declaration. ECMA-262 §16.2.3. `decl` carries an
+    /// optional inner declaration (`export const x = …`, `export function`,
+    /// `export class`, `export default expr`) that executes locally; the
+    /// `specifiers` record which local names become exports for the linker.
+    Export {
+        decl: Option<Box<Stmt>>,
+        specifiers: Vec<ExportSpecifier>,
+        /// `true` for `export default …` — the local binding name is the
+        /// synthetic `*default*` and `exported`=="default".
+        is_default: bool,
     },
     Empty,
 }
