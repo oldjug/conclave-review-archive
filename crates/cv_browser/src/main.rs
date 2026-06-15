@@ -37,6 +37,7 @@ mod idb_persist;
 mod opfs;
 mod worker;
 mod service_worker;
+mod iframe;
 
 /// The shared Cache Storage backing map: cache-name -> (url -> Response).
 /// Hoisted to a renderer-thread-local so a SECOND realm (the Service Worker
@@ -2979,6 +2980,255 @@ fn paint_layout_request(html_bytes: &[u8], url: &str, w: u32, h: u32) -> (u32, u
     paint_box(&lb, &mut bmp, &mut texts);
     cv_ui::bake_content_text_into_bitmap(&mut bmp, &mut texts);
     (bmp.width, bmp.height, pixels_to_bgra(&bmp.pixels))
+}
+
+/// `<iframe>` rendering kill-switch. Default ON: `srcdoc`/`src` frames render
+/// their real nested document into the iframe box. `CV_IFRAMES=0` reverts to
+/// the legacy "empty box" behaviour (escape hatch — a frame that mis-fetches
+/// or mis-lays-out can be turned off without a rebuild). The `src` network
+/// fetch reuses the SAME budgeted keep-alive client + subresource-security
+/// pipeline as `<img>`/`<link>`, so it carries no new platform-init risk.
+fn iframes_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("CV_IFRAMES").as_deref() != Ok("0"))
+}
+
+/// Fetch the child document HTML for an `<iframe>`'s `src` over the shared
+/// keep-alive client, after running it through the subresource-security
+/// pipeline (UIR upgrade, mixed-content block, CSP `frame-src`). Returns the
+/// decoded HTML text, or `None` if the URL is blocked, unfetchable, or
+/// non-HTTP. `srcdoc` does NOT come through here — it's inline markup.
+fn fetch_iframe_document(abs_url: &str) -> Option<String> {
+    let url = Url::parse(abs_url).ok()?;
+    if !matches!(url.scheme.as_str(), "http" | "https") {
+        return None;
+    }
+    let doc_origin_msg = DOCUMENT_ORIGIN_STR.with(|o| o.borrow().clone());
+    // CSP `frame-src` + mixed-content (iframe is an active subresource).
+    let resolved = resolve_subresource_url(
+        url,
+        cv_net::security::CspDirective::Frame,
+        cv_net::trust::ResourceKind::ActiveScript,
+        &doc_origin_msg,
+    )?;
+    let client = session_client(8_000);
+    // A nested document load is a navigation (`Sec-Fetch-Dest: document`,
+    // `Sec-Fetch-Mode: navigate`), exactly like the top-level fetch.
+    let meta = subresource_meta(cv_net::Destination::Document, cv_net::FetchMode::Navigate);
+    let resp = client.fetch_with_meta(&resolved, Some(meta)).ok()?;
+    if !is_http_success(resp.status) {
+        return None;
+    }
+    validate_response_length(&resp, &resolved.to_string()).ok()?;
+    Some(decode_text_subresource(&resp))
+}
+
+/// Render an `<iframe>`'s nested browsing context into an [`EmbeddedImage`]
+/// sized to the iframe content box (`box_w` × `box_h` CSS px).
+///
+/// This is the real nested-context render: the child HTML is parsed into its
+/// own document, given its own stylesheets + layout at the iframe's viewport
+/// size, and baked (background + text + images) into a self-contained bitmap
+/// that the painter blits into the iframe box. It is NOT an empty placeholder.
+///
+/// Sandbox enforcement (HTML §4.8.5): when `flags.scripts_enabled()` is false
+/// the child renders with scripting OFF (the default no-JS layout path never
+/// executes the frame's `<script>`s); when true, scripts run via the
+/// JS-enabled render path before layout. The frame's effective origin
+/// (opaque unless `allow-same-origin`) is computed by the caller for
+/// `contentDocument`/`postMessage` access checks.
+///
+/// `html` is the child document source (`srcdoc` markup or the fetched `src`
+/// body); `frame_url` is the resolved URL used as the child's base URL for
+/// relative subresources and link resolution (`about:srcdoc` for srcdoc).
+fn render_iframe_to_embedded_image(
+    html: &str,
+    frame_url: &str,
+    box_w: u32,
+    box_h: u32,
+    flags: &iframe::SandboxFlags,
+) -> cv_layout::EmbeddedImage {
+    let w = box_w.max(1).min(8192);
+    let h = box_h.max(1).min(8192);
+    let cfg = cv_layout::LayoutConfig {
+        viewport_w: w as f32,
+        viewport_h: h as f32,
+        measure_text_fn: Some(layout_text_measurer()),
+        ..cv_layout::LayoutConfig::default()
+    };
+    let mut bmp = cv_gfx::Bitmap::new(w, h);
+    bmp.clear(cv_gfx::Color::WHITE);
+    let mut texts: Vec<cv_ui::TextItem> = Vec::new();
+
+    if flags.scripts_enabled() {
+        // allow-scripts (or unsandboxed): run the child's scripts in a fresh
+        // in-process interpreter, then lay out the mutated document. The JS
+        // render path returns a CONTENT-ONLY bitmap (no browser chrome is
+        // baked into it — chrome is composited separately by the window), with
+        // page content starting at row 0. Copy the top `h` content rows into
+        // the frame box, clamping to whatever the child actually produced.
+        if let Ok(paint) = render_html_string_with_extra_js(html, frame_url, &cfg, "") {
+            let src = &paint.bitmap;
+            for dy in 0..h {
+                if dy >= src.height {
+                    break;
+                }
+                let copy_w = w.min(src.width);
+                let sstart = (dy as usize) * (src.width as usize);
+                let dstart = (dy as usize) * (w as usize);
+                bmp.pixels[dstart..dstart + copy_w as usize]
+                    .copy_from_slice(&src.pixels[sstart..sstart + copy_w as usize]);
+            }
+            return cv_layout::EmbeddedImage {
+                width: w,
+                height: h,
+                pixels: bmp.pixels,
+            };
+        }
+        // Fall through to the no-JS path if the JS render errored — the frame
+        // still shows its real static content rather than going blank.
+    }
+
+    // No-script render: the child document's static content (background, text,
+    // images, CSS) without executing any of its `<script>`s. This is the
+    // sandbox default (no allow-scripts) AND the safe fallback.
+    let doc = cv_html::parse(html);
+    let mut sheets = vec![parse_user_agent_stylesheet()];
+    if std::env::var("CV_NO_EXTERNAL_CSS").is_err() {
+        sheets.extend(fetch_external_stylesheets(&doc, frame_url));
+    }
+    sheets.extend(collect_stylesheets(&doc));
+    let lb = build_layout_tree(&doc, &sheets, frame_url, &cfg, &Default::default());
+    paint_box(&lb, &mut bmp, &mut texts);
+    cv_ui::bake_content_text_into_bitmap(&mut bmp, &mut texts);
+    cv_layout::EmbeddedImage {
+        width: w,
+        height: h,
+        pixels: bmp.pixels,
+    }
+}
+
+/// Compute the used pixel dimensions of an `<iframe>` box from its width/height
+/// attributes (or CSS, when the caller already lowered them into the style),
+/// falling back to the HTML default replaced-element size of 300×150 CSS px
+/// (HTML §4.8.5 "the default object size is 300 CSS pixels wide and 150 CSS
+/// pixels tall").
+fn iframe_box_dimensions(attr_w: Option<u32>, attr_h: Option<u32>) -> (u32, u32) {
+    let w = attr_w.unwrap_or(300).clamp(1, 8192);
+    let h = attr_h.unwrap_or(150).clamp(1, 8192);
+    (w, h)
+}
+
+/// Parse an integer pixel dimension from an HTML width/height attribute value
+/// (`"320"`, `"320px"`, `"100%"` → ignored). Returns `None` for absent /
+/// non-integer / percentage values so the caller falls back to the default.
+fn parse_iframe_dim_attr(attrs: &[cv_html::Attribute], name: &str) -> Option<u32> {
+    attrs
+        .iter()
+        .find(|a| a.name.eq_ignore_ascii_case(name))
+        .and_then(|a| {
+            let v = a.value.trim();
+            v.trim_end_matches("px").parse::<u32>().ok()
+        })
+}
+
+/// Build the [`EmbeddedImage`] for an `<iframe>` element from its attributes,
+/// resolving `srcdoc` (inline markup, wins over `src`) or `src` (fetched
+/// nested document) into a real rendered nested browsing context. Returns the
+/// rendered image plus the used `(width, height)` of the iframe box. Returns
+/// `None` when iframes are disabled, when there is no content to load, or when
+/// the `src` fetch is blocked/fails (the caller then leaves an empty box,
+/// which still shows the iframe's CSS background/border like Chrome).
+///
+/// `base_url` is the embedding document's URL (used to resolve a relative
+/// `src` and as the child base URL for `srcdoc` → `about:srcdoc`).
+fn build_iframe_embedded_image(
+    attrs: &[cv_html::Attribute],
+    base_url: &Url,
+) -> Option<(cv_layout::EmbeddedImage, u32, u32)> {
+    let get = |name: &str| {
+        attrs
+            .iter()
+            .find(|a| a.name.eq_ignore_ascii_case(name))
+            .map(|a| a.value.clone())
+    };
+    build_iframe_embedded_image_core(
+        get("srcdoc"),
+        get("src"),
+        get("sandbox"),
+        parse_iframe_dim_attr(attrs, "width"),
+        parse_iframe_dim_attr(attrs, "height"),
+        base_url,
+    )
+}
+
+/// Arena (`cv_dom`) variant: resolve the iframe attributes from the arena
+/// node, then share the same render core as the cv_html walker.
+fn build_iframe_embedded_image_arena(
+    doc: &cv_dom::Document,
+    id: cv_dom::NodeId,
+    base_url: &Url,
+) -> Option<(cv_layout::EmbeddedImage, u32, u32)> {
+    let dim = |name: &str| -> Option<u32> {
+        doc.attr_raw(id, name)
+            .and_then(|v| v.trim().trim_end_matches("px").parse::<u32>().ok())
+    };
+    build_iframe_embedded_image_core(
+        doc.get_attribute(id, "srcdoc"),
+        doc.get_attribute(id, "src"),
+        doc.get_attribute(id, "sandbox"),
+        dim("width"),
+        dim("height"),
+        base_url,
+    )
+}
+
+/// Shared iframe render core consumed by both the cv_html and arena styled-tree
+/// builders. `srcdoc` (inline markup) wins over `src` (fetched document) per
+/// HTML §4.8.5. Returns the rendered nested-context image + its used box size.
+fn build_iframe_embedded_image_core(
+    srcdoc: Option<String>,
+    src: Option<String>,
+    sandbox: Option<String>,
+    attr_w: Option<u32>,
+    attr_h: Option<u32>,
+    base_url: &Url,
+) -> Option<(cv_layout::EmbeddedImage, u32, u32)> {
+    if !iframes_enabled() {
+        return None;
+    }
+    let flags = iframe::SandboxFlags::parse(sandbox.as_deref());
+    let (box_w, box_h) = iframe_box_dimensions(attr_w, attr_h);
+
+    // `srcdoc` takes priority over `src` (HTML §4.8.5). It is inline markup
+    // with the synthetic URL `about:srcdoc`; relative subresources resolve
+    // against the PARENT base URL, so we pass the parent URL as the base.
+    if let Some(srcdoc) = srcdoc {
+        let img = render_iframe_to_embedded_image(
+            &srcdoc,
+            base_url.to_string().as_str(),
+            box_w,
+            box_h,
+            &flags,
+        );
+        return Some((img, box_w, box_h));
+    }
+
+    // `src`: resolve + fetch the child document, then render it.
+    if let Some(src) = src {
+        let abs = iframe::resolve_frame_src(&base_url.to_string(), &src)?;
+        // `about:blank` is an empty same-origin document — render a blank box.
+        let child_html = if abs == "about:blank" {
+            String::new()
+        } else {
+            fetch_iframe_document(&abs)?
+        };
+        let img = render_iframe_to_embedded_image(&child_html, &abs, box_w, box_h, &flags);
+        return Some((img, box_w, box_h));
+    }
+
+    None
 }
 
 /// Recurse into the layout tree, emitting one `PaintRect` per box
@@ -14873,6 +15123,203 @@ fn install_fetch_inner(
 /// Dispatch a `popstate` / `hashchange` / similar one-shot window
 /// event to any handler registered via `window.onpopstate =` or
 /// `addEventListener("popstate", …)` (root path bucket).
+/// Build a `MessageEvent`-shaped JS object for `postMessage` delivery
+/// (HTML §"web messaging"): `{type:'message', data, origin, source, ports:[],
+/// lastEventId:''}`. `source` is the WindowProxy of the sender (so the
+/// receiver can post back). `origin` is the sender's serialized origin.
+fn make_message_event(
+    data: cv_js::Value,
+    origin: &str,
+    source: cv_js::Value,
+) -> cv_js::Value {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    let mut ev: cv_js::OrderedMap<String, cv_js::Value> = cv_js::OrderedMap::new();
+    ev.insert("type".into(), cv_js::Value::str("message".to_string()));
+    ev.insert("data".into(), data);
+    ev.insert("origin".into(), cv_js::Value::str(origin.to_string()));
+    ev.insert("source".into(), source);
+    ev.insert("lastEventId".into(), cv_js::Value::str(String::new()));
+    ev.insert(
+        "ports".into(),
+        cv_js::Value::Array(Rc::new(RefCell::new(Vec::new()))),
+    );
+    cv_js::Value::Object(Rc::new(RefCell::new(ev)))
+}
+
+/// Compute an `<iframe>`'s effective content-document origin from its
+/// attributes and the embedding document's base URL, honouring the sandbox
+/// attribute (opaque unless `allow-same-origin`). `srcdoc`/`about:blank`
+/// inherit the parent origin; `src` uses the resolved URL's origin.
+fn iframe_effective_origin(
+    attrs: &[cv_html::Attribute],
+    parent_base: &str,
+) -> cv_net::security::Origin {
+    use cv_net::security::Origin;
+    let flags = iframe::SandboxFlags::parse(
+        attrs
+            .iter()
+            .find(|a| a.name.eq_ignore_ascii_case("sandbox"))
+            .map(|a| a.value.as_str()),
+    );
+    // Resolve the document URL the frame loads.
+    let doc_url = if attrs
+        .iter()
+        .any(|a| a.name.eq_ignore_ascii_case("srcdoc"))
+    {
+        // `about:srcdoc` inherits the parent's URL for origin purposes.
+        Url::parse(parent_base).ok()
+    } else if let Some(src) = attrs.iter().find(|a| a.name.eq_ignore_ascii_case("src")) {
+        match iframe::resolve_frame_src(parent_base, &src.value) {
+            Some(abs) if abs == "about:blank" => Url::parse(parent_base).ok(),
+            Some(abs) => Url::parse(&abs).ok(),
+            None => Url::parse(parent_base).ok(),
+        }
+    } else {
+        // No src/srcdoc → empty about:blank, inherits parent origin.
+        Url::parse(parent_base).ok()
+    };
+    match doc_url {
+        Some(u) => iframe::effective_frame_origin(&u, &flags),
+        None => Origin("null".into()),
+    }
+}
+
+/// Wire `contentWindow` / `contentDocument` / cross-boundary `postMessage`
+/// onto an `<iframe>` element's JS wrapper (HTML §4.8.5 + §"web messaging").
+///
+/// `contentWindow` is a real object with its own `message`-listener store and
+/// a `postMessage(message, targetOrigin)` that delivers a `MessageEvent`
+/// (`data`/`origin`/`source`) to THAT window's listeners — the parent→child
+/// boundary crossing — honouring the `targetOrigin` check. `contentDocument`
+/// is the child document wrapper when the frame is same-origin with the
+/// embedder, and `null` when cross-origin or sandboxed-opaque (the spec's
+/// cross-origin restriction).
+fn install_iframe_content_access(
+    el_map: &mut cv_js::OrderedMap<String, cv_js::Value>,
+    attrs: &[cv_html::Attribute],
+) {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    let parent_base = DOCUMENT_URL
+        .with(|u| u.borrow().as_ref().map(|x| x.to_string()))
+        .unwrap_or_else(|| "https://localhost/".to_string());
+    // Derive the parent origin from the parent URL with the SAME serializer
+    // (`Origin::of`) used for the frame origin, so the same-origin comparison
+    // is apples-to-apples regardless of `DOCUMENT_ORIGIN_STR`'s formatting.
+    let parent_origin = Url::parse(&parent_base)
+        .map(|u| cv_net::security::Origin::of(&u))
+        .unwrap_or_else(|_| cv_net::security::Origin("null".into()));
+    let frame_origin = iframe_effective_origin(attrs, &parent_base);
+    let same_origin = iframe::can_access_frame_dom(&parent_origin, &frame_origin);
+
+    // The child window's own `message`-listener store.
+    let child_listeners: Rc<RefCell<Vec<(String, cv_js::Value)>>> =
+        Rc::new(RefCell::new(Vec::new()));
+
+    let mut cw: cv_js::OrderedMap<String, cv_js::Value> = cv_js::OrderedMap::new();
+
+    let al_store = child_listeners.clone();
+    cw.insert(
+        "addEventListener".into(),
+        cv_js::native_fn("addEventListener", move |args| {
+            let ty = args
+                .first()
+                .map(|v| v.to_display_string())
+                .unwrap_or_default();
+            let cb = args.get(1).cloned().unwrap_or(cv_js::Value::Undefined);
+            if !matches!(cb, cv_js::Value::Undefined | cv_js::Value::Null) {
+                al_store.borrow_mut().push((ty, cb));
+            }
+            Ok(cv_js::Value::Undefined)
+        }),
+    );
+    let rm_store = child_listeners.clone();
+    cw.insert(
+        "removeEventListener".into(),
+        cv_js::native_fn("removeEventListener", move |args| {
+            let ty = args
+                .first()
+                .map(|v| v.to_display_string())
+                .unwrap_or_default();
+            let cb = args.get(1).cloned().unwrap_or(cv_js::Value::Undefined);
+            rm_store
+                .borrow_mut()
+                .retain(|(t, c)| !(*t == ty && cv_js::Value::strict_eq(c, &cb)));
+            Ok(cv_js::Value::Undefined)
+        }),
+    );
+
+    // contentWindow.postMessage(message, targetOrigin) — parent → child.
+    // The receiver is the FRAME, so the targetOrigin check is against the
+    // frame's origin; the delivered event's `origin` is the SENDER (parent),
+    // `source` is the parent window — exactly Chrome's behaviour.
+    let post_store = child_listeners.clone();
+    let frame_origin_for_post = frame_origin.clone();
+    let sender_origin_for_post = parent_origin.clone();
+    let post_message = cv_js::native_fn_with_interp("postMessage", move |interp, args| {
+        let message = args.first().cloned().unwrap_or(cv_js::Value::Undefined);
+        let target_origin = args
+            .get(1)
+            .map(|v| v.to_display_string())
+            .unwrap_or_else(|| "/".to_string());
+        let sender_origin = sender_origin_for_post.clone();
+        if matches!(
+            iframe::post_message_delivery(
+                &target_origin,
+                &sender_origin,
+                &frame_origin_for_post
+            ),
+            iframe::PostMessageDelivery::Drop
+        ) {
+            return Ok(cv_js::Value::Undefined);
+        }
+        let mut seen = std::collections::HashSet::new();
+        let cloned = structured_clone_value(interp, &message, &mut seen)
+            .unwrap_or_else(|_| message.clone());
+        let parent_window = interp
+            .get_global("window")
+            .unwrap_or(cv_js::Value::Undefined);
+        let event = make_message_event(cloned, &sender_origin.0, parent_window);
+        let cbs: Vec<cv_js::Value> = post_store
+            .borrow()
+            .iter()
+            .filter(|(t, _)| t == "message")
+            .map(|(_, c)| c.clone())
+            .collect();
+        for cb in cbs {
+            let _ = interp.call_value(cb, vec![event.clone()]);
+        }
+        // Inline `frame.contentWindow.onmessage` handler, if present.
+        Ok(cv_js::Value::Undefined)
+    });
+    cw.insert("postMessage".into(), post_message);
+    cw.insert(
+        "origin".into(),
+        cv_js::Value::str(frame_origin.0.clone()),
+    );
+
+    let cw_val = cv_js::Value::Object(Rc::new(RefCell::new(cw)));
+    el_map.insert("contentWindow".into(), cw_val);
+
+    // contentDocument: same-origin → a child document wrapper; cross-origin or
+    // sandboxed-opaque → null (HTML §"Cross-origin objects").
+    if same_origin {
+        let mut cd: cv_js::OrderedMap<String, cv_js::Value> = cv_js::OrderedMap::new();
+        cd.insert("URL".into(), cv_js::Value::str(parent_base.clone()));
+        cd.insert(
+            "documentURI".into(),
+            cv_js::Value::str(parent_base.clone()),
+        );
+        el_map.insert(
+            "contentDocument".into(),
+            cv_js::Value::Object(Rc::new(RefCell::new(cd))),
+        );
+    } else {
+        el_map.insert("contentDocument".into(), cv_js::Value::Null);
+    }
+}
+
 fn fire_window_event(interp: &mut cv_js::Interp, name: &str) {
     let mut ev: cv_js::OrderedMap<String, cv_js::Value> = cv_js::OrderedMap::new();
     ev.insert("type".into(), cv_js::Value::str(name.to_string()));
@@ -24838,6 +25285,11 @@ fn install_minimal_dom_with_url(interp: &cv_js::Interp, initial_title: String, p
         Ok(cv_js::Value::Bool(!prevented))
     });
 
+    // NB: `window.postMessage` is installed in `install_dom_api` (it must
+    // deliver to the same window/document empty-path listener bucket that
+    // `install_dom_api`'s `window.addEventListener` writes to). Defining it
+    // here would be shadowed by that later override anyway.
+
     let mut window_map: HashMap<String, cv_js::Value> = HashMap::new();
     window_map.insert("location".into(), location);
     window_map.insert("navigator".into(), navigator.clone());
@@ -34035,6 +34487,10 @@ fn walk_for_table(
             }
         }
 
+        if tag_lc == "iframe" {
+            install_iframe_content_access(&mut el_map, attrs);
+        }
+
         // `element.getBoundingClientRect()` — V1 stub returning zeros.
         // Sites mostly call this defensively; values lie about geometry
         // but the method existing is what scripts gate on.
@@ -42959,6 +43415,52 @@ fn install_dom_api(
         let mut m = o.borrow_mut();
         m.insert("addEventListener".into(), doc_add_listener.clone());
         m.insert("removeEventListener".into(), doc_remove_listener.clone());
+
+        // window.postMessage(message, targetOrigin[, transfer]) — HTML
+        // §"web messaging". Pages routinely post to their OWN window
+        // (`window`/`self`) for in-page async messaging. Delivered as a real
+        // `MessageEvent` (`data`/`origin`/`source`/`ports`) to the window's
+        // `message` listeners via the SAME empty-path dispatch the window
+        // listeners register into (the table's `event_listeners`), so it
+        // actually reaches `window.addEventListener('message', …)`. The
+        // `targetOrigin` check drops the message if the receiver origin does
+        // not match a non-`*` target.
+        let pm_table = table.clone();
+        let post_message = cv_js::native_fn_with_interp("postMessage", move |interp, args| {
+            let message = args.first().cloned().unwrap_or(cv_js::Value::Undefined);
+            let target_origin = args
+                .get(1)
+                .map(|v| v.to_display_string())
+                .unwrap_or_else(|| "/".to_string());
+            let origin = document_origin();
+            // Self-post: sender == receiver == this document's origin.
+            if matches!(
+                iframe::post_message_delivery(&target_origin, &origin, &origin),
+                iframe::PostMessageDelivery::Drop
+            ) {
+                return Ok(cv_js::Value::Undefined);
+            }
+            let mut seen = std::collections::HashSet::new();
+            let cloned = structured_clone_value(interp, &message, &mut seen)
+                .unwrap_or_else(|_| message.clone());
+            let win = interp
+                .get_global("window")
+                .unwrap_or(cv_js::Value::Undefined);
+            let event = make_message_event(cloned, &origin.0, win.clone());
+            // Deliver to the window/document empty-path `message` listeners.
+            dispatch_event_to_path(interp, &pm_table, &[], "message", &event);
+            // Inline `window.onmessage` handler, if any.
+            if let cv_js::Value::Object(w) = &win {
+                let inline = w.borrow().get("onmessage").cloned();
+                if let Some(cb) = inline {
+                    if !matches!(cb, cv_js::Value::Undefined | cv_js::Value::Null) {
+                        let _ = interp.call_value_with_this(cb, win.clone(), vec![event.clone()]);
+                    }
+                }
+            }
+            Ok(cv_js::Value::Undefined)
+        });
+        m.insert("postMessage".into(), post_message);
     }
 
     let document = interp
@@ -44559,6 +45061,33 @@ fn build_styled_tree_full<'a>(
                     style.embedded_image = Some(std::sync::Arc::new(img));
                 }
             }
+            if name.eq_ignore_ascii_case("iframe") {
+                // Real nested browsing context: render the child document
+                // (srcdoc/src) into the iframe box. Sandbox + origin are
+                // enforced inside `build_iframe_embedded_image`.
+                let base = IMAGE_BASE_URL
+                    .with(|c| c.borrow().clone())
+                    .or_else(|| Url::parse("https://localhost/").ok());
+                if let Some(base) = base {
+                    if let Some((img, bw, bh)) = build_iframe_embedded_image(attrs, &base) {
+                        // An iframe is a replaced inline-level box; honour an
+                        // explicit width/height when the attrs gave one, else
+                        // the rendered default 300×150.
+                        if style.width.is_none() {
+                            style.width = Some(cv_layout::LengthSpec::Px(bw as f32));
+                        }
+                        if style.height.is_none() {
+                            style.height = Some(cv_layout::LengthSpec::Px(bh as f32));
+                        }
+                        if matches!(style.display, Some(cv_layout::Display::None))
+                            || style.display.is_none()
+                        {
+                            style.display = Some(cv_layout::Display::InlineBlock);
+                        }
+                        style.embedded_image = Some(std::sync::Arc::new(img));
+                    }
+                }
+            }
             // Form-control rendering: show the value or placeholder as text,
             // even though the DOM didn't have a text child.
             let form_text: Option<String> = match name.as_str() {
@@ -45747,6 +46276,29 @@ fn build_styled_tree_full_arena_inner(
                         style.display = Some(cv_layout::Display::InlineBlock);
                     }
                     style.embedded_image = Some(std::sync::Arc::new(img));
+                }
+            }
+            if tag.eq_ignore_ascii_case("iframe") {
+                // Real nested browsing context on the arena render path —
+                // mirrors the cv_html walker's <iframe> branch.
+                let base = IMAGE_BASE_URL
+                    .with(|c| c.borrow().clone())
+                    .or_else(|| Url::parse("https://localhost/").ok());
+                if let Some(base) = base {
+                    if let Some((img, bw, bh)) = build_iframe_embedded_image_arena(doc, id, &base) {
+                        if style.width.is_none() {
+                            style.width = Some(cv_layout::LengthSpec::Px(bw as f32));
+                        }
+                        if style.height.is_none() {
+                            style.height = Some(cv_layout::LengthSpec::Px(bh as f32));
+                        }
+                        if matches!(style.display, Some(cv_layout::Display::None))
+                            || style.display.is_none()
+                        {
+                            style.display = Some(cv_layout::Display::InlineBlock);
+                        }
+                        style.embedded_image = Some(std::sync::Arc::new(img));
+                    }
                 }
             }
             // Form controls: synthetic visible text + widget bitmaps + intrinsic
@@ -67742,6 +68294,253 @@ var el = document.getElementById('el');
         assert!(r > 240, "red channel stays high, got {r}");
         assert!(gg > 100 && gg < 160 && b > 100 && b < 160,
             "g,b ≈ 128 from 50% blend, got ({r},{gg},{b})");
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // <iframe> — nested browsing context (render + sandbox + postMessage)
+    // ════════════════════════════════════════════════════════════════════
+
+    fn unpack_bgra(px: u32) -> (u8, u8, u8) {
+        // EmbeddedImage pixels are BGRA-packed in a u32 (0xAARRGGBB host order
+        // for the painter's blit path): bits [16..24]=R, [8..16]=G, [0..8]=B.
+        let r = ((px >> 16) & 0xff) as u8;
+        let g = ((px >> 8) & 0xff) as u8;
+        let b = (px & 0xff) as u8;
+        (r, g, b)
+    }
+
+    /// Set the document security context thread-locals the iframe origin logic
+    /// reads (normally set during a real navigation). Returns nothing; the
+    /// thread-local lives for the rest of the test thread.
+    fn set_doc_context(url: &str) {
+        let u = Url::parse(url).unwrap();
+        DOCUMENT_URL.with(|c| *c.borrow_mut() = Some(u.clone()));
+        DOCUMENT_ORIGIN_STR.with(|o| *o.borrow_mut() = url_origin_string(&u));
+    }
+
+    #[test]
+    fn iframe_srcdoc_renders_content_into_box() {
+        // A srcdoc with a solid red body must produce red pixels in the
+        // rendered frame bitmap — not an empty/blank box.
+        let flags = iframe::SandboxFlags::unsandboxed();
+        let img = render_iframe_to_embedded_image(
+            "<body style=\"margin:0;background:#ff0000;width:300px;height:150px\"></body>",
+            "https://parent.test/",
+            300,
+            150,
+            &flags,
+        );
+        assert_eq!(img.width, 300);
+        assert_eq!(img.height, 150);
+        // Sample a pixel well inside the box.
+        let idx = (75usize) * 300 + 150;
+        let (r, g, b) = unpack_bgra(img.pixels[idx]);
+        assert!(
+            r > 200 && g < 80 && b < 80,
+            "iframe srcdoc red body should render red, got ({r},{g},{b})"
+        );
+    }
+
+    #[test]
+    fn iframe_sandbox_without_allow_scripts_does_not_run_js() {
+        // The frame's script would paint the body red. WITHOUT allow-scripts
+        // it must NOT run → body stays white.
+        let srcdoc = "<body style=\"margin:0;background:#ffffff;width:300px;height:150px\">\
+            <script>document.body.style.background='#ff0000';</script></body>";
+        let no_scripts = iframe::SandboxFlags::parse(Some("allow-same-origin"));
+        assert!(!no_scripts.scripts_enabled());
+        let img = render_iframe_to_embedded_image(
+            srcdoc,
+            "https://parent.test/",
+            300,
+            150,
+            &no_scripts,
+        );
+        let idx = (75usize) * 300 + 150;
+        let (r, g, b) = unpack_bgra(img.pixels[idx]);
+        assert!(
+            r > 200 && g > 200 && b > 200,
+            "sandboxed (no allow-scripts) frame must stay white, got ({r},{g},{b})"
+        );
+    }
+
+    #[test]
+    fn iframe_allow_scripts_runs_frame_js() {
+        // WITH allow-scripts the frame's script runs: it repaints the body
+        // red. The rendered frame must therefore show red (proves scripts ran
+        // AND the content-row copy is aligned to row 0).
+        let srcdoc = "<body style=\"margin:0;background:#ffffff;width:300px;height:150px\">\
+            <script>document.body.style.background='#ff0000';</script></body>";
+        let with_scripts = iframe::SandboxFlags::parse(Some("allow-scripts allow-same-origin"));
+        assert!(with_scripts.scripts_enabled());
+        let img = render_iframe_to_embedded_image(
+            srcdoc,
+            "https://parent.test/",
+            300,
+            150,
+            &with_scripts,
+        );
+        let idx = (75usize) * 300 + 150;
+        let (r, g, b) = unpack_bgra(img.pixels[idx]);
+        assert!(
+            r > 200 && g < 80 && b < 80,
+            "allow-scripts frame JS should paint body red, got ({r},{g},{b})"
+        );
+    }
+
+    #[test]
+    fn iframe_default_box_is_300x150() {
+        // No width/height attrs → HTML default replaced size 300×150.
+        assert_eq!(iframe_box_dimensions(None, None), (300, 150));
+        assert_eq!(iframe_box_dimensions(Some(640), Some(480)), (640, 480));
+    }
+
+    #[test]
+    fn iframe_contentdocument_same_origin_accessible() {
+        set_doc_context("https://app.test/index.html");
+        // srcdoc inherits the parent origin → same-origin → contentDocument
+        // is a real object (not null).
+        let html = "<body><iframe srcdoc=\"<p>hi</p>\"></iframe></body>";
+        let doc = cv_html::parse(html);
+        let mut rt = LiveInterp::new(&doc, "https://app.test/index.html");
+        rt.run_script(
+            "var f = document.querySelector('iframe'); \
+             window.__cd = (f.contentDocument === null) ? 'null' : 'object';",
+        );
+        let v = rt
+            .interp
+            .run_completion_value("window.__cd")
+            .unwrap()
+            .to_display_string();
+        assert_eq!(v, "object", "same-origin contentDocument must be accessible");
+    }
+
+    #[test]
+    fn iframe_contentdocument_cross_origin_is_null() {
+        set_doc_context("https://app.test/index.html");
+        // A cross-origin src → contentDocument must be null (spec: cross-origin
+        // objects are restricted). No network is performed for this check — the
+        // origin is decided from the resolved URL alone.
+        let html =
+            "<body><iframe src=\"https://other.test/frame.html\"></iframe></body>";
+        let doc = cv_html::parse(html);
+        let mut rt = LiveInterp::new(&doc, "https://app.test/index.html");
+        rt.run_script(
+            "var f = document.querySelector('iframe'); \
+             window.__cd = (f.contentDocument === null) ? 'null' : 'object';",
+        );
+        let v = rt
+            .interp
+            .run_completion_value("window.__cd")
+            .unwrap()
+            .to_display_string();
+        assert_eq!(v, "null", "cross-origin contentDocument must be null");
+    }
+
+    #[test]
+    fn iframe_sandboxed_opaque_contentdocument_is_null() {
+        set_doc_context("https://app.test/index.html");
+        // srcdoc would be same-origin, but `sandbox` without allow-same-origin
+        // gives the frame an opaque origin → contentDocument null.
+        let html = "<body><iframe sandbox srcdoc=\"<p>x</p>\"></iframe></body>";
+        let doc = cv_html::parse(html);
+        let mut rt = LiveInterp::new(&doc, "https://app.test/index.html");
+        rt.run_script(
+            "var f = document.querySelector('iframe'); \
+             window.__cd = (f.contentDocument === null) ? 'null' : 'object';",
+        );
+        let v = rt
+            .interp
+            .run_completion_value("window.__cd")
+            .unwrap()
+            .to_display_string();
+        assert_eq!(
+            v, "null",
+            "sandboxed-opaque frame contentDocument must be null"
+        );
+    }
+
+    #[test]
+    fn parent_post_message_to_frame_delivers_message_event() {
+        set_doc_context("https://app.test/index.html");
+        // The parent registers a listener on the frame's contentWindow, then
+        // posts a message; the listener must fire with data + the parent's
+        // origin. (Same context-interp delivery: parent ⇄ child boundary.)
+        let html = "<body><iframe srcdoc=\"<p>x</p>\"></iframe></body>";
+        let doc = cv_html::parse(html);
+        let mut rt = LiveInterp::new(&doc, "https://app.test/index.html");
+        rt.run_script(
+            "var f = document.querySelector('iframe'); \
+             window.__got = ''; window.__org = ''; \
+             f.contentWindow.addEventListener('message', function(e){ \
+                 window.__got = e.data; window.__org = e.origin; }); \
+             f.contentWindow.postMessage('hello-frame', '*');",
+        );
+        let data = rt
+            .interp
+            .run_completion_value("window.__got")
+            .unwrap()
+            .to_display_string();
+        let org = rt
+            .interp
+            .run_completion_value("window.__org")
+            .unwrap()
+            .to_display_string();
+        assert_eq!(data, "hello-frame", "frame must receive the posted data");
+        assert_eq!(
+            org, "https://app.test",
+            "event.origin must be the SENDER (parent) origin"
+        );
+    }
+
+    #[test]
+    fn post_message_target_origin_mismatch_is_dropped() {
+        set_doc_context("https://app.test/index.html");
+        // Posting with a targetOrigin that does not match the frame origin must
+        // NOT deliver (silently dropped per spec). The same-origin srcdoc
+        // frame's origin is https://app.test; target https://evil.test ≠ that.
+        let html = "<body><iframe srcdoc=\"<p>x</p>\"></iframe></body>";
+        let doc = cv_html::parse(html);
+        let mut rt = LiveInterp::new(&doc, "https://app.test/index.html");
+        rt.run_script(
+            "var f = document.querySelector('iframe'); \
+             window.__got = 'NONE'; \
+             f.contentWindow.addEventListener('message', function(e){ window.__got = e.data; }); \
+             f.contentWindow.postMessage('secret', 'https://evil.test');",
+        );
+        let data = rt
+            .interp
+            .run_completion_value("window.__got")
+            .unwrap()
+            .to_display_string();
+        assert_eq!(
+            data, "NONE",
+            "message to a mismatched targetOrigin must be dropped"
+        );
+    }
+
+    #[test]
+    fn window_post_message_self_delivers() {
+        set_doc_context("https://app.test/index.html");
+        // window.postMessage to itself with '*' delivers a message event to a
+        // window 'message' listener with data + origin.
+        let html = "<body></body>";
+        let doc = cv_html::parse(html);
+        let mut rt = LiveInterp::new(&doc, "https://app.test/index.html");
+        rt.run_script(
+            "window.__d=''; \
+             window.addEventListener('message', function(e){ window.__d = e.data + '|' + e.origin; }); \
+             window.postMessage('self-msg', '*');",
+        );
+        let v = rt
+            .interp
+            .run_completion_value("window.__d")
+            .unwrap()
+            .to_display_string();
+        assert!(
+            v.starts_with("self-msg|"),
+            "window self postMessage must deliver data + origin, got {v:?}"
+        );
     }
 }
 
