@@ -32135,11 +32135,32 @@ fn build_time_ranges_jsobj(ranges: Vec<(f64, f64)>) -> cv_js::Value {
     Value::Object(Rc::new(RefCell::new(m)))
 }
 
-/// Build a WebGLRenderingContext-shaped Value. V1 ships the GL surface
-/// as no-op methods returning sane defaults: feature-detect succeeds,
-/// shaders compile (returning fake objects), draw calls are silent.
-/// Real rendering lands when cv_gpu exists.
-fn build_webgl_jsobj() -> cv_js::Value {
+/// Build a WebGLRenderingContext-shaped Value.
+///
+/// When `CV_WEBGL` is set, this returns a REAL context backed by
+/// [`cv_gfx::webgl::WebGlContext`]: shaders are really compiled (so
+/// `getShaderParameter(COMPILE_STATUS)` reflects genuine GLSL validity),
+/// `clear` fills the drawing buffer, and `drawArrays`/`drawElements`
+/// rasterize triangles into the canvas bitmap (composited onto the page
+/// through the normal canvas path). When the flag is OFF (the default), it
+/// falls back to [`build_webgl_stub_jsobj`] — the crash-free no-op surface
+/// that lets feature-detecting pages run without rendering. The flag is
+/// default-OFF because the software pipeline is new and per-frame CPU shader
+/// execution is costly; flip on after soak.
+fn build_webgl_jsobj(
+    canvas_ctx: std::rc::Rc<std::cell::RefCell<cv_gfx::CanvasContext2D>>,
+    webgl2: bool,
+) -> cv_js::Value {
+    if std::env::var("CV_WEBGL").is_ok() {
+        return build_webgl_real_jsobj(canvas_ctx, webgl2);
+    }
+    build_webgl_stub_jsobj()
+}
+
+/// The crash-free no-op WebGL surface (the default when `CV_WEBGL` is unset):
+/// feature-detect succeeds and draws are silent so a page that probes WebGL
+/// keeps running. Honest: it renders nothing rather than faking pixels.
+fn build_webgl_stub_jsobj() -> cv_js::Value {
     use std::cell::RefCell;
     use std::rc::Rc;
     use cv_js::OrderedMap as HashMap;
@@ -32147,64 +32168,8 @@ fn build_webgl_jsobj() -> cv_js::Value {
     // Drawing-buffer dimensions read by code that resizes canvases.
     g.insert("drawingBufferWidth".into(), cv_js::Value::Number(300.0));
     g.insert("drawingBufferHeight".into(), cv_js::Value::Number(150.0));
-    // Common GL constants (truncated list — pages typically reference
-    // these by name as gl.<NAME>).
-    for (name, val) in &[
-        ("DEPTH_TEST", 0x0B71),
-        ("STENCIL_TEST", 0x0B90),
-        ("BLEND", 0x0BE2),
-        ("CULL_FACE", 0x0B44),
-        ("SCISSOR_TEST", 0x0C11),
-        ("COLOR_BUFFER_BIT", 0x4000),
-        ("DEPTH_BUFFER_BIT", 0x100),
-        ("STENCIL_BUFFER_BIT", 0x400),
-        ("TRIANGLES", 0x0004),
-        ("TRIANGLE_STRIP", 0x0005),
-        ("TRIANGLE_FAN", 0x0006),
-        ("LINES", 0x0001),
-        ("LINE_STRIP", 0x0003),
-        ("POINTS", 0x0000),
-        ("ARRAY_BUFFER", 0x8892),
-        ("ELEMENT_ARRAY_BUFFER", 0x8893),
-        ("STATIC_DRAW", 0x88E4),
-        ("DYNAMIC_DRAW", 0x88E8),
-        ("STREAM_DRAW", 0x88E0),
-        ("FLOAT", 0x1406),
-        ("UNSIGNED_BYTE", 0x1401),
-        ("UNSIGNED_SHORT", 0x1403),
-        ("UNSIGNED_INT", 0x1405),
-        ("RGB", 0x1907),
-        ("RGBA", 0x1908),
-        ("VERTEX_SHADER", 0x8B31),
-        ("FRAGMENT_SHADER", 0x8B30),
-        ("LINK_STATUS", 0x8B82),
-        ("COMPILE_STATUS", 0x8B81),
-        ("TEXTURE_2D", 0x0DE1),
-        ("TEXTURE0", 0x84C0),
-        ("TEXTURE_MIN_FILTER", 0x2801),
-        ("TEXTURE_MAG_FILTER", 0x2800),
-        ("LINEAR", 0x2601),
-        ("NEAREST", 0x2600),
-        ("CLAMP_TO_EDGE", 0x812F),
-        ("REPEAT", 0x2901),
-        ("FRAMEBUFFER", 0x8D40),
-        ("RENDERBUFFER", 0x8D41),
-        ("DEPTH_COMPONENT16", 0x81A5),
-        ("DEPTH_ATTACHMENT", 0x8D00),
-        ("COLOR_ATTACHMENT0", 0x8CE0),
-        ("FRAMEBUFFER_COMPLETE", 0x8CD5),
-        ("SRC_ALPHA", 0x0302),
-        ("ONE_MINUS_SRC_ALPHA", 0x0303),
-        ("ONE", 1),
-        ("ZERO", 0),
-        ("FUNC_ADD", 0x8006),
-        ("MAX_TEXTURE_SIZE", 0x0D33),
-        ("MAX_VERTEX_ATTRIBS", 0x8869),
-        ("MAX_VERTEX_UNIFORM_VECTORS", 0x8DFB),
-        ("ACTIVE_UNIFORMS", 0x8B86),
-        ("ACTIVE_ATTRIBUTES", 0x8B89),
-        ("NO_ERROR", 0),
-    ] {
+    // Common GL constants — pages reference these by name as gl.<NAME>.
+    for (name, val) in webgl_constants() {
         g.insert((*name).into(), cv_js::Value::Number(f64::from(*val as i32)));
     }
     // Object constructors return tagged anonymous objects so subsequent
@@ -32383,6 +32348,665 @@ fn build_webgl_jsobj() -> cv_js::Value {
         cv_js::native_fn("isContextLost", |_| Ok(cv_js::Value::Bool(false))),
     );
     cv_js::Value::Object(Rc::new(RefCell::new(g)))
+}
+
+/// Extract the raw little-endian bytes backing a JS typed array / ArrayBuffer
+/// value (the engine stores them as `_bytes`: an Array of Number bytes). A
+/// plain JS Array of numbers is interpreted as float32 components (some demos
+/// pass `[x,y,z]`). Returns the bytes or `None` if `v` carries no buffer.
+fn webgl_typed_array_bytes(v: &cv_js::Value) -> Option<Vec<u8>> {
+    match v {
+        cv_js::Value::Object(o) => {
+            let m = o.borrow();
+            // _bytes byte storage (Uint8/Float32/etc views + ArrayBuffer).
+            if let Some(cv_js::Value::Array(a)) = m.get("_bytes") {
+                return Some(a.borrow().iter().map(|x| x.to_number() as u8).collect());
+            }
+            None
+        }
+        // A bare JS Array: treat as a list of f32 components.
+        cv_js::Value::Array(a) => {
+            let mut out = Vec::with_capacity(a.borrow().len() * 4);
+            for x in a.borrow().iter() {
+                out.extend_from_slice(&(x.to_number() as f32).to_le_bytes());
+            }
+            Some(out)
+        }
+        _ => None,
+    }
+}
+
+/// Pull `n` f32 numeric args starting at `start` from a JS arg list.
+fn webgl_f32_args(args: &[cv_js::Value], start: usize, n: usize) -> Vec<f32> {
+    (0..n)
+        .map(|i| args.get(start + i).map(|v| v.to_number() as f32).unwrap_or(0.0))
+        .collect()
+}
+
+/// Read a uniform's float values from a `uniform*fv(loc, array)` call's array
+/// argument (typed array or plain Array).
+fn webgl_uniform_fv(v: &cv_js::Value) -> Vec<f32> {
+    match v {
+        cv_js::Value::Array(a) => a.borrow().iter().map(|x| x.to_number() as f32).collect(),
+        cv_js::Value::Object(o) => {
+            let m = o.borrow();
+            if let Some(cv_js::Value::Array(a)) = m.get("_bytes") {
+                // Float32Array bytes → f32 values.
+                let bytes: Vec<u8> = a.borrow().iter().map(|x| x.to_number() as u8).collect();
+                bytes
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect()
+            } else {
+                Vec::new()
+            }
+        }
+        cv_js::Value::Number(n) => vec![*n as f32],
+        _ => Vec::new(),
+    }
+}
+
+/// The REAL WebGL context: a `cv_gfx::webgl::WebGlContext` driven by the JS
+/// surface, rendering into the canvas's bitmap so output composites onto the
+/// page. Each created GL object is a JS object carrying a numeric `_glHandle`
+/// the methods unpack back into a `Handle`.
+fn build_webgl_real_jsobj(
+    canvas_ctx: std::rc::Rc<std::cell::RefCell<cv_gfx::CanvasContext2D>>,
+    webgl2: bool,
+) -> cv_js::Value {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use cv_js::OrderedMap as HashMap;
+    use cv_gfx::webgl::{Handle, WebGlContext};
+
+    let (cw, ch) = canvas_ctx.borrow().size();
+    let gl = Rc::new(RefCell::new(WebGlContext::new(cw, ch)));
+
+    // Copy the GL color buffer into the canvas bitmap so the page composites
+    // it. Called after clear/draw (the operations that change pixels).
+    let canvas_for_flush = canvas_ctx.clone();
+    let gl_for_flush = gl.clone();
+    let flush = Rc::new(move || {
+        let g = gl_for_flush.borrow();
+        let mut c = canvas_for_flush.borrow_mut();
+        let (gw, gh) = (g.color_buffer.width, g.color_buffer.height);
+        if c.bitmap.width != gw || c.bitmap.height != gh {
+            c.resize(gw, gh);
+        }
+        c.bitmap.pixels.copy_from_slice(&g.color_buffer.pixels);
+    });
+
+    let mut gmap: HashMap<String, cv_js::Value> = HashMap::new();
+    gmap.insert("drawingBufferWidth".into(), cv_js::Value::Number(f64::from(cw)));
+    gmap.insert("drawingBufferHeight".into(), cv_js::Value::Number(f64::from(ch)));
+    // GL constants (same table the stub exposes).
+    for (name, val) in webgl_constants() {
+        gmap.insert((*name).into(), cv_js::Value::Number(f64::from(*val as i32)));
+    }
+    let obj = cv_js::Value::Object(Rc::new(RefCell::new(gmap)));
+
+    // Helper to read a `_glHandle` off an arg object → Handle.
+    fn arg_handle(args: &[cv_js::Value], i: usize) -> Option<Handle> {
+        match args.get(i) {
+            Some(cv_js::Value::Object(o)) => o
+                .borrow()
+                .get("_glHandle")
+                .map(|v| Handle(v.to_number() as u32)),
+            _ => None,
+        }
+    }
+    fn arg_u32(args: &[cv_js::Value], i: usize) -> u32 {
+        args.get(i).map(|v| v.to_number() as u32).unwrap_or(0)
+    }
+    fn arg_i32(args: &[cv_js::Value], i: usize) -> i32 {
+        args.get(i).map(|v| v.to_number() as i32).unwrap_or(0)
+    }
+    fn arg_bool(args: &[cv_js::Value], i: usize) -> bool {
+        args.get(i).map(|v| v.to_bool()).unwrap_or(false)
+    }
+
+    macro_rules! method {
+        ($name:expr, $body:expr) => {{
+            if let cv_js::Value::Object(o) = &obj {
+                o.borrow_mut()
+                    .insert($name.into(), cv_js::native_fn($name, $body));
+            }
+        }};
+    }
+
+    // --- object creation: return JS objects carrying _glHandle ---
+    macro_rules! creator {
+        ($name:expr, $make:expr) => {{
+            let gl = gl.clone();
+            method!($name, move |_args| {
+                let h: Handle = $make(&mut gl.borrow_mut());
+                let mut m: HashMap<String, cv_js::Value> = HashMap::new();
+                m.insert("_glHandle".into(), cv_js::Value::Number(f64::from(h.0)));
+                Ok(cv_js::Value::Object(Rc::new(RefCell::new(m))))
+            });
+        }};
+    }
+    creator!("createBuffer", |g: &mut WebGlContext| g.create_buffer());
+    creator!("createTexture", |g: &mut WebGlContext| g.create_texture());
+    creator!("createProgram", |g: &mut WebGlContext| g.create_program());
+    creator!("createFramebuffer", |g: &mut WebGlContext| g.create_buffer());
+    creator!("createRenderbuffer", |g: &mut WebGlContext| g.create_buffer());
+    creator!("createVertexArray", |g: &mut WebGlContext| g.create_buffer());
+    {
+        // createShader(type) needs the type arg.
+        let gl = gl.clone();
+        method!("createShader", move |args| {
+            let kind = arg_u32(&args, 0);
+            let h = gl.borrow_mut().create_shader(kind);
+            let mut m: HashMap<String, cv_js::Value> = HashMap::new();
+            m.insert("_glHandle".into(), cv_js::Value::Number(f64::from(h.0)));
+            Ok(cv_js::Value::Object(Rc::new(RefCell::new(m))))
+        });
+    }
+
+    // --- shaders ---
+    {
+        let gl = gl.clone();
+        method!("shaderSource", move |args| {
+            if let Some(h) = arg_handle(&args, 0) {
+                let src = args.get(1).map(|v| v.to_display_string()).unwrap_or_default();
+                gl.borrow_mut().shader_source(h, src);
+            }
+            Ok(cv_js::Value::Undefined)
+        });
+    }
+    {
+        let gl = gl.clone();
+        method!("compileShader", move |args| {
+            if let Some(h) = arg_handle(&args, 0) {
+                gl.borrow_mut().compile_shader(h);
+            }
+            Ok(cv_js::Value::Undefined)
+        });
+    }
+    {
+        let gl = gl.clone();
+        method!("getShaderParameter", move |args| {
+            // COMPILE_STATUS → real boolean. Others → sane numeric default.
+            let pname = arg_u32(&args, 1);
+            if pname == 0x8B81 {
+                let ok = arg_handle(&args, 0)
+                    .map(|h| gl.borrow().shader_compile_status(h))
+                    .unwrap_or(false);
+                return Ok(cv_js::Value::Bool(ok));
+            }
+            Ok(cv_js::Value::Number(0.0))
+        });
+    }
+    {
+        let gl = gl.clone();
+        method!("getShaderInfoLog", move |args| {
+            let log = arg_handle(&args, 0)
+                .map(|h| gl.borrow().shader_info_log(h))
+                .unwrap_or_default();
+            Ok(cv_js::Value::str(log))
+        });
+    }
+    {
+        let gl = gl.clone();
+        method!("deleteShader", move |args| {
+            let _ = (&gl, arg_handle(&args, 0));
+            Ok(cv_js::Value::Undefined)
+        });
+    }
+
+    // --- programs ---
+    {
+        let gl = gl.clone();
+        method!("attachShader", move |args| {
+            if let (Some(p), Some(s)) = (arg_handle(&args, 0), arg_handle(&args, 1)) {
+                gl.borrow_mut().attach_shader(p, s);
+            }
+            Ok(cv_js::Value::Undefined)
+        });
+    }
+    method!("detachShader", |_| Ok(cv_js::Value::Undefined));
+    {
+        let gl = gl.clone();
+        method!("linkProgram", move |args| {
+            if let Some(p) = arg_handle(&args, 0) {
+                gl.borrow_mut().link_program(p);
+            }
+            Ok(cv_js::Value::Undefined)
+        });
+    }
+    {
+        let gl = gl.clone();
+        method!("getProgramParameter", move |args| {
+            let pname = arg_u32(&args, 1);
+            if pname == 0x8B82 {
+                let ok = arg_handle(&args, 0)
+                    .map(|h| gl.borrow().program_link_status(h))
+                    .unwrap_or(false);
+                return Ok(cv_js::Value::Bool(ok));
+            }
+            Ok(cv_js::Value::Number(0.0))
+        });
+    }
+    {
+        let gl = gl.clone();
+        method!("getProgramInfoLog", move |args| {
+            let log = arg_handle(&args, 0)
+                .map(|h| gl.borrow().program_info_log(h))
+                .unwrap_or_default();
+            Ok(cv_js::Value::str(log))
+        });
+    }
+    {
+        let gl = gl.clone();
+        method!("useProgram", move |args| {
+            if let Some(p) = arg_handle(&args, 0) {
+                gl.borrow_mut().use_program(p);
+            }
+            Ok(cv_js::Value::Undefined)
+        });
+    }
+    method!("deleteProgram", |_| Ok(cv_js::Value::Undefined));
+
+    // --- attribute / uniform locations ---
+    {
+        // The current program is tracked inside WebGlContext; getAttribLocation
+        // takes a program object + name.
+        let gl = gl.clone();
+        method!("getAttribLocation", move |args| {
+            let name = args.get(1).map(|v| v.to_display_string()).unwrap_or_default();
+            let loc = arg_handle(&args, 0)
+                .map(|p| gl.borrow().get_attrib_location(p, &name))
+                .unwrap_or(-1);
+            Ok(cv_js::Value::Number(f64::from(loc)))
+        });
+    }
+    {
+        // getUniformLocation returns an object whose _uniformName the uniform*
+        // setters read back.
+        method!("getUniformLocation", move |args| {
+            let name = args.get(1).map(|v| v.to_display_string()).unwrap_or_default();
+            let mut m: HashMap<String, cv_js::Value> = HashMap::new();
+            m.insert("_uniformName".into(), cv_js::Value::str(name));
+            Ok(cv_js::Value::Object(Rc::new(RefCell::new(m))))
+        });
+    }
+    fn uniform_name(args: &[cv_js::Value]) -> Option<String> {
+        match args.first() {
+            Some(cv_js::Value::Object(o)) => o
+                .borrow()
+                .get("_uniformName")
+                .map(|v| v.to_display_string()),
+            _ => None,
+        }
+    }
+
+    // uniform1f..4f / 1i..4i
+    macro_rules! uniform_scalar {
+        ($name:expr, $n:expr) => {{
+            let gl = gl.clone();
+            method!($name, move |args| {
+                if let Some(name) = uniform_name(&args) {
+                    let vals = webgl_f32_args(&args, 1, $n);
+                    gl.borrow_mut().set_uniform(&name, vals);
+                }
+                Ok(cv_js::Value::Undefined)
+            });
+        }};
+    }
+    uniform_scalar!("uniform1f", 1);
+    uniform_scalar!("uniform2f", 2);
+    uniform_scalar!("uniform3f", 3);
+    uniform_scalar!("uniform4f", 4);
+    uniform_scalar!("uniform1i", 1);
+    uniform_scalar!("uniform2i", 2);
+    uniform_scalar!("uniform3i", 3);
+    uniform_scalar!("uniform4i", 4);
+    // uniform*fv
+    for fv in ["uniform1fv", "uniform2fv", "uniform3fv", "uniform4fv", "uniform1iv", "uniform2iv", "uniform3iv", "uniform4iv"] {
+        let gl = gl.clone();
+        method!(fv, move |args| {
+            if let Some(name) = uniform_name(&args) {
+                if let Some(arr) = args.get(1) {
+                    let vals = webgl_uniform_fv(arr);
+                    gl.borrow_mut().set_uniform(&name, vals);
+                }
+            }
+            Ok(cv_js::Value::Undefined)
+        });
+    }
+    // uniformMatrix{2,3,4}fv(loc, transpose, value)
+    for (mname, n) in [("uniformMatrix2fv", 2usize), ("uniformMatrix3fv", 3), ("uniformMatrix4fv", 4)] {
+        let gl = gl.clone();
+        method!(mname, move |args| {
+            if let Some(name) = uniform_name(&args) {
+                if let Some(arr) = args.get(2) {
+                    let vals = webgl_uniform_fv(arr);
+                    if vals.len() == n * n {
+                        gl.borrow_mut().set_uniform_matrix(&name, n, &vals);
+                    }
+                }
+            }
+            Ok(cv_js::Value::Undefined)
+        });
+    }
+
+    // --- buffers ---
+    {
+        let gl = gl.clone();
+        method!("bindBuffer", move |args| {
+            let target = arg_u32(&args, 0);
+            if let Some(h) = arg_handle(&args, 1) {
+                gl.borrow_mut().bind_buffer(target, h);
+            }
+            Ok(cv_js::Value::Undefined)
+        });
+    }
+    {
+        let gl = gl.clone();
+        method!("bufferData", move |args| {
+            // bufferData(target, sizeOrData, usage)
+            let target = arg_u32(&args, 0);
+            let usage = arg_u32(&args, 2);
+            if let Some(data) = args.get(1).and_then(webgl_typed_array_bytes) {
+                gl.borrow_mut().buffer_data(target, &data, usage);
+            } else {
+                // size-only form (preallocation): allocate zeroed storage.
+                let size = arg_i32(&args, 1).max(0) as usize;
+                gl.borrow_mut().buffer_data(target, &vec![0u8; size], usage);
+            }
+            Ok(cv_js::Value::Undefined)
+        });
+    }
+    {
+        let gl = gl.clone();
+        method!("bufferSubData", move |args| {
+            let target = arg_u32(&args, 0);
+            let offset = arg_i32(&args, 1).max(0) as usize;
+            if let Some(data) = args.get(2).and_then(webgl_typed_array_bytes) {
+                gl.borrow_mut().buffer_sub_data(target, offset, &data);
+            }
+            Ok(cv_js::Value::Undefined)
+        });
+    }
+    method!("deleteBuffer", |_| Ok(cv_js::Value::Undefined));
+
+    // --- vertex attributes ---
+    {
+        let gl = gl.clone();
+        method!("enableVertexAttribArray", move |args| {
+            gl.borrow_mut().enable_vertex_attrib_array(arg_u32(&args, 0));
+            Ok(cv_js::Value::Undefined)
+        });
+    }
+    {
+        let gl = gl.clone();
+        method!("disableVertexAttribArray", move |args| {
+            gl.borrow_mut().disable_vertex_attrib_array(arg_u32(&args, 0));
+            Ok(cv_js::Value::Undefined)
+        });
+    }
+    {
+        let gl = gl.clone();
+        method!("vertexAttribPointer", move |args| {
+            gl.borrow_mut().vertex_attrib_pointer(
+                arg_u32(&args, 0),
+                arg_i32(&args, 1),
+                arg_u32(&args, 2),
+                arg_bool(&args, 3),
+                arg_i32(&args, 4),
+                arg_i32(&args, 5),
+            );
+            Ok(cv_js::Value::Undefined)
+        });
+    }
+    for (avn, n) in [("vertexAttrib1f", 1usize), ("vertexAttrib2f", 2), ("vertexAttrib3f", 3), ("vertexAttrib4f", 4)] {
+        let gl = gl.clone();
+        method!(avn, move |args| {
+            let comps = webgl_f32_args(&args, 1, n);
+            let mut v = [0.0, 0.0, 0.0, 1.0];
+            for (i, c) in comps.iter().enumerate() {
+                v[i] = *c;
+            }
+            gl.borrow_mut().vertex_attrib(arg_u32(&args, 0), v);
+            Ok(cv_js::Value::Undefined)
+        });
+    }
+
+    // --- textures ---
+    {
+        let gl = gl.clone();
+        method!("activeTexture", move |args| {
+            gl.borrow_mut().active_texture(arg_u32(&args, 0));
+            Ok(cv_js::Value::Undefined)
+        });
+    }
+    {
+        let gl = gl.clone();
+        method!("bindTexture", move |args| {
+            let target = arg_u32(&args, 0);
+            if let Some(h) = arg_handle(&args, 1) {
+                gl.borrow_mut().bind_texture(target, h);
+            }
+            Ok(cv_js::Value::Undefined)
+        });
+    }
+    {
+        let gl = gl.clone();
+        method!("texImage2D", move |args| {
+            // texImage2D(target, level, internalformat, width, height, border,
+            //            format, type, pixels)  OR the DOM-source overload.
+            let target = arg_u32(&args, 0);
+            let level = arg_i32(&args, 1).max(0) as usize;
+            if args.len() >= 9 {
+                let w = arg_i32(&args, 3).max(0) as u32;
+                let h = arg_i32(&args, 4).max(0) as u32;
+                if let Some(bytes) = args.get(8).and_then(webgl_typed_array_bytes) {
+                    gl.borrow_mut().tex_image_2d(target, level, w, h, &bytes);
+                }
+            }
+            Ok(cv_js::Value::Undefined)
+        });
+    }
+    method!("texSubImage2D", |_| Ok(cv_js::Value::Undefined));
+    method!("texParameteri", |_| Ok(cv_js::Value::Undefined));
+    method!("texParameterf", |_| Ok(cv_js::Value::Undefined));
+    method!("generateMipmap", |_| Ok(cv_js::Value::Undefined));
+    method!("deleteTexture", |_| Ok(cv_js::Value::Undefined));
+    method!("pixelStorei", |_| Ok(cv_js::Value::Undefined));
+
+    // --- raster state ---
+    {
+        let gl = gl.clone();
+        method!("viewport", move |args| {
+            gl.borrow_mut().viewport(
+                arg_i32(&args, 0),
+                arg_i32(&args, 1),
+                arg_i32(&args, 2).max(0) as u32,
+                arg_i32(&args, 3).max(0) as u32,
+            );
+            Ok(cv_js::Value::Undefined)
+        });
+    }
+    {
+        let gl = gl.clone();
+        method!("clearColor", move |args| {
+            let v = webgl_f32_args(&args, 0, 4);
+            gl.borrow_mut().clear_color(v[0], v[1], v[2], v[3]);
+            Ok(cv_js::Value::Undefined)
+        });
+    }
+    {
+        let gl = gl.clone();
+        let flush = flush.clone();
+        method!("clear", move |args| {
+            gl.borrow_mut().clear(arg_u32(&args, 0));
+            flush();
+            Ok(cv_js::Value::Undefined)
+        });
+    }
+    {
+        let gl = gl.clone();
+        method!("enable", move |args| {
+            gl.borrow_mut().enable(arg_u32(&args, 0));
+            Ok(cv_js::Value::Undefined)
+        });
+    }
+    {
+        let gl = gl.clone();
+        method!("disable", move |args| {
+            gl.borrow_mut().disable(arg_u32(&args, 0));
+            Ok(cv_js::Value::Undefined)
+        });
+    }
+    for noop in ["depthFunc", "blendFunc", "blendEquation", "cullFace", "frontFace", "scissor", "clearDepth", "clearStencil", "depthMask", "colorMask", "lineWidth", "polygonOffset", "hint", "flush", "finish", "bindFramebuffer", "framebufferTexture2D", "framebufferRenderbuffer", "bindRenderbuffer", "renderbufferStorage", "bindVertexArray", "blendFuncSeparate", "blendEquationSeparate", "stencilFunc", "stencilOp", "stencilMask"] {
+        method!(noop, |_| Ok(cv_js::Value::Undefined));
+    }
+
+    // --- draws ---
+    {
+        let gl = gl.clone();
+        let flush = flush.clone();
+        method!("drawArrays", move |args| {
+            let _ = gl.borrow_mut().draw_arrays(arg_u32(&args, 0), arg_i32(&args, 1), arg_i32(&args, 2));
+            flush();
+            Ok(cv_js::Value::Undefined)
+        });
+    }
+    {
+        let gl = gl.clone();
+        let flush = flush.clone();
+        method!("drawElements", move |args| {
+            let _ = gl.borrow_mut().draw_elements(
+                arg_u32(&args, 0),
+                arg_i32(&args, 1),
+                arg_u32(&args, 2),
+                arg_i32(&args, 3),
+            );
+            flush();
+            Ok(cv_js::Value::Undefined)
+        });
+    }
+
+    // --- queries ---
+    {
+        let gl = gl.clone();
+        method!("getError", move |_| {
+            Ok(cv_js::Value::Number(f64::from(gl.borrow_mut().get_error())))
+        });
+    }
+    method!("getParameter", move |args| {
+        let p = args.first().map(|v| v.to_number() as i32).unwrap_or(0);
+        match p {
+            0x0D33 => Ok(cv_js::Value::Number(4096.0)), // MAX_TEXTURE_SIZE
+            0x8869 => Ok(cv_js::Value::Number(16.0)),   // MAX_VERTEX_ATTRIBS
+            0x8DFB => Ok(cv_js::Value::Number(128.0)),  // MAX_VERTEX_UNIFORM_VECTORS
+            _ => Ok(cv_js::Value::Number(0.0)),
+        }
+    });
+    method!("getSupportedExtensions", |_| {
+        Ok(cv_js::Value::Array(Rc::new(RefCell::new(Vec::new()))))
+    });
+    method!("getExtension", |_| Ok(cv_js::Value::Null));
+    method!("checkFramebufferStatus", |_| {
+        Ok(cv_js::Value::Number(f64::from(0x8CD5)))
+    });
+    method!("isContextLost", |_| Ok(cv_js::Value::Bool(false)));
+    {
+        // readPixels(x, y, w, h, format, type, pixels)
+        let gl = gl.clone();
+        method!("readPixels", move |args| {
+            let x = arg_i32(&args, 0).max(0) as u32;
+            let y = arg_i32(&args, 1).max(0) as u32;
+            let w = arg_i32(&args, 2).max(0) as u32;
+            let h = arg_i32(&args, 3).max(0) as u32;
+            if let Some(cv_js::Value::Object(o)) = args.get(6) {
+                if let Some(cv_js::Value::Array(buf)) = o.borrow().get("_bytes") {
+                    let g = gl.borrow();
+                    let mut out = buf.borrow_mut();
+                    let mut idx = 0usize;
+                    for yy in 0..h {
+                        for xx in 0..w {
+                            let px = g.read_pixel(x + xx, y + yy);
+                            for c in px {
+                                if idx < out.len() {
+                                    out[idx] = cv_js::Value::Number(f64::from(c));
+                                }
+                                idx += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(cv_js::Value::Undefined)
+        });
+    }
+    let _ = webgl2;
+    obj
+}
+
+/// The GL enum-constant table shared by the stub and real WebGL contexts.
+fn webgl_constants() -> &'static [(&'static str, u32)] {
+    &[
+        ("DEPTH_TEST", 0x0B71),
+        ("STENCIL_TEST", 0x0B90),
+        ("BLEND", 0x0BE2),
+        ("CULL_FACE", 0x0B44),
+        ("SCISSOR_TEST", 0x0C11),
+        ("COLOR_BUFFER_BIT", 0x4000),
+        ("DEPTH_BUFFER_BIT", 0x100),
+        ("STENCIL_BUFFER_BIT", 0x400),
+        ("TRIANGLES", 0x0004),
+        ("TRIANGLE_STRIP", 0x0005),
+        ("TRIANGLE_FAN", 0x0006),
+        ("LINES", 0x0001),
+        ("LINE_STRIP", 0x0003),
+        ("POINTS", 0x0000),
+        ("ARRAY_BUFFER", 0x8892),
+        ("ELEMENT_ARRAY_BUFFER", 0x8893),
+        ("STATIC_DRAW", 0x88E4),
+        ("DYNAMIC_DRAW", 0x88E8),
+        ("STREAM_DRAW", 0x88E0),
+        ("FLOAT", 0x1406),
+        ("UNSIGNED_BYTE", 0x1401),
+        ("UNSIGNED_SHORT", 0x1403),
+        ("UNSIGNED_INT", 0x1405),
+        ("RGB", 0x1907),
+        ("RGBA", 0x1908),
+        ("VERTEX_SHADER", 0x8B31),
+        ("FRAGMENT_SHADER", 0x8B30),
+        ("LINK_STATUS", 0x8B82),
+        ("COMPILE_STATUS", 0x8B81),
+        ("TEXTURE_2D", 0x0DE1),
+        ("TEXTURE0", 0x84C0),
+        ("TEXTURE1", 0x84C1),
+        ("TEXTURE_MIN_FILTER", 0x2801),
+        ("TEXTURE_MAG_FILTER", 0x2800),
+        ("TEXTURE_WRAP_S", 0x2802),
+        ("TEXTURE_WRAP_T", 0x2803),
+        ("LINEAR", 0x2601),
+        ("NEAREST", 0x2600),
+        ("CLAMP_TO_EDGE", 0x812F),
+        ("REPEAT", 0x2901),
+        ("FRAMEBUFFER", 0x8D40),
+        ("RENDERBUFFER", 0x8D41),
+        ("DEPTH_COMPONENT16", 0x81A5),
+        ("DEPTH_ATTACHMENT", 0x8D00),
+        ("COLOR_ATTACHMENT0", 0x8CE0),
+        ("FRAMEBUFFER_COMPLETE", 0x8CD5),
+        ("SRC_ALPHA", 0x0302),
+        ("ONE_MINUS_SRC_ALPHA", 0x0303),
+        ("ONE", 1),
+        ("ZERO", 0),
+        ("FUNC_ADD", 0x8006),
+        ("MAX_TEXTURE_SIZE", 0x0D33),
+        ("MAX_VERTEX_ATTRIBS", 0x8869),
+        ("MAX_VERTEX_UNIFORM_VECTORS", 0x8DFB),
+        ("ACTIVE_UNIFORMS", 0x8B86),
+        ("ACTIVE_ATTRIBUTES", 0x8B89),
+        ("ARRAY_BUFFER_BINDING", 0x8894),
+        ("NO_ERROR", 0),
+    ]
 }
 
 /// RFC 4648 base64 encoder. Used by `FileReader.readAsDataURL` to
@@ -33496,6 +34120,7 @@ fn walk_for_table(
             // getContext yield identical handles (spec-conformant).
             let cached: Rc<RefCell<Option<cv_js::Value>>> = Rc::new(RefCell::new(None));
             let cached_clone = cached.clone();
+            let cached_webgl: Rc<RefCell<Option<cv_js::Value>>> = Rc::new(RefCell::new(None));
             let canvas_js = Rc::new(RefCell::new(None));
             canvas_js_cell = Some(canvas_js.clone());
             let canvas_js_for_get = canvas_js.clone();
@@ -33525,7 +34150,14 @@ fn walk_for_table(
                     return Ok(v);
                 }
                 if kind == "webgl" || kind == "webgl2" || kind == "experimental-webgl" {
-                    return Ok(build_webgl_jsobj());
+                    // WebGL gets its OWN cache cell — a canvas's webgl context
+                    // is a distinct object from its 2d context.
+                    if let Some(v) = cached_webgl.borrow().as_ref() {
+                        return Ok(v.clone());
+                    }
+                    let v = build_webgl_jsobj(ctx_for_get.clone(), kind == "webgl2");
+                    *cached_webgl.borrow_mut() = Some(v.clone());
+                    return Ok(v);
                 }
                 Ok(cv_js::Value::Null)
             });
@@ -40130,6 +40762,7 @@ fn make_new_element_js_with_canvas_registry(
         canvas_js_cell = Some(canvas_js.clone());
         let cached_ctx: Rc<RefCell<Option<cv_js::Value>>> = Rc::new(RefCell::new(None));
         let cached_ctx_for_get = cached_ctx.clone();
+        let cached_webgl: Rc<RefCell<Option<cv_js::Value>>> = Rc::new(RefCell::new(None));
         let canvas_js_for_get = canvas_js.clone();
         let ctx_for_get = ctx.clone();
         let get_context = cv_js::native_fn("getContext", move |args| {
@@ -40139,6 +40772,15 @@ fn make_new_element_js_with_canvas_registry(
                 .unwrap_or_default();
             if std::env::var("CV_CANVASLOG").is_ok() || std::env::var("CV_FETCHLOG").is_ok() {
                 cv_js::diag_log(&format!("[CANVAS] getContext('{kind}') on created canvas"));
+            }
+            let lk = kind.to_ascii_lowercase();
+            if lk == "webgl" || lk == "webgl2" || lk == "experimental-webgl" {
+                if let Some(existing) = cached_webgl.borrow().as_ref() {
+                    return Ok(existing.clone());
+                }
+                let v = build_webgl_jsobj(ctx_for_get.clone(), lk == "webgl2");
+                *cached_webgl.borrow_mut() = Some(v.clone());
+                return Ok(v);
             }
             if !kind.eq_ignore_ascii_case("2d") {
                 return Ok(cv_js::Value::Null);
@@ -61814,6 +62456,208 @@ mod tests {
         assert!(
             ctx.borrow().bitmap.pixels.iter().any(|px| *px != 0),
             "dynamic canvas bitmap should still be populated after rerender"
+        );
+    }
+
+    // ---- WebGL JS-surface wiring (real GL execution) ----
+    //
+    // These drive `build_webgl_real_jsobj` directly (the same object
+    // `getContext('webgl')` returns under CV_WEBGL) through the JS
+    // interpreter, then assert on the canvas BITMAP — proving the GL pipeline
+    // really executes and composites onto the page, not no-ops.
+
+    /// Build a runtime + a real WebGL JS object bound to a fresh canvas
+    /// context, install it as global `gl`, and return both so the test can run
+    /// JS against `gl` and inspect the canvas pixels.
+    fn webgl_test_harness() -> (
+        LiveInterp,
+        std::rc::Rc<std::cell::RefCell<cv_gfx::CanvasContext2D>>,
+    ) {
+        let html = "<!doctype html><html><body></body></html>";
+        let cfg = cv_layout::LayoutConfig::default();
+        let (mut runtime, _doc, _sheets, _paint) =
+            build_runtime_and_first_paint(html, "https://example.com/", &cfg, "")
+                .expect("render ok");
+        let ctx = std::rc::Rc::new(std::cell::RefCell::new(cv_gfx::CanvasContext2D::new(64, 64)));
+        let gl = build_webgl_real_jsobj(ctx.clone(), false);
+        runtime.interp.define_global("gl", gl);
+        (runtime, ctx)
+    }
+
+    #[test]
+    fn webgl_invalid_shader_reports_compile_status_false_with_log() {
+        let (mut runtime, _ctx) = webgl_test_harness();
+        let r = runtime
+            .interp
+            .run_completion_value(
+                "(function(){ \
+                   var s = gl.createShader(gl.FRAGMENT_SHADER); \
+                   gl.shaderSource(s, 'void main(){ gl_FragColor = vec4(1.0 }'); \
+                   gl.compileShader(s); \
+                   var ok = gl.getShaderParameter(s, gl.COMPILE_STATUS); \
+                   var log = gl.getShaderInfoLog(s); \
+                   return ok + '|' + (log.length > 0); \
+                 })()",
+            )
+            .expect("js runs");
+        assert_eq!(
+            r.to_display_string(),
+            "false|true",
+            "an invalid shader must report COMPILE_STATUS=false with a non-empty info log (not fake success)"
+        );
+    }
+
+    #[test]
+    fn webgl_valid_shader_reports_compile_status_true() {
+        let (mut runtime, _ctx) = webgl_test_harness();
+        let r = runtime
+            .interp
+            .run_completion_value(
+                "(function(){ \
+                   var s = gl.createShader(gl.VERTEX_SHADER); \
+                   gl.shaderSource(s, 'attribute vec2 a; void main(){ gl_Position = vec4(a,0.0,1.0); }'); \
+                   gl.compileShader(s); \
+                   return gl.getShaderParameter(s, gl.COMPILE_STATUS); \
+                 })()",
+            )
+            .expect("js runs");
+        assert_eq!(r.to_display_string(), "true");
+    }
+
+    #[test]
+    fn webgl_clear_fills_canvas_bitmap_with_clear_color() {
+        let (mut runtime, ctx) = webgl_test_harness();
+        runtime
+            .interp
+            .run_completion_value(
+                "gl.clearColor(1.0, 0.0, 0.0, 1.0); gl.clear(gl.COLOR_BUFFER_BIT);",
+            )
+            .expect("js runs");
+        // The canvas bitmap (what the page composites) must be filled red.
+        let c = ctx.borrow();
+        let px = cv_gfx::Color::from_bgra_u32(c.bitmap.pixels[32 * 64 + 32]);
+        assert_eq!(
+            (px.r, px.g, px.b, px.a),
+            (255, 0, 0, 255),
+            "clear(COLOR_BUFFER_BIT) must fill the canvas with clearColor"
+        );
+    }
+
+    #[test]
+    fn webgl_draw_triangle_paints_into_canvas() {
+        let (mut runtime, ctx) = webgl_test_harness();
+        runtime
+            .interp
+            .run_completion_value(
+                "(function(){ \
+                   gl.clearColor(0.0,0.0,0.0,1.0); gl.clear(gl.COLOR_BUFFER_BIT); \
+                   var vs = gl.createShader(gl.VERTEX_SHADER); \
+                   gl.shaderSource(vs, 'attribute vec2 pos; void main(){ gl_Position = vec4(pos,0.0,1.0); }'); \
+                   gl.compileShader(vs); \
+                   var fs = gl.createShader(gl.FRAGMENT_SHADER); \
+                   gl.shaderSource(fs, 'void main(){ gl_FragColor = vec4(0.0,1.0,0.0,1.0); }'); \
+                   gl.compileShader(fs); \
+                   var p = gl.createProgram(); \
+                   gl.attachShader(p, vs); gl.attachShader(p, fs); gl.linkProgram(p); \
+                   gl.useProgram(p); \
+                   var buf = gl.createBuffer(); \
+                   gl.bindBuffer(gl.ARRAY_BUFFER, buf); \
+                   var verts = new Float32Array([-0.8,-0.8, 0.8,-0.8, 0.0,0.8]); \
+                   gl.bufferData(gl.ARRAY_BUFFER, verts, gl.STATIC_DRAW); \
+                   var loc = gl.getAttribLocation(p, 'pos'); \
+                   gl.enableVertexAttribArray(loc); \
+                   gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0); \
+                   gl.drawArrays(gl.TRIANGLES, 0, 3); \
+                   return gl.getProgramParameter(p, gl.LINK_STATUS); \
+                 })()",
+            )
+            .expect("js runs");
+        let c = ctx.borrow();
+        let center = cv_gfx::Color::from_bgra_u32(c.bitmap.pixels[32 * 64 + 32]);
+        assert_eq!(
+            (center.r, center.g, center.b, center.a),
+            (0, 255, 0, 255),
+            "drawArrays of a triangle with a solid-green fragment shader must paint the inside green"
+        );
+        let corner = cv_gfx::Color::from_bgra_u32(c.bitmap.pixels[1 * 64 + 1]);
+        assert_eq!(
+            (corner.r, corner.g, corner.b, corner.a),
+            (0, 0, 0, 255),
+            "outside the triangle must remain the clear color"
+        );
+    }
+
+    #[test]
+    fn webgl_gl_position_uniform_transform_moves_the_triangle() {
+        let (mut runtime, ctx) = webgl_test_harness();
+        runtime
+            .interp
+            .run_completion_value(
+                "(function(){ \
+                   gl.clearColor(0.0,0.0,0.0,1.0); gl.clear(gl.COLOR_BUFFER_BIT); \
+                   var vs = gl.createShader(gl.VERTEX_SHADER); \
+                   gl.shaderSource(vs, 'attribute vec2 pos; uniform vec2 off; void main(){ gl_Position = vec4(pos + off, 0.0, 1.0); }'); \
+                   gl.compileShader(vs); \
+                   var fs = gl.createShader(gl.FRAGMENT_SHADER); \
+                   gl.shaderSource(fs, 'void main(){ gl_FragColor = vec4(1.0,0.0,0.0,1.0); }'); \
+                   gl.compileShader(fs); \
+                   var p = gl.createProgram(); gl.attachShader(p,vs); gl.attachShader(p,fs); gl.linkProgram(p); gl.useProgram(p); \
+                   var off = gl.getUniformLocation(p, 'off'); \
+                   gl.uniform2f(off, 0.6, 0.0); \
+                   var buf = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, buf); \
+                   gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-0.3,-0.3, 0.0,-0.3, -0.15,0.3]), gl.STATIC_DRAW); \
+                   var loc = gl.getAttribLocation(p,'pos'); gl.enableVertexAttribArray(loc); gl.vertexAttribPointer(loc,2,gl.FLOAT,false,0,0); \
+                   gl.drawArrays(gl.TRIANGLES, 0, 3); \
+                 })()",
+            )
+            .expect("js runs");
+        let c = ctx.borrow();
+        let is_red = |i: usize| {
+            let p = cv_gfx::Color::from_bgra_u32(c.bitmap.pixels[i]);
+            p.r == 255 && p.g == 0 && p.b == 0
+        };
+        let mut left = 0;
+        let mut right = 0;
+        for y in 0..64usize {
+            for x in 0..64usize {
+                if is_red(y * 64 + x) {
+                    if x < 32 {
+                        left += 1;
+                    } else {
+                        right += 1;
+                    }
+                }
+            }
+        }
+        assert!(right > 0, "translated triangle must paint");
+        assert!(
+            right > left,
+            "the +x uniform offset must shift the fill to the right half (left={left}, right={right})"
+        );
+    }
+
+    #[test]
+    fn webgl_disabled_by_default_returns_crashfree_stub() {
+        // With CV_WEBGL unset (the default), getContext('webgl') yields the
+        // crash-free fallback surface: methods exist and don't panic, and the
+        // canvas stays untouched (honest absence, not faked pixels).
+        let html = "<!doctype html><html><body><canvas id='c' width='32' height='32'></canvas>\
+                    <script>var c=document.getElementById('c');var gl=c.getContext('webgl');\
+                    window.__has=(typeof gl.drawArrays==='function')+'|'+(gl.getError===undefined?'noerr':'haserr');\
+                    gl.clearColor(1,0,0,1);gl.clear(gl.COLOR_BUFFER_BIT);</script></body></html>";
+        let cfg = cv_layout::LayoutConfig::default();
+        let (mut runtime, _doc, _sheets, _paint) =
+            build_runtime_and_first_paint(html, "https://example.com/", &cfg, "")
+                .expect("render ok");
+        let v = runtime
+            .interp
+            .run_completion_value("window.__has")
+            .expect("js runs");
+        // Stub exposes drawArrays as a function (crash-free feature detection).
+        assert!(
+            v.to_display_string().starts_with("true|"),
+            "default stub must expose a callable WebGL surface, got {}",
+            v.to_display_string()
         );
     }
 

@@ -13,6 +13,7 @@ mod font5x7;
 pub mod icc;
 pub mod webgl;
 pub mod webgl_compile;
+pub mod webgl_glsl;
 pub mod webgpu;
 
 pub use canvas::{CanvasContext2D, ClipRect, CompositeOp, FillRule, FillStyle, GradientStop, Path2D, Pattern, PatternRepeat, PathOp, TextAlign, TextBaseline, TextMetrics};
