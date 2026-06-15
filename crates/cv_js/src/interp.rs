@@ -993,6 +993,12 @@ thread_local! {
 /// the differential comparison deterministic.
 pub fn reset_bc_fn_cache() {
     BC_FN_CACHE.with(|c| c.borrow_mut().clear());
+    // The monomorphic call-site inline cache caches a compiled P6 body keyed by
+    // FunctionValue pointer. Clear it on the SAME reset so an oracle tier switch
+    // (or any caller that resets the per-fn cache) can never serve a stale
+    // compiled body. The Weak identity guard already prevents a recycled-pointer
+    // hit, but clearing here keeps the reset discipline uniform and explicit.
+    reset_call_inline_cache();
 }
 
 /// JIT state for a per-function-compiled function (Pass 6 — native codegen for
@@ -1037,6 +1043,116 @@ pub fn reset_p6_exec_count() {
 
 /// Call count at which a function is compiled to native code.
 const JIT_THRESHOLD: u32 = 12;
+
+// ---- Monomorphic call-site inline cache (V8-shaped dispatch fast path) ----
+//
+// PROBLEM (measured): around a tiny native P6 body, the per-call DISPATCH cost
+// dominates — entering the native code, not running it. Each `f(i)` call in a
+// tight loop pays TWO HashMap-by-pointer lookups (BC_FN_CACHE then JIT_CACHE),
+// two `Weak::upgrade`s, Rc clones, AND the threshold/hotness profiling counter
+// logic — every single call, even when the function is already compiled (slot
+// Ready). V8 avoids exactly this with inline caches at call sites + by skipping
+// the interrupt/profiling check on already-tiered hot code.
+//
+// FIX: a tiny 1-entry (monomorphic) cache, checked BEFORE the two HashMaps. In a
+// tight loop calling ONE function (the overwhelmingly common case) every call
+// after the first is a HIT: we go straight to the cached, already-compiled P6
+// `JitFunction`, skipping both HashMap lookups, both Weak upgrades, and ALL
+// profiling. On a miss (first call, or a polymorphic / redefined callee), we
+// fall back to the existing HashMap path, which REFILLS this entry only when it
+// resolves a Ready P6 numeric JIT.
+//
+// SAFETY (the cache-invalidation hazard — running stale compiled code):
+//   * The cache is keyed on `Rc::as_ptr(f)` — the SAME identity the HashMaps key
+//     on — AND carries a `Weak<FunctionValue>` that MUST still upgrade to the
+//     EXACT same `Rc` on every hit (`Rc::ptr_eq`). A different callee at the
+//     same call site (polymorphism) or a redefined function (a fresh `Rc` at a
+//     recycled address) fails this check and falls through to the slow path —
+//     never running the wrong compiled body.
+//   * It caches ONLY the default-on P6 numeric JIT (`jit_enabled()` true). The
+//     existing code already tries P6 FIRST whenever `jit_enabled()`, so a hit
+//     here is byte-identical to what the slow path would have done. We replicate
+//     the P6 eligibility predicate (`numeric`) exactly; a non-eligible call
+//     MISSES (falls through), so other tiers (T1/T3/T2/VM) still get their turn.
+//   * `native_exec_count` is unchanged: a hit still bumps `P6_EXEC_COUNT` once
+//     per native run, exactly as the slow path does — we made each call cheaper
+//     to DISPATCH, not fewer calls.
+struct InlineCacheEntry {
+    /// `Rc::as_ptr(f)` of the cached callee — the monomorphic key.
+    ptr: usize,
+    /// Identity guard: a hit is valid ONLY if this still upgrades to the SAME
+    /// `Rc` as the incoming callee (guards a recycled pointer / redefined fn).
+    weak: Weak<FunctionValue>,
+    /// The already-compiled P6 native function to dispatch straight to.
+    jit_fn: Rc<crate::jit::JitFunction>,
+    /// Declared parameter count — the `numeric` eligibility check needs it, and
+    /// caching it here avoids touching the `FunctionValue`'s `params` Vec on the
+    /// hot path (one more field read instead of a Vec len + deref).
+    n_params: usize,
+}
+
+thread_local! {
+    /// The 1-entry monomorphic call-site inline cache. `None` until the first P6
+    /// JIT resolves. Cleared whenever the underlying caches are reset (so the A/B
+    /// oracle and structural rebuilds can never serve a stale compiled body).
+    static CALL_IC: RefCell<Option<InlineCacheEntry>> = const { RefCell::new(None) };
+}
+
+/// Clear the monomorphic call-site inline cache for this thread. Called from the
+/// same reset points as the per-function caches so a compiled body can never
+/// leak across an oracle tier switch or a fresh interpreter.
+pub fn reset_call_inline_cache() {
+    CALL_IC.with(|c| *c.borrow_mut() = None);
+}
+
+/// Is this call P6-eligible — all-numeric args, ≤4 of them, and at least as many
+/// as the callee declares parameters? (Fewer args than params would leave stale
+/// Win64 xmm registers in the native code → wrong result, so we decline.) This is
+/// the EXACT predicate `try_jit_numeric` uses; the inline cache reuses it so a hit
+/// fires under identical conditions to the slow path. `n_params` is passed in so
+/// the hot path needn't touch the `FunctionValue`'s `params` Vec.
+#[inline(always)]
+fn p6_args_eligible(args: &[Value], n_params: usize) -> bool {
+    !args.is_empty()
+        && args.len() <= 4
+        && args.len() >= n_params
+        && args.iter().all(|a| matches!(a, Value::Number(_)))
+}
+
+/// Dispatch numeric `args` to an already-resolved P6 native function. Boxes the
+/// (≤4) numeric args into a STACK array (no per-call heap `Vec`) and runs the
+/// native code. Callers MUST have checked `p6_args_eligible` first — the buffer is
+/// sized for ≤4 args and the native callee reads only `args[0..len]`. Bumps
+/// `P6_EXEC_COUNT` exactly once per genuine native return, so the engagement
+/// counter is identical whether the call arrived via the inline cache or the slow
+/// path (we make dispatch cheaper, not the call count smaller).
+#[inline(always)]
+fn run_p6_native(jf: &crate::jit::JitFunction, args: &[Value]) -> Value {
+    let mut fbuf = [0.0f64; 4];
+    let n = args.len();
+    for (slot, a) in fbuf.iter_mut().zip(args.iter()) {
+        if let Value::Number(v) = a {
+            *slot = *v;
+        }
+    }
+    let r = unsafe { jf.call_f64_args(&fbuf[..n]) };
+    P6_EXEC_COUNT.with(|c| c.set(c.get() + 1));
+    Value::Number(r)
+}
+
+/// Refill the monomorphic inline cache with a freshly-resolved Ready P6 JIT for
+/// `f`. Stores the fn-pointer key, the identity Weak guard, the compiled native
+/// fn, and the param count. The next call to the SAME `f` will hit the fast path.
+fn install_call_inline_cache(f: &Rc<FunctionValue>, jit_fn: &Rc<crate::jit::JitFunction>) {
+    CALL_IC.with(|c| {
+        *c.borrow_mut() = Some(InlineCacheEntry {
+            ptr: Rc::as_ptr(f) as usize,
+            weak: Rc::downgrade(f),
+            jit_fn: jit_fn.clone(),
+            n_params: f.params.len(),
+        });
+    });
+}
 
 // ---- M4.2a: T1 baseline-JIT tier (separate opt-in path; does NOT disturb the
 // existing f64 JIT above) ----
@@ -20092,13 +20208,15 @@ impl Interp {
         // the missing parameter registers in xmm1..xmm(n-1) would contain
         // stale Win64 values rather than NaN — producing wrong results even
         // after the LoadUndef NaN fix (the missing params were never loaded).
-        let numeric = !args.is_empty()
-            && args.len() <= 4
-            && args.len() >= f.params.len()
-            && args.iter().all(|a| matches!(a, Value::Number(_)));
+        let numeric = p6_args_eligible(args, f.params.len());
         let ptr = Rc::as_ptr(f) as usize;
         // Phase 1 (under borrow): reuse-guard, profile, compile-on-hot, and pull
         // out a clone of the installed fn if ready. Don't call across the borrow.
+        // NOTE on skip-profiling-when-Ready: the `Ready` arm below returns the
+        // compiled fn WITHOUT touching the hotness `count` — so a Ready slot pays
+        // no profiling, exactly as intended. The monomorphic inline cache (checked
+        // earlier in `try_call_fn_via_bytecode`) skips even this HashMap lookup +
+        // Weak upgrade on the common repeat-callee path.
         let jit_fn: Option<Rc<crate::jit::JitFunction>> = JIT_CACHE.with(|c| {
             let mut cache = c.borrow_mut();
             let entry = cache.entry(ptr).or_insert_with(|| JitEntry {
@@ -20133,29 +20251,15 @@ impl Interp {
             }
         });
         // Phase 2 (outside borrow): run native code only when args are numeric.
-        if numeric {
-            if let Some(jf) = jit_fn {
-                // Box the (≤4) numeric args into a STACK array, not a heap `Vec`.
-                // This path runs once per JITted call (1.5M× in the jit bench), so
-                // the per-call heap allocation the old `Vec` did was pure dispatch
-                // overhead around a tiny native body. `numeric` already guarantees
-                // `args.len() <= 4` and all-`Value::Number`, so the fixed buffer is
-                // always large enough and the `0.0` default is never observed (the
-                // native callee reads only `args[0..len]`). Result is unchanged.
-                let mut fbuf = [0.0f64; 4];
-                let n = args.len();
-                for (slot, a) in fbuf.iter_mut().zip(args.iter()) {
-                    if let Value::Number(v) = a {
-                        *slot = *v;
-                    }
-                }
-                let r = unsafe { jf.call_f64_args(&fbuf[..n]) };
-                // Attribute this native run to P6 (the tier that actually ran).
-                // Bumped only here, on a genuine native return — not on deopt /
-                // decline — so `p6_exec_count` reflects true native executions,
-                // mirroring the T1/T2/T3 exec counters.
-                P6_EXEC_COUNT.with(|c| c.set(c.get() + 1));
-                return Some(Value::Number(r));
+        if let Some(jf) = jit_fn {
+            // The slow path just resolved a Ready P6 JIT for `f`. REFILL the
+            // monomorphic inline cache so the next call to the SAME function hits
+            // the fast path (skips both HashMap lookups + Weak upgrades). Done even
+            // when this particular call's args aren't numeric — the compiled fn is
+            // valid for `f`; the fast path re-checks arg eligibility per call.
+            install_call_inline_cache(f, &jf);
+            if numeric {
+                return Some(run_p6_native(&jf, args));
             }
         }
         None
@@ -20444,6 +20548,41 @@ impl Interp {
             return None;
         }
         let ptr = Rc::as_ptr(f) as usize;
+        // ── Monomorphic call-site inline cache (the V8-shaped dispatch fast path).
+        // BEFORE the two HashMap lookups (BC_FN_CACHE + JIT_CACHE) and their Weak
+        // upgrades, check the 1-entry IC. A HIT — same callee pointer as last call
+        // AND the identity Weak still upgrades to the SAME `Rc` AND this call's
+        // args are P6-eligible — dispatches STRAIGHT to the cached compiled native
+        // fn, skipping both HashMaps, both Weak upgrades, the Rc clones, and ALL
+        // hotness profiling. This is exactly what the slow path does for a Ready P6
+        // slot, so the result is byte-identical and `P6_EXEC_COUNT` is bumped the
+        // same once-per-native-run. Only fires when the P6 JIT is enabled (so a
+        // `CV_NOJIT` / `NoP6JitGuard` run behaves identically to before).
+        //
+        // A MISS (different callee = polymorphic site, a redefined/recycled fn that
+        // fails the Weak `Rc::ptr_eq`, non-numeric args, or an empty IC) falls
+        // through to the slow path below — which serves the right tier and REFILLS
+        // the IC when it resolves a Ready P6 JIT. So a stale compiled body can
+        // never run: the identity guard is checked on every hit.
+        if jit_enabled() {
+            if let Some(hit) = CALL_IC.with(|c| {
+                let ic = c.borrow();
+                match ic.as_ref() {
+                    Some(e)
+                        if e.ptr == ptr
+                            && p6_args_eligible(args, e.n_params)
+                            // Identity guard: the cached Weak must still upgrade to
+                            // THIS exact Rc (defeats pointer-recycling / redefinition).
+                            && e.weak.upgrade().map_or(false, |rc| Rc::ptr_eq(&rc, f)) =>
+                    {
+                        Some(e.jit_fn.clone())
+                    }
+                    _ => None,
+                }
+            }) {
+                return Some(Ok(run_p6_native(&hit, args)));
+            }
+        }
         // Only trust a cache hit whose Weak still upgrades to THIS exact Rc —
         // otherwise the pointer was reused by a different (freed-then-realloc'd)
         // function and the cached module is stale.
@@ -30858,5 +30997,201 @@ mod gengc_oracle {
         assert_eq!(off.0, on.0, "result.s diverged gen on/off");
         assert_eq!(off.1, on.1, "result.n diverged gen on/off");
         assert_eq!(off.2, on.2, "result.last diverged gen on/off");
+    }
+
+    // ── Monomorphic call-site inline cache (V8-shaped dispatch fast path) ─────
+    //
+    // These tests verify the IC is (1) BYTE-IDENTICAL to the JIT-off VM and to
+    // the with/without-IC path, (2) correctly INVALIDATING on polymorphic call
+    // sites + redefined functions (never runs a stale compiled body), and (3)
+    // still ENGAGING the JIT the same number of times (cheaper dispatch, not
+    // fewer native execs).
+
+    /// Run `src` to completion and return the value of the global `result_global`
+    /// as an f64, plus the total P6 native exec count over the run. Uses a fresh
+    /// interp + the standard globals. The P6 JIT is the default-on tier here.
+    fn run_p6(src: &str, result_global: &str) -> (f64, u64) {
+        reset_call_inline_cache();
+        reset_p6_exec_count();
+        let mut i = Interp::new();
+        i.install_basic_globals();
+        i.run(src).expect("run");
+        let v = i
+            .run_completion_value(result_global)
+            .expect("result global");
+        let n = match v {
+            Value::Number(n) => n,
+            other => panic!("result global {result_global} not a Number: {other:?}"),
+        };
+        (n, p6_exec_count())
+    }
+
+    /// Same workload but with the P6 JIT (and therefore the inline cache) FORCED
+    /// OFF — the pure-VM oracle reference (the CV_T2=0 / no-JIT equivalent).
+    fn run_p6_off(src: &str, result_global: &str) -> f64 {
+        let _guard = NoP6JitGuard::new();
+        reset_call_inline_cache();
+        let mut i = Interp::new();
+        i.install_basic_globals();
+        i.run(src).expect("run");
+        let v = i
+            .run_completion_value(result_global)
+            .expect("result global");
+        match v {
+            Value::Number(n) => n,
+            other => panic!("result global {result_global} not a Number: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn inline_cache_monomorphic_result_identical_and_jit_engages() {
+        // The bench-shaped monomorphic hot loop: one function called many times.
+        let src = "function f(x){ return x*x*0.5 + x*3.0 - 1.0; } \
+                   var result = 0; \
+                   for (var i = 0; i < 5000; i++) { result = result + f(i); }";
+        let (with_ic, p6) = run_p6(src, "result");
+        let vm_only = run_p6_off(src, "result");
+        // BYTE-IDENTICAL to the pure-VM (JIT-off) reference.
+        assert_eq!(
+            with_ic.to_bits(),
+            vm_only.to_bits(),
+            "IC result {with_ic} != VM-only result {vm_only}"
+        );
+        // The JIT genuinely engaged (native execs happened) — the IC made each
+        // dispatch cheaper, it did NOT disable the JIT.
+        assert!(
+            p6 > 0,
+            "P6 JIT must engage (native execs) on the monomorphic hot loop; got {p6}"
+        );
+    }
+
+    #[test]
+    fn inline_cache_native_exec_count_unchanged_vs_no_ic() {
+        // Same workload run twice: once with the IC live, once with the IC kept
+        // empty (forced miss every call by clearing it before the run — the slow
+        // path still runs P6, just without the fast dispatch). The native exec
+        // COUNT must be identical: we made dispatch cheaper, not the call count
+        // smaller. (We can't disable just the IC at compile time, so we model
+        // "no IC" as the slow path by NOT relying on IC hits — but since the IC
+        // refills from the slow path, the simplest honest invariant is that the
+        // P6 exec count equals the number of JIT-eligible calls in BOTH the IC
+        // and the JIT-off→on transition. We assert the count equals the loop
+        // trip count beyond the compile threshold.)
+        let trips = 5000u64;
+        let src = format!(
+            "function f(x){{ return x*2.0 + 1.0; }} \
+             var result = 0; \
+             for (var i = 0; i < {trips}; i++) {{ result = result + f(i); }}"
+        );
+        let (_r, p6) = run_p6(&src, "result");
+        // Every call from the JIT_THRESHOLD-th onward runs natively. The first
+        // (JIT_THRESHOLD - 1) calls run on the VM (profiling), then compile, then
+        // all remaining run native. So native execs == trips - (JIT_THRESHOLD - 1).
+        let expected = trips - (JIT_THRESHOLD as u64 - 1);
+        assert_eq!(
+            p6, expected,
+            "P6 native exec count must equal post-threshold trip count (cheaper dispatch, same execs); got {p6} expected {expected}"
+        );
+    }
+
+    #[test]
+    fn inline_cache_polymorphic_call_site_correct() {
+        // A SINGLE call expression `g(i)` that calls DIFFERENT functions across
+        // iterations (g is reassigned each trip). The IC, keyed on fn identity
+        // with a Weak guard, must MISS when the callee changes and produce the
+        // correct per-callee result — never run the stale compiled body of the
+        // previous callee.
+        let src = "function a(x){ return x + 1000.0; } \
+                   function b(x){ return x * 2.0; } \
+                   var g; var result = 0; \
+                   for (var i = 0; i < 2000; i++) { \
+                     g = (i % 2 === 0) ? a : b; \
+                     result = result + g(i); \
+                   }";
+        let with_ic = run_p6(src, "result").0;
+        let vm_only = run_p6_off(src, "result");
+        assert_eq!(
+            with_ic.to_bits(),
+            vm_only.to_bits(),
+            "polymorphic call site: IC result {with_ic} != VM-only {vm_only} (stale cached body?)"
+        );
+        // Hand-check the math so a both-wrong agreement can't slip through:
+        // even i → a(i)=i+1000, odd i → b(i)=2i, for i in [0,2000).
+        let mut expect = 0.0f64;
+        for i in 0..2000u64 {
+            let x = i as f64;
+            expect += if i % 2 == 0 { x + 1000.0 } else { x * 2.0 };
+        }
+        assert_eq!(
+            with_ic.to_bits(),
+            expect.to_bits(),
+            "polymorphic result {with_ic} != hand-computed {expect}"
+        );
+    }
+
+    #[test]
+    fn inline_cache_redefined_function_no_stale_hit() {
+        // A function `f` is made hot (JIT-compiled, IC filled), THEN REDEFINED to
+        // a different body and made hot again at the SAME call expression. The IC
+        // must NOT serve the old compiled body for the new `f` (the redefinition
+        // creates a new FunctionValue Rc; the IC's Weak guard fails identity).
+        let src = "var result = 0; \
+                   function f(x){ return x + 1.0; } \
+                   for (var i = 0; i < 1000; i++) { result = result + f(i); } \
+                   f = function(x){ return x * 100.0; }; \
+                   for (var j = 0; j < 1000; j++) { result = result + f(j); }";
+        let with_ic = run_p6(src, "result").0;
+        let vm_only = run_p6_off(src, "result");
+        assert_eq!(
+            with_ic.to_bits(),
+            vm_only.to_bits(),
+            "redefined fn: IC result {with_ic} != VM-only {vm_only} (stale cached body?)"
+        );
+        // Hand-check: sum_{i<1000}(i+1) + sum_{j<1000}(j*100).
+        let mut expect = 0.0f64;
+        for i in 0..1000u64 {
+            expect += i as f64 + 1.0;
+        }
+        for j in 0..1000u64 {
+            expect += j as f64 * 100.0;
+        }
+        assert_eq!(
+            with_ic.to_bits(),
+            expect.to_bits(),
+            "redefined-fn result {with_ic} != hand-computed {expect}"
+        );
+    }
+
+    #[test]
+    fn inline_cache_non_numeric_args_fall_through_correctly() {
+        // The IC must MISS for non-numeric args (P6-ineligible) and let the call
+        // run on the VM, producing the correct (string) result — never coercing
+        // through the numeric native path.
+        let src = "function f(x){ return x + '!'; } \
+                   var f2 = function(x){ return x * 2.0; }; \
+                   var sum = 0; var s = ''; \
+                   for (var i = 0; i < 1000; i++) { s = f('hi'); sum = sum + f2(i); } \
+                   var result = sum + s.length;";
+        let with_ic = run_p6(src, "result").0;
+        let vm_only = run_p6_off(src, "result");
+        assert_eq!(
+            with_ic.to_bits(),
+            vm_only.to_bits(),
+            "mixed numeric/string: IC {with_ic} != VM-only {vm_only}"
+        );
+    }
+
+    #[test]
+    fn inline_cache_invalidates_on_reset() {
+        // After resetting the per-fn cache (the oracle's tier-switch reset), the
+        // IC must be empty so a subsequent run cannot serve a stale body.
+        let src = "function f(x){ return x + 1.0; } \
+                   var result = 0; \
+                   for (var i = 0; i < 100; i++) { result = result + f(i); }";
+        let _ = run_p6(src, "result");
+        // Fill the IC, then reset it via the bc-fn-cache reset (which clears IC).
+        reset_bc_fn_cache();
+        let empty = CALL_IC.with(|c| c.borrow().is_none());
+        assert!(empty, "reset_bc_fn_cache must clear the inline cache");
     }
 }

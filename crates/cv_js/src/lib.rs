@@ -97,9 +97,9 @@ pub use interp::{
     native_ctor_pure, native_fn, native_fn_n, native_fn_with_interp, p6_exec_count,
     parse_bigint_from_string,
     register_jit_bank, resolve_promise,
-    reset_bc_fn_cache, reset_p6_exec_count, reset_t1_exec_count, reset_t2_exec_count,
-    reset_t3_exec_count, set_force_tier, t1_exec_count, t2_exec_count, t2_heap_enabled,
-    t3_exec_count,
+    reset_bc_fn_cache, reset_call_inline_cache, reset_p6_exec_count, reset_t1_exec_count,
+    reset_t2_exec_count, reset_t3_exec_count, set_force_tier, t1_exec_count, t2_exec_count,
+    t2_heap_enabled, t3_exec_count,
 };
 pub use lexer::{Keyword, Punct, Token, TokenKind, tokenize};
 pub use parser::{ParseError, parse_program};
