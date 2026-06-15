@@ -58157,6 +58157,20 @@ fn dump_styled_rec<'a>(
 mod tests {
     use super::*;
 
+    /// Serializes tests that mutate PROCESS-GLOBAL render state (the layout
+    /// viewport + `cv_css` device-pixel-ratio). `cargo test` runs tests in
+    /// parallel threads; a DPI/viewport test that sets the global DPR and then
+    /// asserts on it can race a concurrent test that resets it. Acquiring this
+    /// lock for the duration of any such test prevents the interleave. Held
+    /// across the whole test body; poison is ignored (a panicking test should
+    /// still let the next serial test run rather than cascade-fail).
+    fn global_render_state_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+    }
+
     /// Run script in a LiveInterp against `html`, then read a JS expression back.
     /// Both turns drain microtasks → run the checkpoint hook → deliver any queued
     /// MutationRecords, so a `new MutationObserver(...).observe(...)` followed by a
@@ -64261,6 +64275,9 @@ mod tests {
     ///   - `removeEventListener` / `removeListener` unsubscribe.
     #[test]
     fn match_media_live_query_list_and_change_event() {
+        // Serialize against the DPI tests: all three mutate the process-global
+        // layout viewport / device-pixel-ratio and would otherwise interleave.
+        let _serial = global_render_state_lock();
         // Pin a known viewport BEFORE the runtime is built so the initial
         // evaluation is deterministic (800×600).
         set_layout_viewport_px(800.0, 600.0);
@@ -64354,6 +64371,7 @@ mod tests {
     /// 2560×1600 physical client laps to a 1280×800 CSS viewport.
     #[test]
     fn css_viewport_is_physical_over_dpr() {
+        let _serial = global_render_state_lock();
         // dpr = 1.0 → identity (the default, byte-stable path).
         assert_eq!(css_viewport_px(1280, 800, 1.0), (1280.0, 800.0));
         // dpr = 2.0 → physical / 2 == CSS px.
@@ -64376,6 +64394,9 @@ mod tests {
     /// a constructor-only check.
     #[test]
     fn device_pixel_ratio_reflects_simulated_high_dpi() {
+        // Serialize against other tests that mutate the global viewport/DPR, so a
+        // concurrent reset can't race this test's set→assert window.
+        let _serial = global_render_state_lock();
         // Restore cv_css global afterwards (process-global, shared across tests).
         let saved = cv_css::current_device_pixel_ratio();
 
