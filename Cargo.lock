@@ -55,6 +55,7 @@ dependencies = [
  "cv_media",
  "cv_net",
  "cv_paint",
+ "cv_pdf",
  "cv_sched",
  "cv_text",
  "cv_ui",

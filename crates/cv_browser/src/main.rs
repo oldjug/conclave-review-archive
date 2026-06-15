@@ -21487,6 +21487,205 @@ thread_local! {
         std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
+// ============================== PRINT / PDF ================================
+//
+// `window.print()` / export-to-PDF. Chrome re-lays-out the page under the
+// `print` media type, paginates it into `@page` boxes (size/margins, honouring
+// `break-before`/`-after`/`-inside`), and renders it to PDF via the Skia PDF
+// backend with real (selectable) text. We mirror that: the cv_css cascade is
+// switched to print media (`set_print_media`), the layout tree is rebuilt at
+// the printable page width, mapped to `cv_pdf::print_layout::PrintBox`,
+// paginated, and serialised to a real PDF by `cv_pdf::writer`.
+//
+// Spec: CSS Paged Media 3 (the print flow + `@page`), CSS Fragmentation 3
+// (breaks), Media Queries 4 §2.1 (the `print` media type).
+
+thread_local! {
+    /// Context published by the live render path so `window.print()` can
+    /// rebuild the page under the print media type. Holds the current page's
+    /// stylesheets, document label (base URL), and the layout config (for the
+    /// real GDI text-measurement callback + default font/colors). The live DOM
+    /// itself comes from `CURRENT_RENDER_ARENA` so we print exactly what the
+    /// user sees (post-JS-mutation), matching Chrome.
+    static PRINT_CONTEXT: std::cell::RefCell<Option<PrintContext>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Captured page state needed to re-render under print media.
+struct PrintContext {
+    sheets: Vec<cv_css::Stylesheet>,
+    label: String,
+    cfg: cv_layout::LayoutConfig,
+}
+
+/// Publish the print context for the current page (called from the render path).
+fn publish_print_context(
+    sheets: &[cv_css::Stylesheet],
+    label: &str,
+    cfg: &cv_layout::LayoutConfig,
+) {
+    PRINT_CONTEXT.with(|c| {
+        *c.borrow_mut() = Some(PrintContext {
+            sheets: sheets.to_vec(),
+            label: label.to_string(),
+            cfg: cfg.clone_for_runtime(),
+        });
+    });
+}
+
+/// Map an `f32` layout px to PDF points. Our print layout is run at the
+/// printable page WIDTH in px, so we treat 1 CSS px = 1 pt for a faithful 1:1
+/// paged layout (a US-Letter content column of 540px → 540pt wide).
+#[inline]
+fn px_to_pt(v: f32) -> f32 {
+    v
+}
+
+/// Recursively map a laid-out `cv_layout::LayoutBox` into the neutral
+/// `cv_pdf::print_layout::PrintBox` the PDF backend paginates + paints. Text
+/// boxes become `Text` atoms (selectable text); `<img>` boxes with a decoded
+/// bitmap become RGB `Image` atoms; everything else is a `Container` carrying
+/// only its background fill. `visibility:hidden` and zero-size boxes are
+/// skipped (they paint nothing). Coordinates are the box's border-rect in the
+/// document's absolute flow space.
+fn map_layout_to_printbox(b: &cv_layout::LayoutBox) -> cv_pdf::print_layout::PrintBox {
+    use cv_pdf::print_layout::{BreakValue as PB, PaintKind, PrintBox};
+
+    let map_break = |v: cv_layout::BreakValue| match v {
+        cv_layout::BreakValue::Force => PB::Force,
+        cv_layout::BreakValue::Avoid => PB::Avoid,
+        cv_layout::BreakValue::Auto => PB::Auto,
+    };
+
+    // The border box is the paintable extent (background + border fill the
+    // border box; content sits inside). Use it for positioning.
+    let br = b.border_rect();
+    let color = (b.text_color.r, b.text_color.g, b.text_color.b);
+    let background = b.background.and_then(|c| {
+        if c.a == 0 {
+            None // fully transparent — nothing to paint
+        } else {
+            Some((c.r, c.g, c.b))
+        }
+    });
+
+    let kind = match &b.kind {
+        cv_layout::BoxKind::Text(t) => {
+            let size = if b.font_size_px > 0.0 { b.font_size_px } else { 16.0 };
+            // Baseline sits ~0.8em below the content top (typographic ascent).
+            // The content rect top is `b.content.y`; relative to the border-rect
+            // top that's `content.y - br.y`. Add the ascent.
+            let ascent = size * 0.8;
+            let baseline_offset = (b.content.y - br.y) + ascent;
+            PaintKind::Text {
+                text: t.clone(),
+                size: px_to_pt(size),
+                baseline_offset: px_to_pt(baseline_offset),
+            }
+        }
+        _ => {
+            if let Some(img) = &b.embedded_image {
+                // Convert the BGRA u32 pixel buffer to packed RGB bytes.
+                let mut rgb = Vec::with_capacity((img.width * img.height * 3) as usize);
+                for px in &img.pixels {
+                    let b8 = (px & 0xFF) as u8;
+                    let g8 = ((px >> 8) & 0xFF) as u8;
+                    let r8 = ((px >> 16) & 0xFF) as u8;
+                    rgb.push(r8);
+                    rgb.push(g8);
+                    rgb.push(b8);
+                }
+                PaintKind::Image {
+                    width_px: img.width,
+                    height_px: img.height,
+                    rgb,
+                }
+            } else {
+                PaintKind::Container
+            }
+        }
+    };
+
+    let mut pb = PrintBox {
+        x: px_to_pt(br.x),
+        y: px_to_pt(br.y),
+        w: px_to_pt(br.w),
+        h: px_to_pt(br.h),
+        background,
+        color,
+        kind,
+        break_before: map_break(b.break_before),
+        break_after: map_break(b.break_after),
+        break_inside: map_break(b.break_inside),
+        children: Vec::new(),
+    };
+
+    if !b.visibility_hidden {
+        for c in &b.children {
+            pb.children.push(map_layout_to_printbox(c));
+        }
+    }
+    pb
+}
+
+/// Resolve the print page geometry. Defaults to US Letter with Chrome's
+/// default 0.5in margins; `CV_PRINT_PAGE=a4` selects A4. (A full `@page`
+/// size/margin parse is a follow-up; the size+default-margins cover the common
+/// case and the pagination already honours whatever margins are supplied.)
+fn print_page_geometry_from_env() -> cv_pdf::print_layout::PageGeometry {
+    match std::env::var("CV_PRINT_PAGE").ok().as_deref() {
+        Some(p) if p.eq_ignore_ascii_case("a4") => cv_pdf::print_layout::PageGeometry::A4,
+        _ => cv_pdf::print_layout::PageGeometry::LETTER,
+    }
+}
+
+/// Build a real PDF of the current page under the print media type.
+///
+/// Returns `None` when there is no live page to print (no published print
+/// context / arena — e.g. before the first render). The PDF is genuine: real
+/// text operators, filled backgrounds, embedded images, a correct page tree
+/// and xref. `geom` controls the page size + margins (Letter/A4 + the resolved
+/// `@page` margins).
+fn build_print_pdf(geom: cv_pdf::print_layout::PageGeometry) -> Option<Vec<u8>> {
+    let ctx_present = PRINT_CONTEXT.with(|c| c.borrow().is_some());
+    if !ctx_present {
+        return None;
+    }
+    // The arena holds the live (post-JS) DOM — print exactly what's on screen.
+    let arena = CURRENT_RENDER_ARENA.with(|c| c.borrow().clone())?;
+
+    // Printable content width (px == pt). Run layout at this width so the page
+    // re-flows to the paper, not the screen viewport.
+    let content_w = (geom.width_pt - geom.margin_left - geom.margin_right).max(1.0);
+
+    // Switch the cascade to the print media type, rebuild the layout tree, then
+    // ALWAYS restore screen media (even on a panic-free early return path).
+    cv_css::cascade::set_print_media(true);
+
+    let layout_box = PRINT_CONTEXT.with(|c| {
+        let guard = c.borrow();
+        let pctx = guard.as_ref().unwrap();
+        let mut print_cfg = pctx.cfg.clone_for_runtime();
+        print_cfg.viewport_w = content_w;
+        // A tall viewport so nothing is clipped vertically before pagination.
+        print_cfg.viewport_h = 1_000_000.0;
+        let no_overrides = cv_js::OrderedMap::new();
+        build_layout_tree_arena(
+            &arena.borrow(),
+            &pctx.sheets,
+            &pctx.label,
+            &print_cfg,
+            &no_overrides,
+        )
+    });
+
+    cv_css::cascade::set_print_media(false);
+
+    let print_root = map_layout_to_printbox(&layout_box);
+    let pages = cv_pdf::print_layout::paginate(&print_root, geom);
+    Some(cv_pdf::writer::write_pdf(&pages))
+}
+
 /// Set the stored scroll offset for a scroll container by node id. Values are
 /// not clamped here (the layout box's true scroll range isn't known until the
 /// next layout); `apply_persisted_scroll_offsets` clamps on apply.
@@ -23571,6 +23770,9 @@ fn render_with_existing_runtime(
     // apply_to_doc bumped DOC_REVISION) so build_layout_tree reuses it on the
     // CV_DOM path instead of rebuilding every frame.
     runtime.ensure_arena_current(doc, sheets);
+    // Publish the print context so `window.print()` can rebuild this exact page
+    // under the print media type (uses the live arena from ensure_arena_current).
+    publish_print_context(sheets, &label, cfg);
     render_paint_only(doc, sheets, &label, cfg, &style_overrides, title)
 }
 
@@ -25497,6 +25699,52 @@ fn install_minimal_dom_with_url(interp: &cv_js::Interp, initial_title: String, p
 
     let scroll_to = cv_js::native_fn("scrollTo", move |_args| Ok(cv_js::Value::Undefined));
     let scroll_by = cv_js::native_fn("scrollBy", move |_args| Ok(cv_js::Value::Undefined));
+    // window.print() — re-lays-out the current page under the `print` media type,
+    // paginates it into @page boxes, and produces a real PDF (selectable text,
+    // backgrounds, images) via cv_pdf. Chrome opens a print preview dialog; we
+    // have no modal UI, so the PDF is built in memory and written to disk only
+    // when CV_PRINT_TO_PDF is set (so normal browsing never writes files
+    // unexpectedly). The path defaults to ./conclave_print.pdf, overridable via
+    // CV_PRINT_PDF_PATH. The machinery (re-cascade + paginate + emit) always
+    // runs — this is NOT a no-op even when the file is not written. Returns
+    // undefined, matching the DOM `window.print()` signature.
+    let print_fn = cv_js::native_fn("print", move |_args| {
+        let geom = print_page_geometry_from_env();
+        if let Some(pdf) = build_print_pdf(geom) {
+            if std::env::var("CV_PRINT_TO_PDF").is_ok() {
+                let path = std::env::var("CV_PRINT_PDF_PATH")
+                    .unwrap_or_else(|_| "conclave_print.pdf".to_string());
+                if let Err(e) = std::fs::write(&path, &pdf) {
+                    eprintln!("[print] failed to write {path}: {e}");
+                } else {
+                    eprintln!("[print] wrote {} bytes to {path}", pdf.len());
+                }
+            }
+        }
+        Ok(cv_js::Value::Undefined)
+    });
+    // Non-standard automation/export hook: __cv_print_to_pdf__(path) builds the
+    // PDF and writes it to `path` (default ./conclave_print.pdf), returning the
+    // number of bytes written (0 on failure / no page). Lets tests + headless
+    // export drive PDF generation deterministically without a dialog.
+    let print_to_pdf = cv_js::native_fn("__cv_print_to_pdf__", move |args| {
+        let path = args
+            .first()
+            .map(|v| v.to_display_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "conclave_print.pdf".to_string());
+        let geom = print_page_geometry_from_env();
+        match build_print_pdf(geom) {
+            Some(pdf) => match std::fs::write(&path, &pdf) {
+                Ok(()) => Ok(cv_js::Value::Number(pdf.len() as f64)),
+                Err(e) => {
+                    eprintln!("[print] failed to write {path}: {e}");
+                    Ok(cv_js::Value::Number(0.0))
+                }
+            },
+            None => Ok(cv_js::Value::Number(0.0)),
+        }
+    });
     let alert = cv_js::native_fn("alert", move |args| {
         if let Some(v) = args.first() {
             eprintln!("[alert] {}", v.to_display_string());
@@ -25676,6 +25924,8 @@ fn install_minimal_dom_with_url(interp: &cv_js::Interp, initial_title: String, p
     window_map.insert("scrollTo".into(), scroll_to);
     window_map.insert("scrollBy".into(), scroll_by);
     window_map.insert("alert".into(), alert);
+    window_map.insert("print".into(), print_fn);
+    window_map.insert("__cv_print_to_pdf__".into(), print_to_pdf);
     window_map.insert("confirm".into(), confirm);
     window_map.insert("prompt".into(), prompt);
     window_map.insert("addEventListener".into(), add_event_listener);
@@ -48280,6 +48530,16 @@ fn resolve_current_color(style: &mut cv_layout::Style, resolved: cv_layout::Colo
     }
 }
 
+/// Map a cascaded CSS break value to the layout-side enum. `None` (the
+/// property was never set) and `auto` both become `Auto`.
+fn lower_break(v: Option<cv_css::cascade::BreakValue>) -> cv_layout::BreakValue {
+    match v {
+        Some(cv_css::cascade::BreakValue::Force) => cv_layout::BreakValue::Force,
+        Some(cv_css::cascade::BreakValue::Avoid) => cv_layout::BreakValue::Avoid,
+        Some(cv_css::cascade::BreakValue::Auto) | None => cv_layout::BreakValue::Auto,
+    }
+}
+
 fn lower_style(
     cs: &cv_css::cascade::ComputedStyle,
     cfg: &cv_layout::LayoutConfig,
@@ -48761,6 +49021,11 @@ fn lower_style(
         display,
         display_is_list_item: cs.display_is_list_item,
         display_is_flow_root: cs.display_is_flow_root,
+        // CSS Fragmentation 3 break hints → layout (consumed by the print/PDF
+        // pagination path). `None`/`auto` lowers to `Auto`.
+        break_before: lower_break(cs.break_before),
+        break_after: lower_break(cs.break_after),
+        break_inside: lower_break(cs.break_inside),
         background: background_color,
         text_color: clip_text_color.or_else(|| cs.color.map(to_gfx_color)),
         font_size_px: fs_px,
@@ -59756,6 +60021,9 @@ mod tests {
                 a: 255,
             },
             font_size_px: 16.0,
+            break_before: cv_layout::BreakValue::Auto,
+            break_after: cv_layout::BreakValue::Auto,
+            break_inside: cv_layout::BreakValue::Auto,
             kind: cv_layout::BoxKind::Block { tag: "body".into() },
             link_href: Some("https://example.com/link".into()),
             embedded_image: None,
@@ -60303,6 +60571,9 @@ mod tests {
                 a: 255,
             },
             font_size_px: 16.0,
+            break_before: cv_layout::BreakValue::Auto,
+            break_after: cv_layout::BreakValue::Auto,
+            break_inside: cv_layout::BreakValue::Auto,
             kind: cv_layout::BoxKind::Text("hello".to_string()),
             link_href: None,
             embedded_image: None,
@@ -60477,6 +60748,9 @@ mod tests {
                 a: 255,
             },
             font_size_px: 16.0,
+            break_before: cv_layout::BreakValue::Auto,
+            break_after: cv_layout::BreakValue::Auto,
+            break_inside: cv_layout::BreakValue::Auto,
             kind: cv_layout::BoxKind::Block {
                 tag: "div".to_string(),
             },
@@ -60653,6 +60927,9 @@ mod tests {
                 a: 255,
             },
             font_size_px: 16.0,
+            break_before: cv_layout::BreakValue::Auto,
+            break_after: cv_layout::BreakValue::Auto,
+            break_inside: cv_layout::BreakValue::Auto,
             kind: cv_layout::BoxKind::Block {
                 tag: "div".to_string(),
             },
@@ -60815,6 +61092,9 @@ mod tests {
                 a: 255,
             },
             font_size_px: 16.0,
+            break_before: cv_layout::BreakValue::Auto,
+            break_after: cv_layout::BreakValue::Auto,
+            break_inside: cv_layout::BreakValue::Auto,
             kind: cv_layout::BoxKind::Block {
                 tag: "div".to_string(),
             },
@@ -60985,6 +61265,9 @@ mod tests {
             background: Some(bg),
             text_color: cv_layout::Color { r: 0, g: 0, b: 0, a: 255 },
             font_size_px: 16.0,
+            break_before: cv_layout::BreakValue::Auto,
+            break_after: cv_layout::BreakValue::Auto,
+            break_inside: cv_layout::BreakValue::Auto,
             kind: cv_layout::BoxKind::Block { tag: "div".to_string() },
             link_href: None,
             embedded_image: None,
@@ -72397,5 +72680,189 @@ mod async_io_e2e_tests {
             id, "2",
             "reconnect sent Last-Event-ID of the last seen id (2), got: {id:?}"
         );
+    }
+
+    // ============================ PRINT / PDF =============================
+    //
+    // End-to-end print pipeline tests: HTML → cascade (under print media) →
+    // layout (carrying break props) → PrintBox map → paginate → real PDF.
+    // These assert the cv_pdf document structure (page count + text presence)
+    // directly, never opening a viewer. Each test that flips the process-global
+    // print-media flag serialises on PRINT_TEST_LOCK and always restores it.
+
+    static PRINT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Lay a page out under the print media type at the printable Letter width
+    /// (540pt), map it to a PrintBox, paginate, and return both the pages and
+    /// the emitted PDF bytes.
+    fn print_page(
+        html: &str,
+        geom: cv_pdf::print_layout::PageGeometry,
+    ) -> (Vec<cv_pdf::print_layout::PrintPage>, Vec<u8>) {
+        let doc = cv_html::parse(html);
+        let mut sheets = vec![parse_user_agent_stylesheet()];
+        sheets.extend(collect_stylesheets(&doc));
+        let content_w = geom.width_pt - geom.margin_left - geom.margin_right;
+        let cfg = cv_layout::LayoutConfig {
+            viewport_w: content_w,
+            viewport_h: 1_000_000.0,
+            ..cv_layout::LayoutConfig::default()
+        };
+        cv_css::cascade::set_print_media(true);
+        let lb = build_layout_tree(&doc, &sheets, "https://print.test/", &cfg, &Default::default());
+        cv_css::cascade::set_print_media(false);
+        let root = map_layout_to_printbox(&lb);
+        let pages = cv_pdf::print_layout::paginate(&root, geom);
+        let pdf = cv_pdf::writer::write_pdf(&pages);
+        (pages, pdf)
+    }
+
+    fn page_has_text(p: &cv_pdf::print_layout::PrintPage, needle: &str) -> bool {
+        use cv_pdf::print_layout::PrintCmd;
+        p.cmds.iter().any(|c| match c {
+            PrintCmd::Text { text, .. } => text.contains(needle),
+            _ => false,
+        })
+    }
+
+    #[test]
+    fn print_multi_screen_doc_paginates_into_multiple_pages() {
+        let _g = PRINT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Three blocks spaced far enough apart (huge top margins) that they
+        // each land on a different page of the ~720pt content height.
+        let html = "<!doctype html><html><body>\
+            <p style='margin:0'>TOP_MARKER</p>\
+            <p style='margin-top:900px'>MIDDLE_MARKER</p>\
+            <p style='margin-top:900px'>BOTTOM_MARKER</p>\
+            </body></html>";
+        let (pages, pdf) = print_page(html, cv_pdf::print_layout::PageGeometry::LETTER);
+        assert!(
+            pages.len() >= 3,
+            "multi-screen doc should paginate to >=3 pages, got {}",
+            pages.len()
+        );
+        // Content is split at the page boundary: the top marker is on page 1
+        // but the bottom marker is NOT.
+        assert!(page_has_text(&pages[0], "TOP_MARKER"), "top on page 1");
+        assert!(
+            !page_has_text(&pages[0], "BOTTOM_MARKER"),
+            "bottom marker must NOT be on page 1 (content split across pages)"
+        );
+        let pb = pages
+            .iter()
+            .position(|p| page_has_text(p, "BOTTOM_MARKER"))
+            .expect("bottom marker on some later page");
+        assert!(pb >= 2, "bottom marker on a later page (got page {})", pb + 1);
+
+        // The emitted PDF reflects the same page count and contains the text.
+        let s = String::from_utf8_lossy(&pdf);
+        assert!(
+            s.contains(&format!("/Count {}", pages.len())),
+            "PDF /Count matches page count"
+        );
+        assert!(s.contains("(TOP_MARKER) Tj"), "PDF has selectable top text");
+        assert!(s.contains("(BOTTOM_MARKER) Tj"), "PDF has selectable bottom text");
+    }
+
+    #[test]
+    fn media_print_display_none_removes_element_from_pdf() {
+        let _g = PRINT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // `.noprint` is visible on screen but display:none in print. It must be
+        // absent from the print PDF; the printable content remains.
+        let html = "<!doctype html><html><head><style>\
+            @media print { .noprint { display: none; } }\
+            </style></head><body>\
+            <div class='noprint'>SCREEN_ONLY_NAV</div>\
+            <div>PRINTABLE_BODY</div>\
+            </body></html>";
+        let (pages, pdf) = print_page(html, cv_pdf::print_layout::PageGeometry::LETTER);
+        let s = String::from_utf8_lossy(&pdf);
+        assert!(
+            s.contains("(PRINTABLE_BODY) Tj"),
+            "printable content is in the PDF"
+        );
+        assert!(
+            !pages.iter().any(|p| page_has_text(p, "SCREEN_ONLY_NAV")),
+            "display:none-in-print element must be ABSENT from print pages"
+        );
+        assert!(
+            !s.contains("SCREEN_ONLY_NAV"),
+            "screen-only element must not appear in the PDF at all"
+        );
+    }
+
+    #[test]
+    fn page_break_before_forces_new_page() {
+        let _g = PRINT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Two short blocks that would EASILY fit on one page; the forced break
+        // on the second pushes it onto page 2.
+        let html = "<!doctype html><html><body>\
+            <div>BEFORE_BREAK</div>\
+            <div style='page-break-before: always'>AFTER_BREAK</div>\
+            </body></html>";
+        let (pages, _pdf) = print_page(html, cv_pdf::print_layout::PageGeometry::LETTER);
+        assert!(
+            pages.len() >= 2,
+            "page-break-before:always must create a 2nd page, got {}",
+            pages.len()
+        );
+        assert!(page_has_text(&pages[0], "BEFORE_BREAK"), "first block on page 1");
+        assert!(
+            !page_has_text(&pages[0], "AFTER_BREAK"),
+            "forced break pushed second block off page 1"
+        );
+        assert!(
+            pages.iter().skip(1).any(|p| page_has_text(p, "AFTER_BREAK")),
+            "second block lands on a later page"
+        );
+    }
+
+    #[test]
+    fn page_margin_is_honored_in_output() {
+        let _g = PRINT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let html = "<!doctype html><html><body>\
+            <p style='margin:0'>MARGIN_TOP_TEXT</p></body></html>";
+        // A geometry with a deliberately large (100pt) top + left margin.
+        let geom = cv_pdf::print_layout::PageGeometry {
+            margin_top: 100.0,
+            margin_left: 100.0,
+            ..cv_pdf::print_layout::PageGeometry::LETTER
+        };
+        let (pages, _pdf) = print_page(html, geom);
+        use cv_pdf::print_layout::PrintCmd;
+        let txt = pages[0]
+            .cmds
+            .iter()
+            .find_map(|c| match c {
+                PrintCmd::Text { x, baseline_y, text, .. } if text.contains("MARGIN_TOP_TEXT") => {
+                    Some((*x, *baseline_y))
+                }
+                _ => None,
+            })
+            .expect("margin text command present");
+        // Content x must be pushed in by the left margin (>= 100pt).
+        assert!(txt.0 >= 100.0, "left margin honored: x={} (>=100)", txt.0);
+        // The first line's baseline must sit below the top margin (>= 100pt).
+        assert!(
+            txt.1 >= 100.0,
+            "top margin honored: baseline_y={} (>=100)",
+            txt.1
+        );
+    }
+
+    #[test]
+    fn emitted_pdf_parses_with_our_reader() {
+        let _g = PRINT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let html = "<!doctype html><html><body><p>ROUNDTRIP</p></body></html>";
+        let (pages, pdf) = print_page(html, cv_pdf::print_layout::PageGeometry::LETTER);
+        // Our own PDF reader must accept the writer's output: header, startxref,
+        // a parseable xref with the catalog + pages root in use.
+        assert!(cv_pdf::parse_version(&pdf).is_some(), "valid PDF version header");
+        let sx = cv_pdf::find_startxref(&pdf).expect("startxref present");
+        let xref = cv_pdf::parse_xref(&pdf, sx).expect("xref parses");
+        assert!(xref.lookup(1).unwrap().in_use, "catalog object in use");
+        assert!(xref.lookup(2).unwrap().in_use, "pages root in use");
+        // One page in, one page out for this short doc.
+        assert_eq!(pages.len(), 1, "short doc = single page");
     }
 }

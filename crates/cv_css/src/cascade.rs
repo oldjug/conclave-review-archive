@@ -296,6 +296,38 @@ pub struct LogicalEdges {
     pub seq: [u32; 4],
 }
 
+/// CSS Fragmentation 3 break value (the pagination-relevant subset). Maps
+/// `break-before`/`-after`/`-inside` and their legacy `page-break-*` aliases.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BreakValue {
+    /// `auto` — break allowed but not forced (the initial value).
+    Auto,
+    /// `page` / `always` / `left` / `right` — force a page break.
+    Force,
+    /// `avoid` / `avoid-page` — discourage a break.
+    Avoid,
+}
+
+impl BreakValue {
+    /// Parse a `break-*` / `page-break-*` value's tokens. Returns `None` for an
+    /// unrecognised value (leaving any prior cascade winner intact).
+    pub fn from_tokens(toks: &[CssToken]) -> Option<Self> {
+        let kw = toks.iter().find_map(|t| match t {
+            CssToken::Ident(s) => Some(s.to_ascii_lowercase()),
+            _ => None,
+        })?;
+        match kw.as_str() {
+            "auto" => Some(BreakValue::Auto),
+            // CSS Fragmentation 3 §3.1: forced-break values.
+            "page" | "always" | "left" | "right" | "recto" | "verso" => {
+                Some(BreakValue::Force)
+            }
+            "avoid" | "avoid-page" => Some(BreakValue::Avoid),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct ComputedStyle {
     pub color: Option<Color>,
@@ -314,6 +346,14 @@ pub struct ComputedStyle {
     /// captured verbatim; `content: none` / `content: normal` produce
     /// None so the host knows not to generate the box.
     pub content: Option<String>,
+    /// CSS Fragmentation 3 §3.1 — `break-before` / `break-after` (and the
+    /// legacy `page-break-before`/`-after` aliases). Consulted by the print /
+    /// PDF pagination path; `None` = `auto` (the initial value). Ignored for
+    /// on-screen layout (which is not fragmented).
+    pub break_before: Option<BreakValue>,
+    pub break_after: Option<BreakValue>,
+    /// CSS Fragmentation 3 §4.2 — `break-inside` / `page-break-inside`.
+    pub break_inside: Option<BreakValue>,
     pub font_size: Option<Length>,
     pub width: Option<Length>,
     pub height: Option<Length>,
@@ -4188,6 +4228,24 @@ fn apply_declaration(style: &mut ComputedStyle, d: &Declaration) {
                 style.visibility = Some(v);
             }
         }
+        // CSS Fragmentation 3 §3.1 / §4.2 — break properties + legacy aliases.
+        // The legacy `page-break-*` map onto the same fields (Chrome treats
+        // `page-break-before:always` as `break-before:page`, etc.).
+        "break-before" | "page-break-before" => {
+            if let Some(v) = BreakValue::from_tokens(toks) {
+                style.break_before = Some(v);
+            }
+        }
+        "break-after" | "page-break-after" => {
+            if let Some(v) = BreakValue::from_tokens(toks) {
+                style.break_after = Some(v);
+            }
+        }
+        "break-inside" | "page-break-inside" => {
+            if let Some(v) = BreakValue::from_tokens(toks) {
+                style.break_inside = Some(v);
+            }
+        }
         "font-size" => {
             // CSS Values §7.1 — absolute keyword sizes are anchored at
             // the browser's base size (16px).  Relative keywords scale
@@ -7473,21 +7531,29 @@ fn media_atom_matches(toks: &[CssToken], vw: f32, vh: f32, dpr: f32) -> bool {
     {
         let mut not = false;
         let mut matched_type = false;
+        // The active media type — `print` during a print/PDF pass (see
+        // `set_print_media`), `screen` otherwise. `all` matches either.
+        let printing = print_media_active();
         for t in toks {
             if let CssToken::Ident(s) = t {
                 let lc = s.to_ascii_lowercase();
                 if lc == "not" {
                     not = !not;
-                } else if matches!(lc.as_str(), "screen" | "all") {
+                } else if lc == "all" {
                     return !not;
+                } else if lc == "screen" {
+                    // Matches only when NOT printing (Media Queries 4 §2.1).
+                    return if printing { not } else { !not };
+                } else if lc == "print" {
+                    // Matches only during a print/PDF pass.
+                    return if printing { !not } else { not };
                 } else if matches!(
                     lc.as_str(),
-                    "print" | "speech" | "tv" | "aural" | "handheld"
+                    "speech" | "tv" | "aural" | "handheld"
                         | "tty" | "embossed" | "projection" | "braille"
                 ) {
-                    // Non-screen / legacy media types: these never match in a
-                    // screen browser. `speech` is treated as non-screen here
-                    // for consistency with `print`.
+                    // Non-screen / legacy media types: these never match in an
+                    // interactive or print browser context.
                     return not;
                 } else if lc == "only" {
                     // `only screen` — the `only` prefix is a CSS 2.1 compat
@@ -7687,6 +7753,31 @@ pub fn set_device_pixel_ratio(dpr: f32) {
 /// Defaults to `1.0` until the window reports a DPI.
 pub fn current_device_pixel_ratio() -> f32 {
     f32::from_bits(DEVICE_PIXEL_RATIO_BITS.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Process-global "active CSS media type". `false` = `screen` (the default for
+/// interactive rendering), `true` = `print`. Published by the host (cv_browser)
+/// around a print/PDF-export pass so the cascade evaluates `@media print { … }`
+/// blocks (and hides `@media screen`-only rules / honours `display:none` set
+/// only in print). Media Queries 4 §2.1 (media types: `screen` vs `print`);
+/// the CSS print flow re-runs the cascade under the `print` media type.
+/// Stored in an atomic so the lock-free media-query evaluator can read it on
+/// any thread; always restored to `false` after the print pass.
+static PRINT_MEDIA_ACTIVE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Switch the active media type. `true` selects `print`, `false` selects
+/// `screen`. The host wraps a print/PDF layout pass in
+/// `set_print_media(true) … set_print_media(false)` so the SAME cascade code
+/// path produces the print-media computed styles (Chrome re-lays-out the page
+/// under the print media type before paginating).
+pub fn set_print_media(active: bool) {
+    PRINT_MEDIA_ACTIVE.store(active, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// True when the active media type is `print` (see [`set_print_media`]).
+pub fn print_media_active() -> bool {
+    PRINT_MEDIA_ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Find a `linear-gradient(...)` call in `toks` and pull out the first
@@ -9267,6 +9358,64 @@ mod tests {
         let idx = SelectorIndex::build(&sheets);
         let cs = compute_with_index(&idx, el, &[], &[]);
         assert_eq!(cs.color, None);
+    }
+
+    /// Process-global media-type guard for the print/PDF tests. `set_print_media`
+    /// flips a shared atomic, so any test that toggles it must serialise to keep
+    /// the parallel test runner from racing screen tests.
+    static PRINT_MEDIA_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn media_print_matches_only_when_printing() {
+        // Recover a poisoned lock so one failure doesn't cascade-fail the rest.
+        let _g = PRINT_MEDIA_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Both a `@media print` (red) and a `@media screen` (blue) rule.
+        let css = "@media print { div { color: red; } }\
+                   @media screen { div { color: blue; } }";
+        let ss = parse_stylesheet(css);
+        let sheets = [ss];
+        let el = Fake { tag: "div", id: None, classes: &[] };
+        let red = Some(Color { r: 255, g: 0, b: 0, a: 255 });
+        let blue = Some(Color { r: 0, g: 0, b: 255, a: 255 });
+
+        // Screen (default): the screen block wins, the print block is dropped.
+        set_print_media(false);
+        let idx_s = SelectorIndex::build(&sheets);
+        assert_eq!(compute_with_index(&idx_s, el, &[], &[]).color, blue);
+
+        // Print pass: the print block wins, the screen block is dropped.
+        set_print_media(true);
+        let idx_p = SelectorIndex::build(&sheets);
+        let got = compute_with_index(&idx_p, el, &[], &[]).color;
+        // Always restore the global before asserting so a failure can't leak.
+        set_print_media(false);
+        assert_eq!(got, red, "@media print rule must apply during a print pass");
+    }
+
+    #[test]
+    fn display_none_in_print_only_hides_when_printing() {
+        let _g = PRINT_MEDIA_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // An element visible on screen, hidden in print (the canonical
+        // "don't print the nav bar" idiom).
+        let css = "@media print { .nav { display: none; } }";
+        let ss = parse_stylesheet(css);
+        let sheets = [ss];
+        let el = Fake { tag: "div", id: None, classes: &["nav"] };
+        let classes = ["nav".to_string()];
+
+        set_print_media(false);
+        let idx_s = SelectorIndex::build(&sheets);
+        assert_eq!(
+            compute_with_index(&idx_s, el, &[], &classes).display,
+            None,
+            "no display override on screen"
+        );
+
+        set_print_media(true);
+        let idx_p = SelectorIndex::build(&sheets);
+        let disp = compute_with_index(&idx_p, el, &[], &classes).display;
+        set_print_media(false);
+        assert_eq!(disp, Some(Display::None), "display:none must apply in print");
     }
 
     /// Wikipedia heading-weight cascade: inside ONE `@media screen` block a

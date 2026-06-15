@@ -569,6 +569,20 @@ impl BorderStyle {
     }
 }
 
+/// CSS Fragmentation 3 break value (the pagination subset). Mirrors
+/// `cv_css::cascade::BreakValue` (re-defined here so `cv_layout` stays free of
+/// the CSS-crate dependency). Drives the print/PDF page-break logic.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum BreakValue {
+    /// `auto` — break allowed but not forced (the initial value).
+    #[default]
+    Auto,
+    /// `page` / `always` / `left` / `right` — force a page break.
+    Force,
+    /// `avoid` — discourage a break here.
+    Avoid,
+}
+
 #[derive(Clone, Debug)]
 pub struct LayoutBox {
     pub content: Rect,
@@ -892,6 +906,11 @@ pub struct LayoutBox {
     pub background: Option<Color>,
     pub text_color: Color,
     pub font_size_px: f32,
+    /// CSS Fragmentation 3 break hints, carried through from `Style` for the
+    /// print/PDF pagination path. `Auto` for boxes with no break property.
+    pub break_before: BreakValue,
+    pub break_after: BreakValue,
+    pub break_inside: BreakValue,
     pub kind: BoxKind,
     /// If this box (or any inline that produced it) belongs to a clickable
     /// `<a href>`, the resolved href URL ends up here. Used for hit testing.
@@ -1326,6 +1345,12 @@ pub struct Style {
     /// BFC, not yet modelled separately); recorded so CSSOM `display` reads back
     /// as `flow-root`.
     pub display_is_flow_root: bool,
+    /// CSS Fragmentation 3 break hints (`break-before`/`-after`/`-inside` and
+    /// the legacy `page-break-*` aliases). Carried for the print/PDF pagination
+    /// path; ignored by on-screen (unfragmented) layout. `Auto` = initial.
+    pub break_before: BreakValue,
+    pub break_after: BreakValue,
+    pub break_inside: BreakValue,
     pub background: Option<Color>,
     pub text_color: Option<Color>,
     pub font_size_px: Option<f32>,
@@ -3805,6 +3830,9 @@ fn build_box_inner(node: &StyledNode, cfg: &LayoutConfig) -> LayoutBox {
                 background: node.style.background.clone(),
                 text_color: node.style.text_color.unwrap_or(cfg.default_text_color),
                 font_size_px: node.style.font_size_px.unwrap_or(cfg.default_font_size_px),
+                break_before: node.style.break_before,
+                break_after: node.style.break_after,
+                break_inside: node.style.break_inside,
                 kind: BoxKind::Block { tag: tag.clone() },
                 link_href: node.style.link_href.clone(),
                 embedded_image: node.style.embedded_image.clone(),
@@ -3961,6 +3989,9 @@ fn build_box_inner(node: &StyledNode, cfg: &LayoutConfig) -> LayoutBox {
             background: None,
             text_color: node.style.text_color.unwrap_or(cfg.default_text_color),
             font_size_px: node.style.font_size_px.unwrap_or(0.0),
+            break_before: node.style.break_before,
+            break_after: node.style.break_after,
+            break_inside: node.style.break_inside,
             kind: BoxKind::Text(t.clone()),
             // Carry the link/element identity onto the text box. Inline
             // flattening (conclave) emits each link's text as a Text

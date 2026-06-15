@@ -1,20 +1,27 @@
-//! `cv_pdf` — PDF lexer + xref + object stream + indirect refs +
-//! Flate stream decode + page tree walk.
+//! `cv_pdf` — PDF reader AND writer + the browser print/PDF-export pipeline.
 //!
-//! Implements the byte-level structure of a PDF file:
+//! Reader (the byte-level structure of a PDF file):
 //!   * Header detection (`%PDF-1.x` / `%PDF-2.0`)
 //!   * `startxref` + xref table parsing
 //!   * Indirect object lookup by (object number, generation)
 //!   * Cross-reference + trailer dictionary
+//!   * Stream decode (Flate), object lexer, indirect references, page
+//!     tree walk + MediaBox extraction.
 //!
-//! Stream decode (Flate), object lexer, indirect references, page
-//! tree walk + MediaBox extraction all real and tested.
+//! Writer + print flow (`window.print()` / export-to-PDF):
+//!   * [`print_layout`] paginates a laid-out box tree (already cascaded under
+//!     the `print` media type) into [`print_layout::PrintPage`]s, honouring
+//!     `@page` size/margins and `break-before`/`-after`/`-inside`.
+//!   * [`writer`] serialises those pages to a real PDF 1.7 file with selectable
+//!     text, filled rectangles and RGB images.
 
 #![allow(missing_debug_implementations)]
 
 pub mod object;
 pub mod page;
+pub mod print_layout;
 pub mod print_preview;
+pub mod writer;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PdfVersion {
