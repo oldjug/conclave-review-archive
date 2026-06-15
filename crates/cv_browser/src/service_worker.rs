@@ -312,6 +312,9 @@ fn build_sw_realm(
     // M9.1: service workers inherit isolation; pass `true` to keep the JS
     // SharedArrayBuffer constructor available (non-regressing for M8a tests).
     crate::install_shared_memory(&interp, true);
+    // ECMA-262 §9.7 AgentCanBlock: a service-worker agent can block (its own
+    // thread), so `Atomics.wait` is permitted here.
+    crate::set_agent_can_block(true);
 
     let sched: SchedRef = Scheduler::new_ref();
     install_event_loop(&interp, sched.clone());

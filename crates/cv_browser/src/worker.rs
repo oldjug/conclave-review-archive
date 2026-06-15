@@ -272,6 +272,10 @@ fn worker_main(
     // worker tests build SABs Rust-side + use Atomics, but a worker may also
     // construct one — keep it enabled in the worker/test realm).
     install_shared_memory(&interp, true);
+    // ECMA-262 §9.7 AgentCanBlock: a Worker agent CAN block, so `Atomics.wait`
+    // is permitted here (unlike the main thread, where it throws). This thread is
+    // the worker's own agent thread, so set the per-thread flag.
+    crate::set_agent_can_block(true);
 
     // Worker-local scheduler + event loop (setTimeout/setInterval/queueMicrotask
     // fire ON the worker thread).
@@ -313,6 +317,10 @@ fn worker_main(
                 dispatch_message(&mut interp, &onmessage_handlers, data, &from_worker_tx);
                 interp.drain_microtasks();
                 drain_scheduler(&mut interp, &sched, 64);
+                // Resolve any Atomics.waitAsync promises whose waiter is ready.
+                if crate::drain_atomics_async(&mut interp) {
+                    interp.drain_microtasks();
+                }
             }
             Ok(WorkerMsg::Terminate) => break,
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
@@ -321,6 +329,10 @@ fn worker_main(
                 // setTimeout-in-worker callbacks fire even with no messages.
                 drain_scheduler(&mut interp, &sched, 256);
                 interp.drain_microtasks();
+                // Resolve ready Atomics.waitAsync promises on the worker agent.
+                if crate::drain_atomics_async(&mut interp) {
+                    interp.drain_microtasks();
+                }
             }
         }
         // close() finishes the current task + microtask drain, then stops.

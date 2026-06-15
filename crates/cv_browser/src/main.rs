@@ -16783,6 +16783,15 @@ impl LiveInterp {
                 fired = true;
                 self.interp.drain_microtasks();
             }
+            // Resolve any Atomics.waitAsync promises whose waiter is ready (a
+            // Worker's Atomics.notify woke it, or its timeout elapsed). Resolving
+            // the promise queues its `.then` reactions as microtasks, drained in
+            // the same loop.
+            let had_atomics = drain_atomics_async(&mut self.interp);
+            if had_atomics {
+                fired = true;
+                self.interp.drain_microtasks();
+            }
             // Keep any CV_WEBAUDIO realtime device endpoints fed with freshly
             // rendered audio quanta (no-op unless the flag opened a device).
             pump_webaudio_outputs();
@@ -32689,6 +32698,92 @@ fn sab_lookup(id: u64) -> Option<cv_js::sab::SharedArrayBuffer> {
         .map(|(_, buf)| buf.clone())
 }
 
+thread_local! {
+    /// ECMA-262 §9.7 AgentCanBlock — a per-agent (per-thread) property consulted
+    /// by `Atomics.wait` (§25.4.3.14 step 6): the main/UI thread CANNOT block
+    /// (calling `wait` there throws a TypeError); Worker / service-worker agents
+    /// CAN block. Default `false` (main thread); the worker setup flips it true.
+    static AGENT_CAN_BLOCK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+
+    /// `Atomics.waitAsync` token → the pending promise it must resolve. Keyed by
+    /// the waiter token from `cv_js::sab::AtomicsView::wait_async`. The pending
+    /// promise belongs to THIS agent (thread), so it is resolved here, on this
+    /// agent's event loop, by `drain_atomics_async` — matching V8's model where a
+    /// waitAsync promise resolves on the agent that created it.
+    static ATOMICS_ASYNC_PROMISES: RefCellAsync = RefCellAsync::new();
+}
+
+/// Thread-local store of `(token, pending-promise-inner)` for outstanding
+/// `Atomics.waitAsync` calls. Plain newtype so the `thread_local!` const-init
+/// works.
+struct RefCellAsync(
+    std::cell::RefCell<Vec<(u64, std::rc::Rc<std::cell::RefCell<cv_js::OrderedMap<String, cv_js::Value>>>)>>,
+);
+impl RefCellAsync {
+    const fn new() -> Self {
+        RefCellAsync(std::cell::RefCell::new(Vec::new()))
+    }
+}
+
+/// Whether the current agent (thread) may block in `Atomics.wait`.
+fn agent_can_block() -> bool {
+    AGENT_CAN_BLOCK.with(|c| c.get())
+}
+
+/// Mark the current agent as able to block (called on Worker / service-worker
+/// threads during their global-scope setup).
+fn set_agent_can_block(v: bool) {
+    AGENT_CAN_BLOCK.with(|c| c.set(v));
+}
+
+/// Bind a pending promise to a `waitAsync` waiter token (called from the
+/// `Atomics.waitAsync` blocking branch).
+fn register_atomics_async_promise(
+    token: u64,
+    inner: std::rc::Rc<std::cell::RefCell<cv_js::OrderedMap<String, cv_js::Value>>>,
+) {
+    ATOMICS_ASYNC_PROMISES.with(|s| s.0.borrow_mut().push((token, inner)));
+}
+
+/// Host-pump hook: resolve any `Atomics.waitAsync` promises whose waiter became
+/// ready (notified by another agent → "ok", or deadline elapsed → "timed-out").
+/// Returns `true` if it resolved at least one (so the caller re-drains
+/// microtasks). Cheap no-op when there are no outstanding async waiters.
+fn drain_atomics_async(interp: &mut cv_js::Interp) -> bool {
+    // The tokens registered on THIS agent (thread). Empty ⇒ nothing to do.
+    let owned: Vec<u64> =
+        ATOMICS_ASYNC_PROMISES.with(|s| s.0.borrow().iter().map(|(t, _)| *t).collect());
+    if owned.is_empty() {
+        return false;
+    }
+    // Claim only OUR ready waiters from the process-global list.
+    let ready = cv_js::sab::drain_ready_async(&owned);
+    if ready.is_empty() {
+        return false;
+    }
+    let mut resolved_any = false;
+    for (token, result) in ready {
+        // Find the promise bound to this token on THIS thread.
+        let inner = ATOMICS_ASYNC_PROMISES.with(|s| {
+            let mut v = s.0.borrow_mut();
+            if let Some(pos) = v.iter().position(|(t, _)| *t == token) {
+                Some(v.remove(pos).1)
+            } else {
+                None
+            }
+        });
+        if let Some(inner) = inner {
+            cv_js::resolve_promise(
+                interp,
+                &inner,
+                cv_js::Value::str(result.as_str().to_string()),
+            );
+            resolved_any = true;
+        }
+    }
+    resolved_any
+}
+
 /// Build a JS SharedArrayBuffer wrapper object bound to `id`.
 fn make_sab_wrapper(id: u64, byte_length: usize) -> cv_js::Value {
     use std::cell::RefCell;
@@ -32758,107 +32853,363 @@ fn install_shared_memory(interp: &cv_js::Interp, cross_origin_isolated: bool) {
         cv_js::Value::Bool(cross_origin_isolated),
     );
 
-    // `Atomics` — a namespace object of static methods. Each op resolves the
-    // typed-array-or-SAB argument down to its `_sabId`, looks up the shared Arc,
-    // and runs the SeqCst atomic. We accept either a SAB wrapper directly OR a
-    // typed-array view carrying `_sabBacking` (id) so `new Int32Array(sab)`
-    // works. The element index is in i32 units.
-    fn view_id_of(v: &cv_js::Value) -> Option<u64> {
-        if let Some((id, _)) = sab_ref_of(v) {
-            return Some(id);
-        }
-        if let cv_js::Value::Object(o) = v {
+    // `Atomics` — a namespace object of static methods (ECMA-262 §25.4). Each op
+    // resolves the typed-array argument down to its shared backing Arc PLUS its
+    // element type + byteOffset, then runs the real width-aware SeqCst atomic via
+    // `cv_js::sab::AtomicsView::with_type`. We accept a SAB wrapper directly OR a
+    // typed-array view carrying `_sabBacking` (id) / `buffer` (a SAB wrapper).
+    interp.define_global(
+        "Atomics",
+        cv_js::Value::Object(Rc::new(RefCell::new(build_atomics_namespace()))),
+    );
+}
+
+/// Resolve an Atomics first-argument to `(SAB, ElemType, byteOffset)`. A bare SAB
+/// wrapper is treated as an `Int32Array` view at offset 0 (the legacy default);
+/// a typed-array view contributes its real `_typedarray` kind + `byteOffset`.
+/// Returns `None` if it isn't backed by a SharedArrayBuffer (§25.4.3.1 step 5:
+/// a non-shared buffer is not an error for the RMW ops in our model — caller maps
+/// to a no-op/0) or if the kind is non-integer.
+fn atomics_resolve_view(
+    v: &cv_js::Value,
+) -> Option<(cv_js::sab::SharedArrayBuffer, cv_js::sab::ElemType, usize)> {
+    // Direct SAB wrapper → i32 view at 0.
+    if let Some((id, _)) = sab_ref_of(v) {
+        let sab = sab_lookup(id)?;
+        return Some((sab, cv_js::sab::ElemType::I32, 0));
+    }
+    if let cv_js::Value::Object(o) = v {
+        let (kind, byte_off, backing) = {
             let b = o.borrow();
-            // A typed-array view over a SAB carries `_sabBacking`.
-            if let Some(bk) = b.get("_sabBacking") {
-                let id = bk.to_number() as u64;
-                if id != 0 {
-                    return Some(id);
+            let kind = b.get("_typedarray").map(|k| k.to_display_string());
+            let byte_off = b.get("byteOffset").map(|x| x.to_number()).unwrap_or(0.0);
+            let byte_off = if byte_off.is_finite() && byte_off >= 0.0 {
+                byte_off as usize
+            } else {
+                0
+            };
+            // The shared id: `_sabBacking` directly, else recurse into `buffer`.
+            let backing = b
+                .get("_sabBacking")
+                .map(|x| x.to_number() as u64)
+                .filter(|id| *id != 0);
+            (kind, byte_off, backing)
+        };
+        let id = match backing {
+            Some(id) => id,
+            None => {
+                // Recurse into the `.buffer` (a SAB wrapper) outside the borrow.
+                let buf = o.borrow().get("buffer").cloned();
+                match buf.and_then(|b| sab_ref_of(&b).map(|(id, _)| id)) {
+                    Some(id) => id,
+                    None => return None,
                 }
             }
-            // Or a view whose `buffer` is a SAB wrapper.
-            if let Some(buf) = b.get("buffer") {
-                return view_id_of(buf);
-            }
-        }
-        None
+        };
+        let sab = sab_lookup(id)?;
+        // The element type from the view's kind (default i32 if absent — a raw
+        // SAB-backed object). Non-integer kinds (Float32Array, …) are invalid.
+        let elem = match kind.as_deref() {
+            Some(k) => cv_js::sab::ElemType::from_kind(k)?,
+            None => cv_js::sab::ElemType::I32,
+        };
+        return Some((sab, elem, byte_off));
     }
-    macro_rules! atomic_binop {
+    None
+}
+
+/// Coerce an Atomics value argument to an i128 honoring the element type: BigInt
+/// element types read the BigInt's decimal value; numeric types use ToInteger.
+fn atomics_value_arg(v: &cv_js::Value, elem: cv_js::sab::ElemType) -> i128 {
+    if elem.is_bigint() {
+        // BigInt path: parse the decimal string (covers the full ±u64 range).
+        if let cv_js::Value::BigInt(_) = v {
+            return v.to_display_string().parse::<i128>().unwrap_or(0);
+        }
+        // A non-BigInt for a BigInt array: best-effort numeric truncation.
+        let n = v.to_number();
+        return if n.is_finite() { n as i128 } else { 0 };
+    }
+    let n = v.to_number();
+    if n.is_finite() {
+        n as i128
+    } else {
+        0
+    }
+}
+
+/// Wrap an integer RMW/load result back into a JS value of the right kind: a JS
+/// Number for the 32-bit-and-narrower integer types, a BigInt for I64/U64.
+fn atomics_result_value(elem: cv_js::sab::ElemType, n: i128) -> cv_js::Value {
+    if elem.is_bigint() {
+        match cv_js::parse_bigint_from_string(&n.to_string()) {
+            Some(b) => cv_js::Value::BigInt(std::rc::Rc::new(b)),
+            None => cv_js::Value::Number(0.0),
+        }
+    } else {
+        cv_js::Value::Number(n as f64)
+    }
+}
+
+/// A TypeError JsError for the Atomics fast-fail paths (§25.4.3.x throw points).
+fn atomics_type_error(msg: &str) -> cv_js::JsError {
+    cv_js::make_temporal_error("TypeError", msg.to_string())
+}
+
+/// A RangeError JsError (out-of-bounds index — §25.4.3.2 ValidateAtomicAccess).
+fn atomics_range_error(msg: &str) -> cv_js::JsError {
+    cv_js::make_temporal_error("RangeError", msg.to_string())
+}
+
+/// Build the `Atomics` namespace object: the full RMW op set + wait/notify/
+/// waitAsync + isLockFree (ECMA-262 §25.4).
+fn build_atomics_namespace() -> cv_js::OrderedMap<String, cv_js::Value> {
+    use cv_js::OrderedMap as HashMap;
+    use cv_js::sab::AtomicsView;
+
+    let mut atomics: HashMap<String, cv_js::Value> = HashMap::new();
+
+    // ── load / store / RMW (§25.4.3.3–.13) ──
+    macro_rules! rmw_op {
         ($name:expr, $method:ident) => {
             cv_js::native_fn($name, |args| {
                 let view = args.first().cloned().unwrap_or(cv_js::Value::Undefined);
-                let index = args.get(1).map(|v| v.to_number()).unwrap_or(0.0) as usize;
-                let val = args.get(2).map(|v| v.to_number()).unwrap_or(0.0) as i32;
-                let Some(id) = view_id_of(&view) else {
+                let index = args.get(1).map(|v| v.to_number()).unwrap_or(0.0);
+                let Some((sab, elem, off)) = atomics_resolve_view(&view) else {
                     return Ok(cv_js::Value::Number(0.0));
                 };
-                let Some(sab) = sab_lookup(id) else {
-                    return Ok(cv_js::Value::Number(0.0));
-                };
-                let av = cv_js::sab::AtomicsView::new(sab);
-                Ok(cv_js::Value::Number(f64::from(av.$method(index, val))))
+                let av = AtomicsView::with_type(sab, elem, off);
+                let index = if index.is_finite() && index >= 0.0 { index as usize } else { usize::MAX };
+                if !av.in_bounds(index) {
+                    return Err(atomics_range_error("Atomics: index out of range"));
+                }
+                let val = atomics_value_arg(
+                    args.get(2).unwrap_or(&cv_js::Value::Undefined),
+                    elem,
+                );
+                Ok(atomics_result_value(elem, av.$method(index, val)))
             })
         };
     }
-    let mut atomics: HashMap<String, cv_js::Value> = HashMap::new();
+
     atomics.insert(
         "load".into(),
         cv_js::native_fn("load", |args| {
             let view = args.first().cloned().unwrap_or(cv_js::Value::Undefined);
-            let index = args.get(1).map(|v| v.to_number()).unwrap_or(0.0) as usize;
-            let Some(id) = view_id_of(&view) else {
+            let index = args.get(1).map(|v| v.to_number()).unwrap_or(0.0);
+            let Some((sab, elem, off)) = atomics_resolve_view(&view) else {
                 return Ok(cv_js::Value::Number(0.0));
             };
-            let Some(sab) = sab_lookup(id) else {
-                return Ok(cv_js::Value::Number(0.0));
-            };
-            let av = cv_js::sab::AtomicsView::new(sab);
-            Ok(cv_js::Value::Number(f64::from(av.load(index))))
+            let av = AtomicsView::with_type(sab, elem, off);
+            let index = if index.is_finite() && index >= 0.0 { index as usize } else { usize::MAX };
+            if !av.in_bounds(index) {
+                return Err(atomics_range_error("Atomics.load: index out of range"));
+            }
+            Ok(atomics_result_value(elem, av.load(index)))
         }),
     );
     atomics.insert(
         "store".into(),
         cv_js::native_fn("store", |args| {
             let view = args.first().cloned().unwrap_or(cv_js::Value::Undefined);
-            let index = args.get(1).map(|v| v.to_number()).unwrap_or(0.0) as usize;
-            let val = args.get(2).map(|v| v.to_number()).unwrap_or(0.0) as i32;
-            if let Some(id) = view_id_of(&view) {
-                if let Some(sab) = sab_lookup(id) {
-                    cv_js::sab::AtomicsView::new(sab).store(index, val);
-                }
+            let index = args.get(1).map(|v| v.to_number()).unwrap_or(0.0);
+            let Some((sab, elem, off)) = atomics_resolve_view(&view) else {
+                return Ok(cv_js::Value::Number(0.0));
+            };
+            let av = AtomicsView::with_type(sab, elem, off);
+            let index = if index.is_finite() && index >= 0.0 { index as usize } else { usize::MAX };
+            if !av.in_bounds(index) {
+                return Err(atomics_range_error("Atomics.store: index out of range"));
             }
-            Ok(cv_js::Value::Number(f64::from(val)))
+            let val = atomics_value_arg(args.get(2).unwrap_or(&cv_js::Value::Undefined), elem);
+            // §25.4.3.13: store returns the integer value it stored.
+            Ok(atomics_result_value(elem, av.store(index, val)))
         }),
     );
-    atomics.insert("add".into(), atomic_binop!("add", add));
-    atomics.insert("sub".into(), atomic_binop!("sub", sub));
-    atomics.insert("and".into(), atomic_binop!("and", and));
-    atomics.insert("or".into(), atomic_binop!("or", or));
-    atomics.insert("xor".into(), atomic_binop!("xor", xor));
-    atomics.insert("exchange".into(), atomic_binop!("exchange", exchange));
+    atomics.insert("add".into(), rmw_op!("add", add));
+    atomics.insert("sub".into(), rmw_op!("sub", sub));
+    atomics.insert("and".into(), rmw_op!("and", and));
+    atomics.insert("or".into(), rmw_op!("or", or));
+    atomics.insert("xor".into(), rmw_op!("xor", xor));
+    atomics.insert("exchange".into(), rmw_op!("exchange", exchange));
     atomics.insert(
         "compareExchange".into(),
         cv_js::native_fn("compareExchange", |args| {
             let view = args.first().cloned().unwrap_or(cv_js::Value::Undefined);
-            let index = args.get(1).map(|v| v.to_number()).unwrap_or(0.0) as usize;
-            let expected = args.get(2).map(|v| v.to_number()).unwrap_or(0.0) as i32;
-            let replacement = args.get(3).map(|v| v.to_number()).unwrap_or(0.0) as i32;
-            let Some(id) = view_id_of(&view) else {
+            let index = args.get(1).map(|v| v.to_number()).unwrap_or(0.0);
+            let Some((sab, elem, off)) = atomics_resolve_view(&view) else {
                 return Ok(cv_js::Value::Number(0.0));
             };
-            let Some(sab) = sab_lookup(id) else {
-                return Ok(cv_js::Value::Number(0.0));
-            };
-            let av = cv_js::sab::AtomicsView::new(sab);
-            Ok(cv_js::Value::Number(f64::from(
+            let av = AtomicsView::with_type(sab, elem, off);
+            let index = if index.is_finite() && index >= 0.0 { index as usize } else { usize::MAX };
+            if !av.in_bounds(index) {
+                return Err(atomics_range_error("Atomics.compareExchange: index out of range"));
+            }
+            let expected = atomics_value_arg(args.get(2).unwrap_or(&cv_js::Value::Undefined), elem);
+            let replacement =
+                atomics_value_arg(args.get(3).unwrap_or(&cv_js::Value::Undefined), elem);
+            Ok(atomics_result_value(
+                elem,
                 av.compare_exchange(index, expected, replacement),
-            )))
+            ))
         }),
     );
-    interp.define_global(
-        "Atomics",
-        cv_js::Value::Object(Rc::new(RefCell::new(atomics))),
+
+    // ── isLockFree (§25.4.3.16) ──
+    atomics.insert(
+        "isLockFree".into(),
+        cv_js::native_fn("isLockFree", |args| {
+            let size = args.first().map(|v| v.to_number()).unwrap_or(f64::NAN);
+            Ok(cv_js::Value::Bool(cv_js::sab::is_lock_free(size)))
+        }),
     );
+
+    // ── wait (§25.4.3.14) ──
+    atomics.insert(
+        "wait".into(),
+        cv_js::native_fn("wait", |args| {
+            let view = args.first().cloned().unwrap_or(cv_js::Value::Undefined);
+            let index = args.get(1).map(|v| v.to_number()).unwrap_or(0.0);
+            // §25.4.3.14 step 2: only Int32Array / BigInt64Array over a SAB.
+            let Some((sab, elem, off)) = atomics_resolve_view(&view) else {
+                return Err(atomics_type_error(
+                    "Atomics.wait: not a shared integer typed array",
+                ));
+            };
+            if !elem.is_waitable() {
+                return Err(atomics_type_error(
+                    "Atomics.wait requires an Int32Array or BigInt64Array on a SharedArrayBuffer",
+                ));
+            }
+            // §25.4.3.14 step 6: throw if the agent cannot block (main thread).
+            if !agent_can_block() {
+                return Err(atomics_type_error(
+                    "Atomics.wait cannot be called on the main thread; use Atomics.waitAsync",
+                ));
+            }
+            let av = AtomicsView::with_type(sab, elem, off);
+            let index = if index.is_finite() && index >= 0.0 { index as usize } else { usize::MAX };
+            if !av.in_bounds(index) {
+                return Err(atomics_range_error("Atomics.wait: index out of range"));
+            }
+            let value = atomics_value_arg(args.get(2).unwrap_or(&cv_js::Value::Undefined), elem);
+            // §25.4.3.14 step 7: timeout = ToNumber → NaN ⇒ +∞; clamp <0 to 0.
+            let timeout = parse_atomics_timeout(args.get(3));
+            let r = av.wait(index, value, timeout);
+            Ok(cv_js::Value::str(r.as_str().to_string()))
+        }),
+    );
+
+    // ── notify (§25.4.3.15) ──
+    atomics.insert(
+        "notify".into(),
+        cv_js::native_fn("notify", |args| {
+            let view = args.first().cloned().unwrap_or(cv_js::Value::Undefined);
+            let index = args.get(1).map(|v| v.to_number()).unwrap_or(0.0);
+            let Some((sab, elem, off)) = atomics_resolve_view(&view) else {
+                return Err(atomics_type_error(
+                    "Atomics.notify: not a shared integer typed array",
+                ));
+            };
+            if !elem.is_waitable() {
+                return Err(atomics_type_error(
+                    "Atomics.notify requires an Int32Array or BigInt64Array on a SharedArrayBuffer",
+                ));
+            }
+            let av = AtomicsView::with_type(sab, elem, off);
+            let index = if index.is_finite() && index >= 0.0 { index as usize } else { usize::MAX };
+            if !av.in_bounds(index) {
+                return Err(atomics_range_error("Atomics.notify: index out of range"));
+            }
+            // count: undefined ⇒ +∞ (wake all); else ToInteger clamped ≥0.
+            let count = match args.get(2) {
+                None | Some(cv_js::Value::Undefined) => None,
+                Some(c) => {
+                    let n = c.to_number();
+                    if n.is_nan() || n < 0.0 {
+                        Some(0u64)
+                    } else if n.is_infinite() {
+                        None
+                    } else {
+                        Some(n as u64)
+                    }
+                }
+            };
+            Ok(cv_js::Value::Number(av.notify(index, count) as f64))
+        }),
+    );
+
+    // ── waitAsync (§25.4.16 — TC39 proposal, shipping in V8) ──
+    atomics.insert(
+        "waitAsync".into(),
+        cv_js::native_fn_with_interp("waitAsync", |_interp, args| {
+            let view = args.first().cloned().unwrap_or(cv_js::Value::Undefined);
+            let index = args.get(1).map(|v| v.to_number()).unwrap_or(0.0);
+            let Some((sab, elem, off)) = atomics_resolve_view(&view) else {
+                return Err(atomics_type_error(
+                    "Atomics.waitAsync: not a shared integer typed array",
+                ));
+            };
+            if !elem.is_waitable() {
+                return Err(atomics_type_error(
+                    "Atomics.waitAsync requires an Int32Array or BigInt64Array on a SharedArrayBuffer",
+                ));
+            }
+            let av = AtomicsView::with_type(sab, elem, off);
+            let index = if index.is_finite() && index >= 0.0 { index as usize } else { usize::MAX };
+            if !av.in_bounds(index) {
+                return Err(atomics_range_error("Atomics.waitAsync: index out of range"));
+            }
+            let value = atomics_value_arg(args.get(2).unwrap_or(&cv_js::Value::Undefined), elem);
+            let timeout = parse_atomics_timeout(args.get(3));
+            // The result is an object `{ async, value }` (§25.4.16).
+            let mut result: cv_js::OrderedMap<String, cv_js::Value> = cv_js::OrderedMap::new();
+            match av.wait_async(index, value, timeout) {
+                cv_js::sab::WaitAsyncResult::NotEqual => {
+                    result.insert("async".into(), cv_js::Value::Bool(false));
+                    result.insert("value".into(), cv_js::Value::str("not-equal".to_string()));
+                }
+                cv_js::sab::WaitAsyncResult::TimedOutSync => {
+                    result.insert("async".into(), cv_js::Value::Bool(false));
+                    result.insert("value".into(), cv_js::Value::str("timed-out".to_string()));
+                }
+                cv_js::sab::WaitAsyncResult::Async(token) => {
+                    // Create a pending promise and bind it to the waiter token; the
+                    // host pump resolves it ("ok"/"timed-out") via drain_atomics_async.
+                    let (promise, inner) = cv_js::make_pending_promise();
+                    register_atomics_async_promise(token, inner);
+                    result.insert("async".into(), cv_js::Value::Bool(true));
+                    result.insert("value".into(), promise);
+                }
+            }
+            Ok(cv_js::Value::Object(std::rc::Rc::new(std::cell::RefCell::new(
+                result,
+            ))))
+        }),
+    );
+
+    atomics
+}
+
+/// ECMA-262 §25.4.3.14 step 7 / §25.4.16: ToNumber(timeout); NaN (incl. absent)
+/// ⇒ +∞ (block forever / no deadline); negatives clamp to 0 (return immediately
+/// timed-out). Returns `None` for "no deadline" (forever), `Some(ms)` otherwise.
+fn parse_atomics_timeout(arg: Option<&cv_js::Value>) -> Option<f64> {
+    match arg {
+        None | Some(cv_js::Value::Undefined) => None, // ⇒ +∞
+        Some(v) => {
+            let n = v.to_number();
+            if n.is_nan() {
+                None // NaN ⇒ +∞
+            } else if n < 0.0 {
+                Some(0.0)
+            } else if n.is_infinite() {
+                None
+            } else {
+                Some(n)
+            }
+        }
+    }
 }
 
 /// Build a REAL `Worker` JS object (renderer thread): fetch the script
@@ -71809,6 +72160,211 @@ var el = document.getElementById('el');
         assert!(
             matches!(sab, cv_js::Value::Object(_)),
             "new SharedArrayBuffer(8) must return a wrapper object when isolated"
+        );
+    }
+
+    // ---- (e2) Atomics op set + wait/notify/waitAsync/isLockFree (§25.4) ----
+    //
+    // These run REAL JS through the interpreter against the production
+    // `install_shared_memory` wiring. The SAB wrapper is passed directly to the
+    // Atomics ops (the path Workers exercise: `Atomics.load(e.data, 0)`), which
+    // `atomics_resolve_view` treats as an Int32Array over the shared store.
+
+    fn atomics_interp() -> cv_js::Interp {
+        let interp = cv_js::Interp::new();
+        interp.install_basic_globals();
+        interp.install_promise();
+        install_shared_memory(&interp, true);
+        // The default agent (test/main thread) CANNOT block — but several Atomics
+        // tests below want to exercise `wait`'s blocking branch deterministically.
+        // We flip per-test where needed.
+        interp
+    }
+
+    fn run_num(interp: &mut cv_js::Interp, src: &str) -> f64 {
+        interp
+            .run_completion_value(src)
+            .unwrap_or_else(|e| panic!("`{src}` threw: {e:?}"))
+            .to_number()
+    }
+
+    fn run_str(interp: &mut cv_js::Interp, src: &str) -> String {
+        interp
+            .run_completion_value(src)
+            .unwrap_or_else(|e| panic!("`{src}` threw: {e:?}"))
+            .to_display_string()
+    }
+
+    #[test]
+    fn atomics_add_returns_old_and_updates_cell() {
+        let mut i = atomics_interp();
+        // §25.4.3.3: add returns the OLD value; the cell is then updated.
+        run_num(&mut i, "globalThis.sab = new SharedArrayBuffer(16);");
+        run_num(&mut i, "Atomics.store(sab, 0, 10);");
+        assert_eq!(run_num(&mut i, "Atomics.add(sab, 0, 5)"), 10.0, "old value");
+        assert_eq!(run_num(&mut i, "Atomics.load(sab, 0)"), 15.0, "updated cell");
+    }
+
+    #[test]
+    fn atomics_sub_and_and_or_xor_exchange() {
+        let mut i = atomics_interp();
+        run_num(&mut i, "globalThis.sab = new SharedArrayBuffer(16);");
+        run_num(&mut i, "Atomics.store(sab, 0, 100);");
+        assert_eq!(run_num(&mut i, "Atomics.sub(sab, 0, 40)"), 100.0);
+        assert_eq!(run_num(&mut i, "Atomics.load(sab, 0)"), 60.0);
+        run_num(&mut i, "Atomics.store(sab, 0, 0b1010);");
+        assert_eq!(run_num(&mut i, "Atomics.or(sab, 0, 0b0101)"), 0b1010 as f64);
+        assert_eq!(run_num(&mut i, "Atomics.load(sab, 0)"), 0b1111 as f64);
+        assert_eq!(run_num(&mut i, "Atomics.and(sab, 0, 0b1100)"), 0b1111 as f64);
+        assert_eq!(run_num(&mut i, "Atomics.load(sab, 0)"), 0b1100 as f64);
+        assert_eq!(run_num(&mut i, "Atomics.xor(sab, 0, 0b1111)"), 0b1100 as f64);
+        assert_eq!(run_num(&mut i, "Atomics.load(sab, 0)"), 0b0011 as f64);
+        run_num(&mut i, "Atomics.store(sab, 0, 7);");
+        assert_eq!(run_num(&mut i, "Atomics.exchange(sab, 0, 99)"), 7.0);
+        assert_eq!(run_num(&mut i, "Atomics.load(sab, 0)"), 99.0);
+    }
+
+    #[test]
+    fn atomics_compare_exchange_swaps_only_on_match() {
+        let mut i = atomics_interp();
+        run_num(&mut i, "globalThis.sab = new SharedArrayBuffer(8);");
+        run_num(&mut i, "Atomics.store(sab, 0, 5);");
+        // Match → swap, returns old.
+        assert_eq!(run_num(&mut i, "Atomics.compareExchange(sab, 0, 5, 10)"), 5.0);
+        assert_eq!(run_num(&mut i, "Atomics.load(sab, 0)"), 10.0);
+        // No match → no swap, returns current.
+        assert_eq!(run_num(&mut i, "Atomics.compareExchange(sab, 0, 999, 0)"), 10.0);
+        assert_eq!(run_num(&mut i, "Atomics.load(sab, 0)"), 10.0);
+    }
+
+    #[test]
+    fn atomics_is_lock_free() {
+        let mut i = atomics_interp();
+        assert_eq!(run_str(&mut i, "String(Atomics.isLockFree(4))"), "true");
+        assert_eq!(run_str(&mut i, "String(Atomics.isLockFree(1))"), "true");
+        assert_eq!(run_str(&mut i, "String(Atomics.isLockFree(2))"), "true");
+        assert_eq!(run_str(&mut i, "String(Atomics.isLockFree(8))"), "true");
+        assert_eq!(run_str(&mut i, "String(Atomics.isLockFree(3))"), "false");
+        assert_eq!(run_str(&mut i, "String(Atomics.isLockFree(0))"), "false");
+    }
+
+    #[test]
+    fn atomics_wait_not_equal_returns_immediately() {
+        let mut i = atomics_interp();
+        // wait is allowed to run if the value mismatches even on a can-block
+        // agent; not-equal is decided BEFORE the can-block check is reached in
+        // practice — but to be safe, exercise on a blockable agent.
+        set_agent_can_block(true);
+        run_num(&mut i, "globalThis.sab = new SharedArrayBuffer(8);");
+        run_num(&mut i, "Atomics.store(sab, 0, 5);");
+        // Expected 999 != actual 5 → "not-equal", no blocking.
+        assert_eq!(
+            run_str(&mut i, "Atomics.wait(sab, 0, 999, 10000)"),
+            "not-equal"
+        );
+        set_agent_can_block(false);
+    }
+
+    #[test]
+    fn atomics_wait_throws_on_main_thread() {
+        let mut i = atomics_interp();
+        // Default agent (this test thread) cannot block → wait throws TypeError
+        // (§25.4.3.14 step 6) when the value MATCHES (would otherwise block).
+        set_agent_can_block(false);
+        run_num(&mut i, "globalThis.sab = new SharedArrayBuffer(8);");
+        run_num(&mut i, "Atomics.store(sab, 0, 0);");
+        let r = i
+            .run_completion_value(
+                "(function(){ try { var w = Atomics.wait(sab, 0, 0, 100); return 'no-throw:' + w; } \
+                 catch (e) { return (e && e.name) ? e.name : ('threw:' + String(e)); } })()",
+            )
+            .expect("script completes")
+            .to_display_string();
+        assert_eq!(
+            r, "TypeError",
+            "Atomics.wait on a non-blockable agent must throw TypeError (got {r:?})"
+        );
+    }
+
+    #[test]
+    fn atomics_wait_times_out_when_value_matches() {
+        let mut i = atomics_interp();
+        set_agent_can_block(true);
+        run_num(&mut i, "globalThis.sab = new SharedArrayBuffer(8);");
+        run_num(&mut i, "Atomics.store(sab, 0, 0);");
+        // Matches → blocks; with no notifier and a short timeout → "timed-out".
+        assert_eq!(run_str(&mut i, "Atomics.wait(sab, 0, 0, 20)"), "timed-out");
+        set_agent_can_block(false);
+    }
+
+    #[test]
+    fn atomics_notify_with_no_waiters_returns_zero() {
+        let mut i = atomics_interp();
+        run_num(&mut i, "globalThis.sab = new SharedArrayBuffer(8);");
+        assert_eq!(run_num(&mut i, "Atomics.notify(sab, 0)"), 0.0);
+        assert_eq!(run_num(&mut i, "Atomics.notify(sab, 0, 5)"), 0.0);
+    }
+
+    #[test]
+    fn atomics_wait_async_shapes() {
+        let mut i = atomics_interp();
+        run_num(&mut i, "globalThis.sab = new SharedArrayBuffer(8);");
+        run_num(&mut i, "Atomics.store(sab, 0, 1);");
+        // Mismatch → {async:false, value:"not-equal"}.
+        assert_eq!(
+            run_str(&mut i, "Atomics.waitAsync(sab, 0, 2).async ? 'a' : 'sync'"),
+            "sync"
+        );
+        assert_eq!(
+            run_str(&mut i, "Atomics.waitAsync(sab, 0, 2).value"),
+            "not-equal"
+        );
+        // Match + zero timeout → {async:false, value:"timed-out"}.
+        assert_eq!(
+            run_str(&mut i, "Atomics.waitAsync(sab, 0, 1, 0).async ? 'a' : 'sync'"),
+            "sync"
+        );
+        assert_eq!(
+            run_str(&mut i, "Atomics.waitAsync(sab, 0, 1, 0).value"),
+            "timed-out"
+        );
+        // Match + positive timeout → {async:true, value:<promise>}.
+        assert_eq!(
+            run_str(&mut i, "Atomics.waitAsync(sab, 0, 1, 5000).async ? 'async' : 's'"),
+            "async"
+        );
+        assert_eq!(
+            run_str(
+                &mut i,
+                "typeof Atomics.waitAsync(sab, 0, 1, 5000).value.then"
+            ),
+            "function",
+            "the blocking branch's value is a thenable promise"
+        );
+    }
+
+    #[test]
+    fn atomics_wait_async_promise_resolves_on_notify() {
+        let mut i = atomics_interp();
+        run_num(&mut i, "globalThis.sab = new SharedArrayBuffer(8);");
+        run_num(&mut i, "Atomics.store(sab, 0, 42);");
+        // Start an async wait; capture the resolution via a .then side effect.
+        run_num(
+            &mut i,
+            "globalThis.result = 'pending'; \
+             Atomics.waitAsync(sab, 0, 42, 60000).value.then(function(v){ globalThis.result = v; });",
+        );
+        assert_eq!(run_str(&mut i, "globalThis.result"), "pending");
+        // Notify → waiter ready; the host drain resolves the promise; microtasks
+        // run the .then.
+        assert_eq!(run_num(&mut i, "Atomics.notify(sab, 0)"), 1.0, "woke 1");
+        let resolved = drain_atomics_async(&mut i);
+        assert!(resolved, "drain resolved the waitAsync promise");
+        i.drain_microtasks();
+        assert_eq!(
+            run_str(&mut i, "globalThis.result"),
+            "ok",
+            "notify resolves the waitAsync promise to 'ok'"
         );
     }
 

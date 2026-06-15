@@ -92,8 +92,9 @@ pub use interp::{
     NativeFnBody, PROTO_KEY, TierGuard, Value, current_native_this, diag_log, forced_tier,
     gc_enabled, gc_live_object_count, gc_register_array, gc_register_object, gen_gc_enabled,
     is_symbol_key, jit_bank_registry_len,
-    js_stack_snapshot, native_ctor, native_ctor_pure, native_fn, native_fn_n, native_fn_with_interp,
-    parse_bigint_from_string, register_jit_bank,
+    js_stack_snapshot, make_pending_promise, make_settled_promise, make_temporal_error, native_ctor,
+    native_ctor_pure, native_fn, native_fn_n, native_fn_with_interp, parse_bigint_from_string,
+    register_jit_bank, resolve_promise,
     reset_bc_fn_cache, reset_t2_exec_count, set_force_tier, t2_exec_count, t2_heap_enabled,
 };
 pub use lexer::{Keyword, Punct, Token, TokenKind, tokenize};
