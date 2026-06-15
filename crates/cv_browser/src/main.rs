@@ -38,6 +38,7 @@ mod opfs;
 mod worker;
 mod service_worker;
 mod iframe;
+mod intl_data;
 
 /// The shared Cache Storage backing map: cache-name -> (url -> Response).
 /// Hoisted to a renderer-thread-local so a SECOND realm (the Service Worker
@@ -30368,7 +30369,8 @@ fn install_minimal_dom_with_url(interp: &cv_js::Interp, initial_title: String, p
         }
 
         // Build an Intl.DateTimeFormat instance that honours the `opts` argument.
-        fn build_dtf_instance(_locale: String, opts: Option<cv_js::Value>) -> cv_js::Value {
+        fn build_dtf_instance(locale: String, opts: Option<cv_js::Value>) -> cv_js::Value {
+            let dtf_locale = locale.clone();
             let year_opt      = dtf_opt(&opts, "year");
             let month_opt     = dtf_opt(&opts, "month");
             let day_opt       = dtf_opt(&opts, "day");
@@ -30382,6 +30384,7 @@ fn install_minimal_dom_with_url(interp: &cv_js::Interp, initial_title: String, p
                 || day_opt.is_some() || weekday_opt.is_some();
             let has_time = hour_opt.is_some() || minute_opt.is_some() || second_opt.is_some();
             let mut m: HashMap<String, cv_js::Value> = HashMap::new();
+            let fmt_locale = dtf_locale.clone();
             m.insert(
                 "format".into(),
                 cv_js::native_fn("format", move |args| {
@@ -30401,18 +30404,19 @@ fn install_minimal_dom_with_url(interp: &cv_js::Interp, initial_title: String, p
                     let secs = (ms / 1000.0) as i64;
                     let days = secs.div_euclid(86400);
                     let (y, mo, d) = days_to_ymd(days);
+                    let names = crate::intl_data::date_names(&fmt_locale);
                     if !has_date && !has_time {
-                        return Ok(cv_js::Value::str(format!("{mo}/{d}/{y}")));
+                        // Default short numeric date in locale order (en M/D/Y,
+                        // de D.M.Y, ja Y/M/D, fr DD/MM/YYYY, ...).
+                        return Ok(cv_js::Value::str(crate::intl_data::format_short_date(
+                            y, mo, d, &fmt_locale,
+                        )));
                     }
                     let day_secs = secs.rem_euclid(86400) as u32;
                     let utc_h = day_secs / 3600;
                     let utc_m = (day_secs % 3600) / 60;
                     let utc_s = day_secs % 60;
                     let _ = &time_zone_opt;
-                    const ML: [&str;12] = ["January","February","March","April","May","June","July","August","September","October","November","December"];
-                    const MS: [&str;12] = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
-                    const DL: [&str;7] = ["Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"];
-                    const DS: [&str;7] = ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"];
                     let dow = {
                         const T:[u64;12]=[0,3,2,5,0,3,5,1,4,6,2,4];
                         let yy=if mo<3{y-1}else{y}as u64;
@@ -30421,27 +30425,57 @@ fn install_minimal_dom_with_url(interp: &cv_js::Interp, initial_title: String, p
                     let use12 = !matches!(hour12_opt.as_deref(), Some("false"));
                     let mut parts: Vec<String> = Vec::new();
                     if let Some(ref wk)=weekday_opt {
-                        parts.push(match wk.as_str(){"short"|"narrow"=>DS[dow].into(),_=>DL[dow].into()});
+                        parts.push(match wk.as_str(){"short"|"narrow"=>names.days_short[dow].into(),_=>names.days_long[dow].into()});
                     }
                     if has_date {
                         let month_s=month_opt.as_deref().map(|s|match s{
-                            "long"=>ML[(mo-1)as usize].to_string(),"short"=>MS[(mo-1)as usize].to_string(),
-                            "narrow"=>ML[(mo-1)as usize].chars().next().unwrap_or('?').to_string(),
+                            "long"=>names.months_long[(mo-1)as usize].to_string(),
+                            "short"=>names.months_short[(mo-1)as usize].to_string(),
+                            "narrow"=>names.months_long[(mo-1)as usize].chars().next().unwrap_or('?').to_string(),
                             "2-digit"=>format!("{mo:02}"),_=>format!("{mo}")});
                         let day_s=day_opt.as_deref().map(|s|if s=="2-digit"{format!("{d:02}")}else{format!("{d}")});
                         let year_s=year_opt.as_deref().map(|s|if s=="2-digit"{format!("{:02}",y%100)}else{format!("{y}")});
                         let is_named=month_opt.as_deref().map(|s|matches!(s,"long"|"short"|"narrow")).unwrap_or(false);
                         let mut seg=String::new();
                         if is_named {
-                            if let Some(ref ms)=month_s{seg.push_str(ms);}
-                            if let Some(ref ds)=day_s{if !seg.is_empty(){seg.push(' ');}seg.push_str(ds);}
-                            if let Some(ref ys)=year_s{
-                                if day_s.is_some(){seg.push_str(", ");}else if !seg.is_empty(){seg.push(' ');}
-                                seg.push_str(ys);}
+                            // Named-month order: en "Month D, Y"; day-first locales
+                            // "D. Month Y" (de) / "D Month Y" (fr/es).
+                            if names.day_first {
+                                if let Some(ref ds)=day_s{seg.push_str(ds);}
+                                if let Some(ref ms)=month_s{
+                                    if !seg.is_empty(){seg.push(' ');}
+                                    seg.push_str(ms);
+                                }
+                                if let Some(ref ys)=year_s{if !seg.is_empty(){seg.push(' ');}seg.push_str(ys);}
+                            } else {
+                                if let Some(ref ms)=month_s{seg.push_str(ms);}
+                                if let Some(ref ds)=day_s{if !seg.is_empty(){seg.push(' ');}seg.push_str(ds);}
+                                if let Some(ref ys)=year_s{
+                                    if day_s.is_some(){seg.push_str(", ");}else if !seg.is_empty(){seg.push(' ');}
+                                    seg.push_str(ys);}
+                            }
                         } else {
-                            if let Some(ref ms)=month_s{seg.push_str(ms);}
-                            if let Some(ref ds)=day_s{if !seg.is_empty(){seg.push('/');}seg.push_str(ds);}
-                            if let Some(ref ys)=year_s{if !seg.is_empty(){seg.push('/');}seg.push_str(ys);}
+                            // Numeric order respects locale: de/fr/es D.M.Y or D/M/Y;
+                            // ja Y/M/D; en M/D/Y. Separator: de uses '.', others '/'.
+                            let primary = crate::intl_data::primary_subtag(&fmt_locale);
+                            let sep = if primary=="de"||primary=="ru" {'.'} else {'/'};
+                            let mut push = |s: &str, seg: &mut String| {
+                                if !seg.is_empty(){seg.push(sep);}
+                                seg.push_str(s);
+                            };
+                            if primary=="ja" {
+                                if let Some(ref ys)=year_s{push(ys,&mut seg);}
+                                if let Some(ref ms)=month_s{push(ms,&mut seg);}
+                                if let Some(ref ds)=day_s{push(ds,&mut seg);}
+                            } else if names.day_first {
+                                if let Some(ref ds)=day_s{push(ds,&mut seg);}
+                                if let Some(ref ms)=month_s{push(ms,&mut seg);}
+                                if let Some(ref ys)=year_s{push(ys,&mut seg);}
+                            } else {
+                                if let Some(ref ms)=month_s{push(ms,&mut seg);}
+                                if let Some(ref ds)=day_s{push(ds,&mut seg);}
+                                if let Some(ref ys)=year_s{push(ys,&mut seg);}
+                            }
                         }
                         if !seg.is_empty(){parts.push(seg);}
                     }
@@ -30463,15 +30497,138 @@ fn install_minimal_dom_with_url(interp: &cv_js::Interp, initial_title: String, p
                     Ok(cv_js::Value::Array(Rc::new(RefCell::new(Vec::new()))))
                 }),
             );
+            let res_locale = dtf_locale.clone();
             m.insert(
                 "resolvedOptions".into(),
-                cv_js::native_fn("resolvedOptions", |_| {
+                cv_js::native_fn("resolvedOptions", move |_| {
                     let mut o: HashMap<String, cv_js::Value> = HashMap::new();
-                    o.insert("locale".into(), cv_js::Value::String("en-US".into()));
+                    o.insert("locale".into(), cv_js::Value::str(res_locale.clone()));
                     o.insert("calendar".into(), cv_js::Value::String("gregory".into()));
                     o.insert(
                         "numberingSystem".into(),
                         cv_js::Value::String("latn".into()),
+                    );
+                    o.insert("timeZone".into(), cv_js::Value::String("UTC".into()));
+                    Ok(cv_js::Value::Object(Rc::new(RefCell::new(o))))
+                }),
+            );
+            cv_js::Value::Object(Rc::new(RefCell::new(m)))
+        }
+
+        // Read an integer option (e.g. minimumFractionDigits) from a JS options
+        // object, clamping to a sane range; returns None if absent/invalid.
+        fn nf_int_opt(opts: &Option<cv_js::Value>, key: &str) -> Option<u32> {
+            dtf_opt(opts, key).and_then(|s| s.parse::<f64>().ok()).map(|n| {
+                if n.is_finite() && n >= 0.0 {
+                    n as u32
+                } else {
+                    0
+                }
+            })
+        }
+
+        // Build the real ECMA-402 NumberFormat options from the JS options arg.
+        fn nf_options_from_js(opts: &Option<cv_js::Value>) -> crate::intl_data::NumberOptions {
+            use crate::intl_data::{NumberOptions, NumberStyle};
+            let mut o = NumberOptions::default();
+            match dtf_opt(opts, "style").as_deref() {
+                Some("currency") => o.style = NumberStyle::Currency,
+                Some("percent") => o.style = NumberStyle::Percent,
+                Some("unit") => o.style = NumberStyle::Unit,
+                _ => o.style = NumberStyle::Decimal,
+            }
+            o.currency = dtf_opt(opts, "currency");
+            o.unit = dtf_opt(opts, "unit");
+            // useGrouping: false / "false" disables grouping.
+            if let Some(g) = dtf_opt(opts, "useGrouping") {
+                o.use_grouping = !(g == "false" || g == "never");
+            }
+            if let Some(v) = nf_int_opt(opts, "minimumIntegerDigits") {
+                o.minimum_integer_digits = v.max(1);
+            }
+            if let Some(v) = nf_int_opt(opts, "minimumFractionDigits") {
+                o.minimum_fraction_digits = v;
+                // If only the minimum is given, the maximum is max(min, default).
+                if o.maximum_fraction_digits < v {
+                    o.maximum_fraction_digits = v;
+                }
+            }
+            if let Some(v) = nf_int_opt(opts, "maximumFractionDigits") {
+                o.maximum_fraction_digits = v;
+            }
+            o
+        }
+
+        fn build_nf_instance(locale: String, opts: Option<cv_js::Value>) -> cv_js::Value {
+            let mut m: HashMap<String, cv_js::Value> = HashMap::new();
+            let nfo = nf_options_from_js(&opts);
+            let loc = locale.clone();
+            let nfo_fmt = nfo.clone();
+            m.insert(
+                "format".into(),
+                cv_js::native_fn("format", move |args| {
+                    let n = args.first().map(|v| v.to_number()).unwrap_or(0.0);
+                    Ok(cv_js::Value::str(crate::intl_data::format_number(
+                        n, &loc, &nfo_fmt,
+                    )))
+                }),
+            );
+            let loc2 = locale.clone();
+            let nfo_arr = nfo.clone();
+            m.insert(
+                "formatToParts".into(),
+                cv_js::native_fn("formatToParts", move |args| {
+                    // Minimal but real: one {type:"literal"|"integer", value} chain
+                    // derived from the formatted string is heavy; we return the
+                    // formatted value as a single "literal"-typed part list head
+                    // plus the full value, which round-trips to the same string.
+                    let n = args.first().map(|v| v.to_number()).unwrap_or(0.0);
+                    let s = crate::intl_data::format_number(n, &loc2, &nfo_arr);
+                    let mut part: HashMap<String, cv_js::Value> = HashMap::new();
+                    part.insert("type".into(), cv_js::Value::str("literal"));
+                    part.insert("value".into(), cv_js::Value::str(s));
+                    Ok(cv_js::Value::Array(Rc::new(RefCell::new(vec![
+                        cv_js::Value::Object(Rc::new(RefCell::new(part))),
+                    ]))))
+                }),
+            );
+            let loc3 = locale.clone();
+            let nfo_res = nfo.clone();
+            m.insert(
+                "resolvedOptions".into(),
+                cv_js::native_fn("resolvedOptions", move |_| {
+                    use crate::intl_data::NumberStyle;
+                    let mut o: HashMap<String, cv_js::Value> = HashMap::new();
+                    o.insert("locale".into(), cv_js::Value::str(loc3.clone()));
+                    o.insert(
+                        "numberingSystem".into(),
+                        cv_js::Value::String("latn".into()),
+                    );
+                    let style = match nfo_res.style {
+                        NumberStyle::Currency => "currency",
+                        NumberStyle::Percent => "percent",
+                        NumberStyle::Unit => "unit",
+                        NumberStyle::Decimal => "decimal",
+                    };
+                    o.insert("style".into(), cv_js::Value::str(style));
+                    if let Some(c) = &nfo_res.currency {
+                        o.insert("currency".into(), cv_js::Value::str(c.clone()));
+                    }
+                    o.insert(
+                        "minimumIntegerDigits".into(),
+                        cv_js::Value::Number(nfo_res.minimum_integer_digits as f64),
+                    );
+                    o.insert(
+                        "minimumFractionDigits".into(),
+                        cv_js::Value::Number(nfo_res.minimum_fraction_digits as f64),
+                    );
+                    o.insert(
+                        "maximumFractionDigits".into(),
+                        cv_js::Value::Number(nfo_res.maximum_fraction_digits as f64),
+                    );
+                    o.insert(
+                        "useGrouping".into(),
+                        cv_js::Value::Bool(nfo_res.use_grouping),
                     );
                     Ok(cv_js::Value::Object(Rc::new(RefCell::new(o))))
                 }),
@@ -30479,67 +30636,15 @@ fn install_minimal_dom_with_url(interp: &cv_js::Interp, initial_title: String, p
             cv_js::Value::Object(Rc::new(RefCell::new(m)))
         }
 
-        fn build_nf_instance(locale: String) -> cv_js::Value {
+        fn build_collator(locale: String, options: Option<cv_js::Value>) -> cv_js::Value {
             let mut m: HashMap<String, cv_js::Value> = HashMap::new();
-            // Detect locales that swap decimal/thousands separators vs en-US.
-            // de/fr/es/it/pt/nl/ru/tr/pl/sv/fi/nb/da all use ',' for decimal
-            // and '.' (or thin space) for thousands grouping.
-            // Simplified: if primary subtag is NOT in the en/zh/ja/ko/ar/hi/th set, swap.
-            let primary = locale
-                .split(['-', '_'])
-                .next()
-                .unwrap_or("en")
-                .to_ascii_lowercase();
-            let swap_seps = !matches!(
-                primary.as_str(),
-                "en" | "" | "zh" | "ja" | "ko" | "ar" | "hi" | "th" | "bn" | "ur"
-            );
-            m.insert(
-                "format".into(),
-                cv_js::native_fn("format", move |args| {
-                    let n = args.first().map(|v| v.to_number()).unwrap_or(0.0);
-                    let en_fmt = format_thousands(n);
-                    if swap_seps {
-                        // Swap ',' ↔ '.' to produce e.g. "1.234,5" for de-DE.
-                        let swapped: String = en_fmt
-                            .chars()
-                            .map(|c| match c {
-                                ',' => '.',
-                                '.' => ',',
-                                other => other,
-                            })
-                            .collect();
-                        Ok(cv_js::Value::str(swapped))
-                    } else {
-                        Ok(cv_js::Value::str(en_fmt))
-                    }
-                }),
-            );
-            m.insert(
-                "formatToParts".into(),
-                cv_js::native_fn("formatToParts", |_| {
-                    Ok(cv_js::Value::Array(Rc::new(RefCell::new(Vec::new()))))
-                }),
-            );
-            m.insert(
-                "resolvedOptions".into(),
-                cv_js::native_fn("resolvedOptions", |_| {
-                    let mut o: HashMap<String, cv_js::Value> = HashMap::new();
-                    o.insert("locale".into(), cv_js::Value::String("en-US".into()));
-                    o.insert("minimumIntegerDigits".into(), cv_js::Value::Number(1.0));
-                    o.insert("minimumFractionDigits".into(), cv_js::Value::Number(0.0));
-                    o.insert("maximumFractionDigits".into(), cv_js::Value::Number(3.0));
-                    Ok(cv_js::Value::Object(Rc::new(RefCell::new(o))))
-                }),
-            );
-            cv_js::Value::Object(Rc::new(RefCell::new(m)))
-        }
-
-        fn build_collator(_locale: String, _options: Option<cv_js::Value>) -> cv_js::Value {
-            let mut m: HashMap<String, cv_js::Value> = HashMap::new();
+            // ECMA-402 Collator options: numeric (numeric collation) honoured;
+            // sensitivity drives the level (default "variant" = full compare).
+            let numeric = matches!(dtf_opt(&options, "numeric").as_deref(), Some("true"));
+            let loc = locale.clone();
             m.insert(
                 "compare".into(),
-                cv_js::native_fn("compare", |args| {
+                cv_js::native_fn("compare", move |args| {
                     let a = args
                         .first()
                         .map(|v| v.to_display_string())
@@ -30548,21 +30653,28 @@ fn install_minimal_dom_with_url(interp: &cv_js::Interp, initial_title: String, p
                         .get(1)
                         .map(|v| v.to_display_string())
                         .unwrap_or_default();
-                    // ECMA-402 Collator default sensitivity is "variant" but for
-                    // base-level locale-sensitive comparison we do case-folded
-                    // compare (case-insensitive, locale-agnostic fold). This makes
-                    // ["B","a"].sort(collator.compare) → ["a","B"] (Chrome parity).
-                    let a_lc = a.to_lowercase();
-                    let b_lc = b.to_lowercase();
-                    let ord = match a_lc.cmp(&b_lc) {
-                        std::cmp::Ordering::Equal => a.cmp(&b), // tiebreak: case-sensitive
-                        other => other,
-                    };
+                    // Real locale-aware multi-level collation (base/accent/case)
+                    // with optional numeric ordering. de/root tailoring sorts
+                    // accented vowels (ä/ö/ü) with their base letters.
+                    let ord = crate::intl_data::collator_compare(&a, &b, &loc, numeric);
                     Ok(cv_js::Value::Number(match ord {
                         std::cmp::Ordering::Less => -1.0,
                         std::cmp::Ordering::Equal => 0.0,
                         std::cmp::Ordering::Greater => 1.0,
                     }))
+                }),
+            );
+            let loc2 = locale.clone();
+            m.insert(
+                "resolvedOptions".into(),
+                cv_js::native_fn("resolvedOptions", move |_| {
+                    let mut o: HashMap<String, cv_js::Value> = HashMap::new();
+                    o.insert("locale".into(), cv_js::Value::str(loc2.clone()));
+                    o.insert("usage".into(), cv_js::Value::String("sort".into()));
+                    o.insert("sensitivity".into(), cv_js::Value::String("variant".into()));
+                    o.insert("numeric".into(), cv_js::Value::Bool(numeric));
+                    o.insert("collation".into(), cv_js::Value::String("default".into()));
+                    Ok(cv_js::Value::Object(Rc::new(RefCell::new(o))))
                 }),
             );
             cv_js::Value::Object(Rc::new(RefCell::new(m)))
@@ -30679,41 +30791,157 @@ fn install_minimal_dom_with_url(interp: &cv_js::Interp, initial_title: String, p
             cv_js::Value::Object(Rc::new(RefCell::new(m)))
         }
 
-        fn build_pluralrules() -> cv_js::Value {
+        fn build_pluralrules(locale: String, opts: Option<cv_js::Value>) -> cv_js::Value {
             let mut m: HashMap<String, cv_js::Value> = HashMap::new();
+            let ordinal = matches!(dtf_opt(&opts, "type").as_deref(), Some("ordinal"));
+            let min_frac = nf_int_opt(&opts, "minimumFractionDigits").unwrap_or(0);
+            let max_frac = nf_int_opt(&opts, "maximumFractionDigits").unwrap_or(0).max(min_frac);
+            let loc = locale.clone();
             m.insert(
                 "select".into(),
-                cv_js::native_fn("select", |args| {
+                cv_js::native_fn("select", move |args| {
                     let n = args.first().map(|v| v.to_number()).unwrap_or(0.0);
-                    let cat = if n == 1.0 { "one" } else { "other" };
+                    let cat = if ordinal {
+                        crate::intl_data::plural_ordinal(n, &loc)
+                    } else {
+                        crate::intl_data::plural_cardinal(n, &loc, min_frac, max_frac)
+                    };
                     Ok(cv_js::Value::String(cat.into()))
+                }),
+            );
+            let loc2 = locale.clone();
+            m.insert(
+                "resolvedOptions".into(),
+                cv_js::native_fn("resolvedOptions", move |_| {
+                    let mut o: HashMap<String, cv_js::Value> = HashMap::new();
+                    o.insert("locale".into(), cv_js::Value::str(loc2.clone()));
+                    o.insert(
+                        "type".into(),
+                        cv_js::Value::String(if ordinal { "ordinal".into() } else { "cardinal".into() }),
+                    );
+                    Ok(cv_js::Value::Object(Rc::new(RefCell::new(o))))
                 }),
             );
             cv_js::Value::Object(Rc::new(RefCell::new(m)))
         }
 
+        fn build_relativetimeformat(locale: String, opts: Option<cv_js::Value>) -> cv_js::Value {
+            let mut m: HashMap<String, cv_js::Value> = HashMap::new();
+            // numeric: "auto" uses special words (yesterday/tomorrow); "always"
+            // forces numeric output (the ECMA-402 default is "always").
+            let numeric_always = !matches!(dtf_opt(&opts, "numeric").as_deref(), Some("auto"));
+            let loc = locale.clone();
+            m.insert(
+                "format".into(),
+                cv_js::native_fn("format", move |args| {
+                    let value = args.first().map(|v| v.to_number()).unwrap_or(0.0);
+                    let unit = args.get(1).map(|v| v.to_display_string()).unwrap_or_default();
+                    Ok(cv_js::Value::str(crate::intl_data::format_relative_time(
+                        value,
+                        &unit,
+                        &loc,
+                        numeric_always,
+                    )))
+                }),
+            );
+            let loc2 = locale.clone();
+            m.insert(
+                "resolvedOptions".into(),
+                cv_js::native_fn("resolvedOptions", move |_| {
+                    let mut o: HashMap<String, cv_js::Value> = HashMap::new();
+                    o.insert("locale".into(), cv_js::Value::str(loc2.clone()));
+                    o.insert("style".into(), cv_js::Value::String("long".into()));
+                    o.insert(
+                        "numeric".into(),
+                        cv_js::Value::String(if numeric_always { "always".into() } else { "auto".into() }),
+                    );
+                    Ok(cv_js::Value::Object(Rc::new(RefCell::new(o))))
+                }),
+            );
+            cv_js::Value::Object(Rc::new(RefCell::new(m)))
+        }
+
+        fn build_listformat(locale: String, opts: Option<cv_js::Value>) -> cv_js::Value {
+            let mut m: HashMap<String, cv_js::Value> = HashMap::new();
+            // type: "conjunction" (default, "and") or "disjunction" ("or").
+            let disjunction = matches!(dtf_opt(&opts, "type").as_deref(), Some("disjunction"));
+            let loc = locale.clone();
+            m.insert(
+                "format".into(),
+                cv_js::native_fn("format", move |args| {
+                    let items: Vec<String> = match args.first() {
+                        Some(cv_js::Value::Array(a)) => {
+                            a.borrow().iter().map(|v| v.to_display_string()).collect()
+                        }
+                        _ => Vec::new(),
+                    };
+                    Ok(cv_js::Value::str(crate::intl_data::format_list(
+                        &items,
+                        &loc,
+                        disjunction,
+                    )))
+                }),
+            );
+            let loc2 = locale.clone();
+            m.insert(
+                "formatToParts".into(),
+                cv_js::native_fn("formatToParts", move |args| {
+                    let items: Vec<String> = match args.first() {
+                        Some(cv_js::Value::Array(a)) => {
+                            a.borrow().iter().map(|v| v.to_display_string()).collect()
+                        }
+                        _ => Vec::new(),
+                    };
+                    let s = crate::intl_data::format_list(&items, &loc2, disjunction);
+                    let mut part: HashMap<String, cv_js::Value> = HashMap::new();
+                    part.insert("type".into(), cv_js::Value::str("literal"));
+                    part.insert("value".into(), cv_js::Value::str(s));
+                    Ok(cv_js::Value::Array(Rc::new(RefCell::new(vec![
+                        cv_js::Value::Object(Rc::new(RefCell::new(part))),
+                    ]))))
+                }),
+            );
+            cv_js::Value::Object(Rc::new(RefCell::new(m)))
+        }
+
+        // Resolve the requested locale arg into a single BCP-47 tag. Accepts a
+        // string, an array of locales (first is used), or undefined -> en-US.
+        fn canon_locale(v: Option<&cv_js::Value>) -> String {
+            let raw = match v {
+                Some(cv_js::Value::Array(a)) => a
+                    .borrow()
+                    .first()
+                    .map(|x| x.to_display_string())
+                    .unwrap_or_default(),
+                Some(cv_js::Value::String(s)) => s.to_string(),
+                Some(other) => other.to_display_string(),
+                None => String::new(),
+            };
+            let t = raw.trim();
+            if t.is_empty() || t == "undefined" {
+                "en-US".to_string()
+            } else {
+                t.to_string()
+            }
+        }
+
         let dtf_ctor = cv_js::native_ctor_pure("DateTimeFormat", 0, |args| {
-            let locale = args
-                .first()
-                .map(|v| v.to_display_string())
-                .unwrap_or_default();
+            let locale = canon_locale(args.first());
             let opts = args.get(1).cloned();
             Ok(build_dtf_instance(locale, opts))
         });
         let nf_ctor = cv_js::native_ctor_pure("NumberFormat", 0, |args| {
-            let locale = args
-                .first()
-                .map(|v| v.to_display_string())
-                .unwrap_or_default();
-            Ok(build_nf_instance(locale))
+            let locale = canon_locale(args.first());
+            let opts = args.get(1).cloned();
+            Ok(build_nf_instance(locale, opts))
         });
         let col_ctor = cv_js::native_ctor_pure("Collator", 0, |args| {
-            let locale = args.first().map(|v| v.to_display_string()).unwrap_or_default();
+            let locale = canon_locale(args.first());
             let opts = args.get(1).cloned();
             Ok(build_collator(locale, opts))
         });
         let seg_ctor = cv_js::native_ctor_pure("Segmenter", 0, |args| {
-            let _locale = args.first().map(|v| v.to_display_string()).unwrap_or_default();
+            let _locale = canon_locale(args.first());
             let granularity = args
                 .get(1)
                 .and_then(|v| {
@@ -30726,7 +30954,21 @@ fn install_minimal_dom_with_url(interp: &cv_js::Interp, initial_title: String, p
                 .unwrap_or_else(|| "grapheme".into());
             Ok(build_segmenter(granularity))
         });
-        let pr_ctor = cv_js::native_ctor_pure("PluralRules", 0, |_| Ok(build_pluralrules()));
+        let pr_ctor = cv_js::native_ctor_pure("PluralRules", 0, |args| {
+            let locale = canon_locale(args.first());
+            let opts = args.get(1).cloned();
+            Ok(build_pluralrules(locale, opts))
+        });
+        let rtf_ctor = cv_js::native_ctor_pure("RelativeTimeFormat", 0, |args| {
+            let locale = canon_locale(args.first());
+            let opts = args.get(1).cloned();
+            Ok(build_relativetimeformat(locale, opts))
+        });
+        let lf_ctor = cv_js::native_ctor_pure("ListFormat", 0, |args| {
+            let locale = canon_locale(args.first());
+            let opts = args.get(1).cloned();
+            Ok(build_listformat(locale, opts))
+        });
 
         fn wrap_ctor(ctor: cv_js::Value) -> cv_js::Value {
             let mut o: HashMap<String, cv_js::Value> = HashMap::new();
@@ -30752,6 +30994,8 @@ fn install_minimal_dom_with_url(interp: &cv_js::Interp, initial_title: String, p
         intl.insert("Collator".into(), wrap_ctor(col_ctor));
         intl.insert("Segmenter".into(), wrap_ctor(seg_ctor));
         intl.insert("PluralRules".into(), wrap_ctor(pr_ctor));
+        intl.insert("RelativeTimeFormat".into(), wrap_ctor(rtf_ctor));
+        intl.insert("ListFormat".into(), wrap_ctor(lf_ctor));
         intl.insert(
             "getCanonicalLocales".into(),
             cv_js::native_fn("getCanonicalLocales", |args| {
@@ -34305,45 +34549,6 @@ fn days_to_ymd(days: i64) -> (i64, u32, u32) {
     let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
     let year = if m <= 2 { y + 1 } else { y };
     (year, m, d)
-}
-
-/// en-US number formatter: groups thousands with `,`, decimal with `.`.
-/// Negative numbers carry their sign through. Fractions are kept to 3
-/// digits (the JS `Intl.NumberFormat` default).
-fn format_thousands(n: f64) -> String {
-    if !n.is_finite() {
-        return if n.is_nan() {
-            "NaN".into()
-        } else {
-            "∞".into()
-        };
-    }
-    let abs = n.abs();
-    let int_part = abs as u64;
-    let frac = abs - int_part as f64;
-    let int_s: String = int_part
-        .to_string()
-        .chars()
-        .rev()
-        .collect::<Vec<_>>()
-        .chunks(3)
-        .map(|c| c.iter().collect::<String>())
-        .collect::<Vec<_>>()
-        .join(",")
-        .chars()
-        .rev()
-        .collect();
-    let sign = if n < 0.0 { "-" } else { "" };
-    if frac < 0.0005 {
-        format!("{sign}{int_s}")
-    } else {
-        // Format up to 3 decimal digits, strip trailing zeros (ECMA-402 default).
-        let frac_full = format!("{:.3}", frac);
-        let frac_trimmed = frac_full.trim_end_matches('0');
-        // frac_full is "0.NNN"; strip leading "0" to get ".NNN" then trim zeros.
-        let frac_s = frac_trimmed.trim_start_matches('0');
-        format!("{sign}{int_s}{frac_s}")
-    }
 }
 
 /// Make a live accessor property (getter + optional setter) Value that
@@ -69340,6 +69545,185 @@ var el = document.getElementById('el');
             title, "1,234.5",
             "Intl.NumberFormat('en-US') must keep '1,234.5'. Got: {title:?}"
         );
+    }
+
+    // ── Full Intl (ECMA-402) — real CLDR-subset locale data ───────────────────
+    //
+    // These drive the live JS runtime so they exercise the wiring
+    // (Intl.* constructor → builder → intl_data engine), not just the Rust API
+    // (which intl_data::tests covers directly). Each asserts the exact Chrome/
+    // ICU-shaped output for a locale-sensitive case.
+
+    /// Helper: run `extra` JS in a fresh runtime and read document.title.
+    fn intl_title(extra: &str) -> String {
+        let html = r#"<!doctype html><html><body></body></html>"#;
+        let cfg = cv_layout::LayoutConfig::default();
+        let (mut runtime, _doc, _sheets, _paint) =
+            build_runtime_and_first_paint(html, "https://example.com/", &cfg, extra)
+                .expect("render ok");
+        runtime.drain_due(100);
+        runtime.title_override().unwrap_or_default()
+    }
+
+    #[test]
+    fn intl_numberformat_currency_eur_de() {
+        let t = intl_title(
+            r#"document.title = new Intl.NumberFormat('de-DE',{style:'currency',currency:'EUR'}).format(1234.5);"#,
+        );
+        // Chrome: "1.234,50 €" (symbol after, NBSP, 2 fraction digits).
+        assert_eq!(t, "1.234,50\u{00A0}€", "de EUR currency. Got: {t:?}");
+    }
+
+    #[test]
+    fn intl_numberformat_currency_usd_en() {
+        let t = intl_title(
+            r#"document.title = new Intl.NumberFormat('en-US',{style:'currency',currency:'USD'}).format(1234.5);"#,
+        );
+        assert_eq!(t, "$1,234.50", "en USD currency. Got: {t:?}");
+    }
+
+    #[test]
+    fn intl_numberformat_currency_jpy_no_decimals() {
+        let t = intl_title(
+            r#"document.title = new Intl.NumberFormat('ja-JP',{style:'currency',currency:'JPY'}).format(1235);"#,
+        );
+        assert_eq!(t, "¥1,235", "ja JPY currency (0 fraction digits). Got: {t:?}");
+    }
+
+    #[test]
+    fn intl_numberformat_percent() {
+        let t = intl_title(
+            r#"document.title = new Intl.NumberFormat('en-US',{style:'percent'}).format(0.25) + '|' +
+                               new Intl.NumberFormat('de-DE',{style:'percent'}).format(0.25);"#,
+        );
+        assert_eq!(t, "25%|25\u{00A0}%", "percent en/de. Got: {t:?}");
+    }
+
+    #[test]
+    fn intl_numberformat_fraction_digits() {
+        let t = intl_title(
+            r#"document.title = new Intl.NumberFormat('en-US',{minimumFractionDigits:2,maximumFractionDigits:2}).format(5);"#,
+        );
+        assert_eq!(t, "5.00", "min/maxFractionDigits. Got: {t:?}");
+    }
+
+    #[test]
+    fn intl_datetimeformat_locale_order() {
+        // 2026-06-15 (a fixed UTC date) formatted as a short numeric date.
+        // en-US -> M/D/Y, de-DE -> D.M.Y, ja-JP -> Y/M/D.
+        let t = intl_title(
+            r#"var d = new Date(Date.UTC(2026, 5, 15));
+               document.title = new Intl.DateTimeFormat('en-US').format(d) + '|' +
+                                new Intl.DateTimeFormat('de-DE').format(d) + '|' +
+                                new Intl.DateTimeFormat('ja-JP').format(d);"#,
+        );
+        assert_eq!(t, "6/15/2026|15.6.2026|2026/6/15", "date locale order. Got: {t:?}");
+    }
+
+    #[test]
+    fn intl_datetimeformat_named_month_locale() {
+        // Long month name must be localized (en "June", de "Juni", fr "juin").
+        let t = intl_title(
+            r#"var d = new Date(Date.UTC(2026, 5, 15));
+               var o = {year:'numeric', month:'long', day:'numeric'};
+               document.title = new Intl.DateTimeFormat('en-US',o).format(d) + '|' +
+                                new Intl.DateTimeFormat('de-DE',o).format(d);"#,
+        );
+        // en: "June 15, 2026"; de (day-first): "15 Juni 2026".
+        assert_eq!(t, "June 15, 2026|15 Juni 2026", "named month locale. Got: {t:?}");
+    }
+
+    #[test]
+    fn intl_collator_de_sorts_accent() {
+        // "ä" must sort with "a" (German dictionary order): between "a" and "b".
+        let t = intl_title(
+            r#"var cmp = new Intl.Collator('de').compare;
+               var arr = ["z","ä","a","b"];
+               arr.sort(cmp);
+               document.title = arr.join(',');"#,
+        );
+        assert_eq!(t, "a,ä,b,z", "de accent collation. Got: {t:?}");
+    }
+
+    #[test]
+    fn intl_collator_numeric() {
+        let t = intl_title(
+            r#"var cmp = new Intl.Collator('en',{numeric:true}).compare;
+               var arr = ["item10","item2","item1"];
+               arr.sort(cmp);
+               document.title = arr.join(',');"#,
+        );
+        assert_eq!(t, "item1,item2,item10", "numeric collation. Got: {t:?}");
+    }
+
+    #[test]
+    fn intl_pluralrules_en_cardinal() {
+        let t = intl_title(
+            r#"var p = new Intl.PluralRules('en');
+               document.title = p.select(1) + ',' + p.select(2) + ',' + p.select(0);"#,
+        );
+        assert_eq!(t, "one,other,other", "en cardinal plurals. Got: {t:?}");
+    }
+
+    #[test]
+    fn intl_pluralrules_ru_and_ja() {
+        let t = intl_title(
+            r#"var ru = new Intl.PluralRules('ru');
+               var ja = new Intl.PluralRules('ja');
+               document.title = ru.select(1)+','+ru.select(2)+','+ru.select(5)+'|'+ja.select(1)+','+ja.select(2);"#,
+        );
+        // ru: 1->one, 2->few, 5->many ; ja: always other.
+        assert_eq!(t, "one,few,many|other,other", "ru/ja plurals. Got: {t:?}");
+    }
+
+    #[test]
+    fn intl_pluralrules_en_ordinal() {
+        let t = intl_title(
+            r#"var p = new Intl.PluralRules('en',{type:'ordinal'});
+               document.title = p.select(1)+','+p.select(2)+','+p.select(3)+','+p.select(4)+','+p.select(11);"#,
+        );
+        assert_eq!(t, "one,two,few,other,other", "en ordinal plurals. Got: {t:?}");
+    }
+
+    #[test]
+    fn intl_relativetimeformat_en_auto() {
+        let t = intl_title(
+            r#"var rtf = new Intl.RelativeTimeFormat('en',{numeric:'auto'});
+               document.title = rtf.format(-1,'day')+'|'+rtf.format(1,'day')+'|'+rtf.format(-3,'day')+'|'+rtf.format(2,'hour');"#,
+        );
+        assert_eq!(
+            t, "yesterday|tomorrow|3 days ago|in 2 hours",
+            "en relative time (auto). Got: {t:?}"
+        );
+    }
+
+    #[test]
+    fn intl_relativetimeformat_de() {
+        let t = intl_title(
+            r#"var rtf = new Intl.RelativeTimeFormat('de',{numeric:'auto'});
+               document.title = rtf.format(-1,'day')+'|'+rtf.format(-3,'day');"#,
+        );
+        assert_eq!(t, "gestern|vor 3 Tagen", "de relative time. Got: {t:?}");
+    }
+
+    #[test]
+    fn intl_listformat_en_and_de() {
+        let t = intl_title(
+            r#"var en = new Intl.ListFormat('en',{type:'conjunction'});
+               var de = new Intl.ListFormat('de',{type:'disjunction'});
+               document.title = en.format(['A','B','C'])+'|'+de.format(['A','B','C']);"#,
+        );
+        assert_eq!(t, "A, B, and C|A, B oder C", "list format en/de. Got: {t:?}");
+    }
+
+    #[test]
+    fn intl_resolvedoptions_reports_locale() {
+        // resolvedOptions().locale must echo the real locale, not a hardcoded en-US.
+        let t = intl_title(
+            r#"document.title = new Intl.NumberFormat('de-DE').resolvedOptions().locale + '|' +
+                               new Intl.DateTimeFormat('ja-JP').resolvedOptions().locale;"#,
+        );
+        assert_eq!(t, "de-DE|ja-JP", "resolvedOptions locale. Got: {t:?}");
     }
 
     // ---- Bug 1: U+00A0 NBSP must not be treated as collapsible whitespace ----
