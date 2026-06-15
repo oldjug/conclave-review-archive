@@ -239,26 +239,64 @@ fn match_balanced(s: &str, open: char, close: char) -> Option<usize> {
     None
 }
 
-/// Evaluate a `@container` condition string against a container's
-/// resolved inline-axis width in pixels. V1 supports the shorthand
-/// `min-width:`, `max-width:`, `min-inline-size:`, `max-inline-size:`
-/// forms plus the simple `(inline-size > 30em)` / `(inline-size < 600px)`
-/// comparators that show up in every Container Queries L1 example.
-/// Compound conditions joined by `and` / `or` are evaluated left to
-/// right (no `not` yet — uncommon enough to defer).
+/// Which axis sizes a query container exposes — drives whether a
+/// block-axis (`height` / `block-size`) feature is queryable at all.
+/// CSS Containment 3 §2.1: `container-type: inline-size` exposes ONLY the
+/// inline axis; `size` exposes both. Querying an axis the container doesn't
+/// establish never matches (the feature is "unknown" for that container).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ContainerAxes {
+    /// Only inline-axis features (`width` / `inline-size`) are queryable.
+    InlineOnly,
+    /// Both inline- and block-axis features are queryable.
+    Both,
+}
+
+/// Back-compat shim: evaluate an inline-axis `@container` condition against a
+/// single width. Block-axis features are treated as not-queryable (matching a
+/// `container-type: inline-size` container). Prefer
+/// [`eval_container_condition_axes`] when both extents are known.
+pub fn eval_container_condition(condition: &str, container_width_px: f32) -> bool {
+    eval_container_condition_axes(
+        condition,
+        container_width_px,
+        0.0,
+        ContainerAxes::InlineOnly,
+    )
+}
+
+/// Evaluate a `@container` condition string against a container's resolved
+/// content-box inline (`inline_px`) and block (`block_px`) extents.
+///
+/// CSS Containment 3 §3 / Conditional 5 size-feature grammar. Supports:
+///   * range/colon form — `min-width: 600px`, `max-inline-size: 30em`,
+///     `width: 400px`, `min-block-size: 200px`, `aspect-ratio` (not yet);
+///   * comparison form — `inline-size > 30em`, `width <= 1024px`,
+///     `height >= 200px`;
+///   * boolean combinators `and` / `or` / `not` (case-insensitive).
+///
+/// Block-axis features (`height`, `block-size`, `min/max-height`,
+/// `min/max-block-size`) only ever match when `axes == Both`; on an
+/// inline-size-only container they are NOT queryable and evaluate false
+/// (Chrome/Blink `ContainerQueryEvaluator` treats them as `unknown`).
 ///
 /// Returns `true` when the container matches and the block's contained
 /// rules should apply.
-pub fn eval_container_condition(condition: &str, container_width_px: f32) -> bool {
+pub fn eval_container_condition_axes(
+    condition: &str,
+    inline_px: f32,
+    block_px: f32,
+    axes: ContainerAxes,
+) -> bool {
     fn parse_length(raw: &str) -> Option<f32> {
         let raw = raw.trim();
         if let Some(n) = raw.strip_suffix("px") {
             return n.trim().parse::<f32>().ok();
         }
-        if let Some(n) = raw.strip_suffix("em") {
+        if let Some(n) = raw.strip_suffix("rem") {
             return n.trim().parse::<f32>().ok().map(|v| v * 16.0);
         }
-        if let Some(n) = raw.strip_suffix("rem") {
+        if let Some(n) = raw.strip_suffix("em") {
             return n.trim().parse::<f32>().ok().map(|v| v * 16.0);
         }
         // Bare number (rare; Container Queries L1 requires a unit, but
@@ -266,7 +304,23 @@ pub fn eval_container_condition(condition: &str, container_width_px: f32) -> boo
         raw.parse::<f32>().ok()
     }
 
-    fn eval_atom(atom: &str, w: f32) -> bool {
+    // Resolve a feature name to (axis-size, queryable?). Inline-axis features
+    // are always queryable; block-axis features only when `axes == Both`.
+    fn feature_size(name: &str, inline_px: f32, block_px: f32, axes: ContainerAxes) -> Option<f32> {
+        match name {
+            "width" | "inline-size" => Some(inline_px),
+            "height" | "block-size" => {
+                if axes == ContainerAxes::Both {
+                    Some(block_px)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn eval_atom(atom: &str, inline_px: f32, block_px: f32, axes: ContainerAxes) -> bool {
         let s = atom
             .trim()
             .trim_start_matches('(')
@@ -278,26 +332,24 @@ pub fn eval_container_condition(condition: &str, container_width_px: f32) -> boo
                 let (lhs, rhs) = s.split_at(idx);
                 let rhs = &rhs[op.len()..];
                 let lhs = lhs.trim().to_ascii_lowercase();
-                if !matches!(
-                    lhs.as_str(),
-                    "inline-size" | "width" | "block-size" | "height"
-                ) {
+                let Some(size) = feature_size(&lhs, inline_px, block_px, axes) else {
                     return false;
-                }
+                };
                 let Some(target) = parse_length(rhs) else {
                     return false;
                 };
                 return match op {
-                    ">" => w > target,
-                    "<" => w < target,
-                    ">=" => w >= target,
-                    "<=" => w <= target,
-                    "=" => (w - target).abs() < 0.5,
+                    ">" => size > target,
+                    "<" => size < target,
+                    ">=" => size >= target,
+                    "<=" => size <= target,
+                    "=" => (size - target).abs() < 0.5,
                     _ => false,
                 };
             }
         }
-        // Range/colon form: `min-width: 600px` / `max-inline-size: 30em`.
+        // Range/colon form: `min-width: 600px` / `max-inline-size: 30em` /
+        // `min-height: 200px` / `max-block-size: 30em`.
         let (key, value) = match s.split_once(':') {
             Some(p) => p,
             None => return false,
@@ -306,30 +358,45 @@ pub fn eval_container_condition(condition: &str, container_width_px: f32) -> boo
         let Some(target) = parse_length(value) else {
             return false;
         };
-        match key.as_str() {
-            "min-width" | "min-inline-size" => w >= target,
-            "max-width" | "max-inline-size" => w <= target,
-            "width" | "inline-size" => (w - target).abs() < 0.5,
-            _ => false,
+        let (axis_feature, is_min, is_max) = if let Some(f) = key.strip_prefix("min-") {
+            (f, true, false)
+        } else if let Some(f) = key.strip_prefix("max-") {
+            (f, false, true)
+        } else {
+            (key.as_str(), false, false)
+        };
+        let Some(size) = feature_size(axis_feature, inline_px, block_px, axes) else {
+            return false;
+        };
+        if is_min {
+            size >= target
+        } else if is_max {
+            size <= target
+        } else {
+            (size - target).abs() < 0.5
         }
     }
 
-    // Split top-level on `and` / `or`. No `not` for now. Parens
+    let trimmed = condition.trim();
+    let lc = trimmed.to_ascii_lowercase();
+    // Leading `not` negates the whole (sub)condition. CSS Conditional 5 §3.
+    if let Some(rest) = lc.strip_prefix("not ") {
+        let off = trimmed.len() - rest.len();
+        return !eval_container_condition_axes(&trimmed[off..], inline_px, block_px, axes);
+    }
+    // Split top-level on `or` first (lower precedence), then `and`. Parens
     // round-trip through eval_atom so simple `(a) and (b)` works.
-    let lc = condition.to_ascii_lowercase();
-    // `and` short-circuits the simpler way; do an `or` split first so
-    // the partition is correct.
     if lc.contains(" or ") {
-        return condition
+        return trimmed
             .split(" or ")
-            .any(|chunk| eval_container_condition(chunk, container_width_px));
+            .any(|chunk| eval_container_condition_axes(chunk, inline_px, block_px, axes));
     }
     if lc.contains(" and ") {
-        return condition
+        return trimmed
             .split(" and ")
-            .all(|chunk| eval_container_condition(chunk, container_width_px));
+            .all(|chunk| eval_container_condition_axes(chunk, inline_px, block_px, axes));
     }
-    eval_atom(condition, container_width_px)
+    eval_atom(trimmed, inline_px, block_px, axes)
 }
 
 // -------- Anchor positioning ---------------------------------------------

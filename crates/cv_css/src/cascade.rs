@@ -575,6 +575,31 @@ pub struct ComputedStyle {
     /// position so an element shows just one icon (e.g. Wikipedia's
     /// wordmark at `0px -304px` out of a shared SVG sprite).
     pub background_position: Option<(BgPos, BgPos)>,
+    /// CSS Containment 3 §2.1 `container-type`. When `Size` or `InlineSize`,
+    /// this element establishes a *query container* that descendant
+    /// `@container` rules are evaluated against. `Normal` (the default /
+    /// `None`) means it is NOT a query container. `Size` queries both
+    /// inline and block axes; `InlineSize` only the inline axis (and
+    /// applies inline-size containment but NOT block-size containment, so
+    /// the box still sizes to its content vertically).
+    pub container_type: Option<ContainerType>,
+    /// CSS Containment 3 §2.2 `container-name`. Zero or more idents that
+    /// let an `@container <name> (...)` query target this specific
+    /// ancestor instead of the nearest one. Empty = unnamed container.
+    pub container_name: Vec<String>,
+}
+
+/// CSS Containment 3 §2.1 — the kind of query container an element is.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ContainerType {
+    /// `container-type: normal` — not a query container.
+    Normal,
+    /// `container-type: inline-size` — query container on the inline axis
+    /// only (size containment is applied on the inline axis).
+    InlineSize,
+    /// `container-type: size` — query container on both axes (size
+    /// containment is applied on both inline and block axes).
+    Size,
 }
 
 /// One axis of `background-position`: an absolute length or a percentage
@@ -1095,6 +1120,57 @@ fn required_ancestor_signature(sel: &Selector) -> AncestorFilter {
     f
 }
 
+/// CSS Containment 3 §3 — one `@container <name>? (<condition>)` clause.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ContainerQueryClause {
+    /// Optional `container-name` the query targets. `None` = match the
+    /// nearest query container regardless of name.
+    name: Option<String>,
+    /// The raw condition between the outer parens, e.g. `min-width: 300px`
+    /// or `inline-size > 30em`. Evaluated by [`eval_container_condition_axes`].
+    condition: String,
+}
+
+/// CSS Containment 3 §3 — a compiled `@container` guard. Attached (by index)
+/// to every candidate that comes from an `@container` block. At cascade time
+/// the candidate only contributes its declarations when EVERY clause is
+/// satisfied by the element's matching ancestor query container (see
+/// [`QueryContainer`] / [`eval_container_guard`]). Multiple clauses arise
+/// only from doubly-nested `@container` blocks — the common case is one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ContainerQueryGuard {
+    clauses: Vec<ContainerQueryClause>,
+}
+
+/// One live query container in the ancestor chain, supplied by the host
+/// (layout) when resolving a descendant's style. The cascade walks this
+/// stack (nearest-last) to find the container a `@container` guard targets
+/// and evaluates the guard against its laid-out CONTENT-BOX size.
+///
+/// CSS Containment 3 §3: a `@container` rule applies to a descendant only
+/// when its nearest ancestor query container of the right type satisfies
+/// the condition, evaluated against that container's content-box size — NOT
+/// the viewport. `inline_size` is the content-box inline (usually width)
+/// extent; `block_size` the block (usually height) extent. `block_size` is
+/// only queryable when `container_type == Size` (per §2.1, `inline-size`
+/// containers don't apply block-axis containment so the block size isn't a
+/// stable query target).
+#[derive(Clone, Debug, PartialEq)]
+pub struct QueryContainer {
+    /// `container-name`s declared on this container (may be empty).
+    pub names: Vec<String>,
+    /// `container-type`. Determines which axes are queryable.
+    pub container_type: ContainerType,
+    /// Content-box inline-axis size in CSS px.
+    pub inline_size: f32,
+    /// Content-box block-axis size in CSS px (only meaningful for `Size`).
+    pub block_size: f32,
+}
+
+/// The ancestor query-container stack handed to the cascade for one element.
+/// Ordered root-first; the LAST entry is the nearest ancestor container.
+pub type QueryContainerStack<'s> = &'s [QueryContainer];
+
 /// A reference to one selector inside one rule inside one sheet. Used by
 /// `SelectorIndex` so we can find a candidate without re-iterating sheets.
 #[derive(Copy, Clone)]
@@ -1102,6 +1178,11 @@ struct CandidateRef {
     sheet_idx: u32,
     rule_idx: u32,
     sel_idx: u32,
+    /// Index into [`SelectorIndex::container_queries`] of the `@container`
+    /// guard this candidate is gated by, or `u32::MAX` when the candidate
+    /// is NOT inside an `@container` block (the common case). Keeping this
+    /// a `u32` index (not an owned `String`) preserves `CandidateRef: Copy`.
+    container_query: u32,
     /// Globally-monotonic source-order assigned at index build time. Used
     /// by the cascade tiebreaker so we don't need to recompute it per
     /// element.
@@ -1141,6 +1222,10 @@ pub struct SelectorIndex<'a> {
     /// pages whose sheets declare none (the common case) — that probe runs twice
     /// per element and was a large constant-factor cost.
     has_pseudo_rules: bool,
+    /// Side table of `@container` guards. A candidate's `container_query`
+    /// field indexes here; `u32::MAX` means "no guard". Deduplicated by the
+    /// build pass so identical `@container` preludes share one entry.
+    container_queries: Vec<ContainerQueryGuard>,
 }
 
 /// The OWNED part of a `SelectorIndex` (the bucketed candidate maps) with no
@@ -1157,6 +1242,7 @@ pub struct SelectorIndexData {
     by_tag: std::collections::HashMap<String, Vec<CandidateRef>>,
     universal: Vec<CandidateRef>,
     has_pseudo_rules: bool,
+    container_queries: Vec<ContainerQueryGuard>,
 }
 
 /// Blink-style invalidation set: when a keyed feature (a class or id) changes on
@@ -1362,6 +1448,7 @@ impl<'a> SelectorIndex<'a> {
             by_tag: data.by_tag,
             universal: data.universal,
             has_pseudo_rules: data.has_pseudo_rules,
+            container_queries: data.container_queries,
         }
     }
 
@@ -1374,6 +1461,7 @@ impl<'a> SelectorIndex<'a> {
             by_tag: self.by_tag,
             universal: self.universal,
             has_pseudo_rules: self.has_pseudo_rules,
+            container_queries: self.container_queries,
         }
     }
 
@@ -1391,6 +1479,7 @@ impl<'a> SelectorIndex<'a> {
             by_tag: Default::default(),
             universal: Vec::new(),
             has_pseudo_rules: false,
+            container_queries: Vec::new(),
         };
         // CSS cascade layers: assign each named layer an index by first
         // appearance across all sheets in document order. Both the
@@ -1449,11 +1538,14 @@ impl<'a> SelectorIndex<'a> {
                 let is_media = at.name == "media";
                 let is_supports = at.name == "supports";
                 // @container, @layer, @scope, @starting-style: fold their
-                // body rules in too. @container's per-element condition
-                // is left to layout to enforce; the index includes the
-                // candidates so they're at least reachable. @layer rules
-                // inherit normal source-order precedence — full layer
-                // ordering would re-sort across the same origin tier,
+                // body rules in too. @container's per-element condition is now
+                // REALLY enforced: each candidate inside an `@container` block
+                // carries a guard index (its prelude name + condition) and the
+                // cascade evaluates it against the element's nearest ancestor
+                // query container's laid-out content-box size, applying or
+                // withholding the rule accordingly (see eval_container_guard).
+                // @layer rules inherit normal source-order precedence — full
+                // layer ordering would re-sort across the same origin tier,
                 // which V1 approximates with source-order.
                 let is_container = at.name == "container";
                 let is_layer = at.name == "layer";
@@ -1499,6 +1591,7 @@ impl<'a> SelectorIndex<'a> {
                     &mut source_order,
                     origin,
                     cand_layer,
+                    u32::MAX,
                     viewport_w,
                     viewport_h,
                 );
@@ -1518,6 +1611,32 @@ impl<'a> SelectorIndex<'a> {
         layer: Option<u32>,
         sel: &Selector,
     ) {
+        Self::push_candidate_cq(
+            idx,
+            sheet_idx,
+            rule_idx,
+            sel_idx,
+            source_order,
+            origin,
+            layer,
+            sel,
+            u32::MAX,
+        );
+    }
+
+    /// `push_candidate` carrying an `@container` guard index (`u32::MAX` = none).
+    #[allow(clippy::too_many_arguments)]
+    fn push_candidate_cq(
+        idx: &mut SelectorIndexData,
+        sheet_idx: u32,
+        rule_idx: u32,
+        sel_idx: u32,
+        source_order: u32,
+        origin: u8,
+        layer: Option<u32>,
+        sel: &Selector,
+        container_query: u32,
+    ) {
         idx.has_pseudo_rules |= sel.targets_pseudo_element();
         let key = sel.parts.last().map(|p| &p.compound);
         let cand = CandidateRef {
@@ -1527,6 +1646,7 @@ impl<'a> SelectorIndex<'a> {
             source_order,
             origin,
             layer,
+            container_query,
             req_ancestors: required_ancestor_signature(sel),
         };
         match key {
@@ -1568,15 +1688,50 @@ impl<'a> SelectorIndex<'a> {
         source_order: &mut u32,
         origin: u8,
         cand_layer: Option<u32>,
+        container_query: u32,
         vw: f32,
         vh: f32,
     ) {
+        // If THIS at-rule is `@container`, register its guard and use it for
+        // every rule below. A `@container` nested inside another `@container`
+        // (rare but legal — CSS Containment 3 §3) overrides with the inner one
+        // because the nearest ancestor query container governs; matching both
+        // is enforced per-element by checking each enclosing guard. We model the
+        // common single-level case by carrying the innermost guard; the build
+        // pass keeps the OUTER guards reachable too via the candidate set, but
+        // a candidate carries only its innermost guard. Since a doubly-nested
+        // `@container` requires both to pass, we conjoin them into one guard.
+        let active_cq = if at.name == "container" {
+            let (name, condition) = parse_container_prelude(&at.prelude);
+            let mut clauses = if container_query == u32::MAX {
+                Vec::new()
+            } else {
+                // Inherit the enclosing `@container`'s clauses — both ancestor
+                // containers must satisfy their conditions (CSS Containment 3 §3
+                // makes the nearest-container rule apply only when reachable
+                // through containers that each match).
+                idx.container_queries[container_query as usize].clauses.clone()
+            };
+            clauses.push(ContainerQueryClause { name, condition });
+            let guard = ContainerQueryGuard { clauses };
+            // Deduplicate identical guards so repeated `@container (min-width:
+            // 300px)` blocks share one side-table entry.
+            match idx.container_queries.iter().position(|g| *g == guard) {
+                Some(i) => i as u32,
+                None => {
+                    idx.container_queries.push(guard);
+                    (idx.container_queries.len() - 1) as u32
+                }
+            }
+        } else {
+            container_query
+        };
         if let Some(block) = at.block.as_ref() {
             for rule in block {
                 let synthetic_rule_idx = encode_at_rule_idx(top_count, at_idx, *flat_idx);
                 if ancestors_match {
                     for (xi, sel) in rule.selectors.iter().enumerate() {
-                        Self::push_candidate(
+                        Self::push_candidate_cq(
                             idx,
                             sheet_idx,
                             synthetic_rule_idx as u32,
@@ -1585,6 +1740,7 @@ impl<'a> SelectorIndex<'a> {
                             origin,
                             cand_layer,
                             sel,
+                            active_cq,
                         );
                         *source_order = source_order.wrapping_add(1);
                     }
@@ -1605,6 +1761,7 @@ impl<'a> SelectorIndex<'a> {
                 source_order,
                 origin,
                 cand_layer,
+                active_cq,
                 vw,
                 vh,
             );
@@ -1625,6 +1782,32 @@ impl<'a> SelectorIndex<'a> {
         let mut flat: Vec<&'a crate::parser::Rule> = Vec::new();
         flatten_at_rule_all(at, &mut flat);
         flat.get(inner).copied()
+    }
+
+    /// Whether `cand`'s `@container` guard (if any) is satisfied for an element
+    /// whose ancestor query-container stack is `stack`.
+    ///
+    /// `stack == None` means the host did not supply container sizes for this
+    /// resolution (e.g. a tree-walk that hasn't laid out containers yet) — in
+    /// that case `@container` guards are applied OPTIMISTICALLY (the historical
+    /// behavior) so nothing silently disappears. `stack == Some(_)` triggers the
+    /// real CSS Containment 3 §3 evaluation: the guard's clauses are tested
+    /// against the matching ancestor query container's content-box size.
+    fn cand_container_ok(
+        &self,
+        cand: &CandidateRef,
+        stack: Option<QueryContainerStack<'_>>,
+    ) -> bool {
+        if cand.container_query == u32::MAX {
+            return true; // not an @container rule — always eligible
+        }
+        let Some(stack) = stack else {
+            return true; // no container info → optimistic apply
+        };
+        let Some(guard) = self.container_queries.get(cand.container_query as usize) else {
+            return true;
+        };
+        eval_container_guard(guard, stack)
     }
 
     fn collect_for<'b, E: ElementView<'b>>(
@@ -1841,6 +2024,33 @@ where
     style
 }
 
+/// `compute_with_index` plus the element's ancestor query-container stack so
+/// `@container` size queries are really evaluated (CSS Containment 3 §3). This
+/// is the simplest entry point for container-query callers/tests: pass the
+/// nearest-ancestor-last stack of [`QueryContainer`]s and rules inside
+/// `@container` blocks apply only when their condition is satisfied by the
+/// targeted container's content-box size.
+pub fn compute_with_index_cq<'a, E>(
+    idx: &SelectorIndex<'a>,
+    element: E,
+    inline: &'a [Declaration],
+    classes: &[String],
+    containers: QueryContainerStack<'_>,
+) -> ComputedStyle
+where
+    E: ElementView<'a>,
+{
+    compute_with_index_inheriting_filtered_cq(
+        idx,
+        element,
+        inline,
+        classes,
+        None,
+        None,
+        Some(containers),
+    )
+}
+
 /// `compute_with_index` but seeded with the parent element's resolved
 /// `custom_properties` so `var(--name)` references resolve against the
 /// inheritance chain.
@@ -1979,6 +2189,37 @@ pub fn compute_with_index_inheriting_filtered<'a, E>(
 where
     E: ElementView<'a>,
 {
+    compute_with_index_inheriting_filtered_cq(
+        idx,
+        element,
+        inline,
+        classes,
+        inherited_vars,
+        ancestor_filter,
+        None,
+    )
+}
+
+/// `compute_with_index_inheriting_filtered` plus the element's ancestor
+/// query-container stack (CSS Containment 3 §3). When `containers` is `Some`,
+/// rules nested in `@container` blocks are applied only when their size-query
+/// condition is satisfied by the matching ancestor query container's laid-out
+/// content-box size; when it's `None`, those rules apply optimistically (no
+/// container info available). This is the entry point the renderer calls once
+/// it has laid out the query containers, and the one container-query tests use.
+#[allow(clippy::too_many_arguments)]
+pub fn compute_with_index_inheriting_filtered_cq<'a, E>(
+    idx: &SelectorIndex<'a>,
+    element: E,
+    inline: &'a [Declaration],
+    classes: &[String],
+    inherited_vars: Option<&std::collections::HashMap<String, Vec<CssToken>>>,
+    ancestor_filter: Option<&AncestorFilter>,
+    containers: Option<QueryContainerStack<'_>>,
+) -> ComputedStyle
+where
+    E: ElementView<'a>,
+{
     let mut candidates: Vec<CandidateRef> = Vec::with_capacity(32);
     idx.collect_for(element, &mut candidates, classes);
 
@@ -1986,6 +2227,9 @@ where
     let mut counter: usize = 0;
     for cand in &candidates {
         if bloom_can_skip(ancestor_filter, cand) {
+            continue;
+        }
+        if !idx.cand_container_ok(cand, containers) {
             continue;
         }
         let Some(rule) = idx.resolve_rule(cand) else {
@@ -4833,6 +5077,80 @@ fn apply_declaration(style: &mut ComputedStyle, d: &Declaration) {
                 .iter()
                 .any(|t| matches!(t, CssToken::Ident(s) if s.eq_ignore_ascii_case("hidden")));
         }
+        // CSS Containment 3 §2.1 — `container-type: normal | inline-size | size`.
+        // Establishes this element as a query container (or not). The cascade
+        // reads `style.container_type` when building the query-container stack
+        // so `@container` rules can be evaluated against this box's laid-out
+        // content-box size. `contain: <x>` does NOT set container-type (a
+        // separate property), so we only handle the dedicated longhand here.
+        "container-type" => {
+            for t in toks {
+                if let CssToken::Ident(s) = t {
+                    style.container_type = Some(match s.to_ascii_lowercase().as_str() {
+                        "inline-size" => ContainerType::InlineSize,
+                        "size" => ContainerType::Size,
+                        "normal" => ContainerType::Normal,
+                        _ => continue,
+                    });
+                    break;
+                }
+            }
+        }
+        // CSS Containment 3 §2.2 — `container-name: none | <custom-ident>+`.
+        // Names this query container so `@container <name> (...)` can target
+        // it specifically rather than the nearest container of the right type.
+        "container-name" => {
+            let mut names = Vec::new();
+            for t in toks {
+                if let CssToken::Ident(s) = t {
+                    if s.eq_ignore_ascii_case("none") {
+                        names.clear();
+                        break;
+                    }
+                    names.push(s.clone());
+                }
+            }
+            style.container_name = names;
+        }
+        // CSS Containment 3 §2.3 — the `container` shorthand:
+        //   container: <name> [ / <container-type> ]?
+        // e.g. `container: sidebar / inline-size`. Name(s) before the slash,
+        // type after. `container: none` resets both.
+        "container" => {
+            let mut name_toks: Vec<&CssToken> = Vec::new();
+            let mut type_toks: Vec<&CssToken> = Vec::new();
+            let mut after_slash = false;
+            for t in toks {
+                match t {
+                    CssToken::Delim('/') => after_slash = true,
+                    CssToken::Whitespace => {}
+                    other if after_slash => type_toks.push(other),
+                    other => name_toks.push(other),
+                }
+            }
+            let mut names = Vec::new();
+            for t in &name_toks {
+                if let CssToken::Ident(s) = t {
+                    if s.eq_ignore_ascii_case("none") {
+                        names.clear();
+                        break;
+                    }
+                    names.push(s.clone());
+                }
+            }
+            style.container_name = names;
+            for t in &type_toks {
+                if let CssToken::Ident(s) = t {
+                    style.container_type = Some(match s.to_ascii_lowercase().as_str() {
+                        "inline-size" => ContainerType::InlineSize,
+                        "size" => ContainerType::Size,
+                        "normal" => ContainerType::Normal,
+                        _ => continue,
+                    });
+                    break;
+                }
+            }
+        }
         // Properties we parse silently as "noted but not visualised yet".
         // Without these branches the unknown-property path leaves them
         // hanging, which is fine — but listing them keeps the next
@@ -4954,9 +5272,6 @@ fn apply_declaration(style: &mut ComputedStyle, d: &Declaration) {
         | "animation-composition"
         | "contain"
         | "content-visibility"
-        | "container"
-        | "container-type"
-        | "container-name"
         | "anchor-name"
         | "anchor-scope"
         | "position-anchor"
@@ -6216,6 +6531,190 @@ fn flatten_at_rule_all<'a>(at: &'a crate::parser::AtRule, out: &mut Vec<&'a crat
     for nested in &at.nested {
         flatten_at_rule_all(nested, out);
     }
+}
+
+/// Serialize a slice of CSS tokens back to (approximately) canonical CSS
+/// source text — enough for the string-based `@container` condition
+/// evaluator to re-parse `min-width: 300px` / `inline-size > 30em`. Unlike the
+/// debug `Display` impl (which emits `ident(...)`), this round-trips values.
+fn serialize_css_tokens(toks: &[CssToken]) -> String {
+    let mut out = String::new();
+    for t in toks {
+        match t {
+            CssToken::Ident(s) | CssToken::AtKeyword(s) => out.push_str(s),
+            CssToken::Function(s) => {
+                out.push_str(s);
+                out.push('(');
+            }
+            CssToken::Hash(s) => {
+                out.push('#');
+                out.push_str(s);
+            }
+            CssToken::String(s) => {
+                out.push('"');
+                out.push_str(s);
+                out.push('"');
+            }
+            CssToken::Number(n) => out.push_str(&fmt_css_num(*n)),
+            CssToken::Percent(n) => {
+                out.push_str(&fmt_css_num(*n));
+                out.push('%');
+            }
+            CssToken::Dimension { value, unit } => {
+                out.push_str(&fmt_css_num(*value));
+                out.push_str(unit);
+            }
+            CssToken::Whitespace => out.push(' '),
+            CssToken::Colon => out.push(':'),
+            CssToken::Semicolon => out.push(';'),
+            CssToken::Comma => out.push(','),
+            CssToken::LeftBrace => out.push('{'),
+            CssToken::RightBrace => out.push('}'),
+            CssToken::LeftParen => out.push('('),
+            CssToken::RightParen => out.push(')'),
+            CssToken::LeftBracket => out.push('['),
+            CssToken::RightBracket => out.push(']'),
+            CssToken::Delim(c) => out.push(*c),
+            CssToken::Url(s) => {
+                out.push_str("url(");
+                out.push_str(s);
+                out.push(')');
+            }
+            CssToken::Bang => out.push('!'),
+            CssToken::Eof => {}
+        }
+    }
+    out
+}
+
+fn fmt_css_num(n: f64) -> String {
+    if n.fract() == 0.0 {
+        format!("{}", n as i64)
+    } else {
+        format!("{n}")
+    }
+}
+
+/// Parse an `@container` prelude (the tokens between `@container` and `{`) into
+/// `(optional container-name, raw condition string)`. The grammar is
+/// `<container-name>? <container-condition>` (CSS Containment 3 §3): a leading
+/// `<custom-ident>` names the targeted container, followed by a parenthesized
+/// size-query condition. The condition is returned WITHOUT its outer parens so
+/// it feeds directly into `eval_container_condition_axes`.
+fn parse_container_prelude(prelude: &[CssToken]) -> (Option<String>, String) {
+    // Find the first top-level `(` — everything before it (idents) is the
+    // optional name; everything from it on is the condition.
+    let mut name: Option<String> = None;
+    let mut i = 0;
+    while i < prelude.len() {
+        match &prelude[i] {
+            CssToken::Whitespace => i += 1,
+            CssToken::Ident(s) => {
+                // `not`/`and`/`or` are condition keywords, not names.
+                let lc = s.to_ascii_lowercase();
+                if matches!(lc.as_str(), "not" | "and" | "or") {
+                    break;
+                }
+                name = Some(s.clone());
+                i += 1;
+            }
+            _ => break,
+        }
+    }
+    let condition_toks = &prelude[i..];
+    // Strip a single pair of outer parens if the whole condition is wrapped:
+    // `(min-width: 300px)` → `min-width: 300px`. Compound conditions like
+    // `(a) and (b)` keep their inner parens (eval handles them).
+    let raw = serialize_css_tokens(condition_toks);
+    let raw = raw.trim().to_string();
+    let condition = strip_outer_parens(&raw);
+    (name, condition)
+}
+
+/// If `s` is wrapped in a single balanced pair of outer parens (and that pair
+/// spans the whole string), remove them; otherwise return `s` unchanged.
+fn strip_outer_parens(s: &str) -> String {
+    let s = s.trim();
+    if !s.starts_with('(') || !s.ends_with(')') {
+        return s.to_string();
+    }
+    let bytes = s.as_bytes();
+    let mut depth = 0i32;
+    for (i, &b) in bytes.iter().enumerate() {
+        match b {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                // The opening paren closes before the end → not a single wrap.
+                if depth == 0 && i != bytes.len() - 1 {
+                    return s.to_string();
+                }
+            }
+            _ => {}
+        }
+    }
+    s[1..s.len() - 1].trim().to_string()
+}
+
+/// Evaluate a compiled `@container` guard against the element's ancestor
+/// query-container stack. CSS Containment 3 §3: each clause is matched against
+/// the NEAREST ancestor query container that (a) has the right type for the
+/// queried axis and (b) — when the clause names a container — carries that
+/// `container-name`. The guard passes only if EVERY clause passes (clauses
+/// arise from nested `@container` blocks). With an empty stack (no ancestor
+/// container) the guard fails: no container means the size query can't be
+/// satisfied, so the rules are withheld (Chrome: an unmatched container query
+/// never applies).
+fn eval_container_guard(guard: &ContainerQueryGuard, stack: QueryContainerStack<'_>) -> bool {
+    guard
+        .clauses
+        .iter()
+        .all(|clause| eval_container_clause(clause, stack))
+}
+
+fn eval_container_clause(clause: &ContainerQueryClause, stack: QueryContainerStack<'_>) -> bool {
+    // Whether this clause queries the block axis (needs a `size` container).
+    let needs_block = clause_queries_block_axis(&clause.condition);
+    // Walk nearest-first (stack is root-first, so iterate in reverse).
+    for c in stack.iter().rev() {
+        if c.container_type == crate::cascade::ContainerType::Normal {
+            continue;
+        }
+        // Name targeting: a named clause only matches a container that declares
+        // that name; an unnamed clause matches any query container.
+        if let Some(want) = &clause.name {
+            if !c.names.iter().any(|n| n == want) {
+                continue;
+            }
+        }
+        // Axis suitability: a block-axis query needs a `size` container. An
+        // inline-size container is skipped for block queries (keep searching
+        // outward for a `size` container, per the nearest-ELIGIBLE-container
+        // rule).
+        if needs_block && c.container_type != crate::cascade::ContainerType::Size {
+            continue;
+        }
+        let axes = match c.container_type {
+            crate::cascade::ContainerType::Size => crate::modern::ContainerAxes::Both,
+            _ => crate::modern::ContainerAxes::InlineOnly,
+        };
+        return crate::modern::eval_container_condition_axes(
+            &clause.condition,
+            c.inline_size,
+            c.block_size,
+            axes,
+        );
+    }
+    // No eligible ancestor query container → the query cannot match.
+    false
+}
+
+/// Cheap check: does this condition reference a block-axis size feature
+/// (`height` / `block-size`)? Used to require a `size` container before
+/// committing to a particular ancestor.
+fn clause_queries_block_axis(condition: &str) -> bool {
+    let lc = condition.to_ascii_lowercase();
+    lc.contains("height") || lc.contains("block-size")
 }
 
 /// Whether an at-rule's OWN condition matches the current media context
@@ -7548,6 +8047,213 @@ mod tests {
         fn parent(&self) -> Option<Self> {
             None
         }
+    }
+
+    // ---- @container size-query EVALUATION (CSS Containment 3 §3) ----------
+
+    fn red() -> Color {
+        Color { r: 255, g: 0, b: 0, a: 255 }
+    }
+    fn blue() -> Color {
+        Color { r: 0, g: 0, b: 255, a: 255 }
+    }
+
+    fn qc(names: &[&str], ty: ContainerType, inline: f32, block: f32) -> QueryContainer {
+        QueryContainer {
+            names: names.iter().map(|s| s.to_string()).collect(),
+            container_type: ty,
+            inline_size: inline,
+            block_size: block,
+        }
+    }
+
+    /// The headline test: a `@container (min-width: 300px)` rule applies to a
+    /// descendant when the container is 400px wide and is WITHHELD when the
+    /// SAME viewport/index but a 200px container is supplied. The property
+    /// difference is driven purely by container size, not the viewport.
+    #[test]
+    fn container_min_width_applies_by_container_size_not_viewport() {
+        let css = "@container (min-width: 300px) { .card { color: red; } }";
+        let ss = parse_stylesheet(css);
+        let sheets = [ss];
+        // Identical index/viewport for both resolutions — only the container
+        // size differs, isolating the variable under test.
+        let idx = SelectorIndex::build_with_viewport(&sheets, 1024.0, 768.0);
+        let el = Fake { tag: "div", id: None, classes: &["card"] };
+        let classes = ["card".to_string()];
+
+        // Container 400px wide ≥ 300px → rule applies, color = red.
+        let wide = [qc(&[], ContainerType::InlineSize, 400.0, 0.0)];
+        let cs_wide = compute_with_index_cq(&idx, el, &[], &classes, &wide);
+        assert_eq!(cs_wide.color, Some(red()), "400px container ≥ 300px applies");
+
+        // Container 200px wide < 300px → rule withheld, color = None.
+        let narrow = [qc(&[], ContainerType::InlineSize, 200.0, 0.0)];
+        let cs_narrow = compute_with_index_cq(&idx, el, &[], &classes, &narrow);
+        assert_eq!(cs_narrow.color, None, "200px container < 300px withholds");
+    }
+
+    /// `container-name` must target the RIGHT ancestor. The query names
+    /// `sidebar`; only the `sidebar` container's size should decide the match,
+    /// even when a nearer unnamed container has a contradicting size.
+    #[test]
+    fn container_name_targets_the_named_ancestor() {
+        let css = "@container sidebar (min-width: 300px) { .x { color: red; } }";
+        let ss = parse_stylesheet(css);
+        let sheets = [ss];
+        let idx = SelectorIndex::build_with_viewport(&sheets, 1024.0, 768.0);
+        let el = Fake { tag: "div", id: None, classes: &["x"] };
+        let classes = ["x".to_string()];
+
+        // Stack root-first: outer `sidebar` is 400px (matches), nearer unnamed
+        // `main` is 100px (would fail). Because the query names `sidebar`, the
+        // nearer unnamed container is skipped and the 400px sidebar matches.
+        let stack = [
+            qc(&["sidebar"], ContainerType::InlineSize, 400.0, 0.0),
+            qc(&["main"], ContainerType::InlineSize, 100.0, 0.0),
+        ];
+        let cs = compute_with_index_cq(&idx, el, &[], &classes, &stack);
+        assert_eq!(cs.color, Some(red()), "named sidebar (400px) drives the match");
+
+        // Now make the sidebar narrow (200px) while the unnamed container is
+        // wide (1000px). The named query must follow the NARROW sidebar and
+        // withhold — proving it ignores the nearer/wider unnamed container.
+        let stack2 = [
+            qc(&["sidebar"], ContainerType::InlineSize, 200.0, 0.0),
+            qc(&["main"], ContainerType::InlineSize, 1000.0, 0.0),
+        ];
+        let cs2 = compute_with_index_cq(&idx, el, &[], &classes, &stack2);
+        assert_eq!(cs2.color, None, "named sidebar (200px) withholds despite wide neighbor");
+    }
+
+    /// The cascade still applies the OUTER (non-container) rule, and the inner
+    /// container rule wins by source order when its condition holds; the prior
+    /// "fold unconditionally" stub would have always applied red.
+    #[test]
+    fn container_rule_does_not_clobber_base_when_unsatisfied() {
+        let css = ".card { color: blue; } \
+                   @container (min-width: 300px) { .card { color: red; } }";
+        let ss = parse_stylesheet(css);
+        let sheets = [ss];
+        let idx = SelectorIndex::build_with_viewport(&sheets, 1024.0, 768.0);
+        let el = Fake { tag: "div", id: None, classes: &["card"] };
+        let classes = ["card".to_string()];
+
+        // Wide container → @container red wins (later source order).
+        let wide = [qc(&[], ContainerType::InlineSize, 400.0, 0.0)];
+        assert_eq!(
+            compute_with_index_cq(&idx, el, &[], &classes, &wide).color,
+            Some(red())
+        );
+        // Narrow container → @container drops out, base blue remains.
+        let narrow = [qc(&[], ContainerType::InlineSize, 200.0, 0.0)];
+        assert_eq!(
+            compute_with_index_cq(&idx, el, &[], &classes, &narrow).color,
+            Some(blue())
+        );
+        // No container in scope at all → query can't be satisfied, base blue.
+        let empty: [QueryContainer; 0] = [];
+        assert_eq!(
+            compute_with_index_cq(&idx, el, &[], &classes, &empty).color,
+            Some(blue())
+        );
+    }
+
+    /// Block-axis (`min-height`) queries require a `container-type: size`
+    /// container; an `inline-size` container does NOT expose the block axis
+    /// (CSS Containment 3 §2.1), so the query must NOT match against it.
+    #[test]
+    fn container_block_axis_needs_size_container() {
+        let css = "@container (min-height: 200px) { .y { color: red; } }";
+        let ss = parse_stylesheet(css);
+        let sheets = [ss];
+        let idx = SelectorIndex::build_with_viewport(&sheets, 1024.0, 768.0);
+        let el = Fake { tag: "div", id: None, classes: &["y"] };
+        let classes = ["y".to_string()];
+
+        // size container, 300px tall ≥ 200px → applies.
+        let size_tall = [qc(&[], ContainerType::Size, 400.0, 300.0)];
+        assert_eq!(
+            compute_with_index_cq(&idx, el, &[], &classes, &size_tall).color,
+            Some(red()),
+            "size container 300px tall ≥ 200px applies"
+        );
+        // size container, 100px tall < 200px → withholds.
+        let size_short = [qc(&[], ContainerType::Size, 400.0, 100.0)];
+        assert_eq!(
+            compute_with_index_cq(&idx, el, &[], &classes, &size_short).color,
+            None,
+            "size container 100px tall < 200px withholds"
+        );
+        // inline-size container, even though tall → block axis NOT queryable.
+        let inline_tall = [qc(&[], ContainerType::InlineSize, 400.0, 999.0)];
+        assert_eq!(
+            compute_with_index_cq(&idx, el, &[], &classes, &inline_tall).color,
+            None,
+            "inline-size container can't satisfy a block-axis query"
+        );
+    }
+
+    /// `container-type` / `container-name` must be parsed onto the computed
+    /// style (the prior code dropped them into a catch-all that ignored them),
+    /// including the `container:` shorthand with a `/ <type>` segment.
+    #[test]
+    fn container_type_and_name_parse_onto_computed_style() {
+        let ss = parse_stylesheet("div { container-type: inline-size; container-name: a b; }");
+        let el = Fake { tag: "div", id: None, classes: &[] };
+        let cs = compute(&[ss], el);
+        assert_eq!(cs.container_type, Some(ContainerType::InlineSize));
+        assert_eq!(cs.container_name, vec!["a".to_string(), "b".to_string()]);
+
+        // `container: sidebar / size` shorthand → name + type.
+        let ss2 = parse_stylesheet("aside { container: sidebar / size; }");
+        let el2 = Fake { tag: "aside", id: None, classes: &[] };
+        let cs2 = compute(&[ss2], el2);
+        assert_eq!(cs2.container_type, Some(ContainerType::Size));
+        assert_eq!(cs2.container_name, vec!["sidebar".to_string()]);
+    }
+
+    /// Compound `and` condition: BOTH must hold against the container size.
+    #[test]
+    fn container_compound_and_condition() {
+        let css = "@container (min-width: 300px) and (max-width: 500px) { .z { color: red; } }";
+        let ss = parse_stylesheet(css);
+        let sheets = [ss];
+        let idx = SelectorIndex::build_with_viewport(&sheets, 1024.0, 768.0);
+        let el = Fake { tag: "div", id: None, classes: &["z"] };
+        let classes = ["z".to_string()];
+
+        let in_range = [qc(&[], ContainerType::InlineSize, 400.0, 0.0)];
+        assert_eq!(
+            compute_with_index_cq(&idx, el, &[], &classes, &in_range).color,
+            Some(red()),
+            "400px is within [300,500]"
+        );
+        let too_wide = [qc(&[], ContainerType::InlineSize, 600.0, 0.0)];
+        assert_eq!(
+            compute_with_index_cq(&idx, el, &[], &classes, &too_wide).color,
+            None,
+            "600px exceeds max-width 500px"
+        );
+    }
+
+    /// Regression guard: when NO container stack is supplied (`compute_with_index`,
+    /// the historical entry point), `@container` rules still apply optimistically
+    /// so the renderer (before it wires container sizes) does not silently lose
+    /// styling. The strict withholding only kicks in with `compute_with_index_cq`.
+    #[test]
+    fn container_optimistic_without_stack() {
+        let css = "@container (min-width: 300px) { .card { color: red; } }";
+        let ss = parse_stylesheet(css);
+        let sheets = [ss];
+        let idx = SelectorIndex::build_with_viewport(&sheets, 1024.0, 768.0);
+        let el = Fake { tag: "div", id: None, classes: &["card"] };
+        let classes = ["card".to_string()];
+        // No stack (None) → optimistic apply (prior behavior preserved).
+        assert_eq!(
+            compute_with_index(&idx, el, &[], &classes).color,
+            Some(red())
+        );
     }
 
     #[test]
