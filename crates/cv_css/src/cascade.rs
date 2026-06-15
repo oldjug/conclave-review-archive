@@ -174,6 +174,128 @@ pub fn resolve_relative_font_weight(weight: u16, inherited: u16) -> u16 {
     }
 }
 
+/// CSS `writing-mode` (CSS Writing Modes 4 §3.1). Determines the block-flow
+/// direction and whether the inline axis runs horizontally or vertically.
+/// `None`/`HorizontalTb` is the initial value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum WritingMode {
+    /// `horizontal-tb` — inline axis is horizontal, block axis runs
+    /// top→bottom (the default for Latin text). inline-size = width.
+    #[default]
+    HorizontalTb,
+    /// `vertical-rl` — inline axis is vertical (top→bottom), block axis
+    /// runs right→left. inline-size = height. block-start = right edge.
+    VerticalRl,
+    /// `vertical-lr` — inline axis is vertical (top→bottom), block axis
+    /// runs left→right. inline-size = height. block-start = left edge.
+    VerticalLr,
+}
+
+impl WritingMode {
+    /// True when the inline axis is vertical (i.e. inline-size maps to
+    /// height and block-size to width). CSS Writing Modes 4 §6.
+    pub fn is_vertical(self) -> bool {
+        matches!(self, WritingMode::VerticalRl | WritingMode::VerticalLr)
+    }
+    pub fn from_str(s: &str) -> Option<WritingMode> {
+        match s.to_ascii_lowercase().as_str() {
+            "horizontal-tb" | "lr" | "lr-tb" | "rl" | "rl-tb" => Some(WritingMode::HorizontalTb),
+            "vertical-rl" | "tb" | "tb-rl" => Some(WritingMode::VerticalRl),
+            "vertical-lr" => Some(WritingMode::VerticalLr),
+            _ => None,
+        }
+    }
+}
+
+/// CSS `direction` (CSS Writing Modes 4 §2.1). Sets the inline base
+/// direction. `None`/`Ltr` is the initial value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Direction {
+    #[default]
+    Ltr,
+    Rtl,
+}
+
+impl Direction {
+    pub fn from_str(s: &str) -> Option<Direction> {
+        match s.to_ascii_lowercase().as_str() {
+            "ltr" => Some(Direction::Ltr),
+            "rtl" => Some(Direction::Rtl),
+            _ => None,
+        }
+    }
+}
+
+/// The four flow-relative box edges, in CSS Logical order. Used to index the
+/// logical accumulators on [`ComputedStyle`] before they are resolved to
+/// physical sides via [`map_logical_side`].
+pub const LOGICAL_BLOCK_START: usize = 0;
+pub const LOGICAL_INLINE_END: usize = 1;
+pub const LOGICAL_BLOCK_END: usize = 2;
+pub const LOGICAL_INLINE_START: usize = 3;
+
+/// Map a flow-relative edge index (LOGICAL_*) to its physical side index in
+/// the `[top, right, bottom, left]` arrays, per CSS Logical Properties 1 §2.1
+/// + CSS Writing Modes 4. This is the canonical mapping table:
+///
+/// | writing-mode | dir | inline-start | inline-end | block-start | block-end |
+/// |--------------|-----|--------------|------------|-------------|-----------|
+/// | horizontal-tb| ltr | left         | right      | top         | bottom    |
+/// | horizontal-tb| rtl | right        | left       | top         | bottom    |
+/// | vertical-rl  | ltr | top          | bottom     | right       | left      |
+/// | vertical-rl  | rtl | bottom       | top        | right       | left      |
+/// | vertical-lr  | ltr | top          | bottom     | left        | right     |
+/// | vertical-lr  | rtl | bottom       | top        | left        | right     |
+///
+/// Physical indices: 0=top, 1=right, 2=bottom, 3=left.
+pub fn map_logical_side(logical: usize, wm: WritingMode, dir: Direction) -> usize {
+    const TOP: usize = 0;
+    const RIGHT: usize = 1;
+    const BOTTOM: usize = 2;
+    const LEFT: usize = 3;
+    let ltr = dir == Direction::Ltr;
+    match wm {
+        WritingMode::HorizontalTb => match logical {
+            LOGICAL_BLOCK_START => TOP,
+            LOGICAL_BLOCK_END => BOTTOM,
+            LOGICAL_INLINE_START => if ltr { LEFT } else { RIGHT },
+            LOGICAL_INLINE_END => if ltr { RIGHT } else { LEFT },
+            _ => TOP,
+        },
+        WritingMode::VerticalRl => match logical {
+            LOGICAL_BLOCK_START => RIGHT,
+            LOGICAL_BLOCK_END => LEFT,
+            LOGICAL_INLINE_START => if ltr { TOP } else { BOTTOM },
+            LOGICAL_INLINE_END => if ltr { BOTTOM } else { TOP },
+            _ => TOP,
+        },
+        WritingMode::VerticalLr => match logical {
+            LOGICAL_BLOCK_START => LEFT,
+            LOGICAL_BLOCK_END => RIGHT,
+            LOGICAL_INLINE_START => if ltr { TOP } else { BOTTOM },
+            LOGICAL_INLINE_END => if ltr { BOTTOM } else { TOP },
+            _ => TOP,
+        },
+    }
+}
+
+/// A flow-relative box quantity (margin / padding / inset) accumulated during
+/// cascade BEFORE the writing-mode + direction are finalized (they may be
+/// inherited from an ancestor and thus unknown at cascade time). Each side
+/// carries the cascade sequence number of its winning declaration so the
+/// logical→physical resolver can correctly arbitrate against a competing
+/// PHYSICAL longhand that targets the same physical slot (CSS Logical 1 §2:
+/// logical + physical longhands "share a computed value", taken from the
+/// higher-priority cascade declaration). Indexed by LOGICAL_* constants.
+#[derive(Clone, Debug, Default)]
+pub struct LogicalEdges {
+    pub vals: [Option<Length>; 4],
+    /// `auto` keyword flag per side (margins only).
+    pub autos: [bool; 4],
+    /// Cascade sequence number of the winning declaration per side.
+    pub seq: [u32; 4],
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct ComputedStyle {
     pub color: Option<Color>,
@@ -587,6 +709,57 @@ pub struct ComputedStyle {
     /// let an `@container <name> (...)` query target this specific
     /// ancestor instead of the nearest one. Empty = unnamed container.
     pub container_name: Vec<String>,
+
+    // ---- CSS Writing Modes 4 + CSS Logical Properties 1 ----
+    /// `writing-mode`. `None` = the initial `horizontal-tb`. Inherits
+    /// (CSS Writing Modes 4 §3.1) — the inherit fill-in happens in
+    /// `build_styled_tree` after the parent value is known.
+    pub writing_mode: Option<WritingMode>,
+    /// `direction`. `None` = the initial `ltr`. Inherits.
+    pub direction: Option<Direction>,
+    /// Flow-relative margin longhands (margin-inline/-block-*), captured
+    /// raw at cascade time and mapped to physical `margin` sides by
+    /// [`resolve_logical_box`] once writing-mode + direction are final.
+    pub logical_margin: LogicalEdges,
+    /// Flow-relative padding longhands.
+    pub logical_padding: LogicalEdges,
+    /// Flow-relative inset longhands (inset-inline/-block-*).
+    pub logical_inset: LogicalEdges,
+    /// `inline-size` — maps to `width` in horizontal writing modes and to
+    /// `height` in vertical writing modes (CSS Logical 1 §4.1).
+    pub inline_size: Option<Length>,
+    /// `block-size` — maps to `height` in horizontal, `width` in vertical.
+    pub block_size: Option<Length>,
+    pub min_inline_size: Option<Length>,
+    pub max_inline_size: Option<Length>,
+    pub min_block_size: Option<Length>,
+    pub max_block_size: Option<Length>,
+    /// Cascade sequence of the winning `inline-size`/`block-size` decl,
+    /// vs. physical `width`/`height` — last (highest) wins.
+    pub logical_size_seq: [u32; 2], // [inline_size, block_size]
+    pub physical_size_seq: [u32; 2], // [width, height]
+    /// Cascade seq for physical min/max width/height, so logical
+    /// min/max-inline/block-size can be arbitrated against them.
+    /// [min_width, min_height, max_width, max_height].
+    pub physical_minmax_seq: [u32; 4],
+    /// Cascade seq for logical min/max inline/block size.
+    /// [min_inline, min_block, max_inline, max_block].
+    pub logical_minmax_seq: [u32; 4],
+    /// Monotonic counter bumped on every applied declaration so logical and
+    /// physical longhands sharing a slot can be arbitrated by cascade order.
+    pub decl_seq: u32,
+    /// Cascade sequence of the winning PHYSICAL margin/padding/inset decl per
+    /// side `[top,right,bottom,left]`, so the logical resolver only overrides a
+    /// physical slot when the logical declaration came later in the cascade.
+    pub physical_margin_seq: [u32; 4],
+    pub physical_padding_seq: [u32; 4],
+    pub physical_inset_seq: [u32; 4],
+    /// True once [`resolve_logical_box`] has run. Lets a second resolution
+    /// (after writing-mode inheritance, in `build_styled_tree`) first undo the
+    /// physical slots it previously wrote, so re-resolving with a different
+    /// inherited writing-mode doesn't leave a stale value at the old physical
+    /// side (e.g. horizontal→`left` then vertical→`top`).
+    pub logical_resolved: bool,
 }
 
 /// CSS Containment 3 §2.1 — the kind of query container an element is.
@@ -3006,6 +3179,14 @@ fn apply_matched_with_inherited_vars(
         };
         apply_declaration(&mut style, &temp);
     }
+    // Map flow-relative box quantities (margin-inline-start, inline-size, …)
+    // onto physical sides/axes using this element's OWN declared writing-mode
+    // + direction (or the horizontal-tb/ltr default). When the element
+    // INHERITS its writing-mode/direction from an ancestor without
+    // redeclaring it, the host's inheritance pass re-runs
+    // `resolve_logical_box` after filling in the inherited values — that pass
+    // is re-resolution-safe (see the undo block in `resolve_logical_box`).
+    resolve_logical_box(&mut style);
     style
 }
 
@@ -3398,6 +3579,201 @@ fn reset_property_to_initial(name: &str, style: &mut ComputedStyle) {
     }
 }
 
+/// Apply a physical margin side longhand (`margin-top` etc.), honouring the
+/// `auto` keyword and recording the cascade sequence so a later logical
+/// longhand can correctly override the same physical slot.
+fn apply_phys_margin(style: &mut ComputedStyle, side: usize, toks: &[CssToken], seq: u32) {
+    if is_auto_keyword(toks) {
+        style.margin[side] = None;
+        style.margin_auto[side] = true;
+        style.physical_margin_seq[side] = seq;
+    } else if let Some(v) = Length::from_tokens(toks) {
+        style.margin[side] = Some(v);
+        style.margin_auto[side] = false;
+        style.physical_margin_seq[side] = seq;
+    }
+}
+
+/// Stash a flow-relative margin longhand value into the logical accumulator
+/// at `logical` (a LOGICAL_* index), honouring `auto` and recording its
+/// cascade sequence. Resolved to a physical side later by `resolve_logical_box`.
+fn apply_logical_margin(edges: &mut LogicalEdges, logical: usize, toks: &[CssToken], seq: u32) {
+    if is_auto_keyword(toks) {
+        edges.vals[logical] = Some(Length::Auto);
+        edges.autos[logical] = true;
+        edges.seq[logical] = seq;
+    } else if let Some(v) = Length::from_tokens(toks) {
+        edges.vals[logical] = Some(v);
+        edges.autos[logical] = false;
+        edges.seq[logical] = seq;
+    }
+}
+
+/// Stash a flow-relative padding/inset longhand into the logical accumulator.
+/// (Padding has no `auto`; inset does but we treat `auto` as "leave None".)
+fn apply_logical_pad(edges: &mut LogicalEdges, logical: usize, toks: &[CssToken], seq: u32) {
+    if let Some(v) = Length::from_tokens(toks) {
+        edges.vals[logical] = Some(v);
+        edges.seq[logical] = seq;
+    }
+}
+
+/// Resolve all flow-relative box quantities accumulated during cascade
+/// (`logical_margin`, `logical_padding`, `logical_inset`, `inline-size`,
+/// `block-size`, and their min/max) into the physical `margin`/`padding`/
+/// inset(top/right/bottom/left)/`width`/`height` slots, using the final
+/// resolved `writing-mode` + `direction`. CSS Logical Properties 1 §2.1.
+///
+/// Cascade arbitration: a logical longhand overrides the physical slot it
+/// maps to ONLY when its declaration came later in the cascade (higher
+/// sequence) than the competing physical longhand — matching CSS Logical 1
+/// §2 ("the pair shares a computed value taken from the higher-priority
+/// declaration"). For the overwhelmingly common case where a page uses only
+/// logical OR only physical names, the physical seq is 0 so the logical
+/// value always wins, and vice versa.
+///
+/// Must be called AFTER writing-mode/direction inheritance is finalized.
+pub fn resolve_logical_box(style: &mut ComputedStyle) {
+    let wm = style.writing_mode.unwrap_or_default();
+    let dir = style.direction.unwrap_or_default();
+
+    // Re-resolution safety: if a prior resolution already mapped logical
+    // values into physical slots (e.g. cv_css cascade resolved with the
+    // default horizontal-tb before writing-mode inheritance was known), undo
+    // those writes before re-mapping with the now-final writing-mode. A
+    // physical slot that currently holds a value but was never set by a
+    // PHYSICAL declaration (its physical_seq is 0) can only have come from a
+    // logical resolution, so it is safe to clear. Physical declarations always
+    // bump physical_seq > 0, so author-declared physical values survive.
+    if style.logical_resolved {
+        let any_logical_margin = style.logical_margin.vals.iter().any(|v| v.is_some());
+        let any_logical_pad = style.logical_padding.vals.iter().any(|v| v.is_some());
+        let any_logical_inset = style.logical_inset.vals.iter().any(|v| v.is_some());
+        if any_logical_margin {
+            for i in 0..4 {
+                if style.physical_margin_seq[i] == 0 {
+                    style.margin[i] = None;
+                    style.margin_auto[i] = false;
+                }
+            }
+        }
+        if any_logical_pad {
+            for i in 0..4 {
+                if style.physical_padding_seq[i] == 0 {
+                    style.padding[i] = None;
+                }
+            }
+        }
+        if any_logical_inset {
+            if style.physical_inset_seq[0] == 0 { style.top = None; }
+            if style.physical_inset_seq[1] == 0 { style.right = None; }
+            if style.physical_inset_seq[2] == 0 { style.bottom = None; }
+            if style.physical_inset_seq[3] == 0 { style.left = None; }
+        }
+        if style.inline_size.is_some() || style.block_size.is_some() {
+            if style.physical_size_seq[0] == 0 { style.width = None; }
+            if style.physical_size_seq[1] == 0 { style.height = None; }
+        }
+        let any_logical_minmax = style.min_inline_size.is_some()
+            || style.min_block_size.is_some()
+            || style.max_inline_size.is_some()
+            || style.max_block_size.is_some();
+        if any_logical_minmax {
+            if style.physical_minmax_seq[0] == 0 { style.min_width = None; }
+            if style.physical_minmax_seq[1] == 0 { style.min_height = None; }
+            if style.physical_minmax_seq[2] == 0 { style.max_width = None; }
+            if style.physical_minmax_seq[3] == 0 { style.max_height = None; }
+        }
+    }
+    style.logical_resolved = true;
+
+    // Margins. An `auto` margin stores `Length::Auto` AND sets the
+    // `margin_auto` flag (the layout engine reads both — `Some(Length::Auto)`
+    // is the value convention, `margin_auto[i]` the centering trigger).
+    for logical in 0..4 {
+        if let Some(v) = style.logical_margin.vals[logical] {
+            let phys = map_logical_side(logical, wm, dir);
+            if style.logical_margin.seq[logical] >= style.physical_margin_seq[phys] {
+                style.margin[phys] = Some(v);
+                style.margin_auto[phys] = style.logical_margin.autos[logical];
+            }
+        }
+    }
+    // Padding.
+    for logical in 0..4 {
+        if let Some(v) = style.logical_padding.vals[logical] {
+            let phys = map_logical_side(logical, wm, dir);
+            if style.logical_padding.seq[logical] >= style.physical_padding_seq[phys] {
+                style.padding[phys] = Some(v);
+            }
+        }
+    }
+    // Insets — physical slots are top/right/bottom/left fields, not an array.
+    for logical in 0..4 {
+        if let Some(v) = style.logical_inset.vals[logical] {
+            let phys = map_logical_side(logical, wm, dir);
+            if style.logical_inset.seq[logical] >= style.physical_inset_seq[phys] {
+                match phys {
+                    0 => style.top = Some(v),
+                    1 => style.right = Some(v),
+                    2 => style.bottom = Some(v),
+                    _ => style.left = Some(v),
+                }
+            }
+        }
+    }
+    // inline-size / block-size → width / height.
+    let vertical = wm.is_vertical();
+    // inline-size maps to width (horizontal) or height (vertical).
+    if let Some(v) = style.inline_size {
+        if vertical {
+            if style.logical_size_seq[0] >= style.physical_size_seq[1] {
+                style.height = Some(v);
+            }
+        } else if style.logical_size_seq[0] >= style.physical_size_seq[0] {
+            style.width = Some(v);
+        }
+    }
+    // block-size maps to height (horizontal) or width (vertical).
+    if let Some(v) = style.block_size {
+        if vertical {
+            if style.logical_size_seq[1] >= style.physical_size_seq[0] {
+                style.width = Some(v);
+            }
+        } else if style.logical_size_seq[1] >= style.physical_size_seq[1] {
+            style.height = Some(v);
+        }
+    }
+    // min/max-inline/block-size → physical min/max-width/height. The logical
+    // value wins the physical slot only if it cascaded at-or-after the
+    // physical declaration. Slot indices: 0=min_width 1=min_height
+    // 2=max_width 3=max_height.
+    if let Some(v) = style.min_inline_size {
+        let phys = if vertical { 1 } else { 0 };
+        if style.logical_minmax_seq[0] >= style.physical_minmax_seq[phys] {
+            if phys == 1 { style.min_height = Some(v); } else { style.min_width = Some(v); }
+        }
+    }
+    if let Some(v) = style.min_block_size {
+        let phys = if vertical { 0 } else { 1 };
+        if style.logical_minmax_seq[1] >= style.physical_minmax_seq[phys] {
+            if phys == 0 { style.min_width = Some(v); } else { style.min_height = Some(v); }
+        }
+    }
+    if let Some(v) = style.max_inline_size {
+        let phys = if vertical { 3 } else { 2 };
+        if style.logical_minmax_seq[2] >= style.physical_minmax_seq[phys] {
+            if phys == 3 { style.max_height = Some(v); } else { style.max_width = Some(v); }
+        }
+    }
+    if let Some(v) = style.max_block_size {
+        let phys = if vertical { 2 } else { 3 };
+        if style.logical_minmax_seq[3] >= style.physical_minmax_seq[phys] {
+            if phys == 2 { style.max_width = Some(v); } else { style.max_height = Some(v); }
+        }
+    }
+}
+
 fn apply_declaration(style: &mut ComputedStyle, d: &Declaration) {
     // Strip `-webkit-` / `-moz-` / `-ms-` / `-o-` so a property like
     // `-webkit-flex-direction` hits the same `flex-direction` arm
@@ -3422,6 +3798,14 @@ fn apply_declaration(style: &mut ComputedStyle, d: &Declaration) {
     // Whitespace is already stripped at parse time, so the value slice
     // can be referenced directly — no per-call clone or filter.
     let toks = &d.value;
+    // Cascade-order tick. Each applied declaration gets a strictly
+    // increasing sequence number so that a logical longhand
+    // (`margin-inline-start`) and a physical longhand (`margin-left`)
+    // that resolve to the same physical side can be arbitrated by which
+    // appeared LATER in the cascade — CSS Logical 1 §2 (the pair "shares
+    // a computed value" taken from the higher-priority declaration).
+    style.decl_seq = style.decl_seq.wrapping_add(1);
+    let seq = style.decl_seq;
     // CSS-wide keywords (CSS Cascade L4 §7.3): `inherit` / `initial` /
     // `unset` / `revert` / `revert-layer`. If the entire value is one
     // of these keywords, we DON'T forward it to the property's normal
@@ -3771,208 +4155,224 @@ fn apply_declaration(style: &mut ComputedStyle, d: &Declaration) {
                 style.font_size = Some(v);
             }
         }
-        // Physical sizing — and their logical aliases. CSS Logical
-        // Properties Level 1 §3: with the default `writing-mode:
-        // horizontal-tb` and `direction: ltr`, the inline axis maps
-        // to width and the block axis to height. We don't yet have
-        // writing-mode plumbing, so treat the logical names as
-        // identical aliases. This handles the common case where a
-        // page sets `min-block-size: 100vh` for a full-height layout
-        // root or `inline-size: 100%` in a flex/grid child.
-        "width" | "inline-size" => {
+        // Physical sizing. The logical `inline-size`/`block-size` are NOT
+        // aliases — they map to width/height depending on writing-mode
+        // (CSS Logical 1 §4.1: inline-size = width in horizontal modes,
+        // = height in vertical modes). We store them separately and
+        // resolve in `resolve_logical_box` once writing-mode is final.
+        "width" => {
             if let Some(v) = Length::from_tokens(toks) {
                 style.width = Some(v);
+                style.physical_size_seq[0] = seq;
             }
         }
-        "height" | "block-size" => {
+        "height" => {
             if let Some(v) = Length::from_tokens(toks) {
                 style.height = Some(v);
+                style.physical_size_seq[1] = seq;
+            }
+        }
+        "inline-size" => {
+            if let Some(v) = Length::from_tokens(toks) {
+                style.inline_size = Some(v);
+                style.logical_size_seq[0] = seq;
+            }
+        }
+        "block-size" => {
+            if let Some(v) = Length::from_tokens(toks) {
+                style.block_size = Some(v);
+                style.logical_size_seq[1] = seq;
             }
         }
         "aspect-ratio" => {
             style.aspect_ratio = parse_aspect_ratio(toks);
         }
+        // CSS Writing Modes 4 §3.1 / §2.1. Both inherit; the inherit
+        // fill-in happens after the parent value is known
+        // (build_styled_tree). The logical→physical resolver
+        // (`resolve_logical_box`) reads these.
+        "writing-mode" => {
+            if let Some(CssToken::Ident(s)) = toks.first() {
+                if let Some(wm) = WritingMode::from_str(s) {
+                    style.writing_mode = Some(wm);
+                }
+            }
+        }
+        "direction" => {
+            if let Some(CssToken::Ident(s)) = toks.first() {
+                if let Some(d) = Direction::from_str(s) {
+                    style.direction = Some(d);
+                }
+            }
+        }
         "margin" => {
             if let Some((sides, autos)) = parse_margin_shorthand(toks) {
                 style.margin = sides;
                 style.margin_auto = autos;
+                for i in 0..4 {
+                    style.physical_margin_seq[i] = seq;
+                }
             }
         }
-        // Physical margin sides — pair each with its CSS Logical L1
-        // alias. Mapping assumes horizontal-tb + LTR (writing-mode is
-        // not yet plumbed); under that mode block-start = top,
-        // block-end = bottom, inline-start = left, inline-end = right.
-        "margin-top" | "margin-block-start" => {
-            if is_auto_keyword(toks) {
-                style.margin[0] = None;
-                style.margin_auto[0] = true;
-            } else if let Some(v) = Length::from_tokens(toks) {
-                style.margin[0] = Some(v);
-                style.margin_auto[0] = false;
-            }
+        // Physical margin sides.
+        "margin-top" => {
+            apply_phys_margin(style, 0, toks, seq);
         }
-        "margin-right" | "margin-inline-end" => {
-            if is_auto_keyword(toks) {
-                style.margin[1] = None;
-                style.margin_auto[1] = true;
-            } else if let Some(v) = Length::from_tokens(toks) {
-                style.margin[1] = Some(v);
-                style.margin_auto[1] = false;
-            }
+        "margin-right" => {
+            apply_phys_margin(style, 1, toks, seq);
         }
-        "margin-bottom" | "margin-block-end" => {
-            if is_auto_keyword(toks) {
-                style.margin[2] = None;
-                style.margin_auto[2] = true;
-            } else if let Some(v) = Length::from_tokens(toks) {
-                style.margin[2] = Some(v);
-                style.margin_auto[2] = false;
-            }
+        "margin-bottom" => {
+            apply_phys_margin(style, 2, toks, seq);
         }
-        "margin-left" | "margin-inline-start" => {
-            if is_auto_keyword(toks) {
-                style.margin[3] = None;
-                style.margin_auto[3] = true;
-            } else if let Some(v) = Length::from_tokens(toks) {
-                style.margin[3] = Some(v);
-                style.margin_auto[3] = false;
-            }
+        "margin-left" => {
+            apply_phys_margin(style, 3, toks, seq);
         }
-        // `margin-block: 10px 20px` / `margin-inline: 10px 20px` —
-        // 1 or 2 value shorthands that expand to the start+end pair.
-        // The `auto` keyword must set margin_auto[i]=true so the layout
-        // engine produces centered blocks (the ubiquitous `margin-inline:
-        // auto` idiom). Previously the auto case went through
-        // Length::from_tokens which returned None and set nothing.
+        // Flow-relative margin longhands — stored raw, mapped to a
+        // physical side in `resolve_logical_box`. CSS Logical 1 §4.2.
+        "margin-block-start" => apply_logical_margin(&mut style.logical_margin, LOGICAL_BLOCK_START, toks, seq),
+        "margin-block-end" => apply_logical_margin(&mut style.logical_margin, LOGICAL_BLOCK_END, toks, seq),
+        "margin-inline-start" => apply_logical_margin(&mut style.logical_margin, LOGICAL_INLINE_START, toks, seq),
+        "margin-inline-end" => apply_logical_margin(&mut style.logical_margin, LOGICAL_INLINE_END, toks, seq),
+        // `margin-block: <start> <end>` / `margin-inline: <start> <end>`
+        // 1-or-2-value flow-relative shorthands.
         "margin-block" => {
             let parts = split_top_level_whitespace(toks);
             if let Some(p) = parts.first() {
-                if is_auto_keyword(p) {
-                    style.margin[0] = Some(Length::Auto);
-                    style.margin_auto[0] = true;
-                    style.margin[2] = Some(Length::Auto);
-                    style.margin_auto[2] = true;
-                } else if let Some(v) = Length::from_tokens(p) {
-                    style.margin[0] = Some(v);
-                    style.margin_auto[0] = false;
-                    style.margin[2] = Some(v);
-                    style.margin_auto[2] = false;
+                apply_logical_margin(&mut style.logical_margin, LOGICAL_BLOCK_START, p, seq);
+                if parts.len() < 2 {
+                    apply_logical_margin(&mut style.logical_margin, LOGICAL_BLOCK_END, p, seq);
                 }
             }
             if let Some(p) = parts.get(1) {
-                if is_auto_keyword(p) {
-                    style.margin[2] = Some(Length::Auto);
-                    style.margin_auto[2] = true;
-                } else if let Some(v) = Length::from_tokens(p) {
-                    style.margin[2] = Some(v);
-                    style.margin_auto[2] = false;
-                }
+                apply_logical_margin(&mut style.logical_margin, LOGICAL_BLOCK_END, p, seq);
             }
         }
         "margin-inline" => {
             let parts = split_top_level_whitespace(toks);
             if let Some(p) = parts.first() {
-                if is_auto_keyword(p) {
-                    style.margin[3] = Some(Length::Auto);
-                    style.margin_auto[3] = true;
-                    style.margin[1] = Some(Length::Auto);
-                    style.margin_auto[1] = true;
-                } else if let Some(v) = Length::from_tokens(p) {
-                    style.margin[3] = Some(v);
-                    style.margin_auto[3] = false;
-                    style.margin[1] = Some(v);
-                    style.margin_auto[1] = false;
+                apply_logical_margin(&mut style.logical_margin, LOGICAL_INLINE_START, p, seq);
+                if parts.len() < 2 {
+                    apply_logical_margin(&mut style.logical_margin, LOGICAL_INLINE_END, p, seq);
                 }
             }
             if let Some(p) = parts.get(1) {
-                if is_auto_keyword(p) {
-                    style.margin[1] = Some(Length::Auto);
-                    style.margin_auto[1] = true;
-                } else if let Some(v) = Length::from_tokens(p) {
-                    style.margin[1] = Some(v);
-                    style.margin_auto[1] = false;
-                }
+                apply_logical_margin(&mut style.logical_margin, LOGICAL_INLINE_END, p, seq);
             }
         }
-        "max-width" | "max-inline-size" => {
+        "max-width" => {
             if !is_auto_keyword(toks) && !is_none_keyword(toks) {
                 if let Some(v) = Length::from_tokens(toks) {
                     style.max_width = Some(v);
+                    style.physical_minmax_seq[2] = seq;
                 }
             }
         }
-        "max-height" | "max-block-size" => {
+        "max-height" => {
             if !is_auto_keyword(toks) && !is_none_keyword(toks) {
                 if let Some(v) = Length::from_tokens(toks) {
                     style.max_height = Some(v);
+                    style.physical_minmax_seq[3] = seq;
                 }
             }
         }
-        "min-width" | "min-inline-size" => {
+        "max-inline-size" => {
+            if !is_auto_keyword(toks) && !is_none_keyword(toks) {
+                style.max_inline_size = Length::from_tokens(toks);
+                style.logical_minmax_seq[2] = seq;
+            }
+        }
+        "max-block-size" => {
+            if !is_auto_keyword(toks) && !is_none_keyword(toks) {
+                style.max_block_size = Length::from_tokens(toks);
+                style.logical_minmax_seq[3] = seq;
+            }
+        }
+        "min-width" => {
             if !is_auto_keyword(toks) {
                 if let Some(v) = Length::from_tokens(toks) {
                     style.min_width = Some(v);
+                    style.physical_minmax_seq[0] = seq;
                 }
             }
         }
-        "min-height" | "min-block-size" => {
+        "min-height" => {
             if !is_auto_keyword(toks) {
                 if let Some(v) = Length::from_tokens(toks) {
                     style.min_height = Some(v);
+                    style.physical_minmax_seq[1] = seq;
                 }
+            }
+        }
+        "min-inline-size" => {
+            if !is_auto_keyword(toks) {
+                style.min_inline_size = Length::from_tokens(toks);
+                style.logical_minmax_seq[0] = seq;
+            }
+        }
+        "min-block-size" => {
+            if !is_auto_keyword(toks) {
+                style.min_block_size = Length::from_tokens(toks);
+                style.logical_minmax_seq[1] = seq;
             }
         }
         "padding" => {
             if let Some(sides) = parse_box_shorthand(toks) {
                 style.padding = sides;
+                for i in 0..4 {
+                    style.physical_padding_seq[i] = seq;
+                }
             }
         }
-        "padding-top" | "padding-block-start" => {
+        "padding-top" => {
             if let Some(v) = Length::from_tokens(toks) {
                 style.padding[0] = Some(v);
+                style.physical_padding_seq[0] = seq;
             }
         }
-        "padding-right" | "padding-inline-end" => {
+        "padding-right" => {
             if let Some(v) = Length::from_tokens(toks) {
                 style.padding[1] = Some(v);
+                style.physical_padding_seq[1] = seq;
             }
         }
-        "padding-bottom" | "padding-block-end" => {
+        "padding-bottom" => {
             if let Some(v) = Length::from_tokens(toks) {
                 style.padding[2] = Some(v);
+                style.physical_padding_seq[2] = seq;
             }
         }
-        "padding-left" | "padding-inline-start" => {
+        "padding-left" => {
             if let Some(v) = Length::from_tokens(toks) {
                 style.padding[3] = Some(v);
+                style.physical_padding_seq[3] = seq;
             }
         }
+        "padding-block-start" => apply_logical_pad(&mut style.logical_padding, LOGICAL_BLOCK_START, toks, seq),
+        "padding-block-end" => apply_logical_pad(&mut style.logical_padding, LOGICAL_BLOCK_END, toks, seq),
+        "padding-inline-start" => apply_logical_pad(&mut style.logical_padding, LOGICAL_INLINE_START, toks, seq),
+        "padding-inline-end" => apply_logical_pad(&mut style.logical_padding, LOGICAL_INLINE_END, toks, seq),
         "padding-block" => {
             let parts = split_top_level_whitespace(toks);
             if let Some(p) = parts.first() {
-                if let Some(v) = Length::from_tokens(p) {
-                    style.padding[0] = Some(v);
-                    style.padding[2] = Some(v);
+                apply_logical_pad(&mut style.logical_padding, LOGICAL_BLOCK_START, p, seq);
+                if parts.len() < 2 {
+                    apply_logical_pad(&mut style.logical_padding, LOGICAL_BLOCK_END, p, seq);
                 }
             }
             if let Some(p) = parts.get(1) {
-                if let Some(v) = Length::from_tokens(p) {
-                    style.padding[2] = Some(v);
-                }
+                apply_logical_pad(&mut style.logical_padding, LOGICAL_BLOCK_END, p, seq);
             }
         }
         "padding-inline" => {
             let parts = split_top_level_whitespace(toks);
             if let Some(p) = parts.first() {
-                if let Some(v) = Length::from_tokens(p) {
-                    style.padding[3] = Some(v);
-                    style.padding[1] = Some(v);
+                apply_logical_pad(&mut style.logical_padding, LOGICAL_INLINE_START, p, seq);
+                if parts.len() < 2 {
+                    apply_logical_pad(&mut style.logical_padding, LOGICAL_INLINE_END, p, seq);
                 }
             }
             if let Some(p) = parts.get(1) {
-                if let Some(v) = Length::from_tokens(p) {
-                    style.padding[1] = Some(v);
-                }
+                apply_logical_pad(&mut style.logical_padding, LOGICAL_INLINE_END, p, seq);
             }
         }
         "border" => {
@@ -4693,21 +5093,25 @@ fn apply_declaration(style: &mut ComputedStyle, d: &Declaration) {
         "top" => {
             if let Some(v) = Length::from_tokens(toks) {
                 style.top = Some(v);
+                style.physical_inset_seq[0] = seq;
             }
         }
         "right" => {
             if let Some(v) = Length::from_tokens(toks) {
                 style.right = Some(v);
+                style.physical_inset_seq[1] = seq;
             }
         }
         "bottom" => {
             if let Some(v) = Length::from_tokens(toks) {
                 style.bottom = Some(v);
+                style.physical_inset_seq[2] = seq;
             }
         }
         "left" => {
             if let Some(v) = Length::from_tokens(toks) {
                 style.left = Some(v);
+                style.physical_inset_seq[3] = seq;
             }
         }
         "z-index" => {
@@ -5181,8 +5585,6 @@ fn apply_declaration(style: &mut ComputedStyle, d: &Declaration) {
         | "word-wrap"
         | "hyphens"
         | "tab-size"
-        | "writing-mode"
-        | "direction"
         | "unicode-bidi"
         | "text-orientation"
         | "text-emphasis"
@@ -5828,32 +6230,14 @@ fn apply_declaration(style: &mut ComputedStyle, d: &Declaration) {
         | "text-anchor"
         | "alignment-baseline" => {}
         // Logical-position single-side properties. For LTR top-to-bottom
-        // writing modes (the common case) these resolve to physical
-        // sides: inline-start→left, inline-end→right, block-start→top,
-        // block-end→bottom. We don't track writing-mode yet so always
-        // use the LTR mapping. Sites use these for spec-compliant CSS
-        // that needs to support RTL but rarely renders in RTL on
-        // English-speaking sites we audit.
-        "inset-inline-start" => {
-            if let Some(v) = Length::from_tokens(toks) {
-                style.left = Some(v);
-            }
-        }
-        "inset-inline-end" => {
-            if let Some(v) = Length::from_tokens(toks) {
-                style.right = Some(v);
-            }
-        }
-        "inset-block-start" => {
-            if let Some(v) = Length::from_tokens(toks) {
-                style.top = Some(v);
-            }
-        }
-        "inset-block-end" => {
-            if let Some(v) = Length::from_tokens(toks) {
-                style.bottom = Some(v);
-            }
-        }
+        // sides via the element's writing-mode + direction. Stored raw in
+        // the logical-inset accumulator and mapped by `resolve_logical_box`
+        // (CSS Logical 1 §4.3). inline-start→left etc. only under the
+        // default horizontal-tb/ltr; vertical-rl maps block-start→right etc.
+        "inset-inline-start" => apply_logical_pad(&mut style.logical_inset, LOGICAL_INLINE_START, toks, seq),
+        "inset-inline-end" => apply_logical_pad(&mut style.logical_inset, LOGICAL_INLINE_END, toks, seq),
+        "inset-block-start" => apply_logical_pad(&mut style.logical_inset, LOGICAL_BLOCK_START, toks, seq),
+        "inset-block-end" => apply_logical_pad(&mut style.logical_inset, LOGICAL_BLOCK_END, toks, seq),
         "inset-inline" => {
             let lengths: Vec<Length> = toks
                 .iter()
@@ -5861,12 +6245,16 @@ fn apply_declaration(style: &mut ComputedStyle, d: &Declaration) {
                 .collect();
             match lengths.len() {
                 1 => {
-                    style.left = Some(lengths[0]);
-                    style.right = Some(lengths[0]);
+                    style.logical_inset.vals[LOGICAL_INLINE_START] = Some(lengths[0]);
+                    style.logical_inset.vals[LOGICAL_INLINE_END] = Some(lengths[0]);
+                    style.logical_inset.seq[LOGICAL_INLINE_START] = seq;
+                    style.logical_inset.seq[LOGICAL_INLINE_END] = seq;
                 }
                 2 => {
-                    style.left = Some(lengths[0]);
-                    style.right = Some(lengths[1]);
+                    style.logical_inset.vals[LOGICAL_INLINE_START] = Some(lengths[0]);
+                    style.logical_inset.vals[LOGICAL_INLINE_END] = Some(lengths[1]);
+                    style.logical_inset.seq[LOGICAL_INLINE_START] = seq;
+                    style.logical_inset.seq[LOGICAL_INLINE_END] = seq;
                 }
                 _ => {}
             }
@@ -5878,12 +6266,16 @@ fn apply_declaration(style: &mut ComputedStyle, d: &Declaration) {
                 .collect();
             match lengths.len() {
                 1 => {
-                    style.top = Some(lengths[0]);
-                    style.bottom = Some(lengths[0]);
+                    style.logical_inset.vals[LOGICAL_BLOCK_START] = Some(lengths[0]);
+                    style.logical_inset.vals[LOGICAL_BLOCK_END] = Some(lengths[0]);
+                    style.logical_inset.seq[LOGICAL_BLOCK_START] = seq;
+                    style.logical_inset.seq[LOGICAL_BLOCK_END] = seq;
                 }
                 2 => {
-                    style.top = Some(lengths[0]);
-                    style.bottom = Some(lengths[1]);
+                    style.logical_inset.vals[LOGICAL_BLOCK_START] = Some(lengths[0]);
+                    style.logical_inset.vals[LOGICAL_BLOCK_END] = Some(lengths[1]);
+                    style.logical_inset.seq[LOGICAL_BLOCK_START] = seq;
+                    style.logical_inset.seq[LOGICAL_BLOCK_END] = seq;
                 }
                 _ => {}
             }
@@ -5923,6 +6315,11 @@ fn apply_declaration(style: &mut ComputedStyle, d: &Declaration) {
                     style.left = Some(lengths[3]);
                 }
                 _ => {}
+            }
+            if !lengths.is_empty() {
+                for i in 0..4 {
+                    style.physical_inset_seq[i] = seq;
+                }
             }
         }
         // `font:` shorthand. Real form is `font: [style] [variant]
@@ -10443,5 +10840,209 @@ mod tests {
         let ss2 = parse_stylesheet("h2 { column-span: none; }");
         let cs2 = compute(&[ss2], el);
         assert!(!cs2.column_span_all, "column-span:none clears the flag");
+    }
+
+    // ─── CSS Writing Modes 4 + CSS Logical Properties 1 ────────────────────
+    // margin index map: [top, right, bottom, left] = [0,1,2,3].
+
+    /// `writing-mode: vertical-rl` / `direction: rtl` parse into ComputedStyle.
+    #[test]
+    fn writing_mode_and_direction_parse() {
+        let ss = parse_stylesheet("p { writing-mode: vertical-rl; direction: rtl; }");
+        let el = Fake { tag: "p", id: None, classes: &[] };
+        let cs = compute(&[ss], el);
+        assert_eq!(cs.writing_mode, Some(WritingMode::VerticalRl));
+        assert_eq!(cs.direction, Some(Direction::Rtl));
+    }
+
+    /// margin-inline-start in horizontal-tb LTR (the default) must resolve to
+    /// margin-LEFT (CSS Logical 1 §2.1 mapping table).
+    #[test]
+    fn margin_inline_start_horizontal_ltr_is_left() {
+        let ss = parse_stylesheet("p { margin-inline-start: 7px; }");
+        let el = Fake { tag: "p", id: None, classes: &[] };
+        let cs = compute(&[ss], el);
+        assert_eq!(cs.margin[3], Some(Length::Px(7.0)), "inline-start → left in horizontal-tb LTR");
+        assert_eq!(cs.margin[1], None, "right must be untouched");
+        assert_eq!(cs.margin[0], None, "top must be untouched");
+    }
+
+    /// margin-inline-start in horizontal-tb RTL must resolve to margin-RIGHT.
+    #[test]
+    fn margin_inline_start_horizontal_rtl_is_right() {
+        let ss = parse_stylesheet("p { direction: rtl; margin-inline-start: 7px; }");
+        let el = Fake { tag: "p", id: None, classes: &[] };
+        let cs = compute(&[ss], el);
+        assert_eq!(cs.margin[1], Some(Length::Px(7.0)), "inline-start → right in horizontal-tb RTL");
+        assert_eq!(cs.margin[3], None, "left must be untouched in RTL");
+    }
+
+    /// margin-inline-start in vertical-rl LTR must resolve to margin-TOP.
+    #[test]
+    fn margin_inline_start_vertical_rl_is_top() {
+        let ss = parse_stylesheet("p { writing-mode: vertical-rl; margin-inline-start: 7px; }");
+        let el = Fake { tag: "p", id: None, classes: &[] };
+        let cs = compute(&[ss], el);
+        assert_eq!(cs.margin[0], Some(Length::Px(7.0)), "inline-start → top in vertical-rl LTR");
+        assert_eq!(cs.margin[3], None, "left must be untouched in vertical-rl");
+    }
+
+    /// block-start in vertical-rl must map to the RIGHT edge (CSS Logical table).
+    #[test]
+    fn margin_block_start_vertical_rl_is_right() {
+        let ss = parse_stylesheet("p { writing-mode: vertical-rl; margin-block-start: 9px; }");
+        let el = Fake { tag: "p", id: None, classes: &[] };
+        let cs = compute(&[ss], el);
+        assert_eq!(cs.margin[1], Some(Length::Px(9.0)), "block-start → right in vertical-rl");
+    }
+
+    /// block-start in vertical-lr must map to the LEFT edge.
+    #[test]
+    fn margin_block_start_vertical_lr_is_left() {
+        let ss = parse_stylesheet("p { writing-mode: vertical-lr; margin-block-start: 9px; }");
+        let el = Fake { tag: "p", id: None, classes: &[] };
+        let cs = compute(&[ss], el);
+        assert_eq!(cs.margin[3], Some(Length::Px(9.0)), "block-start → left in vertical-lr");
+    }
+
+    /// vertical-rl + rtl flips the inline axis: inline-start → BOTTOM.
+    #[test]
+    fn margin_inline_start_vertical_rl_rtl_is_bottom() {
+        let ss = parse_stylesheet("p { writing-mode: vertical-rl; direction: rtl; margin-inline-start: 4px; }");
+        let el = Fake { tag: "p", id: None, classes: &[] };
+        let cs = compute(&[ss], el);
+        assert_eq!(cs.margin[2], Some(Length::Px(4.0)), "inline-start → bottom in vertical-rl RTL");
+    }
+
+    /// inline-size maps to WIDTH in horizontal writing modes.
+    #[test]
+    fn inline_size_horizontal_is_width() {
+        let ss = parse_stylesheet("div { inline-size: 200px; }");
+        let el = Fake { tag: "div", id: None, classes: &[] };
+        let cs = compute(&[ss], el);
+        assert_eq!(cs.width, Some(Length::Px(200.0)), "inline-size → width in horizontal-tb");
+        assert_eq!(cs.height, None, "height untouched");
+    }
+
+    /// inline-size maps to HEIGHT in vertical writing modes; block-size → width.
+    #[test]
+    fn inline_size_vertical_is_height() {
+        let ss = parse_stylesheet("div { writing-mode: vertical-rl; inline-size: 200px; block-size: 50px; }");
+        let el = Fake { tag: "div", id: None, classes: &[] };
+        let cs = compute(&[ss], el);
+        assert_eq!(cs.height, Some(Length::Px(200.0)), "inline-size → height in vertical-rl");
+        assert_eq!(cs.width, Some(Length::Px(50.0)), "block-size → width in vertical-rl");
+    }
+
+    /// min/max-inline/block-size map to the correct physical axis.
+    #[test]
+    fn minmax_logical_size_vertical() {
+        let ss = parse_stylesheet(
+            "div { writing-mode: vertical-lr; min-inline-size: 30px; max-block-size: 80px; }",
+        );
+        let el = Fake { tag: "div", id: None, classes: &[] };
+        let cs = compute(&[ss], el);
+        assert_eq!(cs.min_height, Some(Length::Px(30.0)), "min-inline-size → min-height in vertical");
+        assert_eq!(cs.max_width, Some(Length::Px(80.0)), "max-block-size → max-width in vertical");
+    }
+
+    /// padding-inline-start in vertical-rl → padding-TOP (and -end → bottom).
+    #[test]
+    fn padding_inline_vertical_rl() {
+        let ss = parse_stylesheet(
+            "p { writing-mode: vertical-rl; padding-inline-start: 3px; padding-inline-end: 6px; }",
+        );
+        let el = Fake { tag: "p", id: None, classes: &[] };
+        let cs = compute(&[ss], el);
+        assert_eq!(cs.padding[0], Some(Length::Px(3.0)), "inline-start → padding-top");
+        assert_eq!(cs.padding[2], Some(Length::Px(6.0)), "inline-end → padding-bottom");
+    }
+
+    /// inset-block-start in vertical-rl maps to the physical `right` offset.
+    #[test]
+    fn inset_block_start_vertical_rl_is_right() {
+        let ss = parse_stylesheet("p { writing-mode: vertical-rl; inset-block-start: 12px; }");
+        let el = Fake { tag: "p", id: None, classes: &[] };
+        let cs = compute(&[ss], el);
+        assert_eq!(cs.right, Some(Length::Px(12.0)), "inset-block-start → right in vertical-rl");
+        assert_eq!(cs.top, None, "top untouched");
+    }
+
+    /// CASCADE ORDER: a PHYSICAL longhand declared AFTER a logical one that
+    /// maps to the same physical side must win (CSS Logical 1 §2: the pair
+    /// shares a computed value taken from the higher-priority declaration).
+    #[test]
+    fn physical_after_logical_wins_same_slot() {
+        // horizontal-tb LTR: margin-inline-start → left. margin-left declared
+        // LATER must override it.
+        let ss = parse_stylesheet("p { margin-inline-start: 5px; margin-left: 11px; }");
+        let el = Fake { tag: "p", id: None, classes: &[] };
+        let cs = compute(&[ss], el);
+        assert_eq!(cs.margin[3], Some(Length::Px(11.0)), "later physical margin-left wins over earlier logical");
+    }
+
+    /// CASCADE ORDER: a LOGICAL longhand declared AFTER a physical one that
+    /// maps to the same physical side must win.
+    #[test]
+    fn logical_after_physical_wins_same_slot() {
+        let ss = parse_stylesheet("p { margin-left: 11px; margin-inline-start: 5px; }");
+        let el = Fake { tag: "p", id: None, classes: &[] };
+        let cs = compute(&[ss], el);
+        assert_eq!(cs.margin[3], Some(Length::Px(5.0)), "later logical margin-inline-start wins over earlier physical");
+    }
+
+    /// A 2-value `margin-inline: <start> <end>` in vertical-rl maps start→top
+    /// and end→bottom.
+    #[test]
+    fn margin_inline_shorthand_vertical_rl() {
+        let ss = parse_stylesheet("p { writing-mode: vertical-rl; margin-inline: 2px 8px; }");
+        let el = Fake { tag: "p", id: None, classes: &[] };
+        let cs = compute(&[ss], el);
+        assert_eq!(cs.margin[0], Some(Length::Px(2.0)), "inline-start → top");
+        assert_eq!(cs.margin[2], Some(Length::Px(8.0)), "inline-end → bottom");
+    }
+
+    /// Regression: the plain physical horizontal-tb path is unchanged —
+    /// margin-left still sets margin[3], width still sets width.
+    #[test]
+    fn physical_box_unaffected_default_mode() {
+        let ss = parse_stylesheet("p { margin-left: 4px; width: 100px; padding-top: 2px; left: 5px; }");
+        let el = Fake { tag: "p", id: None, classes: &[] };
+        let cs = compute(&[ss], el);
+        assert_eq!(cs.margin[3], Some(Length::Px(4.0)));
+        assert_eq!(cs.width, Some(Length::Px(100.0)));
+        assert_eq!(cs.padding[0], Some(Length::Px(2.0)));
+        assert_eq!(cs.left, Some(Length::Px(5.0)));
+    }
+
+    /// `map_logical_side` covers the full spec table for all 6 mode/dir combos.
+    #[test]
+    fn map_logical_side_full_table() {
+        use WritingMode::*;
+        use Direction::*;
+        // (top,right,bottom,left) = (0,1,2,3)
+        // horizontal-tb LTR
+        assert_eq!(map_logical_side(LOGICAL_INLINE_START, HorizontalTb, Ltr), 3);
+        assert_eq!(map_logical_side(LOGICAL_INLINE_END, HorizontalTb, Ltr), 1);
+        assert_eq!(map_logical_side(LOGICAL_BLOCK_START, HorizontalTb, Ltr), 0);
+        assert_eq!(map_logical_side(LOGICAL_BLOCK_END, HorizontalTb, Ltr), 2);
+        // horizontal-tb RTL
+        assert_eq!(map_logical_side(LOGICAL_INLINE_START, HorizontalTb, Rtl), 1);
+        assert_eq!(map_logical_side(LOGICAL_INLINE_END, HorizontalTb, Rtl), 3);
+        // vertical-rl LTR
+        assert_eq!(map_logical_side(LOGICAL_INLINE_START, VerticalRl, Ltr), 0);
+        assert_eq!(map_logical_side(LOGICAL_INLINE_END, VerticalRl, Ltr), 2);
+        assert_eq!(map_logical_side(LOGICAL_BLOCK_START, VerticalRl, Ltr), 1);
+        assert_eq!(map_logical_side(LOGICAL_BLOCK_END, VerticalRl, Ltr), 3);
+        // vertical-rl RTL
+        assert_eq!(map_logical_side(LOGICAL_INLINE_START, VerticalRl, Rtl), 2);
+        assert_eq!(map_logical_side(LOGICAL_INLINE_END, VerticalRl, Rtl), 0);
+        // vertical-lr LTR
+        assert_eq!(map_logical_side(LOGICAL_INLINE_START, VerticalLr, Ltr), 0);
+        assert_eq!(map_logical_side(LOGICAL_BLOCK_START, VerticalLr, Ltr), 3);
+        assert_eq!(map_logical_side(LOGICAL_BLOCK_END, VerticalLr, Ltr), 1);
+        // vertical-lr RTL
+        assert_eq!(map_logical_side(LOGICAL_INLINE_START, VerticalLr, Rtl), 2);
+        assert_eq!(map_logical_side(LOGICAL_INLINE_END, VerticalLr, Rtl), 0);
     }
 }

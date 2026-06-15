@@ -900,6 +900,11 @@ pub struct LayoutBox {
     /// never individually cached — they're captured inside their container's
     /// cached fragment instead.
     pub cache_ineligible: bool,
+    /// CSS `writing-mode` (CSS Writing Modes 4 §3.1). `HorizontalTb` (the
+    /// default) stacks in-flow block children top→bottom; a vertical mode
+    /// stacks them along the X axis (right→left for `VerticalRl`, left→right
+    /// for `VerticalLr`). Carried so the block-layout pass can pick the axis.
+    pub writing_mode: WritingMode,
     pub children: Vec<LayoutBox>,
 }
 
@@ -1523,6 +1528,11 @@ pub struct Style {
     /// default: 50% 50% (centre). Used by the painter together with
     /// `object_fit` to position the scaled image inside the content box.
     pub object_position: Option<(BgPos, BgPos)>,
+    /// CSS `writing-mode` (lowered). `None` = the inherited/initial
+    /// `horizontal-tb`. A vertical mode makes a block container stack its
+    /// in-flow block children horizontally (right→left for vertical-rl,
+    /// left→right for vertical-lr) — CSS Writing Modes 4 §7.1.
+    pub writing_mode: Option<WritingMode>,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -1547,6 +1557,29 @@ pub struct EmbeddedImage {
     pub width: u32,
     pub height: u32,
     pub pixels: Vec<u32>,
+}
+
+/// CSS `writing-mode` lowered for layout (CSS Writing Modes 4 §3.1). Drives
+/// whether block-level children stack vertically (horizontal-tb) or
+/// horizontally (vertical-rl/lr), and the block-progression direction.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+pub enum WritingMode {
+    /// Block axis runs top→bottom; inline axis horizontal. The default.
+    #[default]
+    HorizontalTb,
+    /// Block axis runs right→left; inline axis vertical (top→bottom).
+    VerticalRl,
+    /// Block axis runs left→right; inline axis vertical (top→bottom).
+    VerticalLr,
+}
+
+impl WritingMode {
+    /// True for vertical writing modes (inline axis is vertical; block axis
+    /// is horizontal). In these modes a block container stacks its in-flow
+    /// block children along the X axis instead of Y.
+    pub fn is_vertical(self) -> bool {
+        matches!(self, WritingMode::VerticalRl | WritingMode::VerticalLr)
+    }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -3737,6 +3770,7 @@ fn build_box_inner(node: &StyledNode, cfg: &LayoutConfig) -> LayoutBox {
                 element_path: node.style.element_path.clone(),
                 node_id: node.style.node_id,
                 cache_ineligible: false,
+                writing_mode: node.style.writing_mode.unwrap_or_default(),
                 children: kids,
             }
         }
@@ -3894,6 +3928,7 @@ fn build_box_inner(node: &StyledNode, cfg: &LayoutConfig) -> LayoutBox {
             element_path: node.style.element_path.clone(),
             node_id: node.style.node_id,
             cache_ineligible: false,
+            writing_mode: node.style.writing_mode.unwrap_or_default(),
             children: Vec::new(),
         },
     }
@@ -4355,6 +4390,25 @@ fn place_inner(
                 };
                 return;
             }
+            // Vertical writing mode (CSS Writing Modes 4 §7.1): the block
+            // axis is HORIZONTAL, so in-flow block children stack along X
+            // (right→left for vertical-rl, left→right for vertical-lr) and
+            // the cross/inline axis is vertical. Handled by a dedicated
+            // pass that mirrors the horizontal block-stack algorithm with
+            // the axes swapped.
+            if b.writing_mode.is_vertical() {
+                place_vertical_blocks(
+                    b,
+                    content_x,
+                    content_y,
+                    content_w,
+                    child_container_h,
+                    container_h,
+                    ctx,
+                    parent_fs,
+                );
+                return;
+            }
             // First pass: classify each in-flow child as block-level
             // (own line) or inline-level (joins the running line).
             // Out-of-flow children are deferred to the second pass
@@ -4523,6 +4577,153 @@ fn place_inner(
             }
         }
     }
+}
+
+/// Lay out the in-flow BLOCK children of a vertical-writing-mode container
+/// (CSS Writing Modes 4 §7.1). The block axis is horizontal, so children
+/// stack along X: right→left for `vertical-rl` (block-start = right edge),
+/// left→right for `vertical-lr` (block-start = left edge). The cross/inline
+/// axis is vertical — a block child's inline-size (which the cascade already
+/// mapped onto `explicit_height`) fills the container's content height when
+/// auto, exactly mirroring how `width:auto` fills the inline axis in a
+/// horizontal block. Each child's block-axis extent (its physical width) is
+/// content-determined or from its `explicit_width`.
+///
+/// This mirrors the horizontal block-stacking loop with the axes swapped. It
+/// intentionally does not yet model floats / vertical-margin-collapsing in
+/// the rotated frame (rare in vertical content); margins are honoured via the
+/// child's margin-box extent on each axis.
+#[allow(clippy::too_many_arguments)]
+fn place_vertical_blocks(
+    b: &mut LayoutBox,
+    content_x: f32,
+    content_y: f32,
+    content_w: f32,
+    child_container_h: f32,
+    container_h: f32,
+    ctx: &mut LayoutCtx<'_>,
+    parent_fs: f32,
+) {
+    let rl = b.writing_mode == WritingMode::VerticalRl;
+    // Cross (inline/vertical) extent every block child stretches to fill,
+    // analogous to `content_w` in horizontal flow. Children whose own height
+    // (== inline-size) is auto fill this; explicit-height children keep theirs.
+    let cross_h = if child_container_h > 0.0 {
+        child_container_h
+    } else {
+        content_h_for_vertical(b, container_h)
+    };
+
+    // Phase 1 — lay out + cross-axis-stretch each in-flow block child, and
+    // record its block-axis extent (physical width) WITHOUT positioning yet.
+    // We position in phase 2 once the container's block-axis content width is
+    // known, so vertical-rl can pin children to the real right edge even when
+    // the container shrink-wraps. Out-of-flow children are deferred to the
+    // final absolute pass like the horizontal path.
+    let n = b.children.len();
+    let mut block_extents: Vec<f32> = vec![0.0; n];
+    let mut max_child_cross: f32 = 0.0;
+    let mut used_block: f32 = 0.0;
+    for i in 0..n {
+        if !is_in_flow(&b.children[i]) {
+            continue;
+        }
+        // Place the child once to size its subtree. Available cross space is the
+        // container content height (so % heights resolve); available inline
+        // (block-axis / width) is content_w so its auto width shrinks to content.
+        place(
+            &mut b.children[i],
+            content_x,
+            content_y,
+            content_w,
+            cross_h,
+            ctx,
+            parent_fs,
+        );
+        // Cross-axis (vertical / inline) stretch: a block whose inline-size
+        // (height) is auto fills the container's content height — same rule as
+        // width:auto in horizontal flow. explicit_height children keep theirs.
+        if b.children[i].explicit_height.is_none() && cross_h > 0.0 {
+            let c = &b.children[i];
+            let new_h = cross_h
+                - c.padding.top
+                - c.padding.bottom
+                - c.border_width_top()
+                - c.border_width_bottom()
+                - c.margin.top
+                - c.margin.bottom;
+            b.children[i].content.h = new_h.max(0.0);
+        }
+        let mr = b.children[i].margin_rect();
+        block_extents[i] = mr.w; // physical width = block-axis extent
+        max_child_cross = max_child_cross.max(mr.h);
+        used_block += mr.w;
+    }
+
+    // Block-axis content extent (physical width). When `width` is explicitly
+    // set the cascade put it in `explicit_width` → use the caller-resolved
+    // `content_w`; otherwise shrink-to-fit the stacked children.
+    let content_box_w = if b.explicit_width.is_some() {
+        content_w
+    } else {
+        used_block.max(0.0)
+    };
+
+    // Phase 2 — position children along the block axis. vertical-lr: block-start
+    // is the LEFT edge so child i's left = content_x + cursor. vertical-rl:
+    // block-start is the RIGHT edge of the container content box so child i's
+    // RIGHT = content_x + content_box_w - cursor, i.e. its left = right - extent.
+    let mut block_cursor: f32 = 0.0;
+    for i in 0..n {
+        if !is_in_flow(&b.children[i]) {
+            continue;
+        }
+        let extent = block_extents[i];
+        let mr = b.children[i].margin_rect();
+        let target_margin_left = if rl {
+            (content_x + content_box_w) - block_cursor - extent
+        } else {
+            content_x + block_cursor
+        };
+        let dx = target_margin_left - mr.x;
+        let dy = content_y - mr.y;
+        shift_box(&mut b.children[i], dx, dy);
+        block_cursor += extent;
+    }
+
+    let natural_cross = max_child_cross.max(0.0);
+    let content_box_h = resolve_content_height(b, natural_cross, content_box_w, container_h);
+    b.content = Rect {
+        x: content_x,
+        y: content_y,
+        w: content_box_w,
+        h: content_box_h,
+    };
+
+    // Out-of-flow children: position against the padding box like the
+    // horizontal path.
+    let cb = b.padding_rect();
+    for child in &mut b.children {
+        if is_in_flow(child) {
+            continue;
+        }
+        place_absolute(child, &cb, ctx, parent_fs);
+    }
+}
+
+/// Cross (vertical/inline) extent a vertical-mode container offers its block
+/// children when no explicit container content-height is threaded in. Falls
+/// back to the container's own explicit/min height, else the viewport height.
+fn content_h_for_vertical(b: &LayoutBox, viewport_h: f32) -> f32 {
+    if let Some(spec) = b.explicit_height {
+        return spec.resolve(viewport_h).max(0.0);
+    }
+    if let Some(minh) = b.min_height {
+        if viewport_h > 0.0 || !minh.is_percent_based() {
+            return minh.resolve(viewport_h).max(0.0);
+        }
+    }
+    viewport_h.max(0.0)
 }
 
 fn resolve_content_height(b: &LayoutBox, natural_h: f32, content_w: f32, viewport_h: f32) -> f32 {
@@ -10922,5 +11123,118 @@ mod tests {
             "block-fallback child fills full width, got {}",
             root.children[0].content.w
         );
+    }
+
+    // ─── CSS Writing Modes 4 §7.1 — vertical block flow ───────────────────
+
+    /// Build a vertical-writing-mode block container with explicit width/height
+    /// and N fixed-width children (each child also fixed-width via `width`,
+    /// which in the layout `Style` is the physical width = block-axis extent).
+    fn vertical_container(wm: WritingMode, w: f32, h: f32, child_w: f32, n: usize) -> StyledNode {
+        let kids: Vec<StyledNode> = (0..n)
+            .map(|_| {
+                block(
+                    "div",
+                    Style {
+                        display: Some(Display::Block),
+                        width: Some(LengthSpec::Px(child_w)),
+                        ..Style::default()
+                    },
+                    vec![],
+                )
+            })
+            .collect();
+        block(
+            "div",
+            Style {
+                display: Some(Display::Block),
+                width: Some(LengthSpec::Px(w)),
+                height: Some(LengthSpec::Px(h)),
+                writing_mode: Some(wm),
+                ..Style::default()
+            },
+            kids,
+        )
+    }
+
+    /// vertical-rl: block children stack along X starting at the RIGHT edge of
+    /// the container's content box, advancing LEFTward. Block-start = right.
+    #[test]
+    fn vertical_rl_stacks_children_right_to_left() {
+        let doc = vertical_container(WritingMode::VerticalRl, 300.0, 200.0, 40.0, 3);
+        let root = layout(&doc, &LayoutConfig::default());
+        let c = &root.children;
+        assert_eq!(c.len(), 3);
+        // Container content box runs x=[0,300]. First child's RIGHT edge sits at
+        // the right edge (x ≈ 260 left, since width 40 → right 300). Each
+        // subsequent child is to the LEFT of the previous.
+        assert!(
+            (c[0].content.x - 260.0).abs() < 0.5,
+            "first child pinned to right edge (x≈260), got {}",
+            c[0].content.x
+        );
+        assert!(
+            (c[1].content.x - 220.0).abs() < 0.5,
+            "second child to the LEFT of the first (x≈220), got {}",
+            c[1].content.x
+        );
+        assert!(
+            (c[2].content.x - 180.0).abs() < 0.5,
+            "third child further LEFT (x≈180), got {}",
+            c[2].content.x
+        );
+        // They share the same block-progression-perpendicular (cross) origin y.
+        assert!((c[0].content.y - c[1].content.y).abs() < 0.5);
+        assert!((c[1].content.y - c[2].content.y).abs() < 0.5);
+        // Block stacks horizontally → x strictly decreases, not vertically.
+        assert!(c[0].content.x > c[1].content.x && c[1].content.x > c[2].content.x,
+            "right-to-left: x must strictly decrease");
+    }
+
+    /// vertical-lr: block children stack along X starting at the LEFT edge,
+    /// advancing RIGHTward. Block-start = left.
+    #[test]
+    fn vertical_lr_stacks_children_left_to_right() {
+        let doc = vertical_container(WritingMode::VerticalLr, 300.0, 200.0, 40.0, 3);
+        let root = layout(&doc, &LayoutConfig::default());
+        let c = &root.children;
+        assert_eq!(c.len(), 3);
+        assert!((c[0].content.x - 0.0).abs() < 0.5, "first child at left edge, got {}", c[0].content.x);
+        assert!((c[1].content.x - 40.0).abs() < 0.5, "second child to the RIGHT, got {}", c[1].content.x);
+        assert!((c[2].content.x - 80.0).abs() < 0.5, "third child further RIGHT, got {}", c[2].content.x);
+        assert!(c[0].content.x < c[1].content.x && c[1].content.x < c[2].content.x,
+            "left-to-right: x must strictly increase");
+    }
+
+    /// In a vertical mode, a block child whose inline-size (== physical height)
+    /// is AUTO fills the container's content height on the cross/inline axis —
+    /// the analog of width:auto filling the inline axis in horizontal flow.
+    #[test]
+    fn vertical_child_cross_axis_fills_container_height() {
+        let doc = vertical_container(WritingMode::VerticalRl, 300.0, 200.0, 40.0, 1);
+        let root = layout(&doc, &LayoutConfig::default());
+        let c0 = &root.children[0];
+        assert!(
+            (c0.content.h - 200.0).abs() < 0.5,
+            "auto-inline-size child fills container content height (200), got {}",
+            c0.content.h
+        );
+        // Block-axis extent (physical width) stays the explicit 40px.
+        assert!((c0.content.w - 40.0).abs() < 0.5, "child block extent = explicit width 40, got {}", c0.content.w);
+    }
+
+    /// Horizontal (default) block flow is UNCHANGED by the vertical branch:
+    /// children stack top-to-bottom at x=0.
+    #[test]
+    fn horizontal_block_flow_unchanged() {
+        let kids = vec![
+            block("div", Style { display: Some(Display::Block), height: Some(LengthSpec::Px(30.0)), ..Style::default() }, vec![]),
+            block("div", Style { display: Some(Display::Block), height: Some(LengthSpec::Px(30.0)), ..Style::default() }, vec![]),
+        ];
+        let doc = block("div", Style { display: Some(Display::Block), width: Some(LengthSpec::Px(300.0)), ..Style::default() }, kids);
+        let root = layout(&doc, &LayoutConfig::default());
+        let c = &root.children;
+        assert!(c[0].content.x.abs() < 0.5 && c[1].content.x.abs() < 0.5, "stays at x=0");
+        assert!(c[1].content.y > c[0].content.y + 29.0, "second stacks BELOW the first");
     }
 }

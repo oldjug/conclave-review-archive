@@ -19557,6 +19557,79 @@ mod transition_tests {
         TRANSITION_STATE.with(|s| s.borrow_mut().clear());
     }
 
+    /// END-TO-END (cascade → writing-mode INHERITANCE → lower → layout):
+    /// a child of a `vertical-rl` block that uses `margin-inline-start`
+    /// (without redeclaring writing-mode) must map it to `margin-TOP`, because
+    /// writing-mode inherits. This proves the inherited-mode re-resolution path
+    /// in build_styled_tree, not just the same-element case.
+    #[test]
+    fn inherited_vertical_writing_mode_maps_child_logical_margin_to_top() {
+        let html = "<!doctype html><html><body>\
+            <div id=outer><div id=inner>x</div></div></body></html>";
+        let css = "#outer { writing-mode: vertical-rl; } \
+                   #inner { margin-inline-start: 17px; }";
+        let doc = cv_html::parse(html);
+        let ss = cv_css::parse_stylesheet(css);
+        let cfg = cv_layout::LayoutConfig { viewport_w: 800.0, viewport_h: 600.0, ..Default::default() };
+        let lb = build_layout_tree(&doc, &[ss], "file:///t", &cfg, &Default::default());
+        // Find #inner. It inherits vertical-rl, so margin-inline-start → top.
+        let inner = find_box_with_top_margin(&lb).expect("inner box with a top margin must exist");
+        assert!(
+            (inner - 17.0).abs() < 0.5,
+            "inherited vertical-rl: margin-inline-start (17px) must become margin-TOP, got {}",
+            inner
+        );
+    }
+
+    /// Helper: depth-first find the first box whose top margin is ~17px (the
+    /// distinctive value used by the inherited-writing-mode test) so the test
+    /// doesn't depend on anonymous-box structure.
+    fn find_box_with_top_margin(b: &cv_layout::LayoutBox) -> Option<f32> {
+        if (b.margin.top - 17.0).abs() < 0.5 {
+            return Some(b.margin.top);
+        }
+        for c in &b.children {
+            if let Some(v) = find_box_with_top_margin(c) {
+                return Some(v);
+            }
+        }
+        None
+    }
+
+    /// END-TO-END vertical-rl block stacking: two explicitly-sized child blocks
+    /// inside a `writing-mode: vertical-rl` container with explicit width must
+    /// stack along X right-to-left (first child's x > second child's x).
+    #[test]
+    fn end_to_end_vertical_rl_stacks_right_to_left() {
+        let html = "<!doctype html><html><body>\
+            <div id=v><div class=item></div><div class=item></div></div></body></html>";
+        let css = "#v { writing-mode: vertical-rl; width: 300px; height: 200px; } \
+                   .item { width: 40px; }";
+        let doc = cv_html::parse(html);
+        let ss = cv_css::parse_stylesheet(css);
+        let cfg = cv_layout::LayoutConfig { viewport_w: 800.0, viewport_h: 600.0, ..Default::default() };
+        let lb = build_layout_tree(&doc, &[ss], "file:///t", &cfg, &Default::default());
+        // Collect the two 40px-wide item boxes in document order.
+        let mut items: Vec<f32> = Vec::new();
+        collect_item_xs(&lb, &mut items);
+        assert_eq!(items.len(), 2, "expected two .item boxes, got {}", items.len());
+        assert!(
+            items[0] > items[1],
+            "vertical-rl: first item must be to the RIGHT of the second (x0={} > x1={})",
+            items[0], items[1]
+        );
+    }
+
+    /// Helper: collect content.x of every box whose content width is ~40px.
+    fn collect_item_xs(b: &cv_layout::LayoutBox, out: &mut Vec<f32>) {
+        if (b.content.w - 40.0).abs() < 0.5 {
+            out.push(b.content.x);
+        }
+        for c in &b.children {
+            collect_item_xs(c, out);
+        }
+    }
+
     #[test]
     fn apply_css_animations_patches_color_and_radius_fields() {
         use cv_layout::Color as LC;
@@ -41094,6 +41167,13 @@ struct Inherited<'a> {
     /// `visibility:hidden` ancestor hides descendants that don't set their own
     /// `visibility`, and a descendant `visibility:visible` un-hides its subtree.
     visibility: Option<cv_css::properties::Visibility>,
+    /// Parent's computed `writing-mode`. CSS Writing Modes 4 §3.1 — inherits.
+    /// Threaded so a child that doesn't redeclare it still maps its logical
+    /// box properties (margin-inline-start, inline-size, …) against the
+    /// inherited mode, and so vertical block flow propagates down the subtree.
+    writing_mode: Option<cv_css::cascade::WritingMode>,
+    /// Parent's computed `direction`. CSS Writing Modes 4 §2.1 — inherits.
+    direction: Option<cv_css::cascade::Direction>,
 }
 
 /// Build a Blink-style ancestor `AncestorFilter` (Bloom of ancestor tag/id/class
@@ -41198,6 +41278,28 @@ fn build_styled_tree_full<'a>(
             // that declare none, while a descendant's own value still wins.
             if cs.visibility.is_none() {
                 cs.visibility = inherited.visibility;
+            }
+            // `writing-mode` + `direction` inherit (CSS Writing Modes 4 §3.1 /
+            // §2.1). Fill in the inherited value when this element didn't
+            // declare its own, THEN re-run the logical→physical box resolver so
+            // logical longhands (margin-inline-start, inline-size, …) map
+            // against the FINAL writing-mode (the cascade already ran the
+            // resolver once with the element's own/default mode; re-running is
+            // re-resolution-safe). Without this, a child of a `vertical-rl`
+            // block that uses `margin-inline-start` would wrongly map it to
+            // `left` instead of `top`.
+            let wm_was_own = cs.writing_mode.is_some();
+            let dir_was_own = cs.direction.is_some();
+            if cs.writing_mode.is_none() {
+                cs.writing_mode = inherited.writing_mode;
+            }
+            if cs.direction.is_none() {
+                cs.direction = inherited.direction;
+            }
+            if (!wm_was_own && inherited.writing_mode.is_some())
+                || (!dir_was_own && inherited.direction.is_some())
+            {
+                cv_css::cascade::resolve_logical_box(&mut cs);
             }
             // Parent's font-size in px is the `em` reference for this
             // element (CSS Values 4 §6.1.1). `<html>` has no parent,
@@ -41822,6 +41924,10 @@ fn build_styled_tree_full<'a>(
                 // visibility inherits: `cs` already folded in the parent's value
                 // above when this element declared none, so descendants chain.
                 visibility: cs.visibility,
+                // writing-mode / direction inherit: `cs` already folded in the
+                // parent's value above when this element declared none.
+                writing_mode: cs.writing_mode,
+                direction: cs.direction,
             };
             if matches!(style.display, Some(cv_layout::Display::None)) {
                 style.element_path = Some(path);
@@ -42186,6 +42292,8 @@ fn fingerprint_inherited(inh: &Inherited<'_>) -> u64 {
             inh.letter_spacing_px.map(f32::to_bits),
             inh.visibility,
             inh.preserve_whitespace,
+            inh.writing_mode,
+            inh.direction,
         )
     )
     .hash(&mut h);
@@ -42413,6 +42521,21 @@ fn build_styled_tree_full_arena_inner(
             }
             if cs.visibility.is_none() {
                 cs.visibility = inherited.visibility;
+            }
+            // writing-mode / direction inherit + re-resolve logical box (see
+            // the cv_html walker for the detailed rationale).
+            let wm_was_own = cs.writing_mode.is_some();
+            let dir_was_own = cs.direction.is_some();
+            if cs.writing_mode.is_none() {
+                cs.writing_mode = inherited.writing_mode;
+            }
+            if cs.direction.is_none() {
+                cs.direction = inherited.direction;
+            }
+            if (!wm_was_own && inherited.writing_mode.is_some())
+                || (!dir_was_own && inherited.direction.is_some())
+            {
+                cv_css::cascade::resolve_logical_box(&mut cs);
             }
             let parent_em_px = inherited.font_size.unwrap_or(16.0);
             let mut style = lower_style(&cs, cfg, parent_em_px);
@@ -42722,6 +42845,8 @@ fn build_styled_tree_full_arena_inner(
                 line_height: cs.line_height,
                 letter_spacing_px: cs.letter_spacing_px,
                 visibility: cs.visibility,
+                writing_mode: cs.writing_mode,
+                direction: cs.direction,
             };
             // The hash of the inherited values handed to children. If it differs
             // from the cached value, descendants must recompute (inherited inputs
@@ -43900,6 +44025,11 @@ fn lower_style(
                 cv_css::cascade::BgPos::Pct(v) => cv_layout::BgPos::Pct(v),
             };
             (conv(x), conv(y))
+        }),
+        writing_mode: cs.writing_mode.map(|wm| match wm {
+            cv_css::cascade::WritingMode::HorizontalTb => cv_layout::WritingMode::HorizontalTb,
+            cv_css::cascade::WritingMode::VerticalRl => cv_layout::WritingMode::VerticalRl,
+            cv_css::cascade::WritingMode::VerticalLr => cv_layout::WritingMode::VerticalLr,
         }),
     }
 }
@@ -54278,6 +54408,7 @@ mod tests {
             element_path: Some(vec![0]),
             node_id: None,
             cache_ineligible: false,
+            writing_mode: cv_layout::WritingMode::default(),
             children: Vec::new(),
         };
 
@@ -54819,6 +54950,7 @@ mod tests {
             element_path: None,
             node_id: None,
             cache_ineligible: false,
+            writing_mode: cv_layout::WritingMode::default(),
             children: Vec::new(),
         };
         let layout = cv_layout::LayoutBox {
@@ -54989,6 +55121,7 @@ mod tests {
             element_path: None,
             node_id: None,
             cache_ineligible: false,
+            writing_mode: cv_layout::WritingMode::default(),
             children: vec![child],
         };
         let mut bmp = cv_gfx::Bitmap::new(400, 200);
@@ -55159,6 +55292,7 @@ mod tests {
             element_path: None,
             node_id: None,
             cache_ineligible: false,
+            writing_mode: cv_layout::WritingMode::default(),
             children: Vec::new(),
         };
         let parent = cv_layout::LayoutBox {
@@ -55315,6 +55449,7 @@ mod tests {
             element_path: None,
             node_id: None,
             cache_ineligible: false,
+            writing_mode: cv_layout::WritingMode::default(),
             children: vec![child],
         };
         let mut bmp = cv_gfx::Bitmap::new(60, 60);
@@ -55477,6 +55612,7 @@ mod tests {
             element_path: None,
             node_id: None,
             cache_ineligible: false,
+            writing_mode: cv_layout::WritingMode::default(),
             children: Vec::new(),
         }
     }

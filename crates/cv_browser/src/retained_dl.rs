@@ -2982,6 +2982,7 @@ mod tests {
             element_path: None,
             node_id: None,
             cache_ineligible: false,
+            writing_mode: cv_layout::WritingMode::default(),
             children: Vec::new(),
         }
     }
