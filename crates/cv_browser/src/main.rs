@@ -12960,11 +12960,30 @@ fn install_fetch_inner(
     }
     fn rejected_promise(reason: cv_js::Value) -> cv_js::Value {
         let r_cell = Rc::new(RefCell::new(reason));
+        // `.then(onFulfilled, onRejected)`: a rejected promise NEVER calls
+        // onFulfilled; if an onRejected 2nd arg is given it runs and the result
+        // is a resolved promise; otherwise the rejection propagates, so we
+        // return a fresh rejected promise that STILL exposes `.catch`/`.then`
+        // (the previous version returned `undefined`, breaking `.then().catch()`).
+        let r_for_then = r_cell.clone();
+        let then_fn = cv_js::native_fn_with_interp("then", move |interp, args| {
+            if let Some(on_rej) = args.get(1) {
+                if !matches!(on_rej, cv_js::Value::Undefined | cv_js::Value::Null) {
+                    let r = interp
+                        .call_value(on_rej.clone(), vec![r_for_then.borrow().clone()])
+                        .unwrap_or(cv_js::Value::Undefined);
+                    return Ok(resolved_promise(r));
+                }
+            }
+            Ok(rejected_promise(r_for_then.borrow().clone()))
+        });
         let r_for_catch = r_cell.clone();
-        let then_fn = cv_js::native_fn("then", |_| Ok(cv_js::Value::Undefined));
         let catch_fn = cv_js::native_fn_with_interp("catch", move |interp, args| {
             if let Some(cb) = args.first() {
-                let _ = interp.call_value(cb.clone(), vec![r_for_catch.borrow().clone()]);
+                let r = interp
+                    .call_value(cb.clone(), vec![r_for_catch.borrow().clone()])
+                    .unwrap_or(cv_js::Value::Undefined);
+                return Ok(resolved_promise(r));
             }
             Ok(cv_js::Value::Undefined)
         });
@@ -14288,240 +14307,239 @@ fn install_fetch_inner(
         }),
     );
 
-    // ----- Web Audio API (#415) --------------------------------------
-    fn make_audio_node(kind: &'static str) -> cv_js::Value {
-        let k = kind.to_string();
-        obj_with(move |m| {
-            m.insert("kind".into(), cv_js::Value::str(k.clone()));
-            m.insert("numberOfInputs".into(), cv_js::Value::Number(1.0));
-            m.insert("numberOfOutputs".into(), cv_js::Value::Number(1.0));
-            m.insert("channelCount".into(), cv_js::Value::Number(2.0));
+    // ----- Web Audio API (#415) — REAL node graph (cv_audio::graph) ---
+    //
+    // Each AudioContext owns one cv_audio::graph::AudioGraph. The factory
+    // methods (createOscillator/createGain/createBufferSource/…) build JS
+    // node objects backed by that graph; connect/start/gain.value mutate the
+    // live DSP graph; decodeAudioData runs the real cv_audio decoders.
+    //
+    // Actual device output (WASAPI) is the only part gated behind CV_WEBAUDIO
+    // (default OFF), because opening the system endpoint can fail/regress on
+    // some machines; the graph + decode + render-buffer path is ALWAYS real.
+    fn build_audio_context(_realtime: bool) -> cv_js::Value {
+        use cv_js::Value;
+        use cv_js::OrderedMap as HashMap;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let sample_rate = 48_000u32;
+        let graph: AudioGraphRc =
+            Rc::new(RefCell::new(cv_audio::graph::AudioGraph::new(sample_rate)));
+        let mut m: HashMap<String, Value> = HashMap::new();
+        m.insert("state".into(), Value::String("running".into()));
+        m.insert("sampleRate".into(), Value::Number(sample_rate as f64));
+        // currentTime is an accessor reading the live graph clock.
+        {
+            let g = graph.clone();
+            let getter = cv_js::native_fn("get currentTime", move |_| {
+                Ok(Value::Number(g.borrow().current_time()))
+            });
+            let mut acc: HashMap<String, Value> = HashMap::new();
+            acc.insert(cv_js::ACCESSOR_GET.into(), getter);
             m.insert(
-                "channelCountMode".into(),
-                cv_js::Value::String("max".into()),
+                "currentTime".into(),
+                Value::Object(Rc::new(RefCell::new(acc))),
             );
-            m.insert(
-                "channelInterpretation".into(),
-                cv_js::Value::String("speakers".into()),
-            );
-            m.insert(
-                "connect".into(),
-                cv_js::native_fn("connect", |args| {
-                    // Return the destination so chained .connect works.
-                    Ok(args.first().cloned().unwrap_or(cv_js::Value::Undefined))
-                }),
-            );
-            m.insert(
-                "disconnect".into(),
-                cv_js::native_fn("disconnect", |_| Ok(cv_js::Value::Undefined)),
-            );
-            m.insert(
-                "addEventListener".into(),
-                cv_js::native_fn("addEventListener", |_| Ok(cv_js::Value::Undefined)),
-            );
-        })
-    }
-    let audio_ctx_ctor = cv_js::native_ctor_pure("AudioContext", 0, |_| {
-        Ok(obj_with(|m| {
-            m.insert("state".into(), cv_js::Value::String("running".into()));
-            m.insert("sampleRate".into(), cv_js::Value::Number(48000.0));
-            m.insert("currentTime".into(), cv_js::Value::Number(0.0));
-            m.insert("baseLatency".into(), cv_js::Value::Number(0.01));
-            m.insert("outputLatency".into(), cv_js::Value::Number(0.02));
+        }
+        m.insert("baseLatency".into(), Value::Number(0.0));
+        m.insert("outputLatency".into(), Value::Number(0.0));
+        // The destination node (graph node 0).
+        {
+            let dest_id = graph.borrow().destination();
+            let mut d: HashMap<String, Value> = HashMap::new();
+            d.insert("_nodeId".into(), Value::Number(dest_id.0 as f64));
+            d.insert("kind".into(), Value::String("AudioDestinationNode".into()));
+            d.insert("numberOfInputs".into(), Value::Number(1.0));
+            d.insert("numberOfOutputs".into(), Value::Number(0.0));
+            d.insert("maxChannelCount".into(), Value::Number(2.0));
             m.insert(
                 "destination".into(),
-                make_audio_node("AudioDestinationNode"),
+                Value::Object(Rc::new(RefCell::new(d))),
             );
-            m.insert("listener".into(), obj_with(|_| {}));
+        }
+        m.insert("listener".into(), empty_obj());
+        // Factories.
+        {
+            let g = graph.clone();
             m.insert(
                 "createGain".into(),
-                cv_js::native_fn("createGain", |_| {
-                    Ok(obj_with(|g| {
-                        g.insert(
-                            "gain".into(),
-                            obj_with(|p| {
-                                p.insert("value".into(), cv_js::Value::Number(1.0));
-                                p.insert(
-                                    "setValueAtTime".into(),
-                                    cv_js::native_fn("setValueAtTime", |_| {
-                                        Ok(cv_js::Value::Undefined)
-                                    }),
-                                );
-                            }),
-                        );
-                        g.insert(
-                            "connect".into(),
-                            cv_js::native_fn("connect", |args| {
-                                Ok(args.first().cloned().unwrap_or(cv_js::Value::Undefined))
-                            }),
-                        );
-                        g.insert(
-                            "disconnect".into(),
-                            cv_js::native_fn("disconnect", |_| Ok(cv_js::Value::Undefined)),
-                        );
-                    }))
-                }),
+                cv_js::native_fn("createGain", move |_| Ok(make_gain_node(&g))),
             );
+        }
+        {
+            let g = graph.clone();
             m.insert(
                 "createOscillator".into(),
-                cv_js::native_fn("createOscillator", |_| {
-                    Ok(obj_with(|o| {
-                        o.insert("type".into(), cv_js::Value::String("sine".into()));
-                        o.insert(
-                            "frequency".into(),
-                            obj_with(|p| {
-                                p.insert("value".into(), cv_js::Value::Number(440.0));
-                            }),
-                        );
-                        o.insert(
-                            "start".into(),
-                            cv_js::native_fn("start", |_| Ok(cv_js::Value::Undefined)),
-                        );
-                        o.insert(
-                            "stop".into(),
-                            cv_js::native_fn("stop", |_| Ok(cv_js::Value::Undefined)),
-                        );
-                        o.insert(
-                            "connect".into(),
-                            cv_js::native_fn("connect", |args| {
-                                Ok(args.first().cloned().unwrap_or(cv_js::Value::Undefined))
-                            }),
-                        );
-                        o.insert(
-                            "disconnect".into(),
-                            cv_js::native_fn("disconnect", |_| Ok(cv_js::Value::Undefined)),
-                        );
-                    }))
-                }),
+                cv_js::native_fn("createOscillator", move |_| Ok(make_oscillator_node(&g))),
             );
-            m.insert(
-                "createBuffer".into(),
-                cv_js::native_fn("createBuffer", |args| {
-                    let _ch = args.first().map(|v| v.to_number()).unwrap_or(2.0);
-                    let frames = args.get(1).map(|v| v.to_number()).unwrap_or(44100.0);
-                    let rate = args.get(2).map(|v| v.to_number()).unwrap_or(48000.0);
-                    Ok(obj_with(|b| {
-                        b.insert("length".into(), cv_js::Value::Number(frames));
-                        b.insert("duration".into(), cv_js::Value::Number(frames / rate));
-                        b.insert("sampleRate".into(), cv_js::Value::Number(rate));
-                        b.insert("numberOfChannels".into(), cv_js::Value::Number(_ch));
-                        b.insert(
-                            "getChannelData".into(),
-                            cv_js::native_fn("getChannelData", |_| {
-                                Ok(cv_js::Value::Array(Rc::new(RefCell::new(Vec::new()))))
-                            }),
-                        );
-                    }))
-                }),
-            );
+        }
+        {
+            let g = graph.clone();
             m.insert(
                 "createBufferSource".into(),
-                cv_js::native_fn("createBufferSource", |_| {
-                    Ok(make_audio_node("AudioBufferSourceNode"))
-                }),
+                cv_js::native_fn("createBufferSource", move |_| Ok(make_buffer_source_node(&g))),
             );
+        }
+        // createBuffer(numberOfChannels, length, sampleRate) → real AudioBuffer.
+        m.insert(
+            "createBuffer".into(),
+            cv_js::native_fn("createBuffer", |args| {
+                let ch = args.first().map(|v| v.to_number() as usize).unwrap_or(2).max(1);
+                let frames = args.get(1).map(|v| v.to_number() as usize).unwrap_or(0);
+                let rate = args.get(2).map(|v| v.to_number() as u32).unwrap_or(48_000);
+                let buf = cv_audio::graph::AudioBuffer::new(ch, frames, rate);
+                Ok(make_audio_buffer_js(&buf))
+            }),
+        );
+        // decodeAudioData(ArrayBuffer[, success[, error]]) — REAL decode.
+        m.insert(
+            "decodeAudioData".into(),
+            cv_js::native_fn_with_interp("decodeAudioData", move |interp, args| {
+                let bytes = args.first().map(value_to_byte_vec).unwrap_or_default();
+                match cv_audio::decode::decode_audio_data(&bytes) {
+                    Ok(buf) => {
+                        let js_buf = make_audio_buffer_js(&buf);
+                        // Invoke the legacy success callback if provided.
+                        if let Some(cb) = args.get(1) {
+                            if !matches!(cb, Value::Undefined | Value::Null) {
+                                let _ = interp.call_value(cb.clone(), vec![js_buf.clone()]);
+                            }
+                        }
+                        Ok(resolved_promise(js_buf))
+                    }
+                    Err(e) => {
+                        let msg = format!("decodeAudioData failed: {e:?}");
+                        // EncodingError → WebIDL legacy code 0 (no numeric code).
+                        let err = make_dom_exception("EncodingError", 0, &msg);
+                        if let Some(cb) = args.get(2) {
+                            if !matches!(cb, Value::Undefined | Value::Null) {
+                                let _ = interp.call_value(cb.clone(), vec![err.clone()]);
+                            }
+                        }
+                        Ok(rejected_promise(err))
+                    }
+                }
+            }),
+        );
+        // createAnalyser → real pass-through tap exposing time-domain data.
+        {
+            let g = graph.clone();
             m.insert(
                 "createAnalyser".into(),
-                cv_js::native_fn("createAnalyser", |_| {
-                    Ok(obj_with(|a| {
-                        a.insert("fftSize".into(), cv_js::Value::Number(2048.0));
-                        a.insert("frequencyBinCount".into(), cv_js::Value::Number(1024.0));
-                        a.insert(
-                            "getByteFrequencyData".into(),
-                            cv_js::native_fn("getByteFrequencyData", |_| {
-                                Ok(cv_js::Value::Undefined)
-                            }),
-                        );
-                        a.insert(
-                            "getByteTimeDomainData".into(),
-                            cv_js::native_fn("getByteTimeDomainData", |_| {
-                                Ok(cv_js::Value::Undefined)
-                            }),
-                        );
-                        a.insert(
-                            "getFloatFrequencyData".into(),
-                            cv_js::native_fn("getFloatFrequencyData", |_| {
-                                Ok(cv_js::Value::Undefined)
-                            }),
-                        );
-                        a.insert(
-                            "connect".into(),
-                            cv_js::native_fn("connect", |args| {
-                                Ok(args.first().cloned().unwrap_or(cv_js::Value::Undefined))
-                            }),
-                        );
-                    }))
+                cv_js::native_fn("createAnalyser", move |_| Ok(make_analyser_node(&g))),
+            );
+        }
+        // Remaining node factories: build a generic graph-connected pass-
+        // through node (real connect/disconnect into the graph) — correct
+        // audio routing even where the per-node DSP (filter curves etc.) is a
+        // follow-up. They carry audio through rather than dropping it.
+        for (name, kind) in [
+            ("createBiquadFilter", "BiquadFilterNode"),
+            ("createDelay", "DelayNode"),
+            ("createConvolver", "ConvolverNode"),
+            ("createPanner", "PannerNode"),
+            ("createStereoPanner", "StereoPannerNode"),
+            ("createDynamicsCompressor", "DynamicsCompressorNode"),
+            ("createWaveShaper", "WaveShaperNode"),
+            ("createChannelSplitter", "ChannelSplitterNode"),
+            ("createChannelMerger", "ChannelMergerNode"),
+            ("createConstantSource", "ConstantSourceNode"),
+        ] {
+            let g = graph.clone();
+            m.insert(
+                name.into(),
+                cv_js::native_fn(name, move |_| Ok(make_passthrough_node(&g, kind))),
+            );
+        }
+        // startRendering() — OfflineAudioContext: pull `length` frames through
+        // the graph and resolve with a REAL rendered AudioBuffer. (Harmless on
+        // realtime contexts, which have no `length`.)
+        {
+            let g = graph.clone();
+            m.insert(
+                "startRendering".into(),
+                cv_js::native_fn_with_interp("startRendering", move |interp, _args| {
+                    let length = if let Value::Object(o) = interp.native_this() {
+                        o.borrow()
+                            .get("length")
+                            .map(|v| v.to_number() as usize)
+                            .unwrap_or(0)
+                    } else {
+                        0
+                    };
+                    let planar = g.borrow_mut().render_planar(length);
+                    let sr = g.borrow().sample_rate();
+                    let mut buf = cv_audio::graph::AudioBuffer::new(planar.len().max(1), length, sr);
+                    for (c, chan) in planar.into_iter().enumerate() {
+                        if c < buf.channels.len() {
+                            buf.channels[c] = chan;
+                        }
+                    }
+                    Ok(resolved_promise(make_audio_buffer_js(&buf)))
                 }),
             );
-            for (name, k) in [
-                ("createBiquadFilter", "BiquadFilterNode"),
-                ("createDelay", "DelayNode"),
-                ("createConvolver", "ConvolverNode"),
-                ("createPanner", "PannerNode"),
-                ("createStereoPanner", "StereoPannerNode"),
-                ("createDynamicsCompressor", "DynamicsCompressorNode"),
-                ("createWaveShaper", "WaveShaperNode"),
-                ("createChannelSplitter", "ChannelSplitterNode"),
-                ("createChannelMerger", "ChannelMergerNode"),
-                ("createMediaElementSource", "MediaElementAudioSourceNode"),
-                ("createMediaStreamSource", "MediaStreamAudioSourceNode"),
-                (
-                    "createMediaStreamDestination",
-                    "MediaStreamAudioDestinationNode",
-                ),
-                ("createScriptProcessor", "ScriptProcessorNode"),
-                ("createConstantSource", "ConstantSourceNode"),
-                ("createIIRFilter", "IIRFilterNode"),
-            ] {
-                m.insert(
-                    name.into(),
-                    cv_js::native_fn(name, move |_| Ok(make_audio_node(k))),
-                );
+        }
+        // resume/suspend/close return resolved promises (state model is V1).
+        m.insert(
+            "resume".into(),
+            cv_js::native_fn("resume", |_| Ok(resolved_promise(cv_js::Value::Undefined))),
+        );
+        m.insert(
+            "suspend".into(),
+            cv_js::native_fn("suspend", |_| Ok(resolved_promise(cv_js::Value::Undefined))),
+        );
+        m.insert(
+            "close".into(),
+            cv_js::native_fn("close", |_| Ok(resolved_promise(cv_js::Value::Undefined))),
+        );
+        m.insert(
+            "addEventListener".into(),
+            cv_js::native_fn("addEventListener", |_| Ok(cv_js::Value::Undefined)),
+        );
+        // ---- Device output (WASAPI), gated behind CV_WEBAUDIO=1 ----------
+        // For a REALTIME context, if the flag is set, open the system render
+        // endpoint and register (graph, device) so the host audio tick pumps
+        // 128-frame quanta into it via `pump_webaudio_outputs()`. Default OFF:
+        // opening the endpoint is the only environment-risky step, so it stays
+        // opt-in; the graph/decode path above is always real.
+        if _realtime && std::env::var("CV_WEBAUDIO").is_ok() {
+            match cv_audio::output::AudioOutput::open() {
+                Ok(out) => register_webaudio_output(graph.clone(), out),
+                Err(_e) => { /* device unavailable → silent (offline path still real) */ }
             }
-            m.insert(
-                "decodeAudioData".into(),
-                cv_js::native_fn("decodeAudioData", |_| {
-                    // Returns a promise resolving to an AudioBuffer.
-                    Ok(resolved_promise(obj_with(|b| {
-                        b.insert("length".into(), cv_js::Value::Number(0.0));
-                        b.insert("duration".into(), cv_js::Value::Number(0.0));
-                        b.insert("sampleRate".into(), cv_js::Value::Number(48000.0));
-                        b.insert("numberOfChannels".into(), cv_js::Value::Number(2.0));
-                    })))
-                }),
-            );
-            m.insert(
-                "resume".into(),
-                cv_js::native_fn("resume", |_| Ok(resolved_promise(cv_js::Value::Undefined))),
-            );
-            m.insert(
-                "suspend".into(),
-                cv_js::native_fn("suspend", |_| Ok(resolved_promise(cv_js::Value::Undefined))),
-            );
-            m.insert(
-                "close".into(),
-                cv_js::native_fn("close", |_| Ok(resolved_promise(cv_js::Value::Undefined))),
-            );
-        }))
+        }
+        Value::Object(Rc::new(RefCell::new(m)))
+    }
+    let audio_ctx_ctor = cv_js::native_ctor_pure("AudioContext", 0, |_| {
+        Ok(build_audio_context(true))
     });
     interp.define_global("AudioContext", audio_ctx_ctor.clone());
     interp.define_global("webkitAudioContext", audio_ctx_ctor);
-    let offline_audio_ctx_ctor = cv_js::native_ctor_pure("OfflineAudioContext", 0, |args| {
-        let _ch = args.first().map(|v| v.to_number()).unwrap_or(2.0);
-        let frames = args.get(1).map(|v| v.to_number()).unwrap_or(44100.0);
-        let rate = args.get(2).map(|v| v.to_number()).unwrap_or(48000.0);
-        Ok(obj_with(move |m| {
-            m.insert("length".into(), cv_js::Value::Number(frames));
-            m.insert("sampleRate".into(), cv_js::Value::Number(rate));
-            m.insert(
-                "startRendering".into(),
-                cv_js::native_fn("startRendering", |_| Ok(resolved_promise(empty_obj()))),
-            );
-        }))
-    });
+    // OfflineAudioContext(numberOfChannels, length, sampleRate) — renders the
+    // graph to a real AudioBuffer via startRendering().
+    let offline_audio_ctx_ctor =
+        cv_js::native_ctor_pure("OfflineAudioContext", 0, |args| {
+            use cv_js::Value;
+            use cv_js::OrderedMap as HashMap;
+            use std::cell::RefCell;
+            use std::rc::Rc;
+            let _nch = args.first().map(|v| v.to_number() as usize).unwrap_or(2).max(1);
+            let frames = args.get(1).map(|v| v.to_number() as usize).unwrap_or(0);
+            let rate = args.get(2).map(|v| v.to_number() as u32).unwrap_or(48_000);
+            // Reuse the realtime context shape (same factories/graph). The
+            // graph-backed `startRendering` (added by build_audio_context) reads
+            // `length` off the context and renders that many frames for real.
+            let ctx = build_audio_context(false);
+            if let Value::Object(o) = &ctx {
+                let mut cm = o.borrow_mut();
+                cm.insert("length".into(), Value::Number(frames as f64));
+                cm.insert("sampleRate".into(), Value::Number(rate as f64));
+            }
+            Ok(ctx)
+        });
     interp.define_global("OfflineAudioContext", offline_audio_ctx_ctor);
-    // AudioParam / AudioBuffer / individual node constructors as
-    // identity shapes so `instanceof AudioBuffer` shape-checks pass.
+    // Node-class identity shapes so `instanceof OscillatorNode` shape-checks
+    // pass (the engine matches by constructor name).
     for name in [
         "AudioNode",
         "AudioBuffer",
@@ -15870,6 +15888,9 @@ impl LiveInterp {
                 // drain before the next fetch/timer iteration.
                 self.interp.drain_microtasks();
             }
+            // Keep any CV_WEBAUDIO realtime device endpoints fed with freshly
+            // rendered audio quanta (no-op unless the flag opened a device).
+            pump_webaudio_outputs();
             // Settle any background fetch() that completed since the last
             // iteration (the network runs off-thread now). Resolving a promise
             // queues its `.then` reactions as microtasks, drained just below.
@@ -31005,6 +31026,498 @@ fn make_media_accessor(get: cv_js::Value, set: Option<cv_js::Value>) -> cv_js::V
         m.insert(cv_js::ACCESSOR_SET.into(), s);
     }
     cv_js::Value::Object(Rc::new(RefCell::new(m)))
+}
+
+// ===================================================================
+// Web Audio API — real node graph backed by cv_audio::graph::AudioGraph.
+//
+// Each AudioContext owns one `Rc<RefCell<AudioGraph>>`. Every node JS
+// object captures a clone of that Rc plus its `NodeId`, so JS calls
+// (`connect`, `start`, `gain.value = …`) mutate the shared DSP graph.
+// Rendering pulls 128-frame quanta through the graph (see cv_audio).
+// Spec: https://www.w3.org/TR/webaudio/
+// ===================================================================
+
+type AudioGraphRc = std::rc::Rc<std::cell::RefCell<cv_audio::graph::AudioGraph>>;
+
+thread_local! {
+    /// Realtime AudioContexts whose device output is open (CV_WEBAUDIO=1).
+    /// The host audio tick calls [`pump_webaudio_outputs`] to keep each
+    /// endpoint buffer fed with freshly rendered render quanta.
+    static WEBAUDIO_OUTPUTS: std::cell::RefCell<
+        Vec<(AudioGraphRc, cv_audio::output::AudioOutput)>,
+    > = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Register an opened device output + its graph for host-driven pumping.
+fn register_webaudio_output(graph: AudioGraphRc, out: cv_audio::output::AudioOutput) {
+    WEBAUDIO_OUTPUTS.with(|o| o.borrow_mut().push((graph, out)));
+}
+
+/// Pump every registered realtime AudioContext into its device endpoint.
+/// Called from the host's audio/render tick (gated by CV_WEBAUDIO at
+/// registration time, so this is a no-op when the flag is unset). Returns the
+/// total frames written across all contexts this tick.
+fn pump_webaudio_outputs() -> u32 {
+    WEBAUDIO_OUTPUTS.with(|o| {
+        let mut total = 0;
+        for (graph, out) in o.borrow_mut().iter_mut() {
+            total += out.pump(&mut graph.borrow_mut());
+        }
+        total
+    })
+}
+
+/// Read a node id out of a JS node object's `_nodeId` slot.
+fn audio_node_id(v: &cv_js::Value) -> Option<cv_audio::graph::NodeId> {
+    if let cv_js::Value::Object(o) = v {
+        if let Some(cv_js::Value::Number(n)) = o.borrow().get("_nodeId") {
+            return Some(cv_audio::graph::NodeId(*n as usize));
+        }
+    }
+    None
+}
+
+/// Build a JS `AudioParam`-ish object whose `value` setter writes through a
+/// closure into the live graph. We expose `value` as an accessor plus the
+/// automation methods (which set the value immediately — V1 has no ramp
+/// scheduling, but `setValueAtTime(v, t)` with t≈now is the common case and
+/// is honoured for real).
+fn make_audio_param<S>(initial: f64, setter: S) -> cv_js::Value
+where
+    S: Fn(f64) + 'static,
+{
+    use cv_js::Value;
+    use cv_js::OrderedMap as HashMap;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    let setter = Rc::new(setter);
+    let cur = Rc::new(RefCell::new(initial));
+    let mut m: HashMap<String, Value> = HashMap::new();
+    // `value` is a real accessor: reading returns the live value; ASSIGNING
+    // (`param.value = x`) writes through to the graph immediately. This is the
+    // dominant control path (`gain.gain.value = 0.5`) and MUST mutate the DSP.
+    {
+        let c_get = cur.clone();
+        let getter = cv_js::native_fn("get value", move |_| Ok(Value::Number(*c_get.borrow())));
+        let s_set = setter.clone();
+        let c_set = cur.clone();
+        let setter_fn = cv_js::native_fn("set value", move |args| {
+            let v = args.first().map(|x| x.to_number()).unwrap_or(0.0);
+            *c_set.borrow_mut() = v;
+            s_set(v);
+            Ok(Value::Undefined)
+        });
+        let mut acc: HashMap<String, Value> = HashMap::new();
+        acc.insert(cv_js::ACCESSOR_GET.into(), getter);
+        acc.insert(cv_js::ACCESSOR_SET.into(), setter_fn);
+        m.insert("value".into(), Value::Object(Rc::new(RefCell::new(acc))));
+    }
+    m.insert("defaultValue".into(), Value::Number(initial));
+    m.insert("automationRate".into(), Value::String("a-rate".into()));
+    // setValueAtTime / linearRampToValueAtTime / setTargetAtTime all set the
+    // value now (no scheduled curve in V1) — real effect on the graph, and a
+    // chainable return per spec (they return the AudioParam).
+    for name in [
+        "setValueAtTime",
+        "linearRampToValueAtTime",
+        "exponentialRampToValueAtTime",
+        "setTargetAtTime",
+    ] {
+        let s = setter.clone();
+        let c = cur.clone();
+        m.insert(
+            name.into(),
+            cv_js::native_fn_with_interp(name, move |interp, args| {
+                let v = args.first().map(|x| x.to_number()).unwrap_or(0.0);
+                *c.borrow_mut() = v;
+                s(v);
+                Ok(interp.native_this())
+            }),
+        );
+    }
+    {
+        let s = setter.clone();
+        let c = cur.clone();
+        m.insert(
+            "cancelScheduledValues".into(),
+            cv_js::native_fn_with_interp("cancelScheduledValues", move |interp, _args| {
+                s(*c.borrow());
+                Ok(interp.native_this())
+            }),
+        );
+    }
+    Value::Object(Rc::new(RefCell::new(m)))
+}
+
+/// Install the shared `connect`/`disconnect` methods on a node object. These
+/// rewrite the live graph edge set. `connect(target)` returns `target` so
+/// chained `.connect(a).connect(b)` works (per spec `connect` returns the
+/// destination node).
+fn add_audio_connect(m: &mut cv_js::OrderedMap<String, cv_js::Value>, graph: &AudioGraphRc, id: cv_audio::graph::NodeId) {
+    use cv_js::Value;
+    let g = graph.clone();
+    m.insert(
+        "connect".into(),
+        cv_js::native_fn("connect", move |args| {
+            if let Some(target) = args.first() {
+                if let Some(to) = audio_node_id(target) {
+                    g.borrow_mut().connect(id, to);
+                }
+                return Ok(target.clone());
+            }
+            Ok(Value::Undefined)
+        }),
+    );
+    let g2 = graph.clone();
+    m.insert(
+        "disconnect".into(),
+        cv_js::native_fn("disconnect", move |_args| {
+            g2.borrow_mut().disconnect(id);
+            Ok(Value::Undefined)
+        }),
+    );
+}
+
+/// Build a GainNode JS object backed by the graph.
+fn make_gain_node(graph: &AudioGraphRc) -> cv_js::Value {
+    use cv_js::Value;
+    use cv_js::OrderedMap as HashMap;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    let id = graph.borrow_mut().create_gain();
+    let mut m: HashMap<String, Value> = HashMap::new();
+    m.insert("_nodeId".into(), Value::Number(id.0 as f64));
+    m.insert("kind".into(), Value::String("GainNode".into()));
+    m.insert("numberOfInputs".into(), Value::Number(1.0));
+    m.insert("numberOfOutputs".into(), Value::Number(1.0));
+    m.insert("channelCount".into(), Value::Number(2.0));
+    let g = graph.clone();
+    m.insert(
+        "gain".into(),
+        make_audio_param(1.0, move |v| g.borrow_mut().set_gain(id, v as f32)),
+    );
+    add_audio_connect(&mut m, graph, id);
+    Value::Object(Rc::new(RefCell::new(m)))
+}
+
+/// Build an OscillatorNode JS object backed by the graph.
+fn make_oscillator_node(graph: &AudioGraphRc) -> cv_js::Value {
+    use cv_js::Value;
+    use cv_js::OrderedMap as HashMap;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    let id = graph.borrow_mut().create_oscillator();
+    let mut m: HashMap<String, Value> = HashMap::new();
+    m.insert("_nodeId".into(), Value::Number(id.0 as f64));
+    m.insert("kind".into(), Value::String("OscillatorNode".into()));
+    m.insert("type".into(), Value::String("sine".into()));
+    m.insert("numberOfInputs".into(), Value::Number(0.0));
+    m.insert("numberOfOutputs".into(), Value::Number(1.0));
+    let g = graph.clone();
+    m.insert(
+        "frequency".into(),
+        make_audio_param(440.0, move |v| g.borrow_mut().set_osc_frequency(id, v as f32)),
+    );
+    let g = graph.clone();
+    m.insert(
+        "detune".into(),
+        make_audio_param(0.0, move |v| g.borrow_mut().set_osc_detune(id, v as f32)),
+    );
+    // `type` is a plain data prop on the JS object; the graph reads it lazily
+    // on start via a sync, but to keep it always-correct we also intercept
+    // start() to push the current `type` into the graph.
+    let g = graph.clone();
+    m.insert(
+        "start".into(),
+        cv_js::native_fn_with_interp("start", move |interp, args| {
+            // Sync the oscillator type from the JS object before starting.
+            if let Value::Object(o) = interp.native_this() {
+                if let Some(Value::String(t)) = o.borrow().get("type") {
+                    g.borrow_mut()
+                        .set_osc_type(id, cv_audio::graph::OscillatorType::from_str(t.as_str()));
+                }
+            }
+            let when = args.first().map(|x| x.to_number()).unwrap_or(0.0);
+            g.borrow_mut().start(id, when);
+            Ok(Value::Undefined)
+        }),
+    );
+    let g = graph.clone();
+    m.insert(
+        "stop".into(),
+        cv_js::native_fn("stop", move |args| {
+            let when = args.first().map(|x| x.to_number()).unwrap_or(0.0);
+            g.borrow_mut().stop(id, when);
+            Ok(Value::Undefined)
+        }),
+    );
+    m.insert(
+        "addEventListener".into(),
+        cv_js::native_fn("addEventListener", move |_args| Ok(Value::Undefined)),
+    );
+    add_audio_connect(&mut m, graph, id);
+    Value::Object(Rc::new(RefCell::new(m)))
+}
+
+/// Build an AnalyserNode JS object. The audio path is a real graph pass-
+/// through; `getFloatTimeDomainData`/`getByteTimeDomainData` return the most
+/// recently rendered samples at this tap. (FFT frequency-domain output is a
+/// follow-up; time-domain is fully real.)
+fn make_analyser_node(graph: &AudioGraphRc) -> cv_js::Value {
+    use cv_js::Value;
+    use cv_js::OrderedMap as HashMap;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    let id = graph.borrow_mut().create_analyser();
+    let mut m: HashMap<String, Value> = HashMap::new();
+    m.insert("_nodeId".into(), Value::Number(id.0 as f64));
+    m.insert("kind".into(), Value::String("AnalyserNode".into()));
+    m.insert("fftSize".into(), Value::Number(2048.0));
+    m.insert("frequencyBinCount".into(), Value::Number(1024.0));
+    m.insert("minDecibels".into(), Value::Number(-100.0));
+    m.insert("maxDecibels".into(), Value::Number(-30.0));
+    m.insert("smoothingTimeConstant".into(), Value::Number(0.8));
+    let g = graph.clone();
+    m.insert(
+        "getFloatTimeDomainData".into(),
+        cv_js::native_fn_with_interp("getFloatTimeDomainData", move |interp, args| {
+            let data = g.borrow().analyser_data(id);
+            // Copy into the caller's Float32Array via its `set`.
+            if let Some(dest) = args.first() {
+                let set = interp.read_property(dest, "set");
+                if !matches!(set, Value::Undefined) {
+                    let arr: Vec<Value> = data.iter().map(|&s| Value::Number(s as f64)).collect();
+                    let src = Value::Array(Rc::new(RefCell::new(arr)));
+                    let _ = interp.call_value_with_this(set, dest.clone(), vec![src]);
+                }
+            }
+            Ok(Value::Undefined)
+        }),
+    );
+    let g = graph.clone();
+    m.insert(
+        "getByteTimeDomainData".into(),
+        cv_js::native_fn_with_interp("getByteTimeDomainData", move |interp, args| {
+            let data = g.borrow().analyser_data(id);
+            if let Some(dest) = args.first() {
+                let set = interp.read_property(dest, "set");
+                if !matches!(set, Value::Undefined) {
+                    // Spec maps [-1,1] → [0,255] with 128 = silence.
+                    let arr: Vec<Value> = data
+                        .iter()
+                        .map(|&s| {
+                            let b = ((s as f64 * 0.5 + 0.5) * 255.0).round().clamp(0.0, 255.0);
+                            Value::Number(b)
+                        })
+                        .collect();
+                    let src = Value::Array(Rc::new(RefCell::new(arr)));
+                    let _ = interp.call_value_with_this(set, dest.clone(), vec![src]);
+                }
+            }
+            Ok(Value::Undefined)
+        }),
+    );
+    add_audio_connect(&mut m, graph, id);
+    Value::Object(Rc::new(RefCell::new(m)))
+}
+
+/// Build a generic graph-connected pass-through node (real connect/disconnect
+/// routing). Used for node types whose bespoke DSP is a follow-up — they carry
+/// audio through the graph rather than silently dropping it.
+fn make_passthrough_node(graph: &AudioGraphRc, kind: &'static str) -> cv_js::Value {
+    use cv_js::Value;
+    use cv_js::OrderedMap as HashMap;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    let id = graph.borrow_mut().create_analyser(); // pass-through node kind
+    let mut m: HashMap<String, Value> = HashMap::new();
+    m.insert("_nodeId".into(), Value::Number(id.0 as f64));
+    m.insert("kind".into(), Value::String(kind.into()));
+    m.insert("numberOfInputs".into(), Value::Number(1.0));
+    m.insert("numberOfOutputs".into(), Value::Number(1.0));
+    add_audio_connect(&mut m, graph, id);
+    Value::Object(Rc::new(RefCell::new(m)))
+}
+
+/// Build an AudioBuffer JS object from decoded PCM. `getChannelData(c)`
+/// returns a real Float32Array (byte-backed `_typedarray` shape) the page
+/// can index and mutate.
+fn make_audio_buffer_js(buf: &cv_audio::graph::AudioBuffer) -> cv_js::Value {
+    use cv_js::Value;
+    use cv_js::OrderedMap as HashMap;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    let length = buf.length();
+    let channels = buf.number_of_channels();
+    let rate = buf.sample_rate as f64;
+    // Pre-build one Float32Array per channel, stored under `_channelData`.
+    let mut chan_arrays: Vec<Value> = Vec::with_capacity(channels);
+    for c in 0..channels {
+        // Float32Array storage is byte-level: 4 LE bytes per sample.
+        let mut bytes: Vec<Value> = Vec::with_capacity(length * 4);
+        for &s in &buf.channels[c] {
+            for b in s.to_le_bytes() {
+                bytes.push(Value::Number(b as f64));
+            }
+        }
+        let mut ta: HashMap<String, Value> = HashMap::new();
+        ta.insert("_typedarray".into(), Value::String("Float32Array".into()));
+        ta.insert("_bytes".into(), Value::Array(Rc::new(RefCell::new(bytes))));
+        ta.insert("length".into(), Value::Number(length as f64));
+        ta.insert("byteLength".into(), Value::Number((length * 4) as f64));
+        ta.insert("BYTES_PER_ELEMENT".into(), Value::Number(4.0));
+        chan_arrays.push(Value::Object(Rc::new(RefCell::new(ta))));
+    }
+    let chan_rc = Rc::new(RefCell::new(chan_arrays));
+    let mut m: HashMap<String, Value> = HashMap::new();
+    m.insert("length".into(), Value::Number(length as f64));
+    m.insert("duration".into(), Value::Number(buf.duration()));
+    m.insert("sampleRate".into(), Value::Number(rate));
+    m.insert("numberOfChannels".into(), Value::Number(channels as f64));
+    // Hidden slot holding the per-channel Float32Arrays so native code
+    // (AudioBufferSourceNode.start) can read the real PCM back out, and so
+    // the same array identity is returned by getChannelData each call.
+    m.insert(
+        "_channelData".into(),
+        Value::Array(Rc::new(RefCell::new(chan_rc.borrow().clone()))),
+    );
+    let ch = chan_rc.clone();
+    m.insert(
+        "getChannelData".into(),
+        cv_js::native_fn("getChannelData", move |args| {
+            let idx = args.first().map(|v| v.to_number() as usize).unwrap_or(0);
+            Ok(ch.borrow().get(idx).cloned().unwrap_or(Value::Undefined))
+        }),
+    );
+    let ch2 = chan_rc.clone();
+    m.insert(
+        "copyFromChannel".into(),
+        cv_js::native_fn_with_interp("copyFromChannel", move |interp, args| {
+            // copyFromChannel(dest, channelNumber, startInChannel?)
+            let chan = args.get(1).map(|v| v.to_number() as usize).unwrap_or(0);
+            if let (Some(dest), Some(src)) = (args.first(), ch2.borrow().get(chan)) {
+                // Copy via the typed-array `set` method for real byte transfer.
+                let set = interp.read_property(dest, "set");
+                if !matches!(set, Value::Undefined) {
+                    let _ = interp.call_value_with_this(set, dest.clone(), vec![src.clone()]);
+                }
+            }
+            Ok(Value::Undefined)
+        }),
+    );
+    Value::Object(Rc::new(RefCell::new(m)))
+}
+
+/// Build an AudioBufferSourceNode backed by the graph.
+fn make_buffer_source_node(graph: &AudioGraphRc) -> cv_js::Value {
+    use cv_js::Value;
+    use cv_js::OrderedMap as HashMap;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    let id = graph.borrow_mut().create_buffer_source();
+    let mut m: HashMap<String, Value> = HashMap::new();
+    m.insert("_nodeId".into(), Value::Number(id.0 as f64));
+    m.insert("kind".into(), Value::String("AudioBufferSourceNode".into()));
+    m.insert("buffer".into(), Value::Null);
+    m.insert("loop".into(), Value::Bool(false));
+    m.insert("numberOfInputs".into(), Value::Number(0.0));
+    m.insert("numberOfOutputs".into(), Value::Number(1.0));
+    let g = graph.clone();
+    m.insert(
+        "playbackRate".into(),
+        make_audio_param(1.0, move |v| g.borrow_mut().set_buffer_playback_rate(id, v as f32)),
+    );
+    let g = graph.clone();
+    m.insert(
+        "start".into(),
+        cv_js::native_fn_with_interp("start", move |interp, args| {
+            // Pull the assigned `buffer` + `loop` from JS onto the graph node.
+            if let Value::Object(o) = interp.native_this() {
+                let (buf_val, loop_on) = {
+                    let b = o.borrow();
+                    (
+                        b.get("buffer").cloned().unwrap_or(Value::Null),
+                        matches!(b.get("loop"), Some(Value::Bool(true))),
+                    )
+                };
+                if let Value::Object(bo) = &buf_val {
+                    // Reconstruct an AudioBuffer from the JS object's channel data.
+                    if let Some(decoded) = js_audio_buffer_to_native(bo) {
+                        g.borrow_mut().set_buffer(id, decoded);
+                    }
+                }
+                g.borrow_mut().set_buffer_loop(id, loop_on);
+            }
+            let when = args.first().map(|x| x.to_number()).unwrap_or(0.0);
+            g.borrow_mut().start(id, when);
+            Ok(Value::Undefined)
+        }),
+    );
+    let g = graph.clone();
+    m.insert(
+        "stop".into(),
+        cv_js::native_fn("stop", move |args| {
+            let when = args.first().map(|x| x.to_number()).unwrap_or(0.0);
+            g.borrow_mut().stop(id, when);
+            Ok(Value::Undefined)
+        }),
+    );
+    m.insert(
+        "addEventListener".into(),
+        cv_js::native_fn("addEventListener", move |_args| Ok(Value::Undefined)),
+    );
+    add_audio_connect(&mut m, graph, id);
+    Value::Object(Rc::new(RefCell::new(m)))
+}
+
+/// Reconstruct a native AudioBuffer from a JS AudioBuffer object (reads its
+/// `sampleRate`, `numberOfChannels` and the Float32Array channel data stored
+/// under the hidden `_channelData` slot). Decodes the little-endian f32 byte
+/// storage back into samples — the true PCM, including any in-place edits the
+/// page made via `getChannelData(c)[i] = …`.
+fn js_audio_buffer_to_native(
+    bo: &std::rc::Rc<std::cell::RefCell<cv_js::OrderedMap<String, cv_js::Value>>>,
+) -> Option<cv_audio::graph::AudioBuffer> {
+    use cv_js::Value;
+    let b = bo.borrow();
+    let sample_rate = b.get("sampleRate").map(|v| v.to_number() as u32).unwrap_or(48_000);
+    let length = b.get("length").map(|v| v.to_number() as usize).unwrap_or(0);
+    let chans = match b.get("_channelData") {
+        Some(Value::Array(a)) => a.clone(),
+        _ => return None,
+    };
+    let chans = chans.borrow();
+    let nch = chans.len();
+    if nch == 0 {
+        return None;
+    }
+    let mut out = cv_audio::graph::AudioBuffer::new(nch, length, sample_rate);
+    for (c, ta) in chans.iter().enumerate() {
+        if let Value::Object(o) = ta {
+            let to = o.borrow();
+            if let Some(Value::Array(bytes)) = to.get("_bytes") {
+                let raw = bytes.borrow();
+                // 4 LE bytes per f32 sample.
+                let n = (raw.len() / 4).min(length.max(raw.len() / 4));
+                for f in 0..n {
+                    let i = f * 4;
+                    if i + 3 < raw.len() {
+                        let le = [
+                            raw[i].to_number() as u8,
+                            raw[i + 1].to_number() as u8,
+                            raw[i + 2].to_number() as u8,
+                            raw[i + 3].to_number() as u8,
+                        ];
+                        if f < out.channels[c].len() {
+                            out.channels[c][f] = f32::from_le_bytes(le);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Some(out)
 }
 
 /// Coerce a JS value (typed array / ArrayBuffer / plain Array / binary
@@ -59615,6 +60128,164 @@ mod tests {
                   if (keep.isConnected !== false) throw 'removed child should disconnect';",
             )
             .expect("live JS-side child relationships update immediately");
+    }
+
+    // ---- Web Audio API: real graph-backed bindings (#415) ----------
+    //
+    // These run real JS against the live runtime (which installs the
+    // graph-backed AudioContext) and assert REAL DSP output — not that a
+    // constructor exists. They mirror the cv_audio::graph unit tests but
+    // through the JS surface, proving the wiring carries audio.
+
+    fn audio_runtime() -> LiveInterp {
+        let doc = cv_html::parse("<!doctype html><html><body></body></html>");
+        LiveInterp::new(&doc, "https://example.com/")
+    }
+
+    #[test]
+    fn webaudio_offline_oscillator_renders_440hz_sine() {
+        let mut rt = audio_runtime();
+        // OfflineAudioContext, 1 channel, 1 second @ 48k, render a 440Hz sine,
+        // count zero crossings in JS and stash the measured frequency + peak.
+        rt.interp
+            .run(
+                "var ctx = new OfflineAudioContext(1, 48000, 48000);\
+                 var osc = ctx.createOscillator();\
+                 osc.frequency.value = 440;\
+                 osc.connect(ctx.destination);\
+                 osc.start(0);\
+                 ctx.startRendering().then(function(buf){\
+                   var d = buf.getChannelData(0);\
+                   var cross = 0, peak = 0;\
+                   for (var i=1;i<d.length;i++){\
+                     if ((d[i-1] <= 0 && d[i] > 0) || (d[i-1] >= 0 && d[i] < 0)) cross++;\
+                     var a = d[i] < 0 ? -d[i] : d[i]; if (a > peak) peak = a;\
+                   }\
+                   window.__freq = (cross/2) / (d.length/48000);\
+                   window.__peak = peak;\
+                   window.__len = d.length;\
+                 });",
+            )
+            .expect("offline webaudio render runs");
+        rt.interp.drain_microtasks();
+        let freq = rt.interp.get_global("__freq").map(|v| v.to_number()).unwrap_or(0.0);
+        let peak = rt.interp.get_global("__peak").map(|v| v.to_number()).unwrap_or(0.0);
+        let len = rt.interp.get_global("__len").map(|v| v.to_number()).unwrap_or(0.0);
+        assert_eq!(len, 48000.0, "rendered buffer length");
+        assert!((freq - 440.0).abs() < 2.0, "measured {freq}Hz, expected ~440");
+        assert!(peak > 0.95, "sine peak {peak} should reach ~1.0 (real DSP, not silence)");
+    }
+
+    #[test]
+    fn webaudio_gain_half_halves_amplitude_through_js() {
+        let mut rt = audio_runtime();
+        rt.interp
+            .run(
+                "function peakOf(g){\
+                   var ctx = new OfflineAudioContext(1, 4096, 48000);\
+                   var osc = ctx.createOscillator(); osc.frequency.value = 440;\
+                   var gain = ctx.createGain(); gain.gain.value = g;\
+                   osc.connect(gain); gain.connect(ctx.destination); osc.start(0);\
+                   return ctx.startRendering();\
+                 }\
+                 peakOf(1.0).then(function(b){\
+                   var d=b.getChannelData(0), p=0; for(var i=0;i<d.length;i++){var a=d[i]<0?-d[i]:d[i]; if(a>p)p=a;} window.__full=p;\
+                 });\
+                 peakOf(0.5).then(function(b){\
+                   var d=b.getChannelData(0), p=0; for(var i=0;i<d.length;i++){var a=d[i]<0?-d[i]:d[i]; if(a>p)p=a;} window.__half=p;\
+                 });",
+            )
+            .expect("gain render runs");
+        rt.interp.drain_microtasks();
+        let full = rt.interp.get_global("__full").map(|v| v.to_number()).unwrap_or(0.0);
+        let half = rt.interp.get_global("__half").map(|v| v.to_number()).unwrap_or(0.0);
+        assert!(full > 0.9, "full-gain peak {full}");
+        assert!((half - full * 0.5).abs() < 0.02, "gain 0.5 peak {half} should be half of {full}");
+    }
+
+    #[test]
+    fn webaudio_decode_audio_data_returns_real_pcm() {
+        // Build a known 16-bit mono WAV in JS, decode it, assert PCM length +
+        // first sample. Uses the real cv_audio WAV decoder.
+        let mut rt = audio_runtime();
+        rt.interp
+            .run(
+                // 4-frame mono 8kHz WAV: samples 0, 16384, -16384, 32767.
+                "var bytes = [\
+                   0x52,0x49,0x46,0x46, 0x24+8,0,0,0, 0x57,0x41,0x56,0x45,\
+                   0x66,0x6d,0x74,0x20, 16,0,0,0, 1,0, 1,0, 0x40,0x1f,0,0, 0x80,0x3e,0,0, 2,0, 16,0,\
+                   0x64,0x61,0x74,0x61, 8,0,0,0,\
+                   0,0, 0,0x40, 0,0xC0, 0xFF,0x7F\
+                 ];\
+                 var u8 = new Uint8Array(bytes);\
+                 var ctx = new AudioContext();\
+                 ctx.decodeAudioData(u8.buffer).then(function(buf){\
+                   window.__nch = buf.numberOfChannels;\
+                   window.__len = buf.length;\
+                   window.__rate = buf.sampleRate;\
+                   var d = buf.getChannelData(0);\
+                   window.__s0 = d[0];\
+                   window.__s1 = d[1];\
+                 });",
+            )
+            .expect("decodeAudioData runs");
+        rt.interp.drain_microtasks();
+        let nch = rt.interp.get_global("__nch").map(|v| v.to_number()).unwrap_or(-1.0);
+        let len = rt.interp.get_global("__len").map(|v| v.to_number()).unwrap_or(-1.0);
+        let rate = rt.interp.get_global("__rate").map(|v| v.to_number()).unwrap_or(-1.0);
+        let s0 = rt.interp.get_global("__s0").map(|v| v.to_number()).unwrap_or(99.0);
+        let s1 = rt.interp.get_global("__s1").map(|v| v.to_number()).unwrap_or(99.0);
+        assert_eq!(nch, 1.0, "decoded channels");
+        assert_eq!(len, 4.0, "decoded PCM frame count");
+        assert_eq!(rate, 8000.0, "decoded sample rate");
+        assert_eq!(s0, 0.0, "first sample is 0");
+        assert!((s1 - 0.5).abs() < 1e-3, "second sample ~0.5, got {s1}");
+    }
+
+    #[test]
+    fn webaudio_decode_garbage_rejects_not_silence() {
+        let mut rt = audio_runtime();
+        rt.interp
+            .run(
+                "var ctx = new AudioContext();\
+                 var u8 = new Uint8Array([1,2,3,4,5,6,7,8]);\
+                 window.__ok = false; window.__err = false;\
+                 ctx.decodeAudioData(u8.buffer).then(function(){ window.__ok = true; })\
+                   .catch(function(){ window.__err = true; });",
+            )
+            .expect("decode garbage runs");
+        rt.interp.drain_microtasks();
+        // Must NOT resolve with a fake empty buffer — it must reject.
+        let ok = rt.interp.get_global("__ok").map(|v| v.to_bool()).unwrap_or(true);
+        let err = rt.interp.get_global("__err").map(|v| v.to_bool()).unwrap_or(false);
+        assert!(!ok, "garbage must not decode to a fake buffer");
+        assert!(err, "garbage decode must reject (EncodingError)");
+    }
+
+    #[test]
+    fn webaudio_connect_chain_carries_audio() {
+        // source -> gain(0.25) -> destination, with the buffer source playing a
+        // known PCM ramp; the destination must reflect the chain.
+        let mut rt = audio_runtime();
+        rt.interp
+            .run(
+                "var ctx = new OfflineAudioContext(1, 256, 48000);\
+                 var buf = ctx.createBuffer(1, 256, 48000);\
+                 var cd = buf.getChannelData(0);\
+                 for (var i=0;i<256;i++) cd[i] = 0.8;\
+                 var src = ctx.createBufferSource(); src.buffer = buf;\
+                 var gain = ctx.createGain(); gain.gain.value = 0.25;\
+                 src.connect(gain); gain.connect(ctx.destination); src.start(0);\
+                 ctx.startRendering().then(function(out){\
+                   var d = out.getChannelData(0);\
+                   window.__first = d[0];\
+                 });",
+            )
+            .expect("chain render runs");
+        rt.interp.drain_microtasks();
+        let first = rt.interp.get_global("__first").map(|v| v.to_number()).unwrap_or(-99.0);
+        // 0.8 * 0.25 = 0.2
+        assert!((first - 0.2).abs() < 1e-3, "chained output {first} should be 0.8*0.25=0.2");
     }
 
     #[test]

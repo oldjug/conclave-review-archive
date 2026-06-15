@@ -259,12 +259,34 @@ struct IAudioClient {
     vtbl: *mut IAudioClientVtbl,
 }
 
+// IAudioRenderClient — GetBuffer/ReleaseBuffer let us hand decoded PCM
+// straight into the shared-mode endpoint buffer (the real device push path).
+#[repr(C)]
+struct IAudioRenderClientVtbl {
+    QueryInterface:
+        unsafe extern "system" fn(*mut std::ffi::c_void, REFIID, *mut LPVOID) -> HRESULT,
+    AddRef: unsafe extern "system" fn(*mut std::ffi::c_void) -> u32,
+    Release: unsafe extern "system" fn(*mut std::ffi::c_void) -> u32,
+    GetBuffer:
+        unsafe extern "system" fn(*mut std::ffi::c_void, u32, *mut *mut u8) -> HRESULT,
+    ReleaseBuffer: unsafe extern "system" fn(*mut std::ffi::c_void, u32, u32) -> HRESULT,
+}
+#[repr(C)]
+struct IAudioRenderClient {
+    vtbl: *mut IAudioRenderClientVtbl,
+}
+
+const AUDCLNT_BUFFERFLAGS_SILENT: u32 = 0x2;
+
 /// Open the system default audio render endpoint and return its
 /// preferred (mix-format) WAVEFORMATEX along with the IAudioClient
 /// pointer for callers that want to push real PCM into the system.
 pub struct WasapiDevice {
     /// Raw IAudioClient COM pointer. Owned — released on drop.
     audio_client: *mut IAudioClient,
+    /// Raw IAudioRenderClient COM pointer (from `GetService`). Owned —
+    /// released on drop. Used by [`WasapiDevice::write_frames`].
+    render_client: *mut IAudioRenderClient,
     pub mix_format: OutputFormat,
 }
 
@@ -276,6 +298,7 @@ pub enum WasapiError {
     ActivateFailed(i32),
     GetMixFormatFailed(i32),
     InitializeFailed(i32),
+    GetServiceFailed(i32),
     StartFailed(i32),
 }
 
@@ -353,16 +376,91 @@ impl WasapiDevice {
                 ((*(*audio_client).vtbl).Release)(audio_client as _);
                 return Err(WasapiError::InitializeFailed(hr));
             }
+            // Acquire the IAudioRenderClient — the interface we push PCM
+            // through. Must happen after Initialize, before Start.
+            let mut rc: LPVOID = std::ptr::null_mut();
+            let hr = ((*(*audio_client).vtbl).GetService)(
+                audio_client as _,
+                &IID_IAUDIO_RENDER_CLIENT,
+                &mut rc,
+            );
+            if hr < 0 || rc.is_null() {
+                ((*(*audio_client).vtbl).Release)(audio_client as _);
+                return Err(WasapiError::GetServiceFailed(hr));
+            }
+            let render_client = rc as *mut IAudioRenderClient;
             // Start the stream.
             let hr = ((*(*audio_client).vtbl).Start)(audio_client as _);
             if hr < 0 {
+                ((*(*render_client).vtbl).Release)(render_client as _);
                 ((*(*audio_client).vtbl).Release)(audio_client as _);
                 return Err(WasapiError::StartFailed(hr));
             }
             Ok(Self {
                 audio_client,
+                render_client,
                 mix_format,
             })
+        }
+    }
+
+    /// Push interleaved `f32` PCM into the endpoint buffer. `samples` must
+    /// be `frames * channels` long. Returns the number of frames actually
+    /// written (limited by the free space in the shared-mode buffer). This
+    /// is the REAL device push: `GetBuffer` → memcpy → `ReleaseBuffer`.
+    ///
+    /// Note: callers run this on the audio render thread, pacing by
+    /// `buffer_size_frames() - current_padding_frames()` (the standard
+    /// WASAPI shared-mode event loop).
+    pub fn write_frames(&self, samples: &[f32]) -> u32 {
+        let channels = self.mix_format.channels.max(1) as usize;
+        let want_frames = (samples.len() / channels) as u32;
+        if want_frames == 0 {
+            return 0;
+        }
+        unsafe {
+            let buffer_frames = self.buffer_size_frames();
+            let padding = self.current_padding_frames();
+            let free = buffer_frames.saturating_sub(padding);
+            let frames = want_frames.min(free);
+            if frames == 0 {
+                return 0;
+            }
+            let mut ptr: *mut u8 = std::ptr::null_mut();
+            let hr =
+                ((*(*self.render_client).vtbl).GetBuffer)(self.render_client as _, frames, &mut ptr);
+            if hr < 0 || ptr.is_null() {
+                return 0;
+            }
+            // The mix format is float (we initialized at the device mix
+            // format, which is virtually always 32-bit float in shared mode).
+            // Copy `frames * channels` f32 samples.
+            let n = (frames as usize) * channels;
+            let dst = ptr as *mut f32;
+            for i in 0..n {
+                *dst.add(i) = samples.get(i).copied().unwrap_or(0.0);
+            }
+            ((*(*self.render_client).vtbl).ReleaseBuffer)(self.render_client as _, frames, 0);
+            frames
+        }
+    }
+
+    /// Write `frames` of silence into the endpoint (used to prime the
+    /// buffer or recover from underrun without clicks).
+    pub fn write_silence(&self, frames: u32) -> u32 {
+        unsafe {
+            let mut ptr: *mut u8 = std::ptr::null_mut();
+            let hr =
+                ((*(*self.render_client).vtbl).GetBuffer)(self.render_client as _, frames, &mut ptr);
+            if hr < 0 || ptr.is_null() {
+                return 0;
+            }
+            ((*(*self.render_client).vtbl).ReleaseBuffer)(
+                self.render_client as _,
+                frames,
+                AUDCLNT_BUFFERFLAGS_SILENT,
+            );
+            frames
         }
     }
 
@@ -386,6 +484,9 @@ impl WasapiDevice {
 impl Drop for WasapiDevice {
     fn drop(&mut self) {
         unsafe {
+            if !self.render_client.is_null() {
+                ((*(*self.render_client).vtbl).Release)(self.render_client as _);
+            }
             if !self.audio_client.is_null() {
                 let _ = ((*(*self.audio_client).vtbl).Stop)(self.audio_client as _);
                 ((*(*self.audio_client).vtbl).Release)(self.audio_client as _);
