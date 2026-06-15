@@ -90,6 +90,15 @@ pub const WM_CAPTURECHANGED: u32 = 0x0215;
 /// <https://learn.microsoft.com/en-us/windows/win32/hidpi/wm-dpichanged>
 pub const WM_DPICHANGED: u32 = 0x02E0;
 
+/// `WM_GETOBJECT` — sent by the OS accessibility runtime (and Narrator/other
+/// ATs) to request an accessibility interface for the window. When
+/// `lParam == UiaRootObjectId` (-25) the window returns an
+/// `IRawElementProviderSimple` for its UI Automation content root via
+/// `UiaReturnRawElementProvider`. We answer it from the published AX snapshot
+/// (cv_a11y), gated behind `CV_A11Y_UIA`.
+/// <https://learn.microsoft.com/en-us/windows/win32/winauto/wm-getobject>
+pub const WM_GETOBJECT: u32 = 0x003D;
+
 /// Opaque DPI-awareness pseudo-handle passed to `SetProcessDpiAwarenessContext`.
 /// These are NOT real handles — they are small negative sentinel values the OS
 /// recognises. Modelled as a pointer-sized C handle.

@@ -121,6 +121,16 @@ pub enum UiaPropertyId {
     IsOffscreen = 30022,
     Orientation = 30023,
     FrameworkId = 30024,
+    IsRequiredForForm = 30025,
+    // Pattern-property ids (UIAutomationCoreApi.h):
+    ToggleToggleState = 30086,
+    ExpandCollapseState = 30070,
+    ValueValue = 30045,
+    ValueIsReadOnly = 30046,
+    /// `UIA_LevelPropertyId` — heading / hierarchy level.
+    Level = 30154,
+    /// `UIA_AriaRolePropertyId` — the raw ARIA role string (e.g. "button").
+    AriaRole = 30101,
 }
 
 /// `NavigateDirection` enum.
@@ -149,17 +159,40 @@ pub const UIAFRAGMENT_ROOT: i32 = 3;
 
 // ----- Pure-Rust provider model ---------------------------------------
 
+/// Mirror of the UIA `ToggleState` enum (`UIA_ToggleStateIds`) returned by the
+/// Toggle control pattern's `get_ToggleState`. Off/On/Indeterminate match the
+/// checkbox/switch tri-state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(i32)]
+pub enum ToggleState {
+    Off = 0,
+    On = 1,
+    Indeterminate = 2,
+    /// Sentinel: the element does not support the Toggle pattern at all.
+    Unsupported = -1,
+}
+
 #[derive(Debug, Clone)]
 pub struct UiaProvider {
     pub runtime_id: Vec<i32>,
     pub control_type: UiaControlType,
     pub name: String,
     pub help_text: String,
+    /// Value pattern's current value (UIA `ValuePattern.Value`).
+    pub value: String,
     pub bounding: (f64, f64, f64, f64), // l, t, w, h
     pub is_keyboard_focusable: bool,
     pub has_keyboard_focus: bool,
     pub is_enabled: bool,
     pub is_password: bool,
+    /// `aria-required` / native `required` (UIA `IsRequiredForForm`).
+    pub is_required: bool,
+    /// Toggle pattern state for checkbox/radio/switch (Unsupported otherwise).
+    pub toggle_state: ToggleState,
+    /// ExpandCollapse pattern state: `None` when not a disclosure widget.
+    pub expand_collapse: Option<bool>,
+    /// Heading / tree depth level for the `Level` property (0 when N/A).
+    pub level: u32,
     pub automation_id: String,
     pub class_name: String,
     pub framework_id: String,
@@ -167,11 +200,24 @@ pub struct UiaProvider {
 
 impl UiaProvider {
     pub fn from_ax(node: &AxNode) -> Self {
+        use crate::{CheckedState, ExpandedState};
+        let toggle_state = match node.checked {
+            CheckedState::None => ToggleState::Unsupported,
+            CheckedState::Unchecked => ToggleState::Off,
+            CheckedState::Checked => ToggleState::On,
+            CheckedState::Mixed => ToggleState::Indeterminate,
+        };
+        let expand_collapse = match node.expanded {
+            ExpandedState::Undefined => None,
+            ExpandedState::Collapsed => Some(false),
+            ExpandedState::Expanded => Some(true),
+        };
         Self {
             runtime_id: vec![UIAFRAGMENT_ROOT, node.id as i32],
             control_type: control_type_for_role(node.role),
             name: node.name.clone(),
-            help_text: String::new(),
+            help_text: node.description.clone(),
+            value: node.value.clone(),
             bounding: (
                 node.bbox.0 as f64,
                 node.bbox.1 as f64,
@@ -182,14 +228,22 @@ impl UiaProvider {
                 node.role,
                 AxRole::Button
                     | AxRole::Textbox
+                    | AxRole::Searchbox
                     | AxRole::Combobox
                     | AxRole::Link
                     | AxRole::Checkbox
                     | AxRole::Radio
+                    | AxRole::Slider
+                    | AxRole::Spinbutton
+                    | AxRole::Tab
             ),
             has_keyboard_focus: node.focused,
             is_enabled: !node.disabled,
-            is_password: false,
+            is_password: node.password,
+            is_required: node.required,
+            toggle_state,
+            expand_collapse,
+            level: node.level,
             automation_id: format!("ax-{}", node.id),
             class_name: format!("{:?}", node.role),
             framework_id: "Conclave".into(),
@@ -215,6 +269,18 @@ impl UiaProvider {
             IsKeyboardFocusable => VariantValue::Bool(self.is_keyboard_focusable),
             IsEnabled => VariantValue::Bool(self.is_enabled),
             IsPassword => VariantValue::Bool(self.is_password),
+            IsRequiredForForm => VariantValue::Bool(self.is_required),
+            ToggleToggleState => VariantValue::I4(self.toggle_state as i32),
+            ExpandCollapseState => VariantValue::I4(match self.expand_collapse {
+                // ExpandCollapseState: Collapsed=0, Expanded=1, LeafNode=3.
+                Some(true) => 1,
+                Some(false) => 0,
+                None => 3,
+            }),
+            ValueValue => VariantValue::BStr(self.value.clone()),
+            ValueIsReadOnly => VariantValue::Bool(false),
+            Level => VariantValue::I4(self.level as i32),
+            AriaRole => VariantValue::BStr(aria_role_string(self.control_type).to_string()),
             AutomationId => VariantValue::BStr(self.automation_id.clone()),
             ClassName => VariantValue::BStr(self.class_name.clone()),
             FrameworkId => VariantValue::BStr(self.framework_id.clone()),
@@ -222,6 +288,37 @@ impl UiaProvider {
             IsContentElement | IsControlElement => VariantValue::Bool(true),
             IsOffscreen => VariantValue::Bool(false),
             _ => VariantValue::Empty,
+        }
+    }
+
+    /// Report which UIA control patterns this provider supports — used by the
+    /// COM bridge's `GetPatternProvider`. A screen reader queries these to know
+    /// it may call `Toggle()`/`Expand()`/`get_Value()` etc.
+    pub fn supports_pattern(&self, pattern: UiaPatternId) -> bool {
+        use UiaPatternId::*;
+        match pattern {
+            Invoke => matches!(
+                self.control_type,
+                UiaControlType::Button | UiaControlType::Hyperlink | UiaControlType::MenuItem
+            ),
+            Toggle => self.toggle_state != ToggleState::Unsupported,
+            ExpandCollapse => self.expand_collapse.is_some(),
+            Value => matches!(
+                self.control_type,
+                UiaControlType::Edit | UiaControlType::ComboBox
+            ),
+            RangeValue => matches!(
+                self.control_type,
+                UiaControlType::Slider | UiaControlType::Spinner | UiaControlType::ProgressBar
+            ),
+            SelectionItem => matches!(
+                self.control_type,
+                UiaControlType::RadioButton | UiaControlType::TabItem | UiaControlType::ListItem
+            ),
+            Selection => matches!(
+                self.control_type,
+                UiaControlType::List | UiaControlType::ComboBox | UiaControlType::Tab
+            ),
         }
     }
 
@@ -242,15 +339,60 @@ pub enum VariantValue {
     R8Array(Vec<f64>),
 }
 
+/// `UIA_PatternIds` subset — the control patterns we can fulfil from the AX
+/// model. Values from UIAutomationCoreApi.h.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(i32)]
+pub enum UiaPatternId {
+    Invoke = 10000,
+    Selection = 10001,
+    Value = 10002,
+    RangeValue = 10003,
+    SelectionItem = 10010,
+    ExpandCollapse = 10005,
+    Toggle = 10015,
+}
+
+/// The ARIA role token a UIA control type round-trips to for the
+/// `AriaRolePropertyId`. Best-effort: UIA control types are coarser than ARIA
+/// roles, so this is the canonical role for the type.
+fn aria_role_string(ct: UiaControlType) -> &'static str {
+    match ct {
+        UiaControlType::Button => "button",
+        UiaControlType::CheckBox => "checkbox",
+        UiaControlType::ComboBox => "combobox",
+        UiaControlType::Edit => "textbox",
+        UiaControlType::Hyperlink => "link",
+        UiaControlType::Image => "img",
+        UiaControlType::ListItem => "listitem",
+        UiaControlType::List => "list",
+        UiaControlType::Menu => "menu",
+        UiaControlType::MenuItem => "menuitem",
+        UiaControlType::RadioButton => "radio",
+        UiaControlType::Slider => "slider",
+        UiaControlType::Spinner => "spinbutton",
+        UiaControlType::Tab => "tablist",
+        UiaControlType::TabItem => "tab",
+        UiaControlType::Text => "heading",
+        UiaControlType::Tree => "tree",
+        UiaControlType::TreeItem => "treeitem",
+        UiaControlType::Table => "table",
+        UiaControlType::Group => "group",
+        UiaControlType::Document => "document",
+        _ => "",
+    }
+}
+
 fn control_type_for_role(role: AxRole) -> UiaControlType {
     match role {
         AxRole::Button => UiaControlType::Button,
         AxRole::Checkbox => UiaControlType::CheckBox,
         AxRole::Combobox => UiaControlType::ComboBox,
-        AxRole::Textbox => UiaControlType::Edit,
+        AxRole::Textbox | AxRole::Searchbox => UiaControlType::Edit,
         AxRole::Link => UiaControlType::Hyperlink,
         AxRole::Image => UiaControlType::Image,
-        AxRole::Heading | AxRole::Paragraph | AxRole::Document => UiaControlType::Text,
+        AxRole::Document => UiaControlType::Document,
+        AxRole::Heading | AxRole::Paragraph => UiaControlType::Text,
         AxRole::List => UiaControlType::List,
         AxRole::ListItem => UiaControlType::ListItem,
         AxRole::Menu => UiaControlType::Menu,
@@ -265,11 +407,18 @@ fn control_type_for_role(role: AxRole) -> UiaControlType {
         AxRole::Tree => UiaControlType::Tree,
         AxRole::TreeItem => UiaControlType::TreeItem,
         AxRole::Group | AxRole::Section | AxRole::Article | AxRole::Region => UiaControlType::Group,
-        AxRole::Form => UiaControlType::Pane,
-        AxRole::Main | AxRole::Navigation | AxRole::Banner => UiaControlType::Pane,
+        AxRole::Table => UiaControlType::Table,
+        AxRole::Form => UiaControlType::Group,
+        AxRole::Main
+        | AxRole::Navigation
+        | AxRole::Banner
+        | AxRole::Contentinfo
+        | AxRole::Complementary => UiaControlType::Pane,
         AxRole::Search => UiaControlType::Group,
         AxRole::Application => UiaControlType::Window,
-        AxRole::Generic => UiaControlType::Custom,
+        // Presentational nodes are pruned before reaching UIA; if one somehow
+        // surfaces, expose it as a structureless Group rather than a fake leaf.
+        AxRole::Presentation | AxRole::Generic => UiaControlType::Custom,
     }
 }
 

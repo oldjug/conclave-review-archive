@@ -5,6 +5,9 @@ version = 4
 [[package]]
 name = "cv_a11y"
 version = "0.0.1"
+dependencies = [
+ "cv_dom",
+]
 
 [[package]]
 name = "cv_arena"
@@ -34,6 +37,7 @@ version = "0.0.1"
 name = "cv_browser"
 version = "0.0.1"
 dependencies = [
+ "cv_a11y",
  "cv_audio",
  "cv_base",
  "cv_compositor",
@@ -226,6 +230,7 @@ dependencies = [
 name = "cv_ui"
 version = "0.0.1"
 dependencies = [
+ "cv_a11y",
  "cv_compositor",
  "cv_gfx",
  "cv_gpu",

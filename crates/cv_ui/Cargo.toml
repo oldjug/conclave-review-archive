@@ -15,3 +15,4 @@ cv_gpu = { path = "../cv_gpu" }
 cv_layout = { path = "../cv_layout" }
 cv_paint = { path = "../cv_paint" }
 cv_compositor = { path = "../cv_compositor" }
+cv_a11y = { path = "../cv_a11y" }

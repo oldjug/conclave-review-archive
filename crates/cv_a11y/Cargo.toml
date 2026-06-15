@@ -6,5 +6,8 @@ rust-version.workspace = true
 license.workspace = true
 publish = false
 
+[dependencies]
+cv_dom = { path = "../cv_dom" }
+
 [lints]
 workspace = true

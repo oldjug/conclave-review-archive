@@ -9232,6 +9232,16 @@ fn build_browser_session(target: &str) -> Result<BrowserParts, String> {
             st.focused_path.as_deref(),
             None,
         );
+        // Accessibility: rebuild + publish the UIA accessibility tree from the
+        // now-current arena DOM so Narrator / screen readers see this frame's
+        // roles, names and states. Gated behind CV_A11Y_UIA (default OFF) — the
+        // build is cheap and side-effect-free, but we only pay it (and later
+        // construct the OS-facing COM provider) when an assistive technology is
+        // actually present. See cv_a11y::provider for the WM_GETOBJECT bridge.
+        if cv_a11y::a11y_uia_enabled() {
+            let ax = st.runtime.build_ax_tree(st.focused_path.as_deref());
+            cv_a11y::publish(&ax);
+        }
         set_caret_pos_for_render(st.caret_pos);
         // Make JS-created canvas pixels available to this full re-render too.
         // Without it, any DOM-driven frame rebuilt the styled tree with the
@@ -15914,6 +15924,28 @@ impl LiveInterp {
     /// byte-identical to the unconditional rebuild (build_arena_dom is the same).
     fn ensure_arena_current(&mut self, doc: &cv_html::Document, sheets: &[cv_css::Stylesheet]) {
         self.ensure_arena_current_focus(doc, sheets, None, None);
+    }
+
+    /// Build the platform accessibility tree (UI Automation) from the live arena
+    /// DOM. This is the Chrome `AXObjectCache` analogue: roles computed from
+    /// tag + ARIA, accessible names per the W3C accname-1.2 algorithm, and ARIA
+    /// states — produced by [`cv_a11y::build_ax_tree`]. `focus_path` is the
+    /// currently-focused element's tree path (as tracked by the renderer for
+    /// `:focus`); it is resolved to a `cv_dom::NodeId` via the arena path map so
+    /// the focused AX node carries `HasKeyboardFocus`.
+    ///
+    /// Screen readers obtain this tree through the window's UIA provider: the
+    /// window proc answers `WM_GETOBJECT` (lParam == `UiaRootObjectId`) by
+    /// returning an `IRawElementProviderSimple` whose `GetPropertyValue` /
+    /// fragment navigation are served from these nodes
+    /// (`cv_a11y::uia::UiaProvider` + `cv_a11y::uia_provider::handle_wm_getobject`).
+    /// The live COM registration is gated behind `CV_A11Y_UIA` (default OFF) so
+    /// the UIAutomationCore provider is only constructed when an AT is present;
+    /// the AX tree itself is always available for in-process queries and tests.
+    fn build_ax_tree(&self, focus_path: Option<&[usize]>) -> cv_a11y::AxTree {
+        let arena = self.arena.borrow();
+        let focus = focus_path.and_then(|p| self.arena_path_map.get(p).copied());
+        cv_a11y::build_ax_tree(&arena, focus)
     }
 
     /// `ensure_arena_current` with the current focus/hover element paths so a

@@ -4074,6 +4074,17 @@ unsafe extern "system" fn wnd_proc(
     lparam: isize,
 ) -> isize {
     match msg {
+        // Accessibility: the OS / Narrator requests a UI Automation provider for
+        // this window. When CV_A11Y_UIA is on, answer it from the published AX
+        // snapshot (cv_a11y) by constructing a fragment-root COM provider; the
+        // OS reads roles/names/states from there. Default OFF: fall through to
+        // DefWindowProc, which returns 0 (no UIA provider) just like before.
+        sys::WM_GETOBJECT if cv_a11y::a11y_uia_enabled() => {
+            match cv_a11y::com::handle_wm_getobject(hwnd as *mut core::ffi::c_void, wparam, lparam) {
+                Some(lr) => lr,
+                None => unsafe { sys::DefWindowProcW(hwnd, msg, wparam, lparam) },
+            }
+        }
         sys::WM_PAINT => {
             let mut ps: sys::PAINTSTRUCT = unsafe { core::mem::zeroed() };
             let hdc = unsafe { sys::BeginPaint(hwnd, &raw mut ps) };
