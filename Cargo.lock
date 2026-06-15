@@ -61,6 +61,7 @@ dependencies = [
  "cv_ui",
  "cv_unicode",
  "cv_url",
+ "cv_webapi",
 ]
 
 [[package]]
@@ -255,7 +256,9 @@ version = "0.0.1"
 name = "cv_webapi"
 version = "0.0.1"
 dependencies = [
+ "cv_crypto",
  "cv_js",
+ "cv_net",
 ]
 
 [[package]]

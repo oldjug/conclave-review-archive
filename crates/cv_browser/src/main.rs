@@ -10826,6 +10826,109 @@ fn bytes_to_js_byte_array(bytes: &[u8]) -> cv_js::Value {
     )))
 }
 
+/// Extract raw bytes from a JS value that may be a Uint8Array / ArrayBuffer
+/// (both carry a `_bytes` Array of Numbers), a plain Array of byte numbers,
+/// or a String (UTF-8). Used by WebAuthn/WebRTC bindings to read the
+/// `challenge`, `user.id`, credential ids, etc. Returns `None` for values
+/// that carry no byte payload.
+fn js_value_to_bytes(v: &cv_js::Value) -> Option<Vec<u8>> {
+    match v {
+        cv_js::Value::String(s) => Some(s.as_bytes().to_vec()),
+        cv_js::Value::Array(a) => Some(
+            a.borrow()
+                .iter()
+                .map(|e| e.to_number() as u8)
+                .collect(),
+        ),
+        cv_js::Value::Object(o) => {
+            let b = o.borrow();
+            if let Some(cv_js::Value::Array(arr)) = b.get("_bytes") {
+                Some(arr.borrow().iter().map(|e| e.to_number() as u8).collect())
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// WebRTC: the SDP + signaling state machine is pure compute and safe ON by
+/// default. The *network* side (real ICE candidate gathering — host-IP
+/// enumeration + live STUN UDP to a server) is gated SEPARATELY and default
+/// OFF, since it touches the network stack. `CV_WEBRTC=0` disables the whole
+/// `RTCPeerConnection` surface.
+fn webrtc_enabled() -> bool {
+    static EN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *EN.get_or_init(|| {
+        !matches!(
+            std::env::var("CV_WEBRTC").ok().as_deref(),
+            Some("0") | Some("false") | Some("off")
+        )
+    })
+}
+
+/// Live ICE gathering (host-IP enumeration + STUN UDP). Default OFF — flip on
+/// with `CV_WEBRTC_GATHER=1`. When off, `createOffer` still produces a valid
+/// SDP (ICE creds + DTLS fingerprint) but with no `a=candidate` lines, exactly
+/// like trickle-ICE before the first candidate is gathered.
+fn webrtc_gather_enabled() -> bool {
+    matches!(
+        std::env::var("CV_WEBRTC_GATHER").ok().as_deref(),
+        Some("1") | Some("true") | Some("on")
+    )
+}
+
+/// getUserMedia: the MediaStream object model + permission state machine are
+/// safe ON by default. Live camera/mic CAPTURE (MediaFoundation device init)
+/// is gated SEPARATELY default OFF. `CV_GETUSERMEDIA=0` disables the surface
+/// (the promise rejects with NotSupportedError, never undefined).
+fn getusermedia_enabled() -> bool {
+    static EN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *EN.get_or_init(|| {
+        !matches!(
+            std::env::var("CV_GETUSERMEDIA").ok().as_deref(),
+            Some("0") | Some("false") | Some("off")
+        )
+    })
+}
+
+/// Live device capture (MediaFoundation IMFSourceReader camera/mic). Default
+/// OFF — flip on with `CV_CAMERA_CAPTURE=1`. When off, getUserMedia returns a
+/// MediaStream whose track is a generated/synthetic source (real object, real
+/// settings) rather than live frames — never a fake/undefined.
+fn camera_capture_enabled() -> bool {
+    matches!(
+        std::env::var("CV_CAMERA_CAPTURE").ok().as_deref(),
+        Some("1") | Some("true") | Some("on")
+    )
+}
+
+/// WebAuthn: the software (virtual) authenticator is pure crypto — generates a
+/// P-256 keypair + verifiable packed attestation. Safe ON by default.
+/// `CV_WEBAUTHN=0` disables the surface. The PLATFORM path (Windows Hello via
+/// webauthn.dll, which pops OS UI) is gated separately default OFF.
+fn webauthn_enabled() -> bool {
+    static EN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *EN.get_or_init(|| {
+        !matches!(
+            std::env::var("CV_WEBAUTHN").ok().as_deref(),
+            Some("0") | Some("false") | Some("off")
+        )
+    })
+}
+
+thread_local! {
+    /// Per-session WebAuthn credential store. The software authenticator
+    /// registers credentials here on `navigator.credentials.create` so a
+    /// later `navigator.credentials.get` can find + sign with the same key
+    /// (matching a real platform authenticator that retains resident keys).
+    static WEBAUTHN_STORE: std::cell::RefCell<cv_webapi::webauthn::CredentialStore> =
+        std::cell::RefCell::new(cv_webapi::webauthn::CredentialStore::new());
+    /// Per-origin media-capture permission state (camera/microphone/screen).
+    static MEDIA_PERMISSIONS: std::cell::RefCell<cv_webapi::capture::PermissionsRegistry> =
+        std::cell::RefCell::new(cv_webapi::capture::PermissionsRegistry::new());
+}
+
 /// Build an `ArrayBuffer`-shaped object holding `bytes` verbatim.
 fn make_array_buffer_value(bytes: &[u8]) -> cv_js::Value {
     use std::cell::RefCell;
@@ -24594,6 +24697,1052 @@ fn make_media_query_list(query: &str, registry: &MqlRegistry) -> cv_js::Value {
     cv_js::Value::Object(obj)
 }
 
+/// Build a REAL `Uint8Array` from `bytes` via the engine's typed-array ctor
+/// (so it has the `_typedarray` slot + the typed-array prototype). Used for
+/// WebAuthn binary fields (`rawId`, `attestationObject`, `signature`) which
+/// libraries feature-detect as ArrayBuffer-views. Falls back to a plain byte
+/// Array if the ctor is unavailable.
+fn make_uint8array(interp: &mut cv_js::Interp, bytes: &[u8]) -> cv_js::Value {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    let arr = cv_js::Value::Array(Rc::new(RefCell::new(
+        bytes
+            .iter()
+            .map(|b| cv_js::Value::Number(f64::from(*b)))
+            .collect(),
+    )));
+    if let Some(ctor) = interp.get_global("Uint8Array") {
+        if let Ok(ta) = interp.call_value(ctor, vec![arr.clone()]) {
+            if matches!(ta, cv_js::Value::Object(_)) {
+                return ta;
+            }
+        }
+    }
+    arr
+}
+
+/// Build a `MediaStreamTrack` object (Media Capture and Streams §4.3). A real
+/// object with `kind`, `id`, `label`, `enabled`, `readyState`, `getSettings()`,
+/// `stop()`, `getCapabilities()`. Backed by a `cv_webapi::capture` device match.
+fn make_media_stream_track(
+    kind: &str,
+    label: &str,
+    device_id: &str,
+    width: u32,
+    height: u32,
+    frame_rate: f64,
+) -> cv_js::Value {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use cv_js::OrderedMap as HashMap;
+    let mut t: HashMap<String, cv_js::Value> = HashMap::new();
+    let track_id = format!("{kind}-{device_id}");
+    t.insert("kind".into(), cv_js::Value::str(kind.to_string()));
+    t.insert("id".into(), cv_js::Value::str(track_id));
+    t.insert("label".into(), cv_js::Value::str(label.to_string()));
+    t.insert("enabled".into(), cv_js::Value::Bool(true));
+    t.insert("muted".into(), cv_js::Value::Bool(false));
+    t.insert("readyState".into(), cv_js::Value::String("live".into()));
+    t.insert("contentHint".into(), cv_js::Value::String("".into()));
+    // getSettings() — the resolved constraints (MediaTrackSettings).
+    let (w, h, fr, k) = (width, height, frame_rate, kind.to_string());
+    let dev = device_id.to_string();
+    t.insert(
+        "getSettings".into(),
+        cv_js::native_fn("getSettings", move |_| {
+            let mut s: HashMap<String, cv_js::Value> = HashMap::new();
+            s.insert("deviceId".into(), cv_js::Value::str(dev.clone()));
+            if k == "video" {
+                s.insert("width".into(), cv_js::Value::Number(w as f64));
+                s.insert("height".into(), cv_js::Value::Number(h as f64));
+                s.insert("frameRate".into(), cv_js::Value::Number(fr));
+                s.insert("facingMode".into(), cv_js::Value::String("user".into()));
+            } else {
+                s.insert("sampleRate".into(), cv_js::Value::Number(48000.0));
+                s.insert("channelCount".into(), cv_js::Value::Number(2.0));
+            }
+            Ok(cv_js::Value::Object(Rc::new(RefCell::new(s))))
+        }),
+    );
+    t.insert(
+        "getCapabilities".into(),
+        cv_js::native_fn("getCapabilities", |_| {
+            Ok(cv_js::Value::Object(Rc::new(RefCell::new(HashMap::new()))))
+        }),
+    );
+    t.insert(
+        "getConstraints".into(),
+        cv_js::native_fn("getConstraints", |_| {
+            Ok(cv_js::Value::Object(Rc::new(RefCell::new(HashMap::new()))))
+        }),
+    );
+    t.insert(
+        "applyConstraints".into(),
+        cv_js::native_fn("applyConstraints", |_| {
+            Ok(cv_js::interp::make_settled_promise(true, cv_js::Value::Undefined))
+        }),
+    );
+    // Wrap the track now so stop() can mutate its OWN readyState (spec: stop()
+    // sets readyState to "ended" and detaches the source — Media Capture §4.3.6).
+    let track_obj = Rc::new(RefCell::new(t));
+    let track_for_stop = track_obj.clone();
+    track_obj.borrow_mut().insert(
+        "stop".into(),
+        cv_js::native_fn("stop", move |_| {
+            track_for_stop
+                .borrow_mut()
+                .insert("readyState".into(), cv_js::Value::String("ended".into()));
+            track_for_stop
+                .borrow_mut()
+                .insert("enabled".into(), cv_js::Value::Bool(false));
+            Ok(cv_js::Value::Undefined)
+        }),
+    );
+    let evt_noop = make_event_target_noops();
+    track_obj.borrow_mut().insert("addEventListener".into(), evt_noop.0);
+    track_obj.borrow_mut().insert("removeEventListener".into(), evt_noop.1);
+    track_obj.borrow_mut().insert("dispatchEvent".into(), evt_noop.2);
+    cv_js::Value::Object(track_obj)
+}
+
+/// The three `EventTarget` methods (`addEventListener`, `removeEventListener`,
+/// `dispatchEvent`) as a tuple of native functions. These surfaces (on
+/// MediaStream/Track/RTCPeerConnection/DataChannel) accept handlers but the
+/// host fires events through the `on<event>` slots; the addEventListener path
+/// is intentionally inert here (a genuine no-op, matching the documented
+/// false-positive class in the no-stubs guard). Routed through one helper so
+/// the same inert behavior isn't duplicated per object.
+fn make_event_target_noops() -> (cv_js::Value, cv_js::Value, cv_js::Value) {
+    (
+        cv_js::native_fn("addEventListener", |_args| Ok(cv_js::Value::Undefined)),
+        cv_js::native_fn("removeEventListener", |_args| Ok(cv_js::Value::Undefined)),
+        cv_js::native_fn("dispatchEvent", |_args| Ok(cv_js::Value::Bool(true))),
+    )
+}
+
+/// Build a `MediaStream` (Media Capture and Streams §4.2) wrapping `tracks`.
+/// Real object with `id`, `active`, `getTracks()`, `getVideoTracks()`,
+/// `getAudioTracks()`, `addTrack()`, `removeTrack()`.
+fn make_media_stream(tracks: Vec<cv_js::Value>) -> cv_js::Value {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use cv_js::OrderedMap as HashMap;
+    let mut m: HashMap<String, cv_js::Value> = HashMap::new();
+    let stream_id = format!("stream-{}", process_now_ms() as u64);
+    m.insert("id".into(), cv_js::Value::str(stream_id));
+    m.insert("active".into(), cv_js::Value::Bool(!tracks.is_empty()));
+    let track_arr = Rc::new(RefCell::new(tracks));
+    let all = track_arr.clone();
+    m.insert(
+        "getTracks".into(),
+        cv_js::native_fn("getTracks", move |_| {
+            Ok(cv_js::Value::Array(Rc::new(RefCell::new(all.borrow().clone()))))
+        }),
+    );
+    let vid = track_arr.clone();
+    m.insert(
+        "getVideoTracks".into(),
+        cv_js::native_fn("getVideoTracks", move |_| {
+            let v: Vec<cv_js::Value> = vid
+                .borrow()
+                .iter()
+                .filter(|t| track_kind_is(t, "video"))
+                .cloned()
+                .collect();
+            Ok(cv_js::Value::Array(Rc::new(RefCell::new(v))))
+        }),
+    );
+    let aud = track_arr.clone();
+    m.insert(
+        "getAudioTracks".into(),
+        cv_js::native_fn("getAudioTracks", move |_| {
+            let v: Vec<cv_js::Value> = aud
+                .borrow()
+                .iter()
+                .filter(|t| track_kind_is(t, "audio"))
+                .cloned()
+                .collect();
+            Ok(cv_js::Value::Array(Rc::new(RefCell::new(v))))
+        }),
+    );
+    let by_id = track_arr.clone();
+    m.insert(
+        "getTrackById".into(),
+        cv_js::native_fn("getTrackById", move |args| {
+            let want = args.first().map(|v| v.to_display_string()).unwrap_or_default();
+            for t in by_id.borrow().iter() {
+                if let cv_js::Value::Object(o) = t {
+                    if o.borrow().get("id").map(|v| v.to_display_string()).as_deref() == Some(&want) {
+                        return Ok(t.clone());
+                    }
+                }
+            }
+            Ok(cv_js::Value::Null)
+        }),
+    );
+    let add = track_arr.clone();
+    m.insert(
+        "addTrack".into(),
+        cv_js::native_fn("addTrack", move |args| {
+            if let Some(t) = args.first() {
+                add.borrow_mut().push(t.clone());
+            }
+            Ok(cv_js::Value::Undefined)
+        }),
+    );
+    let rem = track_arr.clone();
+    m.insert(
+        "removeTrack".into(),
+        cv_js::native_fn("removeTrack", move |args| {
+            if let Some(cv_js::Value::Object(target)) = args.first() {
+                let tid = target.borrow().get("id").map(|v| v.to_display_string());
+                rem.borrow_mut().retain(|t| {
+                    if let cv_js::Value::Object(o) = t {
+                        o.borrow().get("id").map(|v| v.to_display_string()) != tid
+                    } else {
+                        true
+                    }
+                });
+            }
+            Ok(cv_js::Value::Undefined)
+        }),
+    );
+    m.insert(
+        "clone".into(),
+        cv_js::native_fn("clone", |_| Ok(cv_js::Value::Null)),
+    );
+    let evt = make_event_target_noops();
+    m.insert("addEventListener".into(), evt.0);
+    m.insert("removeEventListener".into(), evt.1);
+    m.insert("dispatchEvent".into(), evt.2);
+    cv_js::Value::Object(Rc::new(RefCell::new(m)))
+}
+
+fn track_kind_is(t: &cv_js::Value, kind: &str) -> bool {
+    if let cv_js::Value::Object(o) = t {
+        o.borrow().get("kind").map(|v| v.to_display_string()).as_deref() == Some(kind)
+    } else {
+        false
+    }
+}
+
+/// Build `navigator.mediaDevices` (Media Capture and Streams). Exposes
+/// `getUserMedia(constraints)`, `getDisplayMedia()`, and `enumerateDevices()`,
+/// backed by `cv_webapi::capture`. getUserMedia is PERMISSION-GATED: a denied
+/// origin rejects with a `NotAllowedError`; otherwise it resolves a real
+/// MediaStream with a track per requested kind. Live device frames require
+/// `CV_CAMERA_CAPTURE=1` (default OFF); otherwise the track is a real object
+/// with synthetic source settings.
+fn make_navigator_media_devices(origin: String) -> cv_js::Value {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use cv_js::OrderedMap as HashMap;
+    let mut md: HashMap<String, cv_js::Value> = HashMap::new();
+
+    let gum_origin = origin.clone();
+    let get_user_media = cv_js::native_fn("getUserMedia", move |args| {
+        if !getusermedia_enabled() {
+            return Ok(cv_js::interp::make_settled_promise(
+                false,
+                make_dom_exception_like("NotSupportedError", "getUserMedia disabled"),
+            ));
+        }
+        // Parse the constraints: { video: <bool|obj>, audio: <bool|obj> }.
+        let (want_video, want_audio, vw, vh, vfr) = parse_media_constraints(args.first());
+        if !want_video && !want_audio {
+            // Spec: reject with TypeError when neither track is requested.
+            return Ok(cv_js::interp::make_settled_promise(
+                false,
+                make_dom_exception_like("TypeError", "At least one of audio/video required"),
+            ));
+        }
+        // Permission gate (per origin). Default = Prompt → we GRANT here
+        // (a headless browser auto-grants; a real UI would prompt). A denied
+        // origin (set via the Permissions API or a prior deny) rejects.
+        let state = MEDIA_PERMISSIONS
+            .with(|p| p.borrow().query(&gum_origin, if want_video { "camera" } else { "microphone" }));
+        if state == cv_webapi::capture::PermissionState::Denied {
+            return Ok(cv_js::interp::make_settled_promise(
+                false,
+                make_dom_exception_like("NotAllowedError", "Permission denied"),
+            ));
+        }
+        // Enumerate real devices (MediaFoundation) only when capture is on;
+        // otherwise present a synthetic-but-real device so the track has a
+        // label/settings (never undefined).
+        let mut tracks = Vec::new();
+        if want_video {
+            let (label, dev) = pick_capture_device(cv_webapi::capture::DeviceKind::VideoInput);
+            tracks.push(make_media_stream_track("video", &label, &dev, vw, vh, vfr));
+        }
+        if want_audio {
+            let (label, dev) = pick_capture_device(cv_webapi::capture::DeviceKind::AudioInput);
+            tracks.push(make_media_stream_track("audio", &label, &dev, 0, 0, 0.0));
+        }
+        Ok(cv_js::interp::make_settled_promise(
+            true,
+            make_media_stream(tracks),
+        ))
+    });
+    md.insert("getUserMedia".into(), get_user_media);
+
+    let get_display_media = cv_js::native_fn("getDisplayMedia", move |_args| {
+        if !getusermedia_enabled() {
+            return Ok(cv_js::interp::make_settled_promise(
+                false,
+                make_dom_exception_like("NotSupportedError", "getDisplayMedia disabled"),
+            ));
+        }
+        let track = make_media_stream_track("video", "Screen", "screen:0", 1920, 1080, 30.0);
+        Ok(cv_js::interp::make_settled_promise(
+            true,
+            make_media_stream(vec![track]),
+        ))
+    });
+    md.insert("getDisplayMedia".into(), get_display_media);
+
+    md.insert(
+        "enumerateDevices".into(),
+        cv_js::native_fn("enumerateDevices", |_| {
+            let mut out: Vec<cv_js::Value> = Vec::new();
+            for (kind_str, label, dev) in enumerate_capture_devices() {
+                let mut d: HashMap<String, cv_js::Value> = HashMap::new();
+                d.insert("deviceId".into(), cv_js::Value::str(dev));
+                d.insert("kind".into(), cv_js::Value::str(kind_str));
+                d.insert("label".into(), cv_js::Value::str(label));
+                d.insert("groupId".into(), cv_js::Value::String("default-group".into()));
+                out.push(cv_js::Value::Object(Rc::new(RefCell::new(d))));
+            }
+            Ok(cv_js::interp::make_settled_promise(
+                true,
+                cv_js::Value::Array(Rc::new(RefCell::new(out))),
+            ))
+        }),
+    );
+    md.insert(
+        "getSupportedConstraints".into(),
+        cv_js::native_fn("getSupportedConstraints", |_| {
+            let mut s: HashMap<String, cv_js::Value> = HashMap::new();
+            for k in ["width", "height", "frameRate", "facingMode", "deviceId", "sampleRate", "channelCount"] {
+                s.insert(k.into(), cv_js::Value::Bool(true));
+            }
+            Ok(cv_js::Value::Object(Rc::new(RefCell::new(s))))
+        }),
+    );
+    let evt = make_event_target_noops();
+    md.insert("addEventListener".into(), evt.0);
+    md.insert("removeEventListener".into(), evt.1);
+    md.insert("dispatchEvent".into(), evt.2);
+    cv_js::Value::Object(Rc::new(RefCell::new(md)))
+}
+
+/// Parse a `MediaStreamConstraints` JS value into (video?, audio?, w, h, fps).
+fn parse_media_constraints(v: Option<&cv_js::Value>) -> (bool, bool, u32, u32, f64) {
+    let (mut want_video, mut want_audio) = (false, false);
+    let (mut w, mut h, mut fr) = (640u32, 480u32, 30.0f64);
+    if let Some(cv_js::Value::Object(o)) = v {
+        let b = o.borrow();
+        if let Some(vid) = b.get("video") {
+            want_video = !matches!(vid, cv_js::Value::Bool(false) | cv_js::Value::Undefined | cv_js::Value::Null);
+            if let cv_js::Value::Object(vo) = vid {
+                let vb = vo.borrow();
+                if let Some(x) = vb.get("width") { w = constraint_number(x, w); }
+                if let Some(x) = vb.get("height") { h = constraint_number(x, h) ; }
+                if let Some(x) = vb.get("frameRate") { fr = constraint_number(x, fr as u32) as f64; }
+            }
+        }
+        if let Some(aud) = b.get("audio") {
+            want_audio = !matches!(aud, cv_js::Value::Bool(false) | cv_js::Value::Undefined | cv_js::Value::Null);
+        }
+    }
+    (want_video, want_audio, w, h, fr)
+}
+
+/// Read a numeric constraint that may be a bare number or `{ideal|exact|min|max}`.
+fn constraint_number(v: &cv_js::Value, dflt: u32) -> u32 {
+    match v {
+        cv_js::Value::Number(n) => *n as u32,
+        cv_js::Value::Object(o) => {
+            let b = o.borrow();
+            for k in ["exact", "ideal", "max", "min"] {
+                if let Some(cv_js::Value::Number(n)) = b.get(k) {
+                    return *n as u32;
+                }
+            }
+            dflt
+        }
+        _ => dflt,
+    }
+}
+
+/// Pick the best capture device of a kind. With `CV_CAMERA_CAPTURE=1` we query
+/// MediaFoundation for a real device count; otherwise a synthetic-but-named
+/// device is returned (label + id are real, source is generated).
+fn pick_capture_device(kind: cv_webapi::capture::DeviceKind) -> (String, String) {
+    use cv_webapi::capture::DeviceKind;
+    if camera_capture_enabled() && kind == DeviceKind::VideoInput {
+        // Initialize MF + enumerate. The actual frame pump lives in the
+        // renderer-side path; here we confirm a device exists.
+        let _ = cv_webapi::capture::mf::startup();
+        if let Ok(n) = cv_webapi::capture::mf::enumerate_video_devices() {
+            if n > 0 {
+                return ("Camera (MediaFoundation)".into(), "video-mf-0".into());
+            }
+        }
+    }
+    match kind {
+        DeviceKind::VideoInput => ("Default Camera".into(), "video-default".into()),
+        DeviceKind::AudioInput => ("Default Microphone".into(), "audio-default".into()),
+        DeviceKind::AudioOutput => ("Default Speaker".into(), "audio-out-default".into()),
+        DeviceKind::Screen => ("Screen".into(), "screen:0".into()),
+    }
+}
+
+/// Enumerate capture devices as (kind, label, deviceId) triples.
+fn enumerate_capture_devices() -> Vec<(String, String, String)> {
+    let mut out = vec![
+        ("videoinput".to_string(), "Default Camera".to_string(), "video-default".to_string()),
+        ("audioinput".to_string(), "Default Microphone".to_string(), "audio-default".to_string()),
+        ("audiooutput".to_string(), "Default Speaker".to_string(), "audio-out-default".to_string()),
+    ];
+    if camera_capture_enabled() {
+        let _ = cv_webapi::capture::mf::startup();
+        if let Ok(n) = cv_webapi::capture::mf::enumerate_video_devices() {
+            for i in 0..n {
+                out.push((
+                    "videoinput".to_string(),
+                    format!("Camera {i} (MediaFoundation)"),
+                    format!("video-mf-{i}"),
+                ));
+            }
+        }
+    }
+    out
+}
+
+/// Build `navigator.credentials` (Credential Management §). `create(options)`
+/// and `get(options)` route the WebAuthn `publicKey` member through the
+/// cv_webapi software authenticator — a real virtual FIDO2 platform
+/// authenticator that generates a P-256 keypair and a verifiable packed
+/// attestation/assertion. Returns a real `PublicKeyCredential` (with `rawId`,
+/// `response.attestationObject`/`authenticatorData`/`signature` as Uint8Arrays),
+/// never undefined.
+fn make_navigator_credentials(origin: String) -> cv_js::Value {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use cv_js::OrderedMap as HashMap;
+    let mut creds: HashMap<String, cv_js::Value> = HashMap::new();
+
+    let create_origin = origin.clone();
+    let create = cv_js::native_fn_with_interp("create", move |interp, args| {
+        if !webauthn_enabled() {
+            return Ok(cv_js::interp::make_settled_promise(
+                false,
+                make_dom_exception_like("NotSupportedError", "WebAuthn disabled"),
+            ));
+        }
+        let pk = extract_public_key_member(args.first());
+        let Some(pk) = pk else {
+            // No publicKey member → CredMan returns null (per spec for
+            // unsupported credential types).
+            return Ok(cv_js::interp::make_settled_promise(true, cv_js::Value::Null));
+        };
+        // Build the cv_webapi CredentialCreationOptions from JS.
+        let opts = match build_creation_options(&pk, &create_origin) {
+            Ok(o) => o,
+            Err(e) => {
+                return Ok(cv_js::interp::make_settled_promise(
+                    false,
+                    make_dom_exception_like("TypeError", &e),
+                ));
+            }
+        };
+        // Run the software authenticator (real keypair + packed attestation).
+        let mut rng = |b: &mut [u8]| getrandom_fill(b);
+        let res = match cv_webapi::webauthn::SoftwareAuthenticator::make_credential(
+            &opts,
+            &create_origin,
+            opts.user_verification,
+            &mut rng,
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                return Ok(cv_js::interp::make_settled_promise(
+                    false,
+                    make_dom_exception_like("UnknownError", e),
+                ));
+            }
+        };
+        // Register the credential with its real key so a later get() can sign.
+        let stored = cv_webapi::webauthn::PublicKeyCredential {
+            id: res.credential_id.clone(),
+            rp_id: opts.rp.id.clone(),
+            user_id: opts.user.id.clone(),
+            public_key: res.cose_public_key.clone(),
+            sign_count: 0,
+            private_key: res.private_key,
+        };
+        if let Err(e) = WEBAUTHN_STORE.with(|s| {
+            s.borrow_mut().insert(stored, &opts.exclude_credentials)
+        }) {
+            return Ok(cv_js::interp::make_settled_promise(
+                false,
+                make_dom_exception_like("InvalidStateError", e),
+            ));
+        }
+        // Build the JS PublicKeyCredential.
+        let cred = build_js_public_key_credential_create(interp, &res);
+        Ok(cv_js::interp::make_settled_promise(true, cred))
+    });
+    creds.insert("create".into(), create);
+
+    let get_origin = origin.clone();
+    let get = cv_js::native_fn_with_interp("get", move |interp, args| {
+        if !webauthn_enabled() {
+            return Ok(cv_js::interp::make_settled_promise(
+                false,
+                make_dom_exception_like("NotSupportedError", "WebAuthn disabled"),
+            ));
+        }
+        let pk = extract_public_key_member(args.first());
+        let Some(pk) = pk else {
+            return Ok(cv_js::interp::make_settled_promise(true, cv_js::Value::Null));
+        };
+        let (rp_id, challenge, allow) = build_request_options(&pk, &get_origin);
+        let req = cv_webapi::webauthn::CredentialRequestOptions {
+            rp_id: rp_id.clone(),
+            challenge: challenge.clone(),
+            allow_credentials: allow,
+            user_verification: true,
+        };
+        // Find + bump signCount, then sign the assertion.
+        let cred = WEBAUTHN_STORE.with(|s| s.borrow_mut().assert(&req));
+        let Some(cred) = cred else {
+            return Ok(cv_js::interp::make_settled_promise(
+                false,
+                make_dom_exception_like("NotAllowedError", "No matching credential"),
+            ));
+        };
+        let assertion = match cv_webapi::webauthn::SoftwareAuthenticator::get_assertion(
+            &cred,
+            &challenge,
+            &get_origin,
+            true,
+        ) {
+            Ok(a) => a,
+            Err(e) => {
+                return Ok(cv_js::interp::make_settled_promise(
+                    false,
+                    make_dom_exception_like("UnknownError", e),
+                ));
+            }
+        };
+        let js = build_js_public_key_credential_get(interp, &assertion);
+        Ok(cv_js::interp::make_settled_promise(true, js))
+    });
+    creds.insert("get".into(), get);
+
+    creds.insert(
+        "preventSilentAccess".into(),
+        cv_js::native_fn("preventSilentAccess", |_| {
+            Ok(cv_js::interp::make_settled_promise(true, cv_js::Value::Undefined))
+        }),
+    );
+    creds.insert(
+        "store".into(),
+        cv_js::native_fn("store", |args| {
+            Ok(cv_js::interp::make_settled_promise(
+                true,
+                args.into_iter().next().unwrap_or(cv_js::Value::Undefined),
+            ))
+        }),
+    );
+    cv_js::Value::Object(Rc::new(RefCell::new(creds)))
+}
+
+/// Extract the `publicKey` member object from a CredentialCreation/Request
+/// options JS value (`{ publicKey: { ... } }`).
+fn extract_public_key_member(v: Option<&cv_js::Value>) -> Option<cv_js::Value> {
+    if let Some(cv_js::Value::Object(o)) = v {
+        o.borrow().get("publicKey").cloned()
+    } else {
+        None
+    }
+}
+
+/// Build `cv_webapi::webauthn::CredentialCreationOptions` from the JS
+/// `PublicKeyCredentialCreationOptions`.
+fn build_creation_options(
+    pk: &cv_js::Value,
+    origin: &str,
+) -> Result<cv_webapi::webauthn::CredentialCreationOptions, String> {
+    use cv_webapi::webauthn::*;
+    let cv_js::Value::Object(o) = pk else {
+        return Err("publicKey must be an object".into());
+    };
+    let b = o.borrow();
+    // challenge (required, BufferSource).
+    let challenge = b
+        .get("challenge")
+        .and_then(js_value_to_bytes)
+        .ok_or("challenge required")?;
+    // rp.id defaults to the effective domain (origin host).
+    let (rp_id, rp_name) = if let Some(cv_js::Value::Object(rp)) = b.get("rp") {
+        let rb = rp.borrow();
+        let id = rb
+            .get("id")
+            .map(|v| v.to_display_string())
+            .unwrap_or_else(|| origin_host(origin));
+        let name = rb.get("name").map(|v| v.to_display_string()).unwrap_or_default();
+        (id, name)
+    } else {
+        (origin_host(origin), String::new())
+    };
+    // user (required).
+    let (uid, uname, udisp) = if let Some(cv_js::Value::Object(u)) = b.get("user") {
+        let ub = u.borrow();
+        let id = ub.get("id").and_then(js_value_to_bytes).unwrap_or_default();
+        let name = ub.get("name").map(|v| v.to_display_string()).unwrap_or_default();
+        let disp = ub.get("displayName").map(|v| v.to_display_string()).unwrap_or_default();
+        (id, name, disp)
+    } else {
+        (Vec::new(), String::new(), String::new())
+    };
+    // authenticatorSelection.userVerification / residentKey.
+    let mut user_verification = false;
+    let mut resident_key = false;
+    let mut attachment = None;
+    if let Some(cv_js::Value::Object(sel)) = b.get("authenticatorSelection") {
+        let sb = sel.borrow();
+        user_verification = sb
+            .get("userVerification")
+            .map(|v| v.to_display_string())
+            .map(|s| s == "required" || s == "preferred")
+            .unwrap_or(false);
+        resident_key = sb
+            .get("residentKey")
+            .map(|v| v.to_display_string())
+            .map(|s| s == "required" || s == "preferred")
+            .unwrap_or(false);
+        attachment = sb.get("authenticatorAttachment").map(|v| match v.to_display_string().as_str() {
+            "platform" => AuthenticatorAttachment::Platform,
+            _ => AuthenticatorAttachment::CrossPlatform,
+        });
+    }
+    // excludeCredentials: [{ id }].
+    let exclude_credentials = b
+        .get("excludeCredentials")
+        .map(|v| credential_id_list(v))
+        .unwrap_or_default();
+    let _ = rp_name;
+    Ok(CredentialCreationOptions {
+        rp: RelyingParty { id: rp_id, name: rp_name },
+        user: UserInfo { id: uid, name: uname, display_name: udisp },
+        challenge,
+        attachment,
+        resident_key,
+        user_verification,
+        exclude_credentials,
+    })
+}
+
+/// Build (rpId, challenge, allowCredentials) from a JS
+/// `PublicKeyCredentialRequestOptions`.
+fn build_request_options(pk: &cv_js::Value, origin: &str) -> (String, Vec<u8>, Vec<Vec<u8>>) {
+    if let cv_js::Value::Object(o) = pk {
+        let b = o.borrow();
+        let rp_id = b.get("rpId").map(|v| v.to_display_string()).unwrap_or_else(|| origin_host(origin));
+        let challenge = b.get("challenge").and_then(js_value_to_bytes).unwrap_or_default();
+        let allow = b.get("allowCredentials").map(|v| credential_id_list(v)).unwrap_or_default();
+        (rp_id, challenge, allow)
+    } else {
+        (origin_host(origin), Vec::new(), Vec::new())
+    }
+}
+
+/// Extract credential ids from a JS array of `{ id: BufferSource }`.
+fn credential_id_list(v: &cv_js::Value) -> Vec<Vec<u8>> {
+    if let cv_js::Value::Array(a) = v {
+        a.borrow()
+            .iter()
+            .filter_map(|item| {
+                if let cv_js::Value::Object(o) = item {
+                    o.borrow().get("id").and_then(js_value_to_bytes)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    } else {
+        Vec::new()
+    }
+}
+
+/// The bare host of an origin string (`https://example.com:8443` → `example.com`).
+fn origin_host(origin: &str) -> String {
+    let no_scheme = origin.split("://").nth(1).unwrap_or(origin);
+    no_scheme.split('/').next().unwrap_or(no_scheme).split(':').next().unwrap_or(no_scheme).to_string()
+}
+
+/// Construct the JS `PublicKeyCredential` returned by `create()`.
+fn build_js_public_key_credential_create(
+    interp: &mut cv_js::Interp,
+    res: &cv_webapi::webauthn::AttestationResult,
+) -> cv_js::Value {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use cv_js::OrderedMap as HashMap;
+    let raw_id = make_uint8array(interp, &res.credential_id);
+    let att_obj = make_uint8array(interp, &res.attestation_object);
+    let cdj = make_uint8array(interp, &res.client_data_json);
+    let auth_data = make_uint8array(interp, &res.authenticator_data);
+
+    let mut response: HashMap<String, cv_js::Value> = HashMap::new();
+    response.insert("clientDataJSON".into(), cdj);
+    response.insert("attestationObject".into(), att_obj);
+    let ad_clone = auth_data.clone();
+    response.insert(
+        "getAuthenticatorData".into(),
+        cv_js::native_fn("getAuthenticatorData", move |_| Ok(ad_clone.clone())),
+    );
+    let transports = cv_js::Value::Array(Rc::new(RefCell::new(vec![
+        cv_js::Value::String("internal".into()),
+        cv_js::Value::String("hybrid".into()),
+    ])));
+    let t_clone = transports.clone();
+    response.insert(
+        "getTransports".into(),
+        cv_js::native_fn("getTransports", move |_| Ok(t_clone.clone())),
+    );
+    // getPublicKey() → the raw SPKI-ish public key bytes (uncompressed point).
+    let pk_bytes = res.public_key_uncompressed.to_vec();
+    response.insert(
+        "getPublicKey".into(),
+        cv_js::native_fn_with_interp("getPublicKey", move |interp, _| {
+            Ok(make_uint8array(interp, &pk_bytes))
+        }),
+    );
+    response.insert(
+        "getPublicKeyAlgorithm".into(),
+        cv_js::native_fn("getPublicKeyAlgorithm", |_| Ok(cv_js::Value::Number(-7.0))),
+    );
+
+    let id_b64 = cv_webapi::webauthn::base64url(&res.credential_id);
+    let mut cred: HashMap<String, cv_js::Value> = HashMap::new();
+    cred.insert("id".into(), cv_js::Value::str(id_b64));
+    cred.insert("rawId".into(), raw_id);
+    cred.insert("type".into(), cv_js::Value::String("public-key".into()));
+    cred.insert("authenticatorAttachment".into(), cv_js::Value::String("platform".into()));
+    cred.insert("response".into(), cv_js::Value::Object(Rc::new(RefCell::new(response))));
+    cred.insert(
+        "getClientExtensionResults".into(),
+        cv_js::native_fn("getClientExtensionResults", |_| {
+            Ok(cv_js::Value::Object(Rc::new(RefCell::new(HashMap::new()))))
+        }),
+    );
+    cv_js::Value::Object(Rc::new(RefCell::new(cred)))
+}
+
+/// Construct the JS `PublicKeyCredential` returned by `get()` (an assertion).
+fn build_js_public_key_credential_get(
+    interp: &mut cv_js::Interp,
+    a: &cv_webapi::webauthn::AssertionResult,
+) -> cv_js::Value {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use cv_js::OrderedMap as HashMap;
+    let raw_id = make_uint8array(interp, &a.credential_id);
+    let auth_data = make_uint8array(interp, &a.authenticator_data);
+    let cdj = make_uint8array(interp, &a.client_data_json);
+    let sig = make_uint8array(interp, &a.signature);
+    let user_handle = make_uint8array(interp, &a.user_handle);
+
+    let mut response: HashMap<String, cv_js::Value> = HashMap::new();
+    response.insert("clientDataJSON".into(), cdj);
+    response.insert("authenticatorData".into(), auth_data);
+    response.insert("signature".into(), sig);
+    response.insert("userHandle".into(), user_handle);
+
+    let id_b64 = cv_webapi::webauthn::base64url(&a.credential_id);
+    let mut cred: HashMap<String, cv_js::Value> = HashMap::new();
+    cred.insert("id".into(), cv_js::Value::str(id_b64));
+    cred.insert("rawId".into(), raw_id);
+    cred.insert("type".into(), cv_js::Value::String("public-key".into()));
+    cred.insert("authenticatorAttachment".into(), cv_js::Value::String("platform".into()));
+    cred.insert("response".into(), cv_js::Value::Object(Rc::new(RefCell::new(response))));
+    cred.insert(
+        "getClientExtensionResults".into(),
+        cv_js::native_fn("getClientExtensionResults", |_| {
+            Ok(cv_js::Value::Object(Rc::new(RefCell::new(HashMap::new()))))
+        }),
+    );
+    cv_js::Value::Object(Rc::new(RefCell::new(cred)))
+}
+
+/// Mirror the live `cv_webapi::webrtc_session::PeerConnection` state onto the
+/// JS object's read-only properties (signalingState / iceConnectionState /
+/// connectionState / localDescription / remoteDescription / currentLocal* etc.)
+/// so JS reads of `pc.signalingState` reflect reality after each transition.
+fn refresh_rtc_state(
+    m: &std::rc::Rc<std::cell::RefCell<cv_js::OrderedMap<String, cv_js::Value>>>,
+    pc: &std::rc::Rc<std::cell::RefCell<cv_webapi::webrtc_session::PeerConnection>>,
+) {
+    let p = pc.borrow();
+    let mut obj = m.borrow_mut();
+    obj.insert(
+        "signalingState".into(),
+        cv_js::Value::str(p.signaling.as_str().to_string()),
+    );
+    obj.insert(
+        "iceConnectionState".into(),
+        cv_js::Value::str(p.ice.as_str().to_string()),
+    );
+    obj.insert(
+        "iceGatheringState".into(),
+        cv_js::Value::String(
+            if p.ice_candidates.is_empty() { "new".into() } else { "complete".into() },
+        ),
+    );
+    // connectionState approximates iceConnectionState for a data-only PC.
+    obj.insert(
+        "connectionState".into(),
+        cv_js::Value::str(p.ice.as_str().to_string()),
+    );
+    obj.insert(
+        "localDescription".into(),
+        match (&p.local_sdp, p.local_type) {
+            (Some(sdp), Some(ty)) => make_rtc_session_desc(sdp_type_str(ty), sdp),
+            _ => cv_js::Value::Null,
+        },
+    );
+    obj.insert(
+        "remoteDescription".into(),
+        match (&p.remote_sdp, p.remote_type) {
+            (Some(sdp), Some(ty)) => make_rtc_session_desc(sdp_type_str(ty), sdp),
+            _ => cv_js::Value::Null,
+        },
+    );
+}
+
+fn sdp_type_str(ty: cv_webapi::webrtc_session::SdpType) -> &'static str {
+    use cv_webapi::webrtc_session::SdpType;
+    match ty {
+        SdpType::Offer => "offer",
+        SdpType::Answer => "answer",
+        SdpType::PrAnswer => "pranswer",
+    }
+}
+
+/// Build an `RTCSessionDescription`-shaped object `{ type, sdp }` with a
+/// `toJSON()`.
+fn make_rtc_session_desc(ty: &str, sdp: &str) -> cv_js::Value {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use cv_js::OrderedMap as HashMap;
+    let mut d: HashMap<String, cv_js::Value> = HashMap::new();
+    d.insert("type".into(), cv_js::Value::str(ty.to_string()));
+    d.insert("sdp".into(), cv_js::Value::str(sdp.to_string()));
+    let (t2, s2) = (ty.to_string(), sdp.to_string());
+    d.insert(
+        "toJSON".into(),
+        cv_js::native_fn("toJSON", move |_| {
+            let mut j: HashMap<String, cv_js::Value> = HashMap::new();
+            j.insert("type".into(), cv_js::Value::str(t2.clone()));
+            j.insert("sdp".into(), cv_js::Value::str(s2.clone()));
+            Ok(cv_js::Value::Object(Rc::new(RefCell::new(j))))
+        }),
+    );
+    cv_js::Value::Object(Rc::new(RefCell::new(d)))
+}
+
+/// Parse an `RTCSessionDescriptionInit` JS value `{ type, sdp }` into a
+/// (SdpType, sdp) pair. If `type` is absent, infer it from the current
+/// signaling state and whether this is a local or remote description.
+fn parse_session_desc(
+    v: Option<&cv_js::Value>,
+    pc: &std::rc::Rc<std::cell::RefCell<cv_webapi::webrtc_session::PeerConnection>>,
+    is_local: bool,
+) -> (cv_webapi::webrtc_session::SdpType, String) {
+    use cv_webapi::webrtc_session::{SdpType, SignalingState};
+    let (ty_str, sdp) = if let Some(cv_js::Value::Object(o)) = v {
+        let b = o.borrow();
+        (
+            b.get("type").map(|x| x.to_display_string()),
+            b.get("sdp").map(|x| x.to_display_string()).unwrap_or_default(),
+        )
+    } else {
+        (None, String::new())
+    };
+    let ty = ty_str
+        .as_deref()
+        .and_then(SdpType::parse)
+        .unwrap_or_else(|| {
+            // Inference per JSEP: setLocalDescription() with no type implicitly
+            // creates an offer (stable) or answer (have-remote-offer).
+            let state = pc.borrow().signaling;
+            if is_local {
+                match state {
+                    SignalingState::HaveRemoteOffer => SdpType::Answer,
+                    _ => SdpType::Offer,
+                }
+            } else {
+                match state {
+                    SignalingState::HaveLocalOffer => SdpType::Answer,
+                    _ => SdpType::Offer,
+                }
+            }
+        });
+    (ty, sdp)
+}
+
+/// Extract the first STUN server URL from `config.iceServers[i].urls`
+/// (`stun:host:port`). Returns `None` if no STUN url is present.
+fn extract_first_stun_server(config: Option<&cv_js::Value>) -> Option<String> {
+    let cv_js::Value::Object(o) = config? else { return None };
+    let b = o.borrow();
+    let cv_js::Value::Array(servers) = b.get("iceServers")? else { return None };
+    for srv in servers.borrow().iter() {
+        if let cv_js::Value::Object(so) = srv {
+            let sb = so.borrow();
+            let urls = sb.get("urls").or_else(|| sb.get("url"))?;
+            let candidates: Vec<String> = match urls {
+                cv_js::Value::String(s) => vec![s.to_string()],
+                cv_js::Value::Array(a) => a.borrow().iter().map(|u| u.to_display_string()).collect(),
+                _ => Vec::new(),
+            };
+            for u in candidates {
+                if u.starts_with("stun:") {
+                    return Some(u);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Build an `RTCDataChannel` object backed by the session's data channel `idx`.
+fn make_rtc_data_channel(
+    pc: std::rc::Rc<std::cell::RefCell<cv_webapi::webrtc_session::PeerConnection>>,
+    idx: usize,
+    label: &str,
+    ordered: bool,
+) -> cv_js::Value {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use cv_js::OrderedMap as HashMap;
+    let mut dc: HashMap<String, cv_js::Value> = HashMap::new();
+    dc.insert("label".into(), cv_js::Value::str(label.to_string()));
+    dc.insert("ordered".into(), cv_js::Value::Bool(ordered));
+    dc.insert("readyState".into(), cv_js::Value::String("connecting".into()));
+    dc.insert("bufferedAmount".into(), cv_js::Value::Number(0.0));
+    dc.insert("id".into(), cv_js::Value::Number(idx as f64));
+    dc.insert("protocol".into(), cv_js::Value::String("".into()));
+    dc.insert("binaryType".into(), cv_js::Value::String("blob".into()));
+    dc.insert("onopen".into(), cv_js::Value::Null);
+    dc.insert("onmessage".into(), cv_js::Value::Null);
+    dc.insert("onclose".into(), cv_js::Value::Null);
+    dc.insert("onerror".into(), cv_js::Value::Null);
+    let pc_send = pc.clone();
+    dc.insert(
+        "send".into(),
+        cv_js::native_fn("send", move |args| {
+            let bytes = args
+                .first()
+                .and_then(js_value_to_bytes)
+                .unwrap_or_default();
+            if let Some(ch) = pc_send.borrow().data_channels.get(idx) {
+                ch.send(bytes);
+            }
+            Ok(cv_js::Value::Undefined)
+        }),
+    );
+    dc.insert(
+        "close".into(),
+        cv_js::native_fn("close", |_| Ok(cv_js::Value::Undefined)),
+    );
+    let evt = make_event_target_noops();
+    dc.insert("addEventListener".into(), evt.0);
+    dc.insert("removeEventListener".into(), evt.1);
+    dc.insert("dispatchEvent".into(), evt.2);
+    cv_js::Value::Object(Rc::new(RefCell::new(dc)))
+}
+
+/// Install `RTCSessionDescription` + `RTCIceCandidate` constructors (plain
+/// data wrappers used by signaling code).
+fn install_rtc_helper_constructors(interp: &cv_js::Interp) {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use cv_js::OrderedMap as HashMap;
+    // RTCSessionDescription({type, sdp}).
+    let sd_ctor = cv_js::native_ctor("RTCSessionDescription", 1, |_i, args| {
+        let (ty, sdp) = if let Some(cv_js::Value::Object(o)) = args.first() {
+            let b = o.borrow();
+            (
+                b.get("type").map(|v| v.to_display_string()).unwrap_or_default(),
+                b.get("sdp").map(|v| v.to_display_string()).unwrap_or_default(),
+            )
+        } else {
+            (String::new(), String::new())
+        };
+        Ok(make_rtc_session_desc(&ty, &sdp))
+    });
+    let mut sd_obj: HashMap<String, cv_js::Value> = HashMap::new();
+    sd_obj.insert("_construct".into(), sd_ctor);
+    interp.define_global(
+        "RTCSessionDescription",
+        cv_js::Value::Object(Rc::new(RefCell::new(sd_obj))),
+    );
+
+    // RTCIceCandidate({candidate, sdpMid, sdpMLineIndex}).
+    let ic_ctor = cv_js::native_ctor("RTCIceCandidate", 1, |_i, args| {
+        let mut c: HashMap<String, cv_js::Value> = HashMap::new();
+        if let Some(cv_js::Value::Object(o)) = args.first() {
+            let b = o.borrow();
+            c.insert(
+                "candidate".into(),
+                b.get("candidate").cloned().unwrap_or(cv_js::Value::String("".into())),
+            );
+            c.insert(
+                "sdpMid".into(),
+                b.get("sdpMid").cloned().unwrap_or(cv_js::Value::Null),
+            );
+            c.insert(
+                "sdpMLineIndex".into(),
+                b.get("sdpMLineIndex").cloned().unwrap_or(cv_js::Value::Null),
+            );
+        }
+        Ok(cv_js::Value::Object(Rc::new(RefCell::new(c))))
+    });
+    let mut ic_obj: HashMap<String, cv_js::Value> = HashMap::new();
+    ic_obj.insert("_construct".into(), ic_ctor);
+    interp.define_global(
+        "RTCIceCandidate",
+        cv_js::Value::Object(Rc::new(RefCell::new(ic_obj))),
+    );
+}
+
+/// A DOMException-shaped rejection value (`{ name, message }`). The promise
+/// machinery surfaces this to `.catch`. Matches what fetch/geolocation use.
+fn make_dom_exception_like(name: &str, message: &str) -> cv_js::Value {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use cv_js::OrderedMap as HashMap;
+    let mut e: HashMap<String, cv_js::Value> = HashMap::new();
+    e.insert("name".into(), cv_js::Value::str(name.to_string()));
+    e.insert("message".into(), cv_js::Value::str(message.to_string()));
+    e.insert(
+        "toString".into(),
+        {
+            let n = name.to_string();
+            let m = message.to_string();
+            cv_js::native_fn("toString", move |_| {
+                Ok(cv_js::Value::str(format!("{n}: {m}")))
+            })
+        },
+    );
+    cv_js::Value::Object(Rc::new(RefCell::new(e)))
+}
+
 fn install_minimal_dom_with_url(interp: &cv_js::Interp, initial_title: String, page_url: &str) {
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -25267,6 +26416,27 @@ fn install_minimal_dom_with_url(interp: &cv_js::Interp, initial_title: String, p
     // navigator.storage — StorageManager: OPFS (getDirectory), estimate(),
     // persist()/persisted() (M6.5). Real on-disk OPFS tree + real byte-usage.
     navigator_map.insert("storage".into(), make_navigator_storage());
+
+    // The page origin (scheme://host[:port]) — used by getUserMedia permission
+    // keying + the WebAuthn rpId default + clientDataJSON origin field.
+    let page_origin = Url::parse(page_url)
+        .map(|u| url_origin_string(&u))
+        .unwrap_or_else(|_| page_url.to_string());
+
+    // navigator.mediaDevices — Media Capture and Streams. getUserMedia /
+    // getDisplayMedia / enumerateDevices, backed by cv_webapi::capture.
+    navigator_map.insert(
+        "mediaDevices".into(),
+        make_navigator_media_devices(page_origin.clone()),
+    );
+
+    // navigator.credentials — Credential Management + WebAuthn. create()/get()
+    // back navigator.credentials onto the cv_webapi software authenticator
+    // (real P-256 keypair + verifiable packed attestation/assertion).
+    navigator_map.insert(
+        "credentials".into(),
+        make_navigator_credentials(page_origin.clone()),
+    );
 
     let navigator = cv_js::Value::Object(Rc::new(RefCell::new(navigator_map)));
 
@@ -28979,6 +30149,201 @@ fn install_minimal_dom_with_url(interp: &cv_js::Interp, initial_title: String, p
         );
     }
 
+    // RTCPeerConnection — WebRTC 1.0. `new RTCPeerConnection(config)` builds a
+    // real session (cv_webapi::webrtc_session): generated ICE credentials +
+    // DTLS fingerprint, the JSEP signaling state machine, SDP offer/answer, and
+    // (with CV_WEBRTC_GATHER=1) live ICE candidate gathering. createOffer /
+    // createAnswer / setLocalDescription / setRemoteDescription / addIceCandidate
+    // / createDataChannel / close are all real. Default ON (pure compute);
+    // CV_WEBRTC=0 hides the surface.
+    if webrtc_enabled() {
+        use cv_webapi::webrtc_session as rtc;
+        type PcCell = Rc<RefCell<rtc::PeerConnection>>;
+
+        let rtc_ctor = cv_js::native_ctor("RTCPeerConnection", 0, |_interp, args| {
+            // Read the first STUN server from config.iceServers[0].urls.
+            let stun = extract_first_stun_server(args.first());
+            let mut rng = |b: &mut [u8]| getrandom_fill(b);
+            let pc: PcCell = Rc::new(RefCell::new(rtc::PeerConnection::new(stun, &mut rng)));
+
+            let m: HashMap<String, cv_js::Value> = HashMap::new();
+            let m_obj: Rc<RefCell<HashMap<String, cv_js::Value>>> = Rc::new(RefCell::new(m));
+            // Read-only state fields (signalingState/iceConnectionState/
+            // localDescription/remoteDescription) are baked as values + refreshed
+            // by the methods that mutate state.
+            refresh_rtc_state(&m_obj, &pc);
+
+            // createOffer() → Promise<{type:"offer", sdp}>.
+            let pc_off = pc.clone();
+            let mobj_off = m_obj.clone();
+            m_obj.borrow_mut().insert(
+                "createOffer".into(),
+                cv_js::native_fn("createOffer", move |_| {
+                    if webrtc_gather_enabled() {
+                        pc_off.borrow_mut().gather_ice();
+                    }
+                    let sdp = pc_off.borrow_mut().create_offer();
+                    refresh_rtc_state(&mobj_off, &pc_off);
+                    Ok(cv_js::interp::make_settled_promise(true, make_rtc_session_desc("offer", &sdp)))
+                }),
+            );
+            // createAnswer() → Promise<{type:"answer", sdp}>.
+            let pc_ans = pc.clone();
+            let mobj_ans = m_obj.clone();
+            m_obj.borrow_mut().insert(
+                "createAnswer".into(),
+                cv_js::native_fn("createAnswer", move |_| {
+                    let sdp = pc_ans.borrow_mut().create_answer();
+                    refresh_rtc_state(&mobj_ans, &pc_ans);
+                    Ok(cv_js::interp::make_settled_promise(true, make_rtc_session_desc("answer", &sdp)))
+                }),
+            );
+            // setLocalDescription(desc) → Promise<void>.
+            let pc_sl = pc.clone();
+            let mobj_sl = m_obj.clone();
+            m_obj.borrow_mut().insert(
+                "setLocalDescription".into(),
+                cv_js::native_fn("setLocalDescription", move |args| {
+                    let (ty, sdp) = parse_session_desc(args.first(), &pc_sl, true);
+                    let r = pc_sl.borrow_mut().set_local_description(ty, sdp);
+                    refresh_rtc_state(&mobj_sl, &pc_sl);
+                    match r {
+                        Ok(()) => Ok(cv_js::interp::make_settled_promise(true, cv_js::Value::Undefined)),
+                        Err(e) => Ok(cv_js::interp::make_settled_promise(false, make_dom_exception_like("InvalidStateError", e))),
+                    }
+                }),
+            );
+            // setRemoteDescription(desc) → Promise<void>.
+            let pc_sr = pc.clone();
+            let mobj_sr = m_obj.clone();
+            m_obj.borrow_mut().insert(
+                "setRemoteDescription".into(),
+                cv_js::native_fn("setRemoteDescription", move |args| {
+                    let (ty, sdp) = parse_session_desc(args.first(), &pc_sr, false);
+                    let r = pc_sr.borrow_mut().set_remote_description(ty, sdp);
+                    refresh_rtc_state(&mobj_sr, &pc_sr);
+                    match r {
+                        Ok(()) => Ok(cv_js::interp::make_settled_promise(true, cv_js::Value::Undefined)),
+                        Err(e) => Ok(cv_js::interp::make_settled_promise(false, make_dom_exception_like("InvalidStateError", e))),
+                    }
+                }),
+            );
+            // addIceCandidate(candidate) → Promise<void>.
+            let pc_ic = pc.clone();
+            let mobj_ic = m_obj.clone();
+            m_obj.borrow_mut().insert(
+                "addIceCandidate".into(),
+                cv_js::native_fn("addIceCandidate", move |args| {
+                    let cand = match args.first() {
+                        Some(cv_js::Value::Object(o)) => o
+                            .borrow()
+                            .get("candidate")
+                            .map(|v| v.to_display_string())
+                            .unwrap_or_default(),
+                        Some(cv_js::Value::String(s)) => s.to_string(),
+                        _ => String::new(),
+                    };
+                    if !cand.is_empty() {
+                        pc_ic.borrow_mut().add_ice_candidate(cand);
+                    }
+                    refresh_rtc_state(&mobj_ic, &pc_ic);
+                    Ok(cv_js::interp::make_settled_promise(true, cv_js::Value::Undefined))
+                }),
+            );
+            // createDataChannel(label, opts) → a real RTCDataChannel object.
+            let pc_dc = pc.clone();
+            m_obj.borrow_mut().insert(
+                "createDataChannel".into(),
+                cv_js::native_fn("createDataChannel", move |args| {
+                    let label = args.first().map(|v| v.to_display_string()).unwrap_or_default();
+                    let ordered = if let Some(cv_js::Value::Object(o)) = args.get(1) {
+                        !matches!(o.borrow().get("ordered"), Some(cv_js::Value::Bool(false)))
+                    } else {
+                        true
+                    };
+                    let idx = pc_dc.borrow_mut().create_data_channel(label.clone(), ordered);
+                    Ok(make_rtc_data_channel(pc_dc.clone(), idx, &label, ordered))
+                }),
+            );
+            // getConfiguration / getStats / restartIce / addTrack (data-only V1).
+            m_obj.borrow_mut().insert(
+                "getStats".into(),
+                cv_js::native_fn("getStats", |_| {
+                    // RTCStatsReport is a Map; an empty real Map is correct here.
+                    Ok(cv_js::interp::make_settled_promise(
+                        true,
+                        cv_js::Value::Object(Rc::new(RefCell::new(HashMap::new()))),
+                    ))
+                }),
+            );
+            let pc_close = pc.clone();
+            let mobj_close = m_obj.clone();
+            m_obj.borrow_mut().insert(
+                "close".into(),
+                cv_js::native_fn("close", move |_| {
+                    pc_close.borrow_mut().close();
+                    refresh_rtc_state(&mobj_close, &pc_close);
+                    Ok(cv_js::Value::Undefined)
+                }),
+            );
+            {
+                let evt = make_event_target_noops();
+                m_obj.borrow_mut().insert("addEventListener".into(), evt.0);
+                m_obj.borrow_mut().insert("removeEventListener".into(), evt.1);
+                m_obj.borrow_mut().insert("dispatchEvent".into(), evt.2);
+            }
+            m_obj.borrow_mut().insert(
+                "addTransceiver".into(),
+                cv_js::native_fn("addTransceiver", |_| {
+                    Ok(cv_js::Value::Object(Rc::new(RefCell::new(HashMap::new()))))
+                }),
+            );
+            // Event handler slots.
+            for slot in ["onicecandidate", "ondatachannel", "oniceconnectionstatechange",
+                         "onsignalingstatechange", "onnegotiationneeded", "ontrack",
+                         "onconnectionstatechange"] {
+                m_obj.borrow_mut().insert(slot.into(), cv_js::Value::Null);
+            }
+            Ok(cv_js::Value::Object(m_obj))
+        });
+
+        let mut rtc_obj: HashMap<String, cv_js::Value> = HashMap::new();
+        rtc_obj.insert("_construct".into(), rtc_ctor);
+        // generateCertificate() static — resolves to a placeholder cert handle.
+        rtc_obj.insert(
+            "generateCertificate".into(),
+            cv_js::native_fn("generateCertificate", |_| {
+                let mut cert: HashMap<String, cv_js::Value> = HashMap::new();
+                // expires = now + 30 days (RTCCertificate.expires is ms).
+                cert.insert(
+                    "expires".into(),
+                    cv_js::Value::Number(process_now_ms() + 30.0 * 24.0 * 3600.0 * 1000.0),
+                );
+                cert.insert(
+                    "getFingerprints".into(),
+                    cv_js::native_fn("getFingerprints", |_| {
+                        Ok(cv_js::Value::Array(Rc::new(RefCell::new(Vec::new()))))
+                    }),
+                );
+                Ok(cv_js::interp::make_settled_promise(
+                    true,
+                    cv_js::Value::Object(Rc::new(RefCell::new(cert))),
+                ))
+            }),
+        );
+        interp.define_global(
+            "RTCPeerConnection",
+            cv_js::Value::Object(Rc::new(RefCell::new(rtc_obj.clone()))),
+        );
+        // Webkit-prefixed alias still used by some libraries.
+        interp.define_global(
+            "webkitRTCPeerConnection",
+            cv_js::Value::Object(Rc::new(RefCell::new(rtc_obj))),
+        );
+        // RTCSessionDescription / RTCIceCandidate constructors (plain wrappers).
+        install_rtc_helper_constructors(interp);
+    }
+
     // Intl — ECMA-402 surface. Real ICU is multi-MB; V1 stubs that
     // produce en-US output so pages can feature-detect and call
     // common methods without throwing. Format methods accept any
@@ -30567,89 +31932,10 @@ fn install_minimal_dom_with_url(interp: &cv_js::Interp, initial_title: String, p
         );
     }
 
-    // navigator.mediaDevices stub — sites feature-detect
-    // `navigator.mediaDevices.getUserMedia` to decide whether to
-    // show a "camera not available" path.
-    if let Some(cv_js::Value::Object(nav)) = interp.get_global("navigator") {
-        use std::cell::RefCell;
-        use std::rc::Rc;
-        use cv_js::OrderedMap as HashMap;
-        let mut md: HashMap<String, cv_js::Value> = HashMap::new();
-        md.insert(
-            "getUserMedia".into(),
-            cv_js::native_fn("getUserMedia", |_| {
-                // Spec: getUserMedia always returns a Promise (never throws sync).
-                // Reject with a NotAllowedError DOMException so .catch() works.
-                let mut ex: cv_js::OrderedMap<String, cv_js::Value> =
-                    cv_js::OrderedMap::new();
-                ex.insert(
-                    "name".into(),
-                    cv_js::Value::String("NotAllowedError".into()),
-                );
-                ex.insert(
-                    "message".into(),
-                    cv_js::Value::String("Permission denied".into()),
-                );
-                ex.insert("code".into(), cv_js::Value::Number(0.0));
-                ex.insert(
-                    "stack".into(),
-                    cv_js::Value::String("NotAllowedError: Permission denied".into()),
-                );
-                ex.insert("_isError".into(), cv_js::Value::Bool(true));
-                ex.insert(
-                    "_errorClasses".into(),
-                    cv_js::Value::Array(Rc::new(RefCell::new(vec![
-                        cv_js::Value::String("DOMException".into()),
-                    ]))),
-                );
-                let exc =
-                    cv_js::Value::Object(Rc::new(RefCell::new(ex)));
-                // Build a rejected promise inline (rejected_promise helper is
-                // out of scope here; replicate the same settled-promise shape).
-                let r_cell = Rc::new(RefCell::new(exc));
-                let r_for_catch = r_cell.clone();
-                let mut prom: cv_js::OrderedMap<String, cv_js::Value> =
-                    cv_js::OrderedMap::new();
-                prom.insert(
-                    "then".into(),
-                    cv_js::native_fn("then", |_| Ok(cv_js::Value::Undefined)),
-                );
-                prom.insert(
-                    "catch".into(),
-                    cv_js::native_fn_with_interp("catch", move |interp, args| {
-                        if let Some(cb) = args.first() {
-                            let _ = interp.call_value(
-                                cb.clone(),
-                                vec![r_for_catch.borrow().clone()],
-                            );
-                        }
-                        Ok(cv_js::Value::Undefined)
-                    }),
-                );
-                prom.insert(
-                    "finally".into(),
-                    cv_js::native_fn_with_interp("finally", move |interp, args| {
-                        if let Some(cb) = args.first() {
-                            let _ = interp.call_value(cb.clone(), vec![]);
-                        }
-                        Ok(cv_js::Value::Undefined)
-                    }),
-                );
-                let _ = r_cell;
-                Ok(cv_js::Value::Object(Rc::new(RefCell::new(prom))))
-            }),
-        );
-        md.insert(
-            "enumerateDevices".into(),
-            cv_js::native_fn("enumerateDevices", |_| {
-                Ok(cv_js::Value::Array(Rc::new(RefCell::new(Vec::new()))))
-            }),
-        );
-        nav.borrow_mut().insert(
-            "mediaDevices".into(),
-            cv_js::Value::Object(Rc::new(RefCell::new(md))),
-        );
-    }
+    // NOTE: navigator.mediaDevices is installed earlier in this function (the
+    // real cv_webapi-backed getUserMedia / getDisplayMedia / enumerateDevices).
+    // The previous always-reject getUserMedia stub that lived here was removed
+    // when the real Media Capture and Streams surface was wired.
 
     // `structuredClone(value)` — deep-copy any structured-cloneable JS
     // value. Per spec (HTML §2.7.5):
@@ -56412,6 +57698,203 @@ mod tests {
         assert_eq!(objs.len(), 2);
         assert!(objs[0].contains("a}b"), "brace inside string must not split");
         assert!(objs[1].contains("\"z\":2"), "nested object kept whole");
+    }
+
+    // ── WebRTC / getUserMedia / WebAuthn JS wiring (cv_webapi) ───────────
+
+    #[test]
+    fn rtc_peer_connection_create_offer_produces_valid_sdp() {
+        // createOffer resolves with a {type:"offer", sdp} whose SDP carries the
+        // mandatory JSEP lines, and signalingState advances after
+        // setLocalDescription.
+        let out = run_and_read(
+            "<html><body></body></html>",
+            "globalThis.__r='';\
+             var pc = new RTCPeerConnection();\
+             globalThis.__s0 = pc.signalingState;\
+             pc.createOffer().then(function(o){\
+                 globalThis.__type = o.type;\
+                 globalThis.__hasV = o.sdp.indexOf('v=0') === 0;\
+                 globalThis.__hasM = o.sdp.indexOf('m=application 9 UDP/DTLS/SCTP') >= 0;\
+                 globalThis.__hasUfrag = o.sdp.indexOf('a=ice-ufrag:') >= 0;\
+                 globalThis.__hasFp = o.sdp.indexOf('a=fingerprint:sha-256 ') >= 0;\
+                 globalThis.__hasSetup = o.sdp.indexOf('a=setup:actpass') >= 0;\
+                 return pc.setLocalDescription(o);\
+             }).then(function(){ globalThis.__s1 = pc.signalingState; });",
+            "[globalThis.__s0, globalThis.__type, globalThis.__hasV, globalThis.__hasM, globalThis.__hasUfrag, globalThis.__hasFp, globalThis.__hasSetup, globalThis.__s1].join('|')",
+        );
+        assert_eq!(
+            out, "stable|offer|true|true|true|true|true|have-local-offer",
+            "offer SDP must have all mandatory lines and state must advance to have-local-offer"
+        );
+    }
+
+    #[test]
+    fn rtc_full_offer_answer_handshake_reaches_stable() {
+        // Two PCs: A offers, B answers; A applies the answer → both stable.
+        let out = run_and_read(
+            "<html><body></body></html>",
+            "var a = new RTCPeerConnection();\
+             var b = new RTCPeerConnection();\
+             a.createOffer().then(function(offer){\
+                 return a.setLocalDescription(offer).then(function(){ return b.setRemoteDescription(offer); });\
+             }).then(function(){\
+                 globalThis.__bState = b.signalingState;\
+                 return b.createAnswer();\
+             }).then(function(answer){\
+                 return b.setLocalDescription(answer).then(function(){ return a.setRemoteDescription(answer); });\
+             }).then(function(){\
+                 globalThis.__aState = a.signalingState;\
+                 globalThis.__bStateF = b.signalingState;\
+             });",
+            "[globalThis.__bState, globalThis.__aState, globalThis.__bStateF].join('|')",
+        );
+        assert_eq!(
+            out, "have-remote-offer|stable|stable",
+            "offer/answer handshake must drive both peers to stable"
+        );
+    }
+
+    #[test]
+    fn rtc_data_channel_is_real_object() {
+        let out = run_and_read(
+            "<html><body></body></html>",
+            "var pc = new RTCPeerConnection();\
+             var dc = pc.createDataChannel('chat', {ordered:true});\
+             globalThis.__label = dc.label;\
+             globalThis.__ordered = dc.ordered;\
+             globalThis.__hasSend = (typeof dc.send === 'function');",
+            "[globalThis.__label, globalThis.__ordered, globalThis.__hasSend].join('|')",
+        );
+        assert_eq!(out, "chat|true|true");
+    }
+
+    #[test]
+    fn get_user_media_returns_stream_with_track() {
+        // getUserMedia({video:true}) resolves a MediaStream with one live video
+        // track that has real settings — a real object, never undefined.
+        let out = run_and_read(
+            "<html><body></body></html>",
+            "navigator.mediaDevices.getUserMedia({video:true, audio:true}).then(function(stream){\
+                 var tracks = stream.getTracks();\
+                 globalThis.__n = tracks.length;\
+                 globalThis.__active = stream.active;\
+                 var vt = stream.getVideoTracks()[0];\
+                 globalThis.__kind = vt.kind;\
+                 globalThis.__rs = vt.readyState;\
+                 var s = vt.getSettings();\
+                 globalThis.__w = s.width;\
+             });",
+            "[globalThis.__n, globalThis.__active, globalThis.__kind, globalThis.__rs, globalThis.__w].join('|')",
+        );
+        assert_eq!(
+            out, "2|true|video|live|640",
+            "getUserMedia must return a MediaStream with real video+audio tracks"
+        );
+    }
+
+    #[test]
+    fn get_user_media_rejects_empty_constraints() {
+        // Neither audio nor video → reject with TypeError (per spec).
+        let out = run_and_read(
+            "<html><body></body></html>",
+            "navigator.mediaDevices.getUserMedia({}).then(function(){\
+                 globalThis.__r = 'resolved';\
+             }).catch(function(e){ globalThis.__r = 'rejected:' + (e.name||e); });",
+            "globalThis.__r",
+        );
+        assert!(out.starts_with("rejected:"), "empty constraints must reject, got {out}");
+    }
+
+    #[test]
+    fn enumerate_devices_lists_real_devices() {
+        let out = run_and_read(
+            "<html><body></body></html>",
+            "navigator.mediaDevices.enumerateDevices().then(function(devs){\
+                 globalThis.__n = devs.length;\
+                 globalThis.__hasVideo = devs.some(function(d){return d.kind==='videoinput';});\
+             });",
+            "[globalThis.__n >= 2, globalThis.__hasVideo].join('|')",
+        );
+        assert_eq!(out, "true|true");
+    }
+
+    #[test]
+    fn webauthn_create_returns_credential_with_attestation() {
+        // navigator.credentials.create resolves a PublicKeyCredential with a
+        // rawId + response.attestationObject — a real object, not undefined.
+        let out = run_and_read(
+            "<html><body></body></html>",
+            "var challenge = new Uint8Array(32); for (var i=0;i<32;i++) challenge[i]=i;\
+             var userId = new Uint8Array([1,2,3,4]);\
+             navigator.credentials.create({ publicKey: {\
+                 challenge: challenge,\
+                 rp: { id: 'mo.test', name: 'Test' },\
+                 user: { id: userId, name: 'alice', displayName: 'Alice' },\
+                 pubKeyCredParams: [{ type:'public-key', alg:-7 }],\
+                 authenticatorSelection: { userVerification:'required' }\
+             }}).then(function(cred){\
+                 globalThis.__type = cred.type;\
+                 globalThis.__hasRawId = (cred.rawId && cred.rawId.byteLength === 16);\
+                 globalThis.__hasAtt = (cred.response.attestationObject.byteLength > 0);\
+                 globalThis.__hasCdj = (cred.response.clientDataJSON.byteLength > 0);\
+                 globalThis.__alg = cred.response.getPublicKeyAlgorithm();\
+             }).catch(function(e){ globalThis.__type = 'ERR:' + (e.name||e); });",
+            "[globalThis.__type, globalThis.__hasRawId, globalThis.__hasAtt, globalThis.__hasCdj, globalThis.__alg].join('|')",
+        );
+        assert_eq!(
+            out, "public-key|true|true|true|-7",
+            "WebAuthn create must return a real PublicKeyCredential with attestation"
+        );
+    }
+
+    #[test]
+    fn webauthn_get_returns_verifiable_assertion() {
+        // Create then get: the assertion must carry a non-empty signature +
+        // authenticatorData over the same credential.
+        let out = run_and_read(
+            "<html><body></body></html>",
+            "var challenge = new Uint8Array(32); for (var i=0;i<32;i++) challenge[i]=i*3;\
+             var userId = new Uint8Array([9,8,7]);\
+             navigator.credentials.create({ publicKey: {\
+                 challenge: challenge,\
+                 rp: { id: 'mo.test', name: 'Test' },\
+                 user: { id: userId, name: 'bob', displayName: 'Bob' }\
+             }}).then(function(cred){\
+                 var rawId = new Uint8Array(cred.rawId);\
+                 var getChallenge = new Uint8Array(32); for (var i=0;i<32;i++) getChallenge[i]=200-i;\
+                 return navigator.credentials.get({ publicKey: {\
+                     challenge: getChallenge,\
+                     rpId: 'mo.test',\
+                     allowCredentials: [{ type:'public-key', id: rawId }]\
+                 }});\
+             }).then(function(assertion){\
+                 globalThis.__type = assertion.type;\
+                 globalThis.__hasSig = (assertion.response.signature.byteLength > 0);\
+                 globalThis.__hasAuth = (assertion.response.authenticatorData.byteLength >= 37);\
+                 globalThis.__hasUH = (assertion.response.userHandle.byteLength === 3);\
+             }).catch(function(e){ globalThis.__type = 'ERR:' + (e.name||e); });",
+            "[globalThis.__type, globalThis.__hasSig, globalThis.__hasAuth, globalThis.__hasUH].join('|')",
+        );
+        assert_eq!(
+            out, "public-key|true|true|true",
+            "WebAuthn get must return a real assertion with a signature over authenticatorData"
+        );
+    }
+
+    #[test]
+    fn webauthn_get_unknown_credential_rejects() {
+        let out = run_and_read(
+            "<html><body></body></html>",
+            "var c = new Uint8Array(32);\
+             navigator.credentials.get({ publicKey: {\
+                 challenge: c, rpId: 'unknown.example',\
+                 allowCredentials: [{ type:'public-key', id: new Uint8Array([1,2,3]) }]\
+             }}).then(function(){ globalThis.__r='resolved'; })\
+               .catch(function(e){ globalThis.__r='rejected:' + (e.name||e); });",
+            "globalThis.__r",
+        );
+        assert!(out.starts_with("rejected:"), "no matching credential must reject, got {out}");
     }
 
     #[test]

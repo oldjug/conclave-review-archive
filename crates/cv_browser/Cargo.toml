@@ -38,3 +38,4 @@ cv_media = { path = "../cv_media" }
 cv_audio = { path = "../cv_audio" }
 cv_a11y = { path = "../cv_a11y" }
 cv_pdf = { path = "../cv_pdf" }
+cv_webapi = { path = "../cv_webapi" }

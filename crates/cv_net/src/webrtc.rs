@@ -137,6 +137,17 @@ impl PeerConnection {
         self.remote_candidates.push(c);
     }
 
+    /// The local ICE candidates gathered so far (host + server-reflexive).
+    /// Used by the SDP layer to emit `a=candidate` lines.
+    pub fn local_candidates(&self) -> &[IceCandidate] {
+        &self.local_candidates
+    }
+
+    /// The remote ICE candidates received via `addIceCandidate`.
+    pub fn remote_candidates(&self) -> &[IceCandidate] {
+        &self.remote_candidates
+    }
+
     /// Compute the ordered candidate-pair list. Each pair priority is
     /// `2^32 * min(G,D) + 2*max(G,D) + (G > D ? 1 : 0)` per spec.
     pub fn candidate_pairs(&self) -> Vec<(IceCandidate, IceCandidate, u64)> {

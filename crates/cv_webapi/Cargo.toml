@@ -8,6 +8,8 @@ publish = false
 
 [dependencies]
 cv_js = { path = "../cv_js" }
+cv_crypto = { path = "../cv_crypto" }
+cv_net = { path = "../cv_net" }
 
 [lints]
 workspace = true
