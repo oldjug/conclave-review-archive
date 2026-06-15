@@ -34,3 +34,4 @@ cv_content = { path = "../cv_content" }
 cv_compositor = { path = "../cv_compositor" }
 cv_paint = { path = "../cv_paint" }
 cv_compression = { path = "../cv_compression" }
+cv_media = { path = "../cv_media" }

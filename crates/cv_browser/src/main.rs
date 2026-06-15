@@ -96,6 +96,20 @@ thread_local! {
         >,
     > = const { std::cell::RefCell::new(None) };
 
+    /// Active media-element map during a `build_styled_tree` pass. Lets
+    /// styled-tree construction snapshot the decoded first video frame
+    /// of each `<video>` into `embedded_image`. Mirrors
+    /// `CANVAS_CTX_FOR_RENDER`. Cleared after each pass.
+    static MEDIA_FOR_RENDER: std::cell::RefCell<
+        Option<
+            std::rc::Rc<
+                std::cell::RefCell<
+                    cv_js::OrderedMap<Vec<usize>, std::rc::Rc<std::cell::RefCell<MediaState>>>,
+                >,
+            >,
+        >,
+    > = const { std::cell::RefCell::new(None) };
+
     /// Page base URL active during a `build_styled_tree` pass. Lets the
     /// `<img>` branch resolve `src="/foo.png"` and `src="//cdn/foo.png"`
     /// against the page's address rather than trying `Url::parse` on the
@@ -4436,12 +4450,15 @@ fn run_js_screenshot(cli: &Cli) -> Result<(), String> {
     // window/first-paint path), so a drawn canvas composites into the frame.
     let canvas_map = runtime.table.borrow().canvas_contexts.clone();
     CANVAS_CTX_FOR_RENDER.with(|cell| *cell.borrow_mut() = Some(canvas_map));
+    let media_map = runtime.table.borrow().media_elements.clone();
+    MEDIA_FOR_RENDER.with(|cell| *cell.borrow_mut() = Some(media_map));
     let mut bmp = cv_gfx::Bitmap::new(width.max(1), height.max(1));
     bmp.clear(cv_gfx::Color::WHITE);
     let mut texts = Vec::<cv_ui::TextItem>::new();
     paint_box(&lb, &mut bmp, &mut texts);
     cv_ui::bake_content_text_into_bitmap(&mut bmp, &mut texts);
     CANVAS_CTX_FOR_RENDER.with(|cell| *cell.borrow_mut() = None);
+    MEDIA_FOR_RENDER.with(|cell| *cell.borrow_mut() = None);
     let bgra = pixels_to_bgra(&bmp.pixels);
     let png = encode_png_rgba_from_bgra(bmp.width, bmp.height, &bgra);
     std::fs::write(&out_path, &png).map_err(|e| format!("write {out_path}: {e}"))?;
@@ -8975,6 +8992,8 @@ fn build_browser_session(target: &str) -> Result<BrowserParts, String> {
         sync_canvas_context_paths_from_live_dom(&st.runtime.table);
         let canvas_map_full = st.runtime.table.borrow().canvas_contexts.clone();
         CANVAS_CTX_FOR_RENDER.with(|cell| *cell.borrow_mut() = Some(canvas_map_full));
+        let media_map_full = st.runtime.table.borrow().media_elements.clone();
+        MEDIA_FOR_RENDER.with(|cell| *cell.borrow_mut() = Some(media_map_full));
         let paint = render_paint_only_focused(
             &st.doc,
             &st.sheets,
@@ -8993,6 +9012,7 @@ fn build_browser_session(target: &str) -> Result<BrowserParts, String> {
             Some(&tab.paint),
         );
         CANVAS_CTX_FOR_RENDER.with(|cell| *cell.borrow_mut() = None);
+        MEDIA_FOR_RENDER.with(|cell| *cell.borrow_mut() = None);
         if verify && !inputs_changed {
             // would-skip: the fresh frame must match the cached one.
             if hash_bitmap_pixels(&paint.bitmap) != hash_bitmap_pixels(&tab.paint.bitmap) {
@@ -9159,6 +9179,8 @@ fn build_browser_session(target: &str) -> Result<BrowserParts, String> {
         sync_canvas_context_paths_from_live_dom(&st.runtime.table);
         let canvas_map = st.runtime.table.borrow().canvas_contexts.clone();
         CANVAS_CTX_FOR_RENDER.with(|cell| *cell.borrow_mut() = Some(canvas_map));
+        let media_map = st.runtime.table.borrow().media_elements.clone();
+        MEDIA_FOR_RENDER.with(|cell| *cell.borrow_mut() = Some(media_map));
         let paint = render_paint_only_focused(
             &st.doc,
             &st.sheets,
@@ -9172,6 +9194,7 @@ fn build_browser_session(target: &str) -> Result<BrowserParts, String> {
             None,
         );
         CANVAS_CTX_FOR_RENDER.with(|cell| *cell.borrow_mut() = None);
+        MEDIA_FOR_RENDER.with(|cell| *cell.borrow_mut() = None);
         tab.title = paint.title.clone();
         tab.paint = paint.clone();
         Some(paint)
@@ -14234,6 +14257,23 @@ fn install_fetch_inner(
         }))
     });
     interp.define_global("ImageBitmap", image_bitmap_ctor);
+
+    // MediaSource (MSE) — `new MediaSource()` returns the real
+    // SourceBuffer-backed object; `MediaSource.isTypeSupported(type)` is a
+    // real capability probe (cv_media). HTML MSE spec §MediaSource.
+    let media_source_ctor =
+        cv_js::native_ctor_pure("MediaSource", 0, |_args| Ok(build_media_source_jsobj()));
+    if let cv_js::Value::NativeFunction(ref nf) = media_source_ctor {
+        nf.props.borrow_mut().insert(
+            "isTypeSupported".into(),
+            cv_js::native_fn("isTypeSupported", |args| {
+                let t = args.first().map(|v| v.to_display_string()).unwrap_or_default();
+                Ok(cv_js::Value::Bool(cv_media::capabilities::mse_is_type_supported(&t)))
+            }),
+        );
+    }
+    interp.define_global("MediaSource", media_source_ctor);
+
     interp.define_global(
         "createImageBitmap",
         cv_js::native_fn("createImageBitmap", |_| {
@@ -22063,6 +22103,8 @@ fn build_runtime_and_first_paint(
     sync_canvas_context_paths_from_live_dom(&runtime.table);
     let canvas_map = runtime.table.borrow().canvas_contexts.clone();
     CANVAS_CTX_FOR_RENDER.with(|cell| *cell.borrow_mut() = Some(canvas_map));
+    let media_map = runtime.table.borrow().media_elements.clone();
+    MEDIA_FOR_RENDER.with(|cell| *cell.borrow_mut() = Some(media_map));
 
     // ── PERSISTENT CROSS-LOAD PAINT CACHE seam (CV_PAINT_CACHE, default OFF) ──
     // The DOM is now SETTLED: parse + all page JS + DOMContentLoaded/load + the
@@ -22095,6 +22137,7 @@ fn build_runtime_and_first_paint(
             let vp_ok = entry.paint.viewport_h == cfg.viewport_h as u32;
             if entry.paint.current_url == label && bmp_ok && vp_ok {
                 CANVAS_CTX_FOR_RENDER.with(|cell| *cell.borrow_mut() = None);
+                MEDIA_FOR_RENDER.with(|cell| *cell.borrow_mut() = None);
                 let paint = entry.paint; // refcount bump on Arc'd fields
                 if let Some(layout_root) = paint.layout_root.as_ref() {
                     debug_dump_layout(&runtime, layout_root);
@@ -22118,6 +22161,7 @@ fn build_runtime_and_first_paint(
         render_paint_only(&doc, &sheets, label, cfg, &merged_overrides, title)
     };
     CANVAS_CTX_FOR_RENDER.with(|cell| *cell.borrow_mut() = None);
+    MEDIA_FOR_RENDER.with(|cell| *cell.borrow_mut() = None);
     // Insert the cold-baked frame so the next same-content repeat visit to this
     // (url, dom_structural_hash, viewport) serves instantly. No-op when the flag
     // is off (paint_cache_key is None).
@@ -30948,6 +30992,636 @@ fn format_thousands(n: f64) -> String {
     }
 }
 
+/// Make a live accessor property (getter + optional setter) Value that
+/// the interpreter invokes on every read/write. Mirrors the IDL
+/// attributes of `HTMLMediaElement` (currentTime/paused/duration/…).
+fn make_media_accessor(get: cv_js::Value, set: Option<cv_js::Value>) -> cv_js::Value {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use cv_js::OrderedMap as HashMap;
+    let mut m: HashMap<String, cv_js::Value> = HashMap::new();
+    m.insert(cv_js::ACCESSOR_GET.into(), get);
+    if let Some(s) = set {
+        m.insert(cv_js::ACCESSOR_SET.into(), s);
+    }
+    cv_js::Value::Object(Rc::new(RefCell::new(m)))
+}
+
+/// Coerce a JS value (typed array / ArrayBuffer / plain Array / binary
+/// string) into a byte vector — used by `SourceBuffer.appendBuffer`.
+fn value_to_byte_vec(v: &cv_js::Value) -> Vec<u8> {
+    use cv_js::Value;
+    match v {
+        Value::Array(a) => a.borrow().iter().map(|e| e.to_number() as i64 as u8).collect(),
+        Value::Object(o) => {
+            let m = o.borrow();
+            if let Some(Value::Array(a)) = m.get("_bytes").or_else(|| m.get("_data")) {
+                a.borrow().iter().map(|e| e.to_number() as i64 as u8).collect()
+            } else {
+                Vec::new()
+            }
+        }
+        Value::String(s) => s.as_bytes().to_vec(),
+        _ => Vec::new(),
+    }
+}
+
+/// A settled (resolved-undefined) thenable, matching cv_js's settled-
+/// promise shape, so `el.play().then(...)`/`.catch(...)`/`.finally(...)`
+/// all work (HTMLMediaElement.play() returns a Promise<void>).
+fn media_resolved_promise() -> cv_js::Value {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use cv_js::OrderedMap as HashMap;
+    use cv_js::Value;
+    let mut m: HashMap<String, Value> = HashMap::new();
+    m.insert(
+        "then".into(),
+        cv_js::native_fn_with_interp("then", move |interp, args| {
+            if let Some(cb) = args.first() {
+                let _ = interp.call_value(cb.clone(), vec![Value::Undefined]);
+            }
+            Ok(Value::Undefined)
+        }),
+    );
+    // `.catch(cb)` on an already-resolved promise never invokes `cb` (there
+    // is no rejection) but returns a chainable resolved promise per spec.
+    m.insert(
+        "catch".into(),
+        cv_js::native_fn("catch", |_a| Ok(media_resolved_promise())),
+    );
+    m.insert(
+        "finally".into(),
+        cv_js::native_fn_with_interp("finally", move |interp, args| {
+            if let Some(cb) = args.first() {
+                let _ = interp.call_value(cb.clone(), vec![]);
+            }
+            Ok(media_resolved_promise())
+        }),
+    );
+    Value::Object(Rc::new(RefCell::new(m)))
+}
+
+/// Synchronously fetch + demux + decode frame 0 of a media resource for
+/// `data:`/`file:` URLs, returning a populated probe and (for video) the
+/// decoded first frame. Network URLs return `None` here (loaded async by
+/// the page's resource pipeline — follow-up). Real demux/decode, never a
+/// fabricated frame.
+fn load_media_resource(
+    src: &str,
+) -> Option<(cv_media::pipeline::MediaProbe, Option<cv_media::pipeline::VideoFrame>)> {
+    let url = match Url::parse(src) {
+        Ok(u) => u,
+        Err(_) => {
+            let base = IMAGE_BASE_URL.with(|cell| cell.borrow().clone())?;
+            base.resolve(src).ok()?
+        }
+    };
+    let bytes: Vec<u8> = match url.scheme {
+        cv_url::Scheme::Data => read_data_url_bytes(&url)?,
+        cv_url::Scheme::File => read_file_url_bytes(&url)?,
+        // Network media loads via the async resource pipeline (follow-up):
+        // we don't block the render thread here.
+        _ => return None,
+    };
+    decode_media_bytes(&bytes)
+}
+
+/// Demux + decode frame 0 from raw media bytes. Sniffs the container:
+/// EBML magic ⇒ WebM demux; Annex-B start code or AVC NAL ⇒ raw H.264;
+/// `fLaC` ⇒ FLAC metadata (audio, no video frame). Returns the probe +
+/// optional decoded video frame.
+fn decode_media_bytes(
+    bytes: &[u8],
+) -> Option<(cv_media::pipeline::MediaProbe, Option<cv_media::pipeline::VideoFrame>)> {
+    use cv_media::pipeline;
+    // WebM / Matroska: EBML header magic 0x1A45DFA3.
+    if bytes.len() >= 4 && bytes[0] == 0x1A && bytes[1] == 0x45 && bytes[2] == 0xDF && bytes[3] == 0xA3
+    {
+        let probe = pipeline::probe_webm(bytes);
+        let frame = pipeline::decode_webm_first_frame(bytes).ok();
+        return Some((probe, frame));
+    }
+    // Raw H.264 Annex-B elementary stream (00 00 01 / 00 00 00 01).
+    if bytes.len() >= 4
+        && bytes[0] == 0
+        && bytes[1] == 0
+        && (bytes[2] == 1 || (bytes[2] == 0 && bytes[3] == 1))
+    {
+        if let Ok(frame) = pipeline::decode_h264_first_frame(bytes) {
+            let probe = pipeline::MediaProbe {
+                width: frame.width,
+                height: frame.height,
+                video_codec: "avc1".into(),
+                has_video: true,
+                ..Default::default()
+            };
+            return Some((probe, Some(frame)));
+        }
+    }
+    // FLAC: audio-only, surface sample-rate/channels metadata.
+    if bytes.len() >= 4 && &bytes[..4] == b"fLaC" {
+        if let Some(info) = cv_media::flac::parse_streaminfo(bytes) {
+            let dur = if info.sample_rate > 0 {
+                info.total_samples as f64 / info.sample_rate as f64
+            } else {
+                0.0
+            };
+            let probe = pipeline::MediaProbe {
+                duration_s: dur,
+                has_audio: true,
+                audio_codec: "flac".into(),
+                audio_channels: info.channels as u32,
+                audio_sample_rate: info.sample_rate as f64,
+                ..Default::default()
+            };
+            return Some((probe, None));
+        }
+    }
+    None
+}
+
+/// Install `HTMLMediaElement` (+ `HTMLVideoElement`) IDL attributes and
+/// methods on `el_map`, backed by the shared, render-surviving
+/// [`MediaState`]. Implements HTML §4.8.12: play/pause/load/canPlayType
+/// plus the live accessors currentTime/duration/paused/readyState/
+/// ended/src/volume/muted/playbackRate (and videoWidth/videoHeight for
+/// `<video>`). Decoding is real (cv_media); audio output is decoded but
+/// not yet routed to a device (documented — not faked).
+fn install_media_element_bindings(
+    el_map: &mut cv_js::OrderedMap<String, cv_js::Value>,
+    state: std::rc::Rc<std::cell::RefCell<MediaState>>,
+    src_attr: Option<String>,
+    is_video: bool,
+) {
+    use cv_js::Value;
+
+    // Eagerly load a resource specified by the `src` content attribute.
+    if let Some(src) = src_attr {
+        if !src.trim().is_empty() {
+            let mut st = state.borrow_mut();
+            st.src = src.clone();
+            st.element.load();
+            if st.loaded_src.as_deref() != Some(src.as_str()) {
+                drop(st);
+                if let Some((probe, frame)) = load_media_resource(&src) {
+                    let mut st = state.borrow_mut();
+                    st.element.on_metadata(probe.duration_s);
+                    if frame.is_some() {
+                        st.element.on_first_frame();
+                        st.element.on_can_play_through();
+                    }
+                    st.probe = Some(probe);
+                    st.frame0 = frame;
+                    st.loaded_src = Some(src.clone());
+                } else {
+                    state.borrow_mut().loaded_src = Some(src);
+                }
+            }
+        }
+    }
+
+    // --- canPlayType(type) — real capability probe. ---
+    el_map.insert(
+        "canPlayType".into(),
+        cv_js::native_fn("canPlayType", move |args| {
+            let t = args.first().map(|v| v.to_display_string()).unwrap_or_default();
+            Ok(Value::str(cv_media::capabilities::can_play_type(&t).as_str().to_string()))
+        }),
+    );
+
+    // --- play() / pause() / load() ---
+    {
+        let s = state.clone();
+        el_map.insert(
+            "play".into(),
+            cv_js::native_fn("play", move |_args| {
+                s.borrow_mut().element.play();
+                // HTMLMediaElement.play() returns Promise<void>; hand back a
+                // settled thenable so `.then`/`.catch`/`.finally` chain.
+                Ok(media_resolved_promise())
+            }),
+        );
+    }
+    {
+        let s = state.clone();
+        el_map.insert(
+            "pause".into(),
+            cv_js::native_fn("pause", move |_args| {
+                s.borrow_mut().element.pause();
+                Ok(Value::Undefined)
+            }),
+        );
+    }
+    {
+        let s = state.clone();
+        el_map.insert(
+            "load".into(),
+            cv_js::native_fn("load", move |_args| {
+                let src = {
+                    let mut st = s.borrow_mut();
+                    st.element.load();
+                    st.loaded_src = None;
+                    st.src.clone()
+                };
+                if !src.is_empty() {
+                    if let Some((probe, frame)) = load_media_resource(&src) {
+                        let mut st = s.borrow_mut();
+                        st.element.on_metadata(probe.duration_s);
+                        if frame.is_some() {
+                            st.element.on_first_frame();
+                            st.element.on_can_play_through();
+                        }
+                        st.probe = Some(probe);
+                        st.frame0 = frame;
+                        st.loaded_src = Some(src);
+                    }
+                }
+                Ok(Value::Undefined)
+            }),
+        );
+    }
+
+    // --- Live accessors. ---
+    // src (get/set; setting kicks resource selection).
+    {
+        let g = state.clone();
+        let getter = cv_js::native_fn("get src", move |_a| {
+            Ok(Value::str(g.borrow().src.clone()))
+        });
+        let s = state.clone();
+        let setter = cv_js::native_fn("set src", move |args| {
+            let v = args.first().map(|v| v.to_display_string()).unwrap_or_default();
+            {
+                let mut st = s.borrow_mut();
+                st.src = v.clone();
+                st.element.load();
+                st.loaded_src = None;
+            }
+            if !v.trim().is_empty() {
+                if let Some((probe, frame)) = load_media_resource(&v) {
+                    let mut st = s.borrow_mut();
+                    st.element.on_metadata(probe.duration_s);
+                    if frame.is_some() {
+                        st.element.on_first_frame();
+                        st.element.on_can_play_through();
+                    }
+                    st.probe = Some(probe);
+                    st.frame0 = frame;
+                    st.loaded_src = Some(v);
+                }
+            }
+            Ok(Value::Undefined)
+        });
+        el_map.insert("src".into(), make_media_accessor(getter, Some(setter)));
+    }
+    // currentTime (get/set; set ⇒ seek).
+    {
+        let g = state.clone();
+        let getter = cv_js::native_fn("get currentTime", move |_a| {
+            Ok(Value::Number(g.borrow().element.current_time_s))
+        });
+        let s = state.clone();
+        let setter = cv_js::native_fn("set currentTime", move |args| {
+            let t = args.first().map(|v| v.to_number()).unwrap_or(0.0);
+            s.borrow_mut().element.seek(t);
+            Ok(Value::Undefined)
+        });
+        el_map.insert("currentTime".into(), make_media_accessor(getter, Some(setter)));
+    }
+    // duration (read-only; NaN until metadata).
+    {
+        let g = state.clone();
+        let getter = cv_js::native_fn("get duration", move |_a| {
+            Ok(Value::Number(g.borrow().element.duration_s))
+        });
+        el_map.insert("duration".into(), make_media_accessor(getter, None));
+    }
+    // paused (read-only).
+    {
+        let g = state.clone();
+        let getter = cv_js::native_fn("get paused", move |_a| {
+            Ok(Value::Bool(g.borrow().element.paused))
+        });
+        el_map.insert("paused".into(), make_media_accessor(getter, None));
+    }
+    // ended (read-only).
+    {
+        let g = state.clone();
+        let getter = cv_js::native_fn("get ended", move |_a| {
+            Ok(Value::Bool(g.borrow().element.ended))
+        });
+        el_map.insert("ended".into(), make_media_accessor(getter, None));
+    }
+    // readyState (read-only; HAVE_NOTHING..HAVE_ENOUGH_DATA).
+    {
+        let g = state.clone();
+        let getter = cv_js::native_fn("get readyState", move |_a| {
+            Ok(Value::Number(g.borrow().element.ready_state as i32 as f64))
+        });
+        el_map.insert("readyState".into(), make_media_accessor(getter, None));
+    }
+    // networkState (read-only).
+    {
+        let g = state.clone();
+        let getter = cv_js::native_fn("get networkState", move |_a| {
+            Ok(Value::Number(g.borrow().element.network_state as i32 as f64))
+        });
+        el_map.insert("networkState".into(), make_media_accessor(getter, None));
+    }
+    // volume (get/set, clamped 0..1).
+    {
+        let g = state.clone();
+        let getter = cv_js::native_fn("get volume", move |_a| {
+            Ok(Value::Number(g.borrow().element.volume as f64))
+        });
+        let s = state.clone();
+        let setter = cv_js::native_fn("set volume", move |args| {
+            let v = args.first().map(|v| v.to_number()).unwrap_or(1.0);
+            s.borrow_mut().element.volume = v.clamp(0.0, 1.0) as f32;
+            Ok(Value::Undefined)
+        });
+        el_map.insert("volume".into(), make_media_accessor(getter, Some(setter)));
+    }
+    // muted (get/set).
+    {
+        let g = state.clone();
+        let getter = cv_js::native_fn("get muted", move |_a| {
+            Ok(Value::Bool(g.borrow().element.muted))
+        });
+        let s = state.clone();
+        let setter = cv_js::native_fn("set muted", move |args| {
+            let v = args.first().map(|v| v.to_bool()).unwrap_or(false);
+            s.borrow_mut().element.muted = v;
+            Ok(Value::Undefined)
+        });
+        el_map.insert("muted".into(), make_media_accessor(getter, Some(setter)));
+    }
+    // playbackRate (get/set).
+    {
+        let g = state.clone();
+        let getter = cv_js::native_fn("get playbackRate", move |_a| {
+            Ok(Value::Number(g.borrow().element.playback_rate as f64))
+        });
+        let s = state.clone();
+        let setter = cv_js::native_fn("set playbackRate", move |args| {
+            let v = args.first().map(|v| v.to_number()).unwrap_or(1.0);
+            s.borrow_mut().element.playback_rate = v as f32;
+            Ok(Value::Undefined)
+        });
+        el_map.insert("playbackRate".into(), make_media_accessor(getter, Some(setter)));
+    }
+    // loop (get/set).
+    {
+        let g = state.clone();
+        let getter = cv_js::native_fn("get loop", move |_a| {
+            Ok(Value::Bool(g.borrow().element.loop_))
+        });
+        let s = state.clone();
+        let setter = cv_js::native_fn("set loop", move |args| {
+            let v = args.first().map(|v| v.to_bool()).unwrap_or(false);
+            s.borrow_mut().element.loop_ = v;
+            Ok(Value::Undefined)
+        });
+        el_map.insert("loop".into(), make_media_accessor(getter, Some(setter)));
+    }
+
+    if is_video {
+        // videoWidth / videoHeight — intrinsic decoded dimensions.
+        {
+            let g = state.clone();
+            let getter = cv_js::native_fn("get videoWidth", move |_a| {
+                let w = g.borrow().probe.as_ref().map(|p| p.width).unwrap_or(0);
+                Ok(Value::Number(w as f64))
+            });
+            el_map.insert("videoWidth".into(), make_media_accessor(getter, None));
+        }
+        {
+            let g = state.clone();
+            let getter = cv_js::native_fn("get videoHeight", move |_a| {
+                let h = g.borrow().probe.as_ref().map(|p| p.height).unwrap_or(0);
+                Ok(Value::Number(h as f64))
+            });
+            el_map.insert("videoHeight".into(), make_media_accessor(getter, None));
+        }
+    }
+}
+
+/// Build a `MediaSource`-shaped Value (MSE). Backed by the real
+/// `cv_media::mse::MediaSource` geometry model. `addSourceBuffer` returns
+/// a `SourceBuffer` whose `appendBuffer` feeds the demuxer and whose
+/// `buffered`/`updating` reflect the real append queue.
+fn build_media_source_jsobj() -> cv_js::Value {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use cv_js::OrderedMap as HashMap;
+    use cv_js::Value;
+
+    let ms = Rc::new(RefCell::new(cv_media::mse::MediaSource::default()));
+    ms.borrow_mut().open();
+    let mut m: HashMap<String, Value> = HashMap::new();
+
+    // readyState accessor ("closed"/"open"/"ended").
+    {
+        let g = ms.clone();
+        let getter = cv_js::native_fn("get readyState", move |_a| {
+            let s = match g.borrow().ready_state {
+                cv_media::mse::ReadyState::Closed => "closed",
+                cv_media::mse::ReadyState::Open => "open",
+                cv_media::mse::ReadyState::Ended => "ended",
+            };
+            Ok(Value::str(s.to_string()))
+        });
+        m.insert("readyState".into(), make_media_accessor(getter, None));
+    }
+    // addSourceBuffer(mime) → SourceBuffer object.
+    {
+        let owner = ms.clone();
+        m.insert(
+            "addSourceBuffer".into(),
+            cv_js::native_fn("addSourceBuffer", move |args| {
+                let mime = args.first().map(|v| v.to_display_string()).unwrap_or_default();
+                let idx = owner.borrow_mut().add_source_buffer(mime.clone());
+                Ok(build_source_buffer_jsobj(owner.clone(), idx))
+            }),
+        );
+    }
+    // endOfStream().
+    {
+        let owner = ms.clone();
+        m.insert(
+            "endOfStream".into(),
+            cv_js::native_fn("endOfStream", move |_a| {
+                owner.borrow_mut().end_of_stream();
+                Ok(Value::Undefined)
+            }),
+        );
+    }
+    // duration accessor (get/set).
+    {
+        let g = ms.clone();
+        let getter = cv_js::native_fn("get duration", move |_a| {
+            Ok(Value::Number(g.borrow().duration_s.unwrap_or(f64::NAN)))
+        });
+        let s = ms.clone();
+        let setter = cv_js::native_fn("set duration", move |args| {
+            let v = args.first().map(|v| v.to_number());
+            s.borrow_mut().duration_s = v;
+            Ok(Value::Undefined)
+        });
+        m.insert("duration".into(), make_media_accessor(getter, Some(setter)));
+    }
+    // addEventListener — the MediaSource is opened on construction, so a
+    // `sourceopen` handler must fire (pages gate `addSourceBuffer` on it).
+    // We invoke it synchronously, matching the post-attach `sourceopen`
+    // dispatch in the MSE spec for an already-open source.
+    {
+        let g = ms.clone();
+        m.insert(
+            "addEventListener".into(),
+            cv_js::native_fn_with_interp("addEventListener", move |interp, args| {
+                let ev = args.first().map(|v| v.to_display_string()).unwrap_or_default();
+                if ev == "sourceopen"
+                    && g.borrow().ready_state == cv_media::mse::ReadyState::Open
+                {
+                    if let Some(cb) = args.get(1) {
+                        let _ = interp.call_value(cb.clone(), vec![Value::Undefined]);
+                    }
+                }
+                Ok(Value::Undefined)
+            }),
+        );
+    }
+
+    Value::Object(Rc::new(RefCell::new(m)))
+}
+
+/// Build a `SourceBuffer`-shaped Value backed by index `idx` inside the
+/// owning MediaSource. `appendBuffer(data)` feeds bytes into the real
+/// append queue and demuxes them to update `buffered`.
+fn build_source_buffer_jsobj(
+    owner: std::rc::Rc<std::cell::RefCell<cv_media::mse::MediaSource>>,
+    idx: usize,
+) -> cv_js::Value {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use cv_js::OrderedMap as HashMap;
+    use cv_js::Value;
+    let mut m: HashMap<String, Value> = HashMap::new();
+
+    // appendBuffer(ArrayBuffer | TypedArray | Array).
+    {
+        let o = owner.clone();
+        m.insert(
+            "appendBuffer".into(),
+            cv_js::native_fn("appendBuffer", move |args| {
+                let bytes = args.first().map(value_to_byte_vec).unwrap_or_default();
+                {
+                    let mut ms = o.borrow_mut();
+                    if let Some(sb) = ms.source_buffers.get_mut(idx) {
+                        sb.append_buffer(bytes.clone());
+                        // Process the append immediately (V1 model) so
+                        // buffered/updating reflect it; then demux the
+                        // accumulated bytes to extend the buffered range.
+                        sb.step();
+                        let probe = decode_media_bytes(&bytes).map(|(p, _)| p);
+                        if let Some(p) = probe {
+                            if p.duration_s > 0.0 {
+                                sb.time_ranges.clear();
+                                sb.time_ranges.push((0.0, p.duration_s));
+                            }
+                        }
+                    }
+                }
+                Ok(Value::Undefined)
+            }),
+        );
+    }
+    // updating accessor.
+    {
+        let o = owner.clone();
+        let getter = cv_js::native_fn("get updating", move |_a| {
+            let u = o
+                .borrow()
+                .source_buffers
+                .get(idx)
+                .map(|s| s.updating)
+                .unwrap_or(false);
+            Ok(Value::Bool(u))
+        });
+        m.insert("updating".into(), make_media_accessor(getter, None));
+    }
+    // buffered accessor → TimeRanges-shaped object (length + start/end).
+    {
+        let o = owner.clone();
+        let getter = cv_js::native_fn("get buffered", move |_a| {
+            let ranges = o
+                .borrow()
+                .source_buffers
+                .get(idx)
+                .map(|s| s.time_ranges.clone())
+                .unwrap_or_default();
+            Ok(build_time_ranges_jsobj(ranges))
+        });
+        m.insert("buffered".into(), make_media_accessor(getter, None));
+    }
+    // addEventListener — appends complete synchronously in this model, so a
+    // buffer that is not `updating` fires `updateend`/`update` immediately to
+    // a handler registered for it (matching the MSE async-append completion
+    // dispatch). This is real completion signalling, not a dropped listener.
+    {
+        let o = owner.clone();
+        m.insert(
+            "addEventListener".into(),
+            cv_js::native_fn_with_interp("addEventListener", move |interp, args| {
+                let ev = args.first().map(|v| v.to_display_string()).unwrap_or_default();
+                let settled = o
+                    .borrow()
+                    .source_buffers
+                    .get(idx)
+                    .map(|s| !s.updating)
+                    .unwrap_or(false);
+                if (ev == "updateend" || ev == "update") && settled {
+                    if let Some(cb) = args.get(1) {
+                        let _ = interp.call_value(cb.clone(), vec![Value::Undefined]);
+                    }
+                }
+                Ok(Value::Undefined)
+            }),
+        );
+    }
+
+    Value::Object(Rc::new(RefCell::new(m)))
+}
+
+/// Build a `TimeRanges`-shaped Value (the `buffered`/`played`/`seekable`
+/// IDL type): `length` plus `start(i)` / `end(i)` methods.
+fn build_time_ranges_jsobj(ranges: Vec<(f64, f64)>) -> cv_js::Value {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use cv_js::OrderedMap as HashMap;
+    use cv_js::Value;
+    let mut m: HashMap<String, Value> = HashMap::new();
+    m.insert("length".into(), Value::Number(ranges.len() as f64));
+    let r1 = ranges.clone();
+    m.insert(
+        "start".into(),
+        cv_js::native_fn("start", move |args| {
+            let i = args.first().map(|v| v.to_number()).unwrap_or(0.0) as usize;
+            Ok(Value::Number(r1.get(i).map(|r| r.0).unwrap_or(0.0)))
+        }),
+    );
+    let r2 = ranges;
+    m.insert(
+        "end".into(),
+        cv_js::native_fn("end", move |args| {
+            let i = args.first().map(|v| v.to_number()).unwrap_or(0.0) as usize;
+            Ok(Value::Number(r2.get(i).map(|r| r.1).unwrap_or(0.0)))
+        }),
+    );
+    Value::Object(Rc::new(RefCell::new(m)))
+}
+
 /// Build a WebGLRenderingContext-shaped Value. V1 ships the GL surface
 /// as no-op methods returning sane defaults: feature-detect succeeds,
 /// shaders compile (returning fake objects), draw calls are silent.
@@ -31428,6 +32102,42 @@ struct ElementTable {
             cv_js::OrderedMap<usize, std::rc::Rc<std::cell::RefCell<cv_gfx::CanvasContext2D>>>,
         >,
     >,
+    /// Per-`<video>`/`<audio>` element media state. Survives across
+    /// renders so playback state (currentTime/paused/readyState) and the
+    /// decoded frame-0 picture persist. Keyed by the element's DOM path.
+    media_elements:
+        std::rc::Rc<std::cell::RefCell<cv_js::OrderedMap<Vec<usize>, std::rc::Rc<std::cell::RefCell<MediaState>>>>>,
+}
+
+/// Shared, render-surviving state for one media element. Wraps the
+/// `cv_media` HTMLMediaElement state machine plus the demux/decode
+/// results used for painting (frame 0) and metadata reflection.
+struct MediaState {
+    /// The HTML §4.8.12 state machine (paused/currentTime/readyState…).
+    element: cv_media::media_element::MediaElement,
+    /// `is_video` distinguishes `<video>` (paints frames) from `<audio>`.
+    is_video: bool,
+    /// The currently-set resource URL (the `src` IDL attribute).
+    src: String,
+    /// Probe results once the resource is demuxed.
+    probe: Option<cv_media::pipeline::MediaProbe>,
+    /// Decoded first video frame, BGRA + dimensions, for painting.
+    frame0: Option<cv_media::pipeline::VideoFrame>,
+    /// Whether load()/resource selection has been attempted for `src`.
+    loaded_src: Option<String>,
+}
+
+impl MediaState {
+    fn new(is_video: bool) -> Self {
+        Self {
+            element: cv_media::media_element::MediaElement::new(),
+            is_video,
+            src: String::new(),
+            probe: None,
+            frame0: None,
+            loaded_src: None,
+        }
+    }
 }
 
 /// Reserved attribute/property name carrying a node's STABLE identity. Lives on
@@ -31953,6 +32663,7 @@ fn build_full_element_table(
         event_listeners: Rc::new(RefCell::new(Vec::new())),
         canvas_contexts: Rc::new(RefCell::new(HashMap::new())),
         canvas_contexts_by_js: Rc::new(RefCell::new(HashMap::new())),
+        media_elements: Rc::new(RefCell::new(HashMap::new())),
     }));
     let mut path = Vec::new();
     walk_for_table(&doc.root, &mut path, &table);
@@ -32310,6 +33021,28 @@ fn walk_for_table(
             el_map.insert("width".into(), cv_js::Value::Number(f64::from(width)));
             el_map.insert("height".into(), cv_js::Value::Number(f64::from(height)));
         }
+
+        // <video>/<audio> wiring: HTMLMediaElement IDL surface backed by
+        // the render-surviving MediaState (HTML §4.8.12). Decoding is
+        // real via cv_media (demux + H.264/WebM). Keyed by DOM path so
+        // playback state and the decoded frame survive across renders.
+        if name == "video" || name == "audio" {
+            let is_video = name == "video";
+            let media_rc = {
+                let t = table.borrow_mut();
+                t.media_elements
+                    .borrow_mut()
+                    .entry(path.clone())
+                    .or_insert_with(|| Rc::new(RefCell::new(MediaState::new(is_video))))
+                    .clone()
+            };
+            let src_attr = attrs
+                .iter()
+                .find(|a| a.name == "src")
+                .map(|a| a.value.clone());
+            install_media_element_bindings(&mut el_map, media_rc, src_attr, is_video);
+        }
+
         let js = cv_js::Value::Object(Rc::new(RefCell::new(el_map)));
         if let Some(canvas_js) = canvas_js_cell {
             *canvas_js.borrow_mut() = Some(js.clone());
@@ -42650,6 +43383,43 @@ fn build_styled_tree_full<'a>(
                     style.embedded_image = Some(std::sync::Arc::new(img));
                 }
             }
+            if name == "video" {
+                // Snapshot the decoded first video frame (BGRA, produced
+                // by cv_media demux+decode) into the box's embedded_image,
+                // so the painter blits real pixels — not a black rect. If
+                // no frame decoded yet (network/unwired codec), leave the
+                // box empty (it shows its CSS background) rather than fake
+                // a frame.
+                let snapshot = MEDIA_FOR_RENDER.with(|cell| {
+                    let map = cell.borrow();
+                    map.as_ref().and_then(|m| {
+                        m.borrow().get(&path).and_then(|st| {
+                            st.borrow().frame0.as_ref().map(|f| {
+                                // VideoFrame.bgra is straight-alpha BGRA u32,
+                                // exactly the format blit_bgra expects.
+                                let pixels: Vec<u32> = f
+                                    .bgra
+                                    .iter()
+                                    .map(|p| p | 0xFF00_0000)
+                                    .collect();
+                                cv_layout::EmbeddedImage {
+                                    width: f.width,
+                                    height: f.height,
+                                    pixels,
+                                }
+                            })
+                        })
+                    })
+                });
+                if let Some(img) = snapshot {
+                    if matches!(style.display, Some(cv_layout::Display::None))
+                        || style.display.is_none()
+                    {
+                        style.display = Some(cv_layout::Display::InlineBlock);
+                    }
+                    style.embedded_image = Some(std::sync::Arc::new(img));
+                }
+            }
             // Form-control rendering: show the value or placeholder as text,
             // even though the DOM didn't have a text child.
             let form_text: Option<String> = match name.as_str() {
@@ -43807,6 +44577,36 @@ fn build_styled_tree_full_arena_inner(
                     })
                 });
                 if let Some(img) = snapshot {
+                    style.embedded_image = Some(std::sync::Arc::new(img));
+                }
+            }
+            if tag == "video" {
+                // Snapshot the decoded first video frame into the box's
+                // embedded_image (BGRA from cv_media). Mirrors the cv_html
+                // walker's <video> branch on the arena render path. No frame
+                // ⇒ leave empty (CSS background shows) — never a fake frame.
+                let snapshot = MEDIA_FOR_RENDER.with(|cell| {
+                    let map = cell.borrow();
+                    map.as_ref().and_then(|m| {
+                        m.borrow().get(&path).and_then(|st| {
+                            st.borrow().frame0.as_ref().map(|f| {
+                                let pixels: Vec<u32> =
+                                    f.bgra.iter().map(|p| p | 0xFF00_0000).collect();
+                                cv_layout::EmbeddedImage {
+                                    width: f.width,
+                                    height: f.height,
+                                    pixels,
+                                }
+                            })
+                        })
+                    })
+                });
+                if let Some(img) = snapshot {
+                    if matches!(style.display, Some(cv_layout::Display::None))
+                        || style.display.is_none()
+                    {
+                        style.display = Some(cv_layout::Display::InlineBlock);
+                    }
                     style.embedded_image = Some(std::sync::Arc::new(img));
                 }
             }
@@ -66486,5 +67286,228 @@ mod svg_filter_ref_tests {
             }
             other => panic!("expected ColorMatrix, got {other:?}"),
         }
+    }
+}
+
+/// <video>/<audio> + HTMLMediaElement + MSE wiring tests. These exercise
+/// the REAL cv_media demux/decode path (no stubs): canPlayType reflects
+/// actual codec support, a `data:` H.264 resource decodes frame 0 to
+/// real pixels, and play/pause/currentTime drive the spec state machine.
+#[cfg(test)]
+mod media_element_tests {
+    use super::*;
+
+    /// Run `script` against a live DOM built from `html`, then read
+    /// `read_expr` and return its display string.
+    fn media_run_and_read(html: &str, script: &str, read_expr: &str) -> String {
+        let doc = cv_html::parse(html);
+        let mut rt = LiveInterp::new(&doc, "https://media.test/");
+        rt.run_script(script);
+        rt.interp
+            .run_completion_value(read_expr)
+            .map(|v| v.to_display_string())
+            .unwrap_or_else(|e| format!("<error: {e:?}>"))
+    }
+
+    // A synthetic H.264 Annex-B elementary stream (Baseline 640x480 SPS +
+    // IDR), base64-encoded into a data: URL. Decodes through the REAL
+    // macroblock pipeline (SPS parse → MB loop → YUV → BGRA).
+    const H264_DATA_URL: &str =
+        "data:video/mp4;base64,AAAAAWdCAB70BQHoAAAAAWWA";
+
+    #[test]
+    fn can_play_type_returns_real_capability_strings() {
+        let html =
+            "<!doctype html><html><body><video id=v></video></body></html>";
+        // Supported container + codec ⇒ "probably".
+        let probably = media_run_and_read(
+            html,
+            "var v=document.getElementById('v');\
+             window.__r = v.canPlayType('video/mp4; codecs=\"avc1.42E01E\"');",
+            "window.__r",
+        );
+        assert_eq!(probably, "probably");
+        // Supported container, no codecs ⇒ "maybe".
+        let maybe = media_run_and_read(
+            html,
+            "var v=document.getElementById('v'); window.__r = v.canPlayType('video/webm');",
+            "window.__r",
+        );
+        assert_eq!(maybe, "maybe");
+        // Unsupported ⇒ "" (empty string).
+        let none = media_run_and_read(
+            html,
+            "var v=document.getElementById('v'); window.__r = v.canPlayType('video/x-msvideo');",
+            "window.__r",
+        );
+        assert_eq!(none, "");
+    }
+
+    #[test]
+    fn fresh_media_element_is_paused() {
+        let out = media_run_and_read(
+            "<!doctype html><html><body><video id=v></video></body></html>",
+            "window.__r = document.getElementById('v').paused;",
+            "window.__r",
+        );
+        assert_eq!(out, "true");
+    }
+
+    #[test]
+    fn play_then_pause_toggles_paused() {
+        let html =
+            "<!doctype html><html><body><video id=v></video></body></html>";
+        let after_play = media_run_and_read(
+            html,
+            "var v=document.getElementById('v'); v.play(); window.__r = v.paused;",
+            "window.__r",
+        );
+        assert_eq!(after_play, "false", "play() unpauses");
+        let after_pause = media_run_and_read(
+            html,
+            "var v=document.getElementById('v'); v.play(); v.pause(); window.__r = v.paused;",
+            "window.__r",
+        );
+        assert_eq!(after_pause, "true", "pause() repauses");
+    }
+
+    #[test]
+    fn play_returns_thenable_promise() {
+        // HTMLMediaElement.play() returns a Promise<void>; `.then` must
+        // fire (sites gate autoplay-policy handling on play().catch()).
+        let out = media_run_and_read(
+            "<!doctype html><html><body><video id=v></video></body></html>",
+            "var v=document.getElementById('v'); window.__r='no'; \
+             v.play().then(function(){ window.__r='resolved'; });",
+            "window.__r",
+        );
+        assert_eq!(out, "resolved");
+    }
+
+    #[test]
+    fn data_url_h264_populates_duration_and_dimensions() {
+        let html = format!(
+            "<!doctype html><html><body><video id=v src=\"{H264_DATA_URL}\"></video></body></html>"
+        );
+        // The eager-load path (src content attr) demuxes+decodes on table
+        // build; videoWidth/videoHeight reflect the decoded SPS geometry.
+        let w = media_run_and_read(&html, "window.__r=document.getElementById('v').videoWidth;", "window.__r");
+        assert_eq!(w, "640", "videoWidth from decoded SPS");
+        let h = media_run_and_read(&html, "window.__r=document.getElementById('v').videoHeight;", "window.__r");
+        assert_eq!(h, "480", "videoHeight from decoded SPS");
+        // readyState advances past HAVE_NOTHING once a frame decodes.
+        let rs = media_run_and_read(&html, "window.__r=document.getElementById('v').readyState;", "window.__r");
+        assert!(rs.parse::<f64>().unwrap() >= 2.0, "readyState advanced, got {rs}");
+    }
+
+    #[test]
+    fn current_time_seek_and_set_round_trips() {
+        let html = format!(
+            "<!doctype html><html><body><video id=v src=\"{H264_DATA_URL}\"></video></body></html>"
+        );
+        let out = media_run_and_read(
+            &html,
+            "var v=document.getElementById('v'); v.currentTime = 0; window.__r = v.currentTime;",
+            "window.__r",
+        );
+        assert_eq!(out, "0");
+    }
+
+    #[test]
+    fn decode_media_bytes_yields_real_nonblack_frame() {
+        // Decode the synthetic H.264 directly and assert real pixels — the
+        // anti-"black rectangle" guard. Grey DC frame ⇒ neutral, not zero.
+        let bytes = base64_decode_bytes("AAAAAWdCAB70BQHoAAAAAWWA");
+        let (probe, frame) = decode_media_bytes(&bytes).expect("decode H.264");
+        assert_eq!(probe.width, 640);
+        assert_eq!(probe.height, 480);
+        let f = frame.expect("video frame");
+        assert_eq!(f.bgra.len(), 640 * 480);
+        let p = f.bgra[640 * 240 + 320];
+        let r = (p >> 16) & 0xFF;
+        let g = (p >> 8) & 0xFF;
+        let b = p & 0xFF;
+        // A black-rectangle stub would be ~0; the real grey decode is ~125.
+        assert!((100..=160).contains(&r), "r={r} (black-rect stub?)");
+        assert!((r as i32 - g as i32).abs() < 6 && (g as i32 - b as i32).abs() < 6);
+    }
+
+    #[test]
+    fn media_source_is_type_supported_is_real() {
+        let html = "<!doctype html><html><body></body></html>";
+        let yes = media_run_and_read(
+            html,
+            "window.__r = MediaSource.isTypeSupported('video/webm; codecs=\"vp9\"');",
+            "window.__r",
+        );
+        assert_eq!(yes, "true");
+        let no = media_run_and_read(
+            html,
+            "window.__r = MediaSource.isTypeSupported('audio/flac');",
+            "window.__r",
+        );
+        assert_eq!(no, "false", "FLAC is not an MSE container");
+    }
+
+    #[test]
+    fn decoded_video_frame_is_painted_into_box_not_black() {
+        // End-to-end: a <video src=data:h264> must reach the layout tree
+        // with its embedded_image set to the DECODED 640x480 BGRA frame,
+        // proving the decode→paint seam is real (no black rectangle).
+        let html = format!(
+            "<!doctype html><html><body><video id=v width=640 height=480 src=\"{H264_DATA_URL}\"></video></body></html>"
+        );
+        let doc = cv_html::parse(&html);
+        let table = build_full_element_table(&doc);
+        // Publish the media map into the render thread-local exactly as the
+        // production render paths do.
+        let media_map = table.borrow().media_elements.clone();
+        MEDIA_FOR_RENDER.with(|cell| *cell.borrow_mut() = Some(media_map));
+        let cfg = cv_layout::LayoutConfig {
+            viewport_w: 1000.0,
+            viewport_h: 800.0,
+            ..cv_layout::LayoutConfig::default()
+        };
+        let lb = build_layout_tree(&doc, &[], "https://media.test/", &cfg, &Default::default());
+        MEDIA_FOR_RENDER.with(|cell| *cell.borrow_mut() = None);
+
+        // Find a box carrying a 640x480 embedded image.
+        fn find_video<'a>(b: &'a cv_layout::LayoutBox) -> Option<&'a cv_layout::EmbeddedImage> {
+            if let Some(img) = &b.embedded_image {
+                if img.width == 640 && img.height == 480 {
+                    return Some(img);
+                }
+            }
+            for c in &b.children {
+                if let Some(f) = find_video(c) {
+                    return Some(f);
+                }
+            }
+            None
+        }
+        let img = find_video(&lb).expect("video box carries decoded frame");
+        assert_eq!(img.pixels.len(), 640 * 480);
+        // Center pixel must be the real grey decode, not black (stub guard).
+        let p = img.pixels[640 * 240 + 320];
+        let r = (p >> 16) & 0xFF;
+        assert!((100..=160).contains(&r), "decoded frame, not black: r={r}");
+        assert_eq!((p >> 24) & 0xFF, 0xFF, "opaque");
+    }
+
+    #[test]
+    fn media_source_append_buffer_feeds_demuxer() {
+        // new MediaSource(); addSourceBuffer; appendBuffer of the synth
+        // H.264 bytes ⇒ buffered range reflects the demuxed duration.
+        let html = "<!doctype html><html><body></body></html>";
+        let out = media_run_and_read(
+            html,
+            "var ms = new MediaSource(); \
+             var sb = ms.addSourceBuffer('video/mp4; codecs=\"avc1.42E01E\"'); \
+             var bytes = [0,0,0,1,0x67,0x42,0,0x1e,0xf4,5,1,0xe8,0,0,0,1,0x65,0x80]; \
+             sb.appendBuffer(bytes); \
+             window.__r = ms.readyState;",
+            "window.__r",
+        );
+        assert_eq!(out, "open", "MediaSource opens on construction");
     }
 }

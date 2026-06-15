@@ -9,6 +9,7 @@
 #![allow(missing_debug_implementations)]
 
 pub mod av1;
+pub mod capabilities;
 pub mod color;
 pub mod dash;
 pub mod ebml;
@@ -30,6 +31,8 @@ pub mod hls;
 pub mod media_element;
 pub mod mp4;
 pub mod mse;
+pub mod pipeline;
 pub mod vorbis;
 pub mod vp9;
+pub mod webm;
 pub mod webvtt;

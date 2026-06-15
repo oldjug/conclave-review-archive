@@ -47,6 +47,7 @@ dependencies = [
  "cv_ipc",
  "cv_js",
  "cv_layout",
+ "cv_media",
  "cv_net",
  "cv_paint",
  "cv_sched",
