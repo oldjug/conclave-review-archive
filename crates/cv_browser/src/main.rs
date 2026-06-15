@@ -3066,13 +3066,10 @@ fn run_render(cli: &Cli) -> Result<(), String> {
         eprintln!("warning: {}", e);
     }
 
-    let html = match response_to_text(&resp, &url.to_string()) {
-        Ok(text) => text,
-        Err(e) => {
-            eprintln!("warning: {}", e);
-            String::from_utf8_lossy(&resp.body).into_owned()
-        }
-    };
+    // Full HTML encoding-sniffing algorithm (BOM → HTTP charset → <meta>
+    // prescan → default windows-1252), not a force-UTF-8 decode. Identical to
+    // the old path for UTF-8 content; decodes legacy/labeled pages correctly.
+    let html = decode_response_body(&resp);
     let doc = cv_html::parse(&html);
     let sheets = collect_stylesheets(&doc);
 
@@ -3926,13 +3923,10 @@ fn run_probe(cli: &Cli) -> Result<(), String> {
         eprintln!("warning: {}", e);
     }
 
-    let html = match response_to_text(&resp, &url.to_string()) {
-        Ok(text) => text,
-        Err(e) => {
-            eprintln!("warning: {}", e);
-            String::from_utf8_lossy(&resp.body).into_owned()
-        }
-    };
+    // Full HTML encoding-sniffing algorithm (BOM → HTTP charset → <meta>
+    // prescan → default windows-1252), not a force-UTF-8 decode. Identical to
+    // the old path for UTF-8 content; decodes legacy/labeled pages correctly.
+    let html = decode_response_body(&resp);
     let cfg = cv_layout::LayoutConfig {
         viewport_w: 1280.0,
         viewport_h: 800.0,
@@ -4213,13 +4207,10 @@ fn run_compare(cli: &Cli) -> Result<(), String> {
     if let Err(e) = validate_response_length(&resp, &url.to_string()) {
         eprintln!("warning: {}", e);
     }
-    let html = match response_to_text(&resp, &url.to_string()) {
-        Ok(text) => text,
-        Err(e) => {
-            eprintln!("warning: {}", e);
-            String::from_utf8_lossy(&resp.body).into_owned()
-        }
-    };
+    // Full HTML encoding-sniffing algorithm (BOM → HTTP charset → <meta>
+    // prescan → default windows-1252), not a force-UTF-8 decode. Identical to
+    // the old path for UTF-8 content; decodes legacy/labeled pages correctly.
+    let html = decode_response_body(&resp);
 
     let cfg = cv_layout::LayoutConfig {
         viewport_w: vw,
@@ -4361,7 +4352,7 @@ fn run_js_screenshot(cli: &Cli) -> Result<(), String> {
         resp.reason,
         resp.body.len()
     );
-    let html = String::from_utf8_lossy(&resp.body).into_owned();
+    let html = decode_response_body(&resp);
     let cfg = cv_layout::LayoutConfig {
         viewport_w: width as f32,
         viewport_h: height as f32,
@@ -4521,13 +4512,7 @@ fn run_dump_layout(cli: &Cli) -> Result<(), String> {
         eprintln!("warning: {}", e);
     }
 
-    let html = match response_to_text(&resp, &url.to_string()) {
-        Ok(text) => std::borrow::Cow::Owned(text),
-        Err(e) => {
-            eprintln!("warning: {}", e);
-            std::borrow::Cow::Owned(String::from_utf8_lossy(&resp.body).into_owned())
-        }
-    };
+    let html = std::borrow::Cow::Owned(decode_response_body(&resp));
     let doc = cv_html::parse(&html);
     let mut sheets = vec![parse_user_agent_stylesheet()];
     if std::env::var("CV_NO_EXTERNAL_CSS").is_err() {
@@ -4593,13 +4578,7 @@ fn run_audit(cli: &Cli) -> Result<(), String> {
         eprintln!("warning: {}", e);
     }
 
-    let html = match response_to_text(&resp, &url.to_string()) {
-        Ok(text) => text,
-        Err(e) => {
-            eprintln!("warning: {}", e);
-            String::from_utf8_lossy(&resp.body).to_string()
-        }
-    };
+    let html = decode_response_body(&resp);
     // Drain any stale per-thread CSS counter from prior runs.
     let _ = cv_css::take_unknown_property_counts();
     let t_html = std::time::Instant::now();
@@ -5505,6 +5484,29 @@ fn response_to_text(resp: &cv_net::http1::Response, url: &str) -> Result<String,
     }
 }
 
+/// Decode an HTTP response body to text using the full HTML encoding-sniffing
+/// algorithm (WHATWG Encoding Standard "decode" + HTML §13.2.3.x): leading
+/// BOM → HTTP `Content-Type; charset` → `<meta charset>` prescan of the first
+/// 1024 bytes → default windows-1252. This is what Chrome/Blink does instead
+/// of force-decoding every body as UTF-8 (which mojibakes non-UTF-8 pages).
+///
+/// For genuinely UTF-8 content this is byte-identical to the old
+/// `from_utf8_lossy` path, so it is safe to drop in everywhere.
+fn decode_response_body(resp: &cv_net::http1::Response) -> String {
+    let ct = resp.header("content-type");
+    cv_unicode::decode_with_detection(&resp.body, ct)
+}
+
+/// Decode a non-HTML text subresource (CSS, classic script, XHR/fetch text).
+/// Honors a BOM and an explicit HTTP `charset` but defaults to UTF-8 (per CSS
+/// Syntax §3.2 and HTML "fetch a classic script"), NOT windows-1252 — those
+/// resource types specify a UTF-8 fallback. Byte-identical to `from_utf8_lossy`
+/// for UTF-8 content.
+fn decode_text_subresource(resp: &cv_net::http1::Response) -> String {
+    let ct = resp.header("content-type");
+    cv_unicode::decode_text_default_utf8(&resp.body, ct)
+}
+
 /// Resolve, fetch, and parse external stylesheets discovered via
 /// `<link rel="stylesheet">`. Failures are silent — a broken or
 /// unreachable sheet should not abort the page render. Returns parsed
@@ -5588,13 +5590,10 @@ fn fetch_external_stylesheets(doc: &cv_html::Document, base_url: &str) -> Vec<cv
                         eprintln!("stylesheet: {}", e);
                         return None;
                     }
-                    match response_to_text(&resp, &abs.to_string()) {
-                        Ok(text) => Some((abs.to_string(), text)),
-                        Err(e) => {
-                            eprintln!("stylesheet: {}", e);
-                            None
-                        }
-                    }
+                    // CSS encoding (CSS Syntax §3.2): BOM → HTTP charset →
+                    // default UTF-8 (NOT windows-1252, which is the HTML
+                    // document default). Honors a labeled legacy stylesheet.
+                    Some((abs.to_string(), decode_text_subresource(&resp)))
                 })
             })
             .collect();
@@ -6171,13 +6170,8 @@ fn fetch_url_text(url: &Url) -> Option<String> {
                     eprintln!("fetch_url_text: {}", e);
                     return None;
                 }
-                match response_to_text(&resp, &url.to_string()) {
-                    Ok(text) => Some(text),
-                    Err(e) => {
-                        eprintln!("fetch_url_text: {}", e);
-                        None
-                    }
-                }
+                // Generic text subresource: BOM → HTTP charset → UTF-8.
+                Some(decode_text_subresource(&resp))
             }
             Err(e) => {
                 eprintln!("fetch_url_text: failed to fetch {}: {}", url.to_string(), e);
@@ -6277,7 +6271,9 @@ fn fetch_script_source(src: &str, base_url: Option<&Url>) -> Option<String> {
             // `script` destination (Fetch: "fetch a classic script").
             let meta = subresource_meta(cv_net::Destination::Script, cv_net::FetchMode::NoCors);
             match client.fetch_with_meta(&resolved, Some(meta)) {
-                Ok(resp) => Some(String::from_utf8_lossy(&resp.body).into_owned()),
+                // Classic script encoding (HTML "fetch a classic script"):
+                // BOM → HTTP charset → default UTF-8.
+                Ok(resp) => Some(decode_text_subresource(&resp)),
                 Err(e) => {
                     eprintln!(
                         "fetch_script_source: failed to fetch {}: {}",
@@ -7548,7 +7544,7 @@ fn build_browser_session(target: &str) -> Result<BrowserParts, String> {
                 let resolved_url = normalize_navigation_target(&current_url, &submit.url)?;
                 let parsed = Url::parse(&resolved_url).ok()?;
                 let resp = fetch_form_submit(&parsed, &submit).ok()?;
-                let html = String::from_utf8_lossy(&resp.body).into_owned();
+                let html = decode_response_body(&resp);
                 match build_runtime_and_first_paint(&html, &resolved_url, &cfg_for_nav, "") {
                     Ok((runtime, doc, sheets, paint)) => {
                         let mut session_guard = session_for_nav.borrow_mut();
@@ -8191,7 +8187,7 @@ fn build_browser_session(target: &str) -> Result<BrowserParts, String> {
                     let resolved_url = normalize_navigation_target(&current_url, &submit.url)?;
                     let parsed = Url::parse(&resolved_url).ok()?;
                     let resp = fetch_form_submit(&parsed, &submit).ok()?;
-                    let html = String::from_utf8_lossy(&resp.body).into_owned();
+                    let html = decode_response_body(&resp);
                     match build_runtime_and_first_paint(&html, &resolved_url, &cfg_for_nav, "") {
                         Ok((runtime, doc, sheets, paint)) => {
                             let mut session_guard = session_for_nav.borrow_mut();
@@ -8310,7 +8306,7 @@ fn build_browser_session(target: &str) -> Result<BrowserParts, String> {
                     return None;
                 }
             };
-            let html = String::from_utf8_lossy(&resp.body).into_owned();
+            let html = decode_response_body(&resp);
             let (runtime, doc, sheets, paint) =
                 build_runtime_and_first_paint(&html, &prev, &cfg_for_nav, "").ok()?;
             let mut session_guard = session_for_nav.borrow_mut();
@@ -8355,7 +8351,7 @@ fn build_browser_session(target: &str) -> Result<BrowserParts, String> {
                     return None;
                 }
             };
-            let html = String::from_utf8_lossy(&resp.body).into_owned();
+            let html = decode_response_body(&resp);
             let (runtime, doc, sheets, paint) =
                 build_runtime_and_first_paint(&html, &next, &cfg_for_nav, "").ok()?;
             let mut session_guard = session_for_nav.borrow_mut();

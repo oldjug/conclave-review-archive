@@ -19,8 +19,14 @@
 #![allow(unused)]
 
 pub mod bidi;
+pub mod encoding;
+mod encoding_tables;
 pub mod linebreak;
 
 pub use bidi::{
     BidiClass, ResolvedLevel, bidi_class, paragraph_level, reorder_line, resolve_paragraph,
+};
+pub use encoding::{
+    Encoding, charset_from_content_type, decode, decode_text_default_utf8, decode_with_detection,
+    detect_encoding, detect_encoding_default_utf8, encoding_for_label, prescan_meta, sniff_bom,
 };
