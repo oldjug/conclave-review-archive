@@ -23,9 +23,17 @@
 //!     after `</table>` and to seed the fragment algorithm (§13.4).
 //!   - The whole **table family** of insertion modes (.9–.15) which drives
 //!     implicit `<tbody>`/`<tr>` and foster parenting.
-//!   - Minimal but real **foreign content** (§13.2.6.5): a namespace flag is
-//!     kept on the stack so the SVG/MathML subtree stays intact and
-//!     self-closing is honored there.
+//!   - Full **foreign content** (§13.2.6.5): a namespace flag is kept on the
+//!     stack so the SVG/MathML subtree stays intact and self-closing is honored
+//!     there; the **adjust-SVG-tag-names** / **adjust-SVG-attributes** /
+//!     **adjust-MathML-attributes** / **adjust-foreign-attributes** tables
+//!     case-fix names (`viewbox`→`viewBox`, `lineargradient`→`linearGradient`,
+//!     `definitionurl`→`definitionURL`, the `xlink:`/`xml:`/`xmlns` namespaced
+//!     set); the **breakout** start-tag set (`b`,`big`,…, plus `font` only with
+//!     `color`/`face`/`size`) pops back to HTML; and the **`MathML` text** /
+//!     **HTML integration points** (`mi`/`mo`/`mn`/`ms`/`mtext`,
+//!     `annotation-xml` with an HTML encoding, SVG `foreignObject`/`desc`/
+//!     `title`) switch the dispatcher back to HTML parsing.
 //!
 //! ## Output adapter
 //!
@@ -58,11 +66,6 @@
 //!     pages don't use framesets.
 //!   - **quirks-mode** (`force_quirks`): carried but not branched on for tree
 //!     shape (it affects CSS, handled elsewhere).
-//!   - **foreign attribute case-fixup table** (`viewBox`/`xlink:*`): the
-//!     namespace flag + intact subtree + self-closing IS built; the full
-//!     attribute case-fixup table is SHOULD-have. Until then attribute names
-//!     pass through as-tokenized, which the existing SVG walker tolerates via
-//!     `eq_ignore_ascii_case`.
 //!
 //! Each deferral has a test asserting its fallback shape, so the gaps are
 //! honest, not hidden stubs.
@@ -356,23 +359,96 @@ impl TreeBuilder {
     // Foreign-content detection (§13.2.6 "tree construction dispatcher")
     // -----------------------------------------------------------------------
 
-    /// Should the token be processed by the foreign-content rules? True when
-    /// the adjusted current node is in the SVG/MathML namespace (with the
-    /// usual HTML-integration-point exceptions simplified to the common case).
+    /// Should the token be processed by the foreign-content rules? This is the
+    /// "tree construction dispatcher" (§13.2.6): the token is processed by the
+    /// CURRENT insertion mode (i.e. HTML rules) when the stack is empty, when
+    /// the adjusted current node is an HTML element, when it is a `MathML` text
+    /// integration point and the token is a (non-`mglyph`/`malignmark`) start tag
+    /// or a character, when it is `annotation-xml` and the token is an `svg`
+    /// start tag, when it is an HTML integration point and the token is a start
+    /// tag or character, or for EOF. Otherwise the foreign-content rules apply.
     fn in_foreign_content(&self, tok: &Token) -> bool {
         if self.open.is_empty() {
             return false;
         }
         let acn = self.adjusted_current_node();
-        if self.arena.ns(acn) == Namespace::Html {
+        let ns = self.arena.ns(acn);
+        if ns == Namespace::Html {
             return false;
         }
-        // Simplified integration points: an HTML start tag/character inside
-        // SVG <foreignObject>/<desc>/<title> or a MathML text integration
-        // point would switch back to HTML. The SVG corpus this engine targets
-        // (inline icons) does not use those, so we keep the subtree foreign.
-        // EOF is always handled by HTML rules.
-        !matches!(tok, Token::Eof)
+        let name = self.arena.name(acn);
+        match tok {
+            Token::Eof => false,
+            // §13.2.6: a character token is HTML-processed at a MathML text
+            // integration point OR an HTML integration point.
+            Token::Text(_) => {
+                !(self.is_mathml_text_integration_point(ns, name)
+                    || self.is_html_integration_point(acn, ns, name))
+            }
+            Token::StartTag { name: tn, .. } => {
+                // MathML text integration point: HTML rules unless the start
+                // tag is `mglyph` or `malignmark`.
+                if self.is_mathml_text_integration_point(ns, name)
+                    && tn != "mglyph"
+                    && tn != "malignmark"
+                {
+                    return false;
+                }
+                // annotation-xml + `<svg>` start tag → HTML rules.
+                if ns == Namespace::MathMl && name == "annotation-xml" && tn == "svg" {
+                    return false;
+                }
+                // HTML integration point: any start tag → HTML rules.
+                if self.is_html_integration_point(acn, ns, name) {
+                    return false;
+                }
+                true
+            }
+            // Comments and end tags: stay in foreign content (the foreign
+            // end-tag handler walks back into HTML when it leaves the subtree).
+            _ => true,
+        }
+    }
+
+    /// §13.2.6.5: a `MathML` text integration point is a `MathML` `mi`/`mo`/`mn`/
+    /// `ms`/`mtext` element.
+    fn is_mathml_text_integration_point(&self, ns: Namespace, name: &str) -> bool {
+        ns == Namespace::MathMl && matches!(name, "mi" | "mo" | "mn" | "ms" | "mtext")
+    }
+
+    /// §13.2.6.5: an HTML integration point is an SVG `foreignObject`/`desc`/
+    /// `title`, or a `MathML` `annotation-xml` whose `encoding` attribute is
+    /// (ASCII-case-insensitively) `text/html` or `application/xhtml+xml`.
+    /// Tag names here are the case-fixed forms stored on the element, so the
+    /// SVG names are matched ASCII-case-insensitively for robustness.
+    fn is_html_integration_point(&self, id: NodeId, ns: Namespace, name: &str) -> bool {
+        match ns {
+            Namespace::Svg => {
+                name.eq_ignore_ascii_case("foreignObject")
+                    || name.eq_ignore_ascii_case("desc")
+                    || name.eq_ignore_ascii_case("title")
+            }
+            Namespace::MathMl => {
+                name == "annotation-xml"
+                    && self.element_attr(id, "encoding").is_some_and(|enc| {
+                        enc.eq_ignore_ascii_case("text/html")
+                            || enc.eq_ignore_ascii_case("application/xhtml+xml")
+                    })
+            }
+            Namespace::Html => false,
+        }
+    }
+
+    /// Look up an element's attribute value by (already-lowercased) name.
+    fn element_attr(&self, id: NodeId, name: &str) -> Option<&str> {
+        if let NodeKind::Element { attrs, .. } = &self.arena.nodes[id].kind {
+            attrs
+                .iter()
+                .find(|a| a.name == name)
+                .map(|a| a.value.as_str())
+        } else {
+            None
+        }
     }
 
     fn adjusted_current_node(&self) -> NodeId {
@@ -572,13 +648,13 @@ impl TreeBuilder {
                 return true;
             }
             // Foreign scope markers (§13.2.4.2): SVG foreignObject/desc/title,
-            // MathML mi/mo/mn/ms/mtext/annotation-xml.
+            // MathML mi/mo/mn/ms/mtext/annotation-xml. SVG names are stored in
+            // their case-fixed form (`foreignObject`), so match case-insensitively.
             let is_marker = if foreign {
-                matches!(
-                    n,
-                    "foreignobject" | "desc" | "title" | "mi" | "mo" | "mn" | "ms"
-                        | "mtext" | "annotation-xml"
-                )
+                n.eq_ignore_ascii_case("foreignobject")
+                    || n.eq_ignore_ascii_case("desc")
+                    || n.eq_ignore_ascii_case("title")
+                    || matches!(n, "mi" | "mo" | "mn" | "ms" | "mtext" | "annotation-xml")
             } else {
                 scope_markers.contains(&n)
             };
@@ -1507,7 +1583,13 @@ impl TreeBuilder {
                 self.insert_html_element(name, attrs);
             }
             "math" => {
+                // §13.2.6.4.7: adjust MathML attributes, then the namespaced
+                // foreign-attribute table, before inserting in the MathML NS.
                 self.reconstruct_active_formatting();
+                let attrs = adjust_foreign_attrs(
+                    adjust_ns_attrs(attrs, Namespace::MathMl),
+                    Namespace::MathMl,
+                );
                 let id = self.create_element(name, attrs, Namespace::MathMl);
                 let place = self.appropriate_place();
                 self.insert_at(place, id);
@@ -1518,7 +1600,12 @@ impl TreeBuilder {
                 }
             }
             "svg" => {
+                // §13.2.6.4.7: adjust SVG attributes, then the namespaced
+                // foreign-attribute table, before inserting in the SVG NS.
+                // (The `svg` tag name itself is not in the SVG tag-name table.)
                 self.reconstruct_active_formatting();
+                let attrs =
+                    adjust_foreign_attrs(adjust_ns_attrs(attrs, Namespace::Svg), Namespace::Svg);
                 let id = self.create_element(name, attrs, Namespace::Svg);
                 let place = self.appropriate_place();
                 self.insert_at(place, id);
@@ -2443,12 +2530,22 @@ impl TreeBuilder {
             Token::Comment(c) => self.insert_comment(c),
             Token::Doctype { .. } => {}
             Token::StartTag { name, attrs, self_closing } => {
-                // If the start tag is an HTML-breakout tag, pop foreign nodes
-                // until we are back in HTML, then reprocess via HTML rules.
-                if is_foreign_breakout(&name) {
-                    while !self.open.is_empty()
-                        && self.arena.ns(self.current()) != Namespace::Html
-                    {
+                // §13.2.6.5: certain HTML start tags break out of foreign
+                // content. `font` only breaks out if it carries a color/face/
+                // size attribute; all others in the set break out unconditionally.
+                // On breakout, pop foreign nodes until the current node is an
+                // HTML element / a MathML text integration point / an HTML
+                // integration point, then reprocess via the current HTML mode.
+                if causes_foreign_breakout(&name, &attrs) {
+                    while !self.open.is_empty() {
+                        let cur = self.current();
+                        let cns = self.arena.ns(cur);
+                        if cns == Namespace::Html
+                            || self.is_mathml_text_integration_point(cns, self.arena.name(cur))
+                            || self.is_html_integration_point(cur, cns, self.arena.name(cur))
+                        {
+                            break;
+                        }
                         self.pop();
                     }
                     self.dispatch(Token::StartTag {
@@ -2459,7 +2556,17 @@ impl TreeBuilder {
                     return;
                 }
                 let ns = self.arena.ns(self.adjusted_current_node());
-                let id = self.create_element(&name, attrs, ns);
+                // §13.2.6.5: adjust the element's tag name (SVG only) and its
+                // attributes (SVG / MathML name fix-ups + the namespaced
+                // foreign-attribute table) so SVG/MathML elements carry the
+                // canonical camelCase names the rasterizer/DOM expect.
+                let fixed_name = if ns == Namespace::Svg {
+                    adjust_svg_tag_name(&name)
+                } else {
+                    name
+                };
+                let fixed_attrs = adjust_foreign_attrs(adjust_ns_attrs(attrs, ns), ns);
+                let id = self.create_element(&fixed_name, fixed_attrs, ns);
                 let place = self.appropriate_place();
                 self.insert_at(place, id);
                 // §13.2.6.5: a self-closing foreign element is childless and is
@@ -2712,14 +2819,17 @@ fn is_foster_target(name: &str) -> bool {
 /// "any other end tag" to know where to stop. HTML namespace list.
 fn is_special(name: &str, ns: Namespace) -> bool {
     if ns != Namespace::Html {
-        // The spec lists a few MathML/SVG specials; for our minimal foreign
-        // handling, foreignObject/desc/title and MathML text containers act
-        // as specials. Keep it conservative.
-        return matches!(
-            name,
-            "foreignobject" | "desc" | "title" | "mi" | "mo" | "mn" | "ms" | "mtext"
-                | "annotation-xml"
-        );
+        // §13.2.4.2 lists these foreign elements as "special": SVG
+        // foreignObject/desc/title and the MathML text containers + mglyph/
+        // malignmark. SVG names are stored case-fixed (`foreignObject`), so
+        // match them case-insensitively.
+        return name.eq_ignore_ascii_case("foreignobject")
+            || name.eq_ignore_ascii_case("desc")
+            || name.eq_ignore_ascii_case("title")
+            || matches!(
+                name,
+                "mi" | "mo" | "mn" | "ms" | "mtext" | "annotation-xml" | "mglyph" | "malignmark"
+            );
     }
     matches!(
         name,
@@ -2740,8 +2850,21 @@ fn is_special(name: &str, ns: Namespace) -> bool {
 }
 
 /// Foreign-content breakout start tags (§13.2.6.5): these force a return to
-/// HTML content even from inside SVG/MathML.
-fn is_foreign_breakout(name: &str) -> bool {
+/// HTML content even from inside SVG/MathML. `font` is special: it only breaks
+/// out when it carries a `color`, `face`, or `size` attribute (otherwise it is
+/// an ordinary unknown foreign element). Source: WHATWG HTML §13.2.6.5 "any
+/// other start tag" prose ("If the current node is an HTML integration point …
+/// Otherwise … If the token is a start tag whose tag name is one of: 'b', …,
+/// or is 'font' and the token has an attribute named 'color', 'face', or
+/// 'size' …").
+fn causes_foreign_breakout(name: &str, attrs: &[Attribute]) -> bool {
+    if name == "font" {
+        return attrs.iter().any(|a| {
+            a.name.eq_ignore_ascii_case("color")
+                || a.name.eq_ignore_ascii_case("face")
+                || a.name.eq_ignore_ascii_case("size")
+        });
+    }
     matches!(
         name,
         "b" | "big" | "blockquote" | "body" | "br" | "center" | "code" | "dd"
@@ -2751,6 +2874,221 @@ fn is_foreign_breakout(name: &str) -> bool {
             | "small" | "span" | "strong" | "strike" | "sub" | "sup" | "table"
             | "tt" | "u" | "ul" | "var"
     )
+}
+
+// ===========================================================================
+// Foreign-content adjustment tables (§13.2.6.5)
+// ===========================================================================
+//
+// The tokenizer ASCII-lowercases every tag name and attribute name
+// (tokenizer.rs lines 161/350/391), so SVG/MathML foreign content arrives as
+// e.g. `viewbox`/`lineargradient`. The spec restores the canonical mixed-case
+// names via four tables, applied when an element is inserted in foreign
+// content. These tables are reproduced verbatim from WHATWG HTML §13.2.6.5
+// ("adjust SVG tag names", "adjust SVG attributes", "adjust MathML
+// attributes", "adjust foreign attributes"), cross-checked against the
+// reference parser parse5 (common/foreign-content.ts).
+
+/// "Adjust SVG tag names" (§13.2.6.5): lowercase tag → canonical camelCase.
+fn adjust_svg_tag_name(name: &str) -> String {
+    let fixed = match name {
+        "altglyph" => "altGlyph",
+        "altglyphdef" => "altGlyphDef",
+        "altglyphitem" => "altGlyphItem",
+        "animatecolor" => "animateColor",
+        "animatemotion" => "animateMotion",
+        "animatetransform" => "animateTransform",
+        "clippath" => "clipPath",
+        "feblend" => "feBlend",
+        "fecolormatrix" => "feColorMatrix",
+        "fecomponenttransfer" => "feComponentTransfer",
+        "fecomposite" => "feComposite",
+        "feconvolvematrix" => "feConvolveMatrix",
+        "fediffuselighting" => "feDiffuseLighting",
+        "fedisplacementmap" => "feDisplacementMap",
+        "fedistantlight" => "feDistantLight",
+        "fedropshadow" => "feDropShadow",
+        "feflood" => "feFlood",
+        "fefunca" => "feFuncA",
+        "fefuncb" => "feFuncB",
+        "fefuncg" => "feFuncG",
+        "fefuncr" => "feFuncR",
+        "fegaussianblur" => "feGaussianBlur",
+        "feimage" => "feImage",
+        "femerge" => "feMerge",
+        "femergenode" => "feMergeNode",
+        "femorphology" => "feMorphology",
+        "feoffset" => "feOffset",
+        "fepointlight" => "fePointLight",
+        "fespecularlighting" => "feSpecularLighting",
+        "fespotlight" => "feSpotLight",
+        "fetile" => "feTile",
+        "feturbulence" => "feTurbulence",
+        "foreignobject" => "foreignObject",
+        "glyphref" => "glyphRef",
+        "lineargradient" => "linearGradient",
+        "radialgradient" => "radialGradient",
+        "textpath" => "textPath",
+        _ => return name.to_string(),
+    };
+    fixed.to_string()
+}
+
+/// One canonical SVG attribute name for a lowercased input, or `None` if the
+/// name is not in the "adjust SVG attributes" table (§13.2.6.5).
+fn adjust_svg_attr_name(name: &str) -> Option<&'static str> {
+    let fixed = match name {
+        "attributename" => "attributeName",
+        "attributetype" => "attributeType",
+        "basefrequency" => "baseFrequency",
+        "baseprofile" => "baseProfile",
+        "calcmode" => "calcMode",
+        "clippathunits" => "clipPathUnits",
+        "diffuseconstant" => "diffuseConstant",
+        "edgemode" => "edgeMode",
+        "filterunits" => "filterUnits",
+        "glyphref" => "glyphRef",
+        "gradienttransform" => "gradientTransform",
+        "gradientunits" => "gradientUnits",
+        "kernelmatrix" => "kernelMatrix",
+        "kernelunitlength" => "kernelUnitLength",
+        "keypoints" => "keyPoints",
+        "keysplines" => "keySplines",
+        "keytimes" => "keyTimes",
+        "lengthadjust" => "lengthAdjust",
+        "limitingconeangle" => "limitingConeAngle",
+        "markerheight" => "markerHeight",
+        "markerunits" => "markerUnits",
+        "markerwidth" => "markerWidth",
+        "maskcontentunits" => "maskContentUnits",
+        "maskunits" => "maskUnits",
+        "numoctaves" => "numOctaves",
+        "pathlength" => "pathLength",
+        "patterncontentunits" => "patternContentUnits",
+        "patterntransform" => "patternTransform",
+        "patternunits" => "patternUnits",
+        "pointsatx" => "pointsAtX",
+        "pointsaty" => "pointsAtY",
+        "pointsatz" => "pointsAtZ",
+        "preservealpha" => "preserveAlpha",
+        "preserveaspectratio" => "preserveAspectRatio",
+        "primitiveunits" => "primitiveUnits",
+        "refx" => "refX",
+        "refy" => "refY",
+        "repeatcount" => "repeatCount",
+        "repeatdur" => "repeatDur",
+        "requiredextensions" => "requiredExtensions",
+        "requiredfeatures" => "requiredFeatures",
+        "specularconstant" => "specularConstant",
+        "specularexponent" => "specularExponent",
+        "spreadmethod" => "spreadMethod",
+        "startoffset" => "startOffset",
+        "stddeviation" => "stdDeviation",
+        "stitchtiles" => "stitchTiles",
+        "surfacescale" => "surfaceScale",
+        "systemlanguage" => "systemLanguage",
+        "tablevalues" => "tableValues",
+        "targetx" => "targetX",
+        "targety" => "targetY",
+        "textlength" => "textLength",
+        "viewbox" => "viewBox",
+        "viewtarget" => "viewTarget",
+        "xchannelselector" => "xChannelSelector",
+        "ychannelselector" => "yChannelSelector",
+        "zoomandpan" => "zoomAndPan",
+        _ => return None,
+    };
+    Some(fixed)
+}
+
+/// Apply the SVG-or-MathML local-name case-fixup tables to every attribute in
+/// the list (§13.2.6.5 "adjust SVG attributes" / "adjust `MathML` attributes").
+/// This runs BEFORE [`adjust_foreign_attrs`], matching the spec's ordering;
+/// the two tables are disjoint (these are unprefixed names; that one handles
+/// the `xlink:`/`xml:`/`xmlns` prefixed names).
+fn adjust_ns_attrs(mut attrs: Vec<Attribute>, ns: Namespace) -> Vec<Attribute> {
+    match ns {
+        Namespace::Svg => {
+            for a in &mut attrs {
+                if is_foreign_attr(&a.name) {
+                    continue; // handled by "adjust foreign attributes"
+                }
+                if let Some(fixed) = adjust_svg_attr_name(&a.name) {
+                    a.name = fixed.to_string();
+                }
+            }
+        }
+        Namespace::MathMl => {
+            for a in &mut attrs {
+                // "Adjust MathML attributes" (§13.2.6.5): the sole entry.
+                if a.name == "definitionurl" {
+                    a.name = "definitionURL".to_string();
+                }
+            }
+        }
+        Namespace::Html => {}
+    }
+    attrs
+}
+
+/// "Adjust foreign attributes" (§13.2.6.5): the namespaced-attribute table.
+///
+/// The spec splits eleven attribute names (`xlink:href`, `xml:lang`, `xmlns`,
+/// …) into a (prefix, local-name, namespace-URI) triple. Our DOM keys
+/// attributes by a single flat string, so the *observable* output of this
+/// algorithm in our model is the qualified name string. Because the tokenizer
+/// ASCII-lowercases attribute names and preserves the `:` (tokenizer.rs:391),
+/// and every canonical qualified name in the table is already all-lowercase
+/// (`xlink:href`, `xml:lang`, `xmlns:xlink`), the tokenized name ALREADY equals
+/// the spec's qualified name — so no string rewrite is required for the names
+/// IN the table. What this function provides is the real, observable guarantee
+/// the spec demands: a namespaced foreign attribute is recognized as such and
+/// is NOT routed through the SVG local-name table (it is excluded from the
+/// fix-up that would otherwise wrongly camelCase its local part). It returns
+/// `true` if the name is a recognized namespaced foreign attribute. The
+/// (prefix, local, namespace-URI) triple is recorded for a future
+/// namespace-aware DOM via [`foreign_attr_namespace`]. Source: WHATWG HTML
+/// §13.2.6.5 "adjust foreign attributes".
+fn adjust_foreign_attrs(attrs: Vec<Attribute>, _ns: Namespace) -> Vec<Attribute> {
+    // No-op rewrite by construction (see doc comment): the tokenized,
+    // lowercased, colon-bearing name is already the canonical qualified name
+    // for every entry in the table. Kept as the explicit spec step so the
+    // pipeline mirrors §13.2.6.5 and so [`is_foreign_attr`] can gate the
+    // local-name fix-up.
+    attrs
+}
+
+/// Whether `name` (already lowercased) is one of the eleven namespaced foreign
+/// attributes from the §13.2.6.5 "adjust foreign attributes" table. Used to
+/// keep such names OUT of the SVG local-name camelCase table.
+fn is_foreign_attr(name: &str) -> bool {
+    matches!(
+        name,
+        "xlink:actuate"
+            | "xlink:arcrole"
+            | "xlink:href"
+            | "xlink:role"
+            | "xlink:show"
+            | "xlink:title"
+            | "xlink:type"
+            | "xml:lang"
+            | "xml:space"
+            | "xmlns"
+            | "xmlns:xlink"
+    )
+}
+
+/// The namespace URI a namespaced foreign attribute lives in (§13.2.6.5).
+/// Recorded for a future namespace-aware DOM; not yet stored on the flat node.
+#[allow(dead_code)]
+fn foreign_attr_namespace(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "xlink:actuate" | "xlink:arcrole" | "xlink:href" | "xlink:role" | "xlink:show"
+        | "xlink:title" | "xlink:type" => "http://www.w3.org/1999/xlink",
+        "xml:lang" | "xml:space" => "http://www.w3.org/XML/1998/namespace",
+        "xmlns" | "xmlns:xlink" => "http://www.w3.org/2000/xmlns/",
+        _ => return None,
+    })
 }
 
 fn is_all_whitespace(s: &str) -> bool {
@@ -3602,5 +3940,228 @@ mod tests {
             })
             .collect();
         assert_eq!(comments, vec!["c1", "c2"], "comments preserved\n{}", serialize(&doc));
+    }
+
+    // ===================================================================
+    // FOREIGN-CONTENT ADJUSTMENTS (§13.2.6.5) — the new tables.
+    // ===================================================================
+
+    /// Read an attribute value (by exact, case-sensitive name) off a node.
+    fn attr<'a>(n: &'a Node, name: &str) -> Option<&'a str> {
+        if let NodeKind::Element { attrs, .. } = &n.kind {
+            attrs.iter().find(|a| a.name == name).map(|a| a.value.as_str())
+        } else {
+            None
+        }
+    }
+
+    fn attr_names(n: &Node) -> Vec<String> {
+        if let NodeKind::Element { attrs, .. } = &n.kind {
+            attrs.iter().map(|a| a.name.clone()).collect()
+        } else {
+            Vec::new()
+        }
+    }
+
+    #[test]
+    fn svg_attr_and_tag_case_fixup() {
+        // The headline case from the task brief: the tokenizer lowercases
+        // `viewbox` and `lineargradient`; "adjust SVG attributes" / "adjust SVG
+        // tag names" (§13.2.6.5) restore `viewBox` / `linearGradient`.
+        let doc = build("<svg viewbox='0 0 10 10'><lineargradient/></svg>");
+        let svg = find(body(&doc), "svg").expect("svg element");
+        assert_eq!(
+            attr(svg, "viewBox"),
+            Some("0 0 10 10"),
+            "viewbox -> viewBox (cased)\nattrs: {:?}\n{}",
+            attr_names(svg),
+            serialize(&doc)
+        );
+        // The lowercase spelling must NOT survive.
+        assert_eq!(attr(svg, "viewbox"), None, "lowercase viewbox removed");
+        // The child element is the cased `linearGradient`, not `lineargradient`.
+        assert_eq!(
+            count(svg, "linearGradient"),
+            1,
+            "lineargradient -> linearGradient (cased child)\n{}",
+            serialize(&doc)
+        );
+        assert_eq!(count(svg, "lineargradient"), 0, "lowercase tag removed");
+    }
+
+    #[test]
+    fn svg_many_attr_and_tag_fixups() {
+        // A representative spread across the SVG tag-name and attribute tables.
+        let doc = build(
+            "<svg preserveaspectratio='xMidYMid'>\
+               <clippath clippathunits='userSpaceOnUse'></clippath>\
+               <radialgradient gradientunits='objectBoundingBox' \
+                  gradienttransform='rotate(45)'></radialgradient>\
+               <fegaussianblur stddeviation='2'></fegaussianblur>\
+               <textpath startoffset='10'></textpath>\
+             </svg>",
+        );
+        let svg = find(body(&doc), "svg").expect("svg");
+        assert_eq!(attr(svg, "preserveAspectRatio"), Some("xMidYMid"));
+
+        let clip = find(svg, "clipPath").expect("clipPath (cased)");
+        assert_eq!(attr(clip, "clipPathUnits"), Some("userSpaceOnUse"));
+
+        let radial = find(svg, "radialGradient").expect("radialGradient (cased)");
+        assert_eq!(attr(radial, "gradientUnits"), Some("objectBoundingBox"));
+        assert_eq!(attr(radial, "gradientTransform"), Some("rotate(45)"));
+
+        let blur = find(svg, "feGaussianBlur").expect("feGaussianBlur (cased)");
+        assert_eq!(attr(blur, "stdDeviation"), Some("2"));
+
+        let tp = find(svg, "textPath").expect("textPath (cased)");
+        assert_eq!(attr(tp, "startOffset"), Some("10"));
+    }
+
+    #[test]
+    fn svg_self_closing_rect_closes() {
+        // §13.2.6.5: a self-closing foreign element is childless and is NOT
+        // pushed, so the following sibling is a sibling, not a descendant.
+        let doc = build("<svg><rect/><circle></circle></svg>");
+        let svg = find(body(&doc), "svg").expect("svg");
+        let rect = find(svg, "rect").expect("rect");
+        assert!(rect.children.is_empty(), "self-closing <rect/> is childless");
+        // rect and circle are direct siblings under svg.
+        assert_eq!(direct_children(svg, "rect").len(), 1);
+        assert_eq!(direct_children(svg, "circle").len(), 1);
+        // circle must NOT be nested inside rect.
+        assert!(find(rect, "circle").is_none(), "rect did not capture circle");
+    }
+
+    #[test]
+    fn svg_foreignobject_reenters_html() {
+        // HTML integration point (§13.2.6.5): inside SVG <foreignObject> the
+        // dispatcher switches back to HTML, so <div> is a real HTML div (in the
+        // HTML namespace) parsed by the in-body rules.
+        let doc = build("<svg><foreignObject><div>x</div></foreignObject></svg>");
+        let svg = find(body(&doc), "svg").expect("svg");
+        // The tag name itself is case-fixed by adjust-SVG-tag-names.
+        let fo = find(svg, "foreignObject").expect("foreignObject (cased)");
+        let div = find(fo, "div").expect("html div inside foreignObject");
+        assert_eq!(text_of(div), "x", "div re-entered HTML\n{}", serialize(&doc));
+    }
+
+    #[test]
+    fn svg_b_start_tag_breaks_out() {
+        // §13.2.6.5 breakout set: a <b> start tag inside SVG pops back to HTML.
+        // The <b> is an HTML element placed after the svg subtree, NOT a child
+        // of svg.
+        let doc = build("<svg><b>bold</b></svg>");
+        let bd = body(&doc);
+        let svg = find(bd, "svg").expect("svg");
+        assert!(
+            find(svg, "b").is_none(),
+            "<b> must NOT be inside svg (broke out)\n{}",
+            serialize(&doc)
+        );
+        let b = find(bd, "b").expect("b broke out to body");
+        assert_eq!(text_of(b), "bold");
+    }
+
+    #[test]
+    fn svg_font_breaks_out_only_with_presentational_attrs() {
+        // §13.2.6.5: `font` breaks out ONLY when it has color/face/size.
+        // Plain <font> stays inside SVG as an ordinary foreign element.
+        let doc = build("<svg><font>x</font></svg>");
+        let svg = find(body(&doc), "svg").expect("svg");
+        assert!(
+            find(svg, "font").is_some(),
+            "plain <font> stays in svg\n{}",
+            serialize(&doc)
+        );
+
+        // <font color=...> breaks out.
+        let doc2 = build("<svg><font color=red>y</font></svg>");
+        let bd2 = body(&doc2);
+        let svg2 = find(bd2, "svg").expect("svg");
+        assert!(
+            find(svg2, "font").is_none(),
+            "<font color> must break out of svg\n{}",
+            serialize(&doc2)
+        );
+        assert!(find(bd2, "font").is_some(), "font broke out to body");
+    }
+
+    #[test]
+    fn mathml_definitionurl_fixup() {
+        // "Adjust MathML attributes" (§13.2.6.5): definitionurl -> definitionURL.
+        let doc = build("<math definitionurl='http://x'></math>");
+        let math = find(body(&doc), "math").expect("math");
+        assert_eq!(
+            attr(math, "definitionURL"),
+            Some("http://x"),
+            "definitionurl -> definitionURL\nattrs: {:?}",
+            attr_names(math)
+        );
+        assert_eq!(attr(math, "definitionurl"), None, "lowercase removed");
+    }
+
+    #[test]
+    fn mathml_text_integration_point_reenters_html() {
+        // MathML text integration point (§13.2.6.5): inside <mtext> an HTML
+        // start tag is parsed by HTML rules, so <b> is HTML (and would obey the
+        // adoption agency / be a real HTML element), not a foreign child.
+        let doc = build("<math><mtext><b>x</b></mtext></math>");
+        let math = find(body(&doc), "math").expect("math");
+        let mtext = find(math, "mtext").expect("mtext");
+        let b = find(mtext, "b").expect("html b inside mtext");
+        assert_eq!(text_of(b), "x", "b re-entered HTML inside mtext\n{}", serialize(&doc));
+    }
+
+    #[test]
+    fn svg_xlink_attr_survives_qualified() {
+        // "Adjust foreign attributes" (§13.2.6.5): the xlink:/xml:/xmlns set is
+        // recognized and its qualified, lowercase canonical name survives
+        // verbatim (and is NOT camelCased by the SVG local-name table).
+        let doc = build("<svg><use xlink:href='#id' xml:lang='en'></use></svg>");
+        let svg = find(body(&doc), "svg").expect("svg");
+        let use_el = find(svg, "use").expect("use");
+        assert_eq!(attr(use_el, "xlink:href"), Some("#id"), "xlink:href qualified name preserved");
+        assert_eq!(attr(use_el, "xml:lang"), Some("en"), "xml:lang qualified name preserved");
+        // Sanity: the helper agrees these are namespaced foreign attrs.
+        assert!(is_foreign_attr("xlink:href") && is_foreign_attr("xml:lang"));
+        assert_eq!(
+            foreign_attr_namespace("xlink:href"),
+            Some("http://www.w3.org/1999/xlink")
+        );
+    }
+
+    #[test]
+    fn svg_end_tag_matches_cased_element() {
+        // The tokenizer lowercases the end tag (`</lineargradient>`); the
+        // foreign end-tag handler must still close the cased `linearGradient`.
+        let doc = build("<svg><linearGradient></linearGradient><rect/></svg>");
+        let svg = find(body(&doc), "svg").expect("svg");
+        let lg = find(svg, "linearGradient").expect("linearGradient");
+        // linearGradient closed correctly → rect is a SIBLING under svg, not a
+        // child of linearGradient.
+        assert!(find(lg, "rect").is_none(), "linearGradient closed; rect is its sibling");
+        assert_eq!(direct_children(svg, "rect").len(), 1);
+        assert_eq!(direct_children(svg, "linearGradient").len(), 1);
+    }
+
+    #[test]
+    fn svg_unit_tables_self_consistent() {
+        // Direct unit coverage of the adjustment tables (every value is the
+        // exact spec camelCase form; idempotent on already-cased / unknown).
+        assert_eq!(adjust_svg_tag_name("foreignobject"), "foreignObject");
+        assert_eq!(adjust_svg_tag_name("animatetransform"), "animateTransform");
+        assert_eq!(adjust_svg_tag_name("circle"), "circle"); // not in table
+        assert_eq!(adjust_svg_attr_name("attributename"), Some("attributeName"));
+        assert_eq!(adjust_svg_attr_name("numoctaves"), Some("numOctaves"));
+        assert_eq!(adjust_svg_attr_name("zoomandpan"), Some("zoomAndPan"));
+        assert_eq!(adjust_svg_attr_name("href"), None); // not in table
+        // Idempotence: a token already lowercased that isn't in the table is
+        // returned unchanged; the SVG attr fix-up never touches foreign attrs.
+        let fixed = adjust_ns_attrs(
+            vec![Attribute { name: "xlink:href".into(), value: "#x".into() }],
+            Namespace::Svg,
+        );
+        assert_eq!(fixed[0].name, "xlink:href", "foreign attr untouched by SVG table");
     }
 }
