@@ -7234,7 +7234,10 @@ fn clause_queries_block_axis(condition: &str) -> bool {
 /// return true so their bodies stay reachable.
 fn at_rule_condition_matches(at: &crate::parser::AtRule, vw: f32, vh: f32) -> bool {
     match at.name.as_str() {
-        "media" => media_query_matches(&at.prelude, vw, vh),
+        // `@media` rules (incl. `(min-resolution: 2dppx)` HiDPI breakpoints)
+        // are selected against the live device pixel ratio so @2x asset rules
+        // apply on a HiDPI monitor — matching Chrome's cascade.
+        "media" => media_query_matches(&at.prelude, vw, vh, current_device_pixel_ratio()),
         "supports" => supports_matches(&at.prelude),
         "container" | "layer" | "scope" | "starting-style" => true,
         // Unknown grouping at-rule: fold optimistically (matches the build
@@ -7334,16 +7337,31 @@ fn supports_matches(prelude: &[CssToken]) -> bool {
 /// the other features implemented in `media_atom_matches`. Unknown / not-yet
 /// implemented features do not match (conservative, never false-positive).
 pub fn media_query_matches_str(query: &str, vw: f32, vh: f32) -> bool {
+    // Back-compat entry point: evaluate at the device-pixel-ratio currently
+    // published by the host (`set_device_pixel_ratio`). Defaults to 1.0 when the
+    // host has not reported a DPI (headless / pre-window), so callers that never
+    // touch HiDPI behave exactly as before.
+    media_query_matches_str_dpr(query, vw, vh, current_device_pixel_ratio())
+}
+
+/// DPR-aware variant of [`media_query_matches_str`]. `dpr` is the device pixel
+/// ratio (physical px ÷ CSS px) the `resolution` / `-webkit-device-pixel-ratio`
+/// features evaluate against. CSS Values 4 §6.1: `1dppx == 96dpi`, and the
+/// `resolution` feature compares the device's pixel density to the queried one;
+/// `dppx`/`x` is exactly `devicePixelRatio` (CSSOM View — `window.devicePixelRatio`
+/// is the `dppx` value of `(resolution)`). See
+/// <https://developer.mozilla.org/en-US/docs/Web/CSS/@media/resolution>.
+pub fn media_query_matches_str_dpr(query: &str, vw: f32, vh: f32, dpr: f32) -> bool {
     let trimmed = query.trim();
     if trimmed.is_empty() {
         // CSSOM View: matchMedia("") → media query list equivalent to `all`.
         return true;
     }
     let toks = crate::tokenizer::tokenize(trimmed);
-    media_query_matches(&toks, vw, vh)
+    media_query_matches(&toks, vw, vh, dpr)
 }
 
-fn media_query_matches(prelude: &[CssToken], vw: f32, vh: f32) -> bool {
+fn media_query_matches(prelude: &[CssToken], vw: f32, vh: f32, dpr: f32) -> bool {
     // Split the prelude on top-level commas — a single query in the list
     // matching = the whole thing matches.
     let mut current: Vec<CssToken> = Vec::new();
@@ -7357,14 +7375,14 @@ fn media_query_matches(prelude: &[CssToken], vw: f32, vh: f32) -> bool {
     }
     groups.push(current);
     for g in groups {
-        if media_query_part_matches(&g, vw, vh) {
+        if media_query_part_matches(&g, vw, vh, dpr) {
             return true;
         }
     }
     false
 }
 
-fn media_query_part_matches(toks: &[CssToken], vw: f32, vh: f32) -> bool {
+fn media_query_part_matches(toks: &[CssToken], vw: f32, vh: f32, dpr: f32) -> bool {
     // Per CSS Media Queries Level 4: a leading `not` keyword negates the
     // ENTIRE media query (it's not just a type-atom modifier). Detect it
     // here and inversely return so `@media not (max-width: 600px)`
@@ -7387,7 +7405,7 @@ fn media_query_part_matches(toks: &[CssToken], vw: f32, vh: f32) -> bool {
     if leading_not {
         // Recurse on the remainder without the leading `not` to compute
         // the natural verdict, then invert.
-        return !media_query_part_matches(inner, vw, vh);
+        return !media_query_part_matches(inner, vw, vh, dpr);
     }
     let toks = inner;
     // Tokenise the query into "atoms" separated by `and` idents.
@@ -7439,14 +7457,14 @@ fn media_query_part_matches(toks: &[CssToken], vw: f32, vh: f32) -> bool {
         return true; // bare `@media { ... }` — applies always
     }
     for atom in atoms {
-        if !media_atom_matches(&atom, vw, vh) {
+        if !media_atom_matches(&atom, vw, vh, dpr) {
             return false;
         }
     }
     true
 }
 
-fn media_atom_matches(toks: &[CssToken], vw: f32, vh: f32) -> bool {
+fn media_atom_matches(toks: &[CssToken], vw: f32, vh: f32, dpr: f32) -> bool {
     // Type atom (`screen`, `print`, `all`, optionally prefixed `only`/
     // `not`).
     if toks
@@ -7560,11 +7578,115 @@ fn media_atom_matches(toks: &[CssToken], vw: f32, vh: f32) -> bool {
         "update" => matches!(value_keyword.as_deref(), Some("fast") | None),
         "color" | "color-index" | "monochrome" => true,
         "grid" => matches!(value_keyword.as_deref(), Some("0") | None),
+        // `resolution` / `min-resolution` / `max-resolution` (Media Queries 4
+        // §6.7) — the device pixel density. `1dppx == 96dpi == 1in` worth of CSS
+        // px, and `dppx`/`x` is exactly `window.devicePixelRatio`. We evaluate
+        // against the live DPR threaded in from the window's monitor DPI. Per
+        // spec, a bare `(resolution)` (no value) matches when resolution != 0
+        // (always true for a screen). The range prefixes use >= / <= on dppx.
+        // <https://developer.mozilla.org/en-US/docs/Web/CSS/@media/resolution>
+        "resolution" => resolution_dppx(&value_toks)
+            .map(|q| (dpr - q).abs() < 1e-3)
+            .unwrap_or(true),
+        "min-resolution" => resolution_dppx(&value_toks)
+            .map(|q| dpr >= q - 1e-3)
+            .unwrap_or(true),
+        "max-resolution" => resolution_dppx(&value_toks)
+            .map(|q| dpr <= q + 1e-3)
+            .unwrap_or(true),
+        // Legacy WebKit alias: the value is the dppx ratio directly (bare
+        // number, no unit). `-webkit-min-device-pixel-ratio` etc. mirror the
+        // `min-/max-resolution` range semantics. Still emitted by Retina-era
+        // sites and asset-pipeline @2x stylesheets.
+        // <https://developer.mozilla.org/en-US/docs/Web/CSS/@media/-webkit-device-pixel-ratio>
+        "-webkit-device-pixel-ratio" => webkit_dpr_value(&value_toks)
+            .map(|q| (dpr - q).abs() < 1e-3)
+            .unwrap_or(true),
+        "-webkit-min-device-pixel-ratio" => webkit_dpr_value(&value_toks)
+            .map(|q| dpr >= q - 1e-3)
+            .unwrap_or(true),
+        "-webkit-max-device-pixel-ratio" => webkit_dpr_value(&value_toks)
+            .map(|q| dpr <= q + 1e-3)
+            .unwrap_or(true),
         // Unknown / unimplemented features: do NOT match. Defaulting
         // to true was the original bug — it applied every speculative
         // media query (including dark-mode and forced-colors) by accident.
         _ => false,
     }
+}
+
+/// Parse a `<resolution>` value (Media Queries 4 §6.7 / CSS Values 4 §6.1) into
+/// dots-per-px (dppx). Accepts `dppx`, `x` (a synonym), `dpi`, and `dpcm`, with
+/// the canonical conversions:
+///   * `1dppx`  → 1.0          (the base unit; == `devicePixelRatio`)
+///   * `1x`     → 1.0          (synonym for `dppx`)
+///   * `96dpi`  → 1.0          (96 CSS px per inch)
+///   * `1dpcm`  → 2.54/96.0    (2.54 cm per inch ⇒ 1in == 96px == 2.54dpcm)
+/// Returns `None` when the value is missing or carries an unrecognised unit.
+fn resolution_dppx(value_toks: &[CssToken]) -> Option<f32> {
+    for t in value_toks {
+        match t {
+            CssToken::Dimension { value, unit } => {
+                let u = unit.to_ascii_lowercase();
+                let dppx = match u.as_str() {
+                    "dppx" | "x" => *value,
+                    "dpi" => *value / 96.0,
+                    // 1in == 2.54cm == 96px ⇒ dppx = dpcm * 2.54 / 96.
+                    "dpcm" => *value * 2.54 / 96.0,
+                    _ => return None,
+                };
+                return Some(dppx as f32);
+            }
+            // A bare `0` is the only unit-less <resolution> the grammar allows
+            // (it is dimensionless because every unit times 0 is 0).
+            CssToken::Number(n) if *n == 0.0 => return Some(0.0),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Parse the value of a legacy `-webkit-*-device-pixel-ratio` feature: a bare
+/// number (the dppx ratio), e.g. `(-webkit-min-device-pixel-ratio: 2)`. Some
+/// authors also write it with a `dppx`/`x` unit; accept those too.
+fn webkit_dpr_value(value_toks: &[CssToken]) -> Option<f32> {
+    for t in value_toks {
+        match t {
+            CssToken::Number(n) => return Some(*n as f32),
+            CssToken::Dimension { value, unit } => {
+                let u = unit.to_ascii_lowercase();
+                if u == "dppx" || u == "x" {
+                    return Some(*value as f32);
+                }
+                return None;
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Process-global device pixel ratio (physical px ÷ CSS px) published by the
+/// window layer when it learns the monitor DPI (HiDPI). Stored as the bit
+/// pattern of an `f32` in an `AtomicU32` so it can be read lock-free from the
+/// media-query evaluator on any thread. Defaults to `1.0` (the 96-dpi baseline)
+/// so headless / pre-window evaluation behaves exactly as before HiDPI landed.
+static DEVICE_PIXEL_RATIO_BITS: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0x3F80_0000); // 1.0_f32 bits
+
+/// Publish the live device pixel ratio. Called by the host (cv_browser) whenever
+/// the window's monitor DPI is read (window open + `WM_DPICHANGED`). A value
+/// `<= 0` or non-finite is ignored so a bad probe can never zero out the ratio.
+pub fn set_device_pixel_ratio(dpr: f32) {
+    if dpr.is_finite() && dpr > 0.0 {
+        DEVICE_PIXEL_RATIO_BITS.store(dpr.to_bits(), std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Read the live device pixel ratio published by [`set_device_pixel_ratio`].
+/// Defaults to `1.0` until the window reports a DPI.
+pub fn current_device_pixel_ratio() -> f32 {
+    f32::from_bits(DEVICE_PIXEL_RATIO_BITS.load(std::sync::atomic::Ordering::Relaxed))
 }
 
 /// Find a `linear-gradient(...)` call in `toks` and pull out the first
@@ -9514,6 +9636,152 @@ mod tests {
             1024.0,
             768.0
         ));
+    }
+
+    /// The `resolution` / `min-resolution` / `max-resolution` media features
+    /// evaluate against the live device pixel ratio (HiDPI). `1dppx == 96dpi`
+    /// and `dppx`/`x` == `devicePixelRatio` (Media Queries 4 §6.7 / CSS Values
+    /// 4 §6.1). A `(min-resolution: 2dppx)` query MUST match at dpr=2 and NOT at
+    /// dpr=1 — the core HiDPI assertion.
+    #[test]
+    fn match_media_resolution_dppx() {
+        // min-resolution: 2dppx — the @2x breakpoint.
+        assert!(
+            !media_query_matches_str_dpr("(min-resolution: 2dppx)", 1024.0, 768.0, 1.0),
+            "(min-resolution: 2dppx) must NOT match at dpr=1"
+        );
+        assert!(
+            media_query_matches_str_dpr("(min-resolution: 2dppx)", 1024.0, 768.0, 2.0),
+            "(min-resolution: 2dppx) MUST match at dpr=2"
+        );
+        // `2x` is a synonym for `2dppx`.
+        assert!(media_query_matches_str_dpr(
+            "(min-resolution: 2x)",
+            1024.0,
+            768.0,
+            2.0
+        ));
+        // dpi conversion: 96dpi == 1dppx, 192dpi == 2dppx.
+        assert!(media_query_matches_str_dpr(
+            "(min-resolution: 192dpi)",
+            1024.0,
+            768.0,
+            2.0
+        ));
+        assert!(!media_query_matches_str_dpr(
+            "(min-resolution: 192dpi)",
+            1024.0,
+            768.0,
+            1.5
+        ));
+        // max-resolution is the inverse range.
+        assert!(media_query_matches_str_dpr(
+            "(max-resolution: 1dppx)",
+            1024.0,
+            768.0,
+            1.0
+        ));
+        assert!(!media_query_matches_str_dpr(
+            "(max-resolution: 1dppx)",
+            1024.0,
+            768.0,
+            1.5
+        ));
+        // Exact `(resolution: 1.5dppx)` at the common 144-dpi (=1.5) scale.
+        assert!(media_query_matches_str_dpr(
+            "(resolution: 1.5dppx)",
+            1024.0,
+            768.0,
+            1.5
+        ));
+        assert!(!media_query_matches_str_dpr(
+            "(resolution: 1.5dppx)",
+            1024.0,
+            768.0,
+            2.0
+        ));
+    }
+
+    /// dpcm conversion: 1in == 2.54cm == 96px, so 96/2.54 ≈ 37.8 dpcm == 1dppx.
+    #[test]
+    fn match_media_resolution_dpcm() {
+        // 2dppx == 192dpi == 192/2.54 ≈ 75.59 dpcm.
+        assert!(media_query_matches_str_dpr(
+            "(min-resolution: 75dpcm)",
+            1024.0,
+            768.0,
+            2.0
+        ));
+        assert!(!media_query_matches_str_dpr(
+            "(min-resolution: 76dpcm)",
+            1024.0,
+            768.0,
+            2.0
+        ));
+    }
+
+    /// Legacy `-webkit-(min-|max-)device-pixel-ratio` — the value is the dppx
+    /// ratio directly (bare number). Retina-era sites still ship these.
+    #[test]
+    fn match_media_webkit_device_pixel_ratio() {
+        assert!(
+            !media_query_matches_str_dpr(
+                "(-webkit-min-device-pixel-ratio: 2)",
+                1024.0,
+                768.0,
+                1.0
+            ),
+            "-webkit-min-device-pixel-ratio: 2 must NOT match at dpr=1"
+        );
+        assert!(
+            media_query_matches_str_dpr(
+                "(-webkit-min-device-pixel-ratio: 2)",
+                1024.0,
+                768.0,
+                2.0
+            ),
+            "-webkit-min-device-pixel-ratio: 2 MUST match at dpr=2"
+        );
+        assert!(media_query_matches_str_dpr(
+            "(-webkit-max-device-pixel-ratio: 1)",
+            1024.0,
+            768.0,
+            1.0
+        ));
+        assert!(media_query_matches_str_dpr(
+            "(-webkit-device-pixel-ratio: 1.5)",
+            1024.0,
+            768.0,
+            1.5
+        ));
+    }
+
+    /// The process-global DPR cell defaults to 1.0 and is updated by
+    /// `set_device_pixel_ratio`; the no-dpr `media_query_matches_str` entry
+    /// point evaluates against it. A bad probe (0 / NaN) is ignored.
+    #[test]
+    fn device_pixel_ratio_global_drives_default_entrypoint() {
+        // Save + restore so this test does not perturb others (process-global).
+        let saved = current_device_pixel_ratio();
+        set_device_pixel_ratio(1.0);
+        assert!(!media_query_matches_str(
+            "(min-resolution: 2dppx)",
+            1024.0,
+            768.0
+        ));
+        set_device_pixel_ratio(2.0);
+        assert!((current_device_pixel_ratio() - 2.0).abs() < 1e-6);
+        assert!(media_query_matches_str(
+            "(min-resolution: 2dppx)",
+            1024.0,
+            768.0
+        ));
+        // A garbage value must NOT zero out the ratio.
+        set_device_pixel_ratio(0.0);
+        assert!((current_device_pixel_ratio() - 2.0).abs() < 1e-6);
+        set_device_pixel_ratio(f32::NAN);
+        assert!((current_device_pixel_ratio() - 2.0).abs() < 1e-6);
+        set_device_pixel_ratio(saved.max(0.000_1));
     }
 
     #[test]

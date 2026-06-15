@@ -53,6 +53,99 @@ pub fn offmain_compositor_enabled() -> bool {
     })
 }
 
+// ===========================================================================
+// HiDPI / devicePixelRatio (CV_HIDPI, default OFF).
+//
+// When ON, the process is made per-monitor-DPI-aware
+// (SetProcessDpiAwarenessContext(PER_MONITOR_AWARE_V2)) and the window reports
+// its monitor's real DPI scale (GetDpiForWindow / 96) so devicePixelRatio,
+// matchMedia (resolution), and the backing-store size track the monitor.
+//
+// Default OFF because flipping process DPI awareness changes how Windows sizes
+// the client area on a HiDPI monitor: with the legacy (unaware) default the OS
+// bitmap-stretches our 96-dpi output and GetClientRect returns *virtualized*
+// (downscaled) pixels, so the existing 1x layout/raster path is byte-stable.
+// Becoming DPI-aware makes GetClientRect return *physical* pixels — larger on a
+// HiDPI monitor — which the layout viewport must then divide by the scale. We
+// gate the whole behaviour so the default 1x path is never perturbed on the CI
+// boxes / 100%-scale machines the golden goldens were captured on. Opt in with
+// CV_HIDPI=1. (On a 100% monitor, dpr == 1.0 and the path is a no-op anyway.)
+// ===========================================================================
+
+/// Resolved-once gate for HiDPI. **Default OFF.** Opt in with `CV_HIDPI=1`.
+static HIDPI_ENABLED: OnceLock<bool> = OnceLock::new();
+
+/// Whether HiDPI / per-monitor devicePixelRatio is enabled. Default OFF.
+pub fn hidpi_enabled() -> bool {
+    *HIDPI_ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("CV_HIDPI").as_deref(),
+            Ok("1") | Ok("on") | Ok("true") | Ok("yes")
+        )
+    })
+}
+
+/// The live device pixel ratio (physical px ÷ CSS px) for the window's current
+/// monitor, stored as the bit pattern of an `f32` in an `AtomicU32` so any
+/// thread (and the cv_browser host that reads it for `window.devicePixelRatio`)
+/// can read it lock-free. Defaults to the 96-dpi baseline `1.0`. Updated on
+/// window creation and on `WM_DPICHANGED`.
+static DEVICE_PIXEL_RATIO_BITS: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0x3F80_0000); // 1.0_f32 bits
+
+/// Read the live device pixel ratio. `1.0` until the window publishes a DPI (or
+/// when CV_HIDPI is off). The cv_browser host polls this for
+/// `window.devicePixelRatio` and for the `matchMedia` resolution features.
+pub fn device_pixel_ratio() -> f32 {
+    f32::from_bits(DEVICE_PIXEL_RATIO_BITS.load(Ordering::Relaxed))
+}
+
+/// Publish a new device pixel ratio (called from window creation + WM_DPICHANGED
+/// with `dpi/96`). Ignores non-finite / non-positive values so a bad probe can
+/// never zero the ratio. No-op when CV_HIDPI is off (the ratio stays 1.0).
+fn set_device_pixel_ratio(dpr: f32) {
+    if hidpi_enabled() && dpr.is_finite() && dpr > 0.0 {
+        DEVICE_PIXEL_RATIO_BITS.store(dpr.to_bits(), Ordering::Relaxed);
+    }
+}
+
+/// Make the process per-monitor-DPI-aware (PER_MONITOR_AWARE_V2, falling back to
+/// PER_MONITOR_AWARE on pre-1703 builds). MUST be called before any window is
+/// created. No-op when CV_HIDPI is off so the default 1x path keeps the legacy
+/// (DPI-unaware ⇒ OS-virtualized) behaviour the goldens were captured under.
+/// Idempotent: a second `SetProcessDpiAwarenessContext` after the first simply
+/// fails (ERROR_ACCESS_DENIED) and is harmless.
+pub fn make_process_dpi_aware() {
+    if !hidpi_enabled() {
+        return;
+    }
+    unsafe {
+        // Prefer V2; fall back to V1 if the OS rejects the V2 context.
+        if sys::SetProcessDpiAwarenessContext(sys::DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) == 0 {
+            let _ =
+                sys::SetProcessDpiAwarenessContext(sys::DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE);
+        }
+    }
+}
+
+/// Read the device pixel ratio for the monitor `hwnd` is on: `GetDpiForWindow /
+/// 96`. Returns `1.0` when CV_HIDPI is off, when `hwnd` is null, or when the OS
+/// reports a `0` DPI (it shouldn't, but never divide by zero). Also republishes
+/// the global ratio so subsequent `device_pixel_ratio()` reads are current.
+pub fn read_window_dpi_scale(hwnd: sys::HWND) -> f32 {
+    if !hidpi_enabled() || hwnd.is_null() {
+        return 1.0;
+    }
+    let dpi = unsafe { sys::GetDpiForWindow(hwnd) };
+    let dpr = if dpi == 0 {
+        1.0
+    } else {
+        dpi as f32 / sys::USER_DEFAULT_SCREEN_DPI as f32
+    };
+    set_device_pixel_ratio(dpr);
+    dpr
+}
+
 /// Win32 message posted by the compositor thread (via thread-safe
 /// `PostMessageW`) to wake the UI pump after a `CompositorStatus` is available
 /// on the status channel. The UI drains the status and updates
@@ -3424,6 +3517,12 @@ impl Window {
         let class_name: Vec<u16> = "ConclaveWindow\0".encode_utf16().collect();
         let title_w: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
 
+        // Make the process per-monitor-DPI-aware BEFORE the window exists, so
+        // GetClientRect / GetDpiForWindow report physical pixels + the real
+        // monitor DPI. No-op unless CV_HIDPI=1 (the default 1x path is
+        // unchanged). Must precede CreateWindowExW.
+        make_process_dpi_aware();
+
         unsafe {
             let h_instance = sys::GetModuleHandleW(core::ptr::null());
 
@@ -3632,6 +3731,12 @@ impl Window {
             // drives the resize handler to re-sync JS geometry + fire `resize`.
             sys::ShowWindow(hwnd, sys::SW_SHOWMAXIMIZED);
             sys::UpdateWindow(hwnd);
+
+            // Publish the window's real monitor DPI scale so window.devicePixelRatio
+            // + matchMedia (resolution) read the true value. No-op (1.0) unless
+            // CV_HIDPI=1. WM_DPICHANGED keeps it current as the window moves
+            // between monitors.
+            let _ = read_window_dpi_scale(hwnd);
 
             // Drive the JS event loop / RAF at ~60Hz once a ticker is
             // installed. WM_TIMER posts into the same message pump, so
@@ -5577,6 +5682,71 @@ unsafe extern "system" fn wnd_proc(
                 clamp_scroll(&mut guard, hwnd);
                 publish_scroll(&guard, hwnd);
             }
+            0
+        }
+        sys::WM_DPICHANGED => {
+            // The window moved to a monitor with a different DPI (or the user
+            // changed the scale). Per
+            // <https://learn.microsoft.com/en-us/windows/win32/hidpi/wm-dpichanged>:
+            //   * wParam LOWORD = the new DPI (X == Y for a window).
+            //   * lParam = a RECT* with the OS-suggested new window position+size.
+            // We MUST resize to that suggested rect for the window to remain a
+            // consistent physical size across the monitor boundary; failing to
+            // do so leaves the window the wrong size. Then republish the DPR so
+            // window.devicePixelRatio + matchMedia(resolution) update live, and
+            // reflow at the new client geometry.
+            if !hidpi_enabled() {
+                // Not DPI-aware ⇒ this message is never delivered; defensively
+                // defer to the default proc.
+                return unsafe { sys::DefWindowProcW(hwnd, msg, wparam, lparam) };
+            }
+            let new_dpi = (wparam & 0xFFFF) as u32;
+            let dpr = if new_dpi == 0 {
+                read_window_dpi_scale(hwnd)
+            } else {
+                let d = new_dpi as f32 / sys::USER_DEFAULT_SCREEN_DPI as f32;
+                set_device_pixel_ratio(d);
+                d
+            };
+            let _ = dpr;
+            // Move + size the window to the OS-suggested rect (lParam → RECT).
+            if lparam != 0 {
+                let r = unsafe { &*(lparam as *const sys::RECT) };
+                unsafe {
+                    sys::MoveWindow(
+                        hwnd,
+                        r.left,
+                        r.top,
+                        r.right - r.left,
+                        r.bottom - r.top,
+                        1,
+                    );
+                }
+            }
+            // Reflow at the new client geometry (the layout viewport in CSS px
+            // is physical-client-px ÷ dpr, computed by the host's resize
+            // handler from the dimensions we feed it). The MoveWindow above
+            // typically posts a WM_SIZE that does this; trigger the handler
+            // directly too so a same-size DPI flip (rare) still reflows.
+            let state_ptr = OWNER_PTR.load(Ordering::SeqCst);
+            if !state_ptr.is_null() {
+                if let Ok(mut guard) = unsafe { (*state_ptr).try_borrow_mut() } {
+                    let mut client = sys::RECT::default();
+                    unsafe { sys::GetClientRect(hwnd, &raw mut client) };
+                    let client_w = (client.right - client.left).max(1) as u32;
+                    let chrome_h = guard.paint.chrome_h as i32;
+                    let viewport_h =
+                        ((client.bottom - client.top) - chrome_h).max(1) as u32;
+                    if guard.to_page.is_none() {
+                        if let Some(resize) = guard.resize_handler.as_mut() {
+                            if let Some(paint) = resize(client_w, viewport_h) {
+                                apply_new_paint(&mut guard, hwnd, paint);
+                            }
+                        }
+                    }
+                }
+            }
+            unsafe { sys::InvalidateRect(hwnd, core::ptr::null(), 0) };
             0
         }
         sys::WM_DESTROY => {

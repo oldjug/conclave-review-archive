@@ -82,6 +82,30 @@ pub const WM_SETCURSOR: u32 = 0x0020;
 /// We use it to pop a stuck pressed-in nav button back out without
 /// triggering its navigation. `lParam` is the HWND gaining capture.
 pub const WM_CAPTURECHANGED: u32 = 0x0215;
+/// `WM_DPICHANGED` — posted to a per-monitor-DPI-aware top-level window when
+/// the DPI changes (the window moved to a monitor with a different scale, or
+/// the user changed the scale). `wParam` LOWORD = the new DPI (e.g. 144 = 150%);
+/// `lParam` points to the OS-suggested new window RECT. We read the new DPI,
+/// republish `devicePixelRatio`, resize to the suggested rect, and repaint.
+/// <https://learn.microsoft.com/en-us/windows/win32/hidpi/wm-dpichanged>
+pub const WM_DPICHANGED: u32 = 0x02E0;
+
+/// Opaque DPI-awareness pseudo-handle passed to `SetProcessDpiAwarenessContext`.
+/// These are NOT real handles — they are small negative sentinel values the OS
+/// recognises. Modelled as a pointer-sized C handle.
+pub type DPI_AWARENESS_CONTEXT = *mut c_void;
+/// `DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2` (-4). The recommended mode:
+/// the window receives `WM_DPICHANGED` and reports the per-monitor DPI, child
+/// windows / non-client area / dialogs scale correctly. (Windows 10 1703+.)
+/// <https://learn.microsoft.com/en-us/windows/win32/hidpi/dpi-awareness-context>
+pub const DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2: DPI_AWARENESS_CONTEXT = -4_isize as _;
+/// `DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE` (-3). Fallback for OS builds
+/// predating the V2 context (pre-1703); still per-monitor but without the V2
+/// improvements (no automatic non-client scaling).
+pub const DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE: DPI_AWARENESS_CONTEXT = -3_isize as _;
+/// Baseline DPI for the 100% scale factor. `devicePixelRatio = dpi / 96`.
+pub const USER_DEFAULT_SCREEN_DPI: u32 = 96;
+
 pub const HTCLIENT: u32 = 1;
 pub const IDC_HAND: LPCWSTR = 32649 as LPCWSTR;
 pub const WM_TIMER: u32 = 0x0113;
@@ -208,6 +232,16 @@ pub struct SCROLLINFO {
 #[link(name = "user32")]
 unsafe extern "system" {
     pub fn GetModuleHandleW(module: LPCWSTR) -> HINSTANCE;
+    /// Per-monitor DPI of the monitor `hwnd` is on (Windows 10 1607+). Returns
+    /// 96 for the 100% baseline, 120 for 125%, 144 for 150%, 192 for 200%, etc.
+    /// Requires the process to be per-monitor-DPI-aware; otherwise returns the
+    /// system DPI. <https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getdpiforwindow>
+    pub fn GetDpiForWindow(hwnd: HWND) -> u32;
+    /// Set the process default DPI awareness to one of the
+    /// `DPI_AWARENESS_CONTEXT_*` pseudo-handles (Windows 10 1703+). Must be
+    /// called before any window is created. Returns nonzero on success.
+    /// <https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setprocessdpiawarenesscontext>
+    pub fn SetProcessDpiAwarenessContext(value: DPI_AWARENESS_CONTEXT) -> i32;
     pub fn LoadCursorW(hInstance: HINSTANCE, lpCursorName: LPCWSTR) -> HCURSOR;
     pub fn SetCursor(hCursor: HCURSOR) -> HCURSOR;
     pub fn GetCursorPos(lpPoint: *mut POINT) -> i32;

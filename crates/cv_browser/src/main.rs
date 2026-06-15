@@ -163,6 +163,31 @@ pub(crate) fn layout_viewport_px() -> (f32, f32) {
     LAYOUT_VIEWPORT_PX.with(|c| c.get())
 }
 
+/// The live device pixel ratio (physical px ÷ CSS px) for the window's monitor.
+/// Read from the cv_ui window layer (which reads the real per-monitor DPI via
+/// `GetDpiForWindow`, gated by `CV_HIDPI`; default `1.0`). We also republish it
+/// into cv_css's process-global so the `@media (resolution)` cascade + the
+/// `matchMedia` resolution features evaluate against the same value the JS
+/// `window.devicePixelRatio` exposes — Chrome keeps them in lockstep.
+pub(crate) fn device_pixel_ratio() -> f32 {
+    let dpr = cv_ui::device_pixel_ratio();
+    cv_css::set_device_pixel_ratio(dpr);
+    dpr
+}
+
+/// Convert a PHYSICAL client size (the DPI-aware `GetClientRect` pixels) to the
+/// CSS-px layout viewport: `css = physical / dpr`. Chrome lays out in CSS px and
+/// rasters at physical px, so the layout viewport is always the backing-store
+/// size divided by the device pixel ratio. At `dpr == 1` this is the identity
+/// (default path, byte-stable). Clamped to >= 1 CSS px so a degenerate 0-size
+/// window never produces a 0 / NaN viewport.
+pub(crate) fn css_viewport_px(physical_w: u32, physical_h: u32, dpr: f32) -> (f32, f32) {
+    let d = if dpr.is_finite() && dpr > 0.0 { dpr } else { 1.0 };
+    let w = (physical_w.max(1) as f32 / d).max(1.0);
+    let h = (physical_h.max(1) as f32 / d).max(1.0);
+    (w, h)
+}
+
 /// Chrome and Firefox both blink the text caret on a ~530 ms cycle
 /// (on-for-530, off-for-530). Matching that cadence makes typing feel
 /// native instead of "weird browser".
@@ -9046,8 +9071,14 @@ fn build_browser_session(target: &str) -> Result<BrowserParts, String> {
     let viewport_for_resize = viewport.clone();
     let base_cfg_for_resize = base_cfg.clone_for_runtime();
     let resize: cv_ui::ResizeHandler = Box::new(move |viewport_w: u32, viewport_h: u32| {
-        let viewport_w = viewport_w.max(1) as f32;
-        let viewport_h = viewport_h.max(1) as f32;
+        // `viewport_w`/`viewport_h` are PHYSICAL client pixels (GetClientRect on
+        // the DPI-aware window). The layout viewport is CSS px = physical ÷ dpr
+        // so `@media (max-width:)` breakpoints + `window.innerWidth` stay in CSS
+        // px even on a HiDPI monitor (Chrome lays out in CSS px, rasters at
+        // physical px). dpr == 1.0 unless CV_HIDPI=1, so the default path divides
+        // by 1 and is byte-identical to before.
+        let dpr = device_pixel_ratio();
+        let (viewport_w, viewport_h) = css_viewport_px(viewport_w, viewport_h, dpr);
         *viewport_for_resize.borrow_mut() = (viewport_w, viewport_h);
         set_layout_viewport_px(viewport_w, viewport_h);
         let cfg_for_resize = cfg_with_viewport(&base_cfg_for_resize, viewport_w, viewport_h);
@@ -22473,6 +22504,19 @@ type MqlRegistry = std::rc::Rc<std::cell::RefCell<Vec<MqlEntry>>>;
 /// `change` fires only on a state transition, not on every evaluation.
 fn reevaluate_media_query_lists(interp: &mut cv_js::Interp, registry: &MqlRegistry) {
     let (vw, vh) = layout_viewport_px();
+    // The live device pixel ratio used by the `(resolution)` features. We read
+    // cv_css's published global (set at the resize boundary by
+    // `device_pixel_ratio()`, or by a `__cv_mql_reevaluate__(w,h,dpr)` test/
+    // WM_DPICHANGED simulation) rather than re-syncing from cv_ui here — so a
+    // just-applied simulated DPR is not clobbered. Refresh
+    // `window.devicePixelRatio` so a page that moved between monitors / changed
+    // scale sees the new value on its next read (CSSOM View: devicePixelRatio
+    // reflects the window's current monitor live).
+    let dpr = cv_css::current_device_pixel_ratio();
+    if let Some(cv_js::Value::Object(w)) = interp.get_global("window") {
+        w.borrow_mut()
+            .insert("devicePixelRatio".into(), cv_js::Value::Number(dpr as f64));
+    }
     // Snapshot the work to do without holding the registry borrow across the JS
     // callbacks (a listener may itself call matchMedia and push a new entry).
     struct Fire {
@@ -22501,7 +22545,7 @@ fn reevaluate_media_query_lists(interp: &mut cv_js::Interp, registry: &MqlRegist
             )
         });
         for e in reg.iter_mut() {
-            let now = cv_css::media_query_matches_str(&e.media, vw, vh);
+            let now = cv_css::media_query_matches_str_dpr(&e.media, vw, vh, dpr);
             if now != e.last_matches {
                 e.last_matches = now;
                 // Keep the object's backing field current for cached reads.
@@ -23856,7 +23900,10 @@ fn install_minimal_dom_with_url(interp: &cv_js::Interp, initial_title: String, p
     });
     // Host hook the resize path / tests call to re-evaluate every MediaQueryList
     // against the current viewport and dispatch `change` on the flipped ones.
-    // Optional arg pair (w, h) lets a caller set the layout viewport first.
+    // Optional arg pair (w, h) lets a caller set the layout viewport first; an
+    // optional 3rd arg (dpr) lets a caller simulate a device-pixel-ratio change
+    // (WM_DPICHANGED), so `(min-resolution:)` / `(resolution:)` queries can be
+    // exercised deterministically without a real HiDPI monitor.
     let mql_reg_for_reeval = mql_registry.clone();
     let mql_reevaluate = cv_js::native_fn_with_interp("__cv_mql_reevaluate__", move |interp, args| {
         if let (Some(w), Some(h)) = (args.first(), args.get(1)) {
@@ -23864,6 +23911,14 @@ fn install_minimal_dom_with_url(interp: &cv_js::Interp, initial_title: String, p
             let hf = h.to_number() as f32;
             if wf > 0.0 && hf > 0.0 {
                 set_layout_viewport_px(wf, hf);
+            }
+        }
+        if let Some(d) = args.get(2) {
+            let df = d.to_number() as f32;
+            if df.is_finite() && df > 0.0 {
+                // Simulated DPR (test / WM_DPICHANGED replay). Publish into cv_css
+                // so the resolution media features below evaluate against it.
+                cv_css::set_device_pixel_ratio(df);
             }
         }
         reevaluate_media_query_lists(interp, &mql_reg_for_reeval);
@@ -23971,7 +24026,16 @@ fn install_minimal_dom_with_url(interp: &cv_js::Interp, initial_title: String, p
     window_map.insert("innerHeight".into(), cv_js::Value::Number(vh_px as f64));
     window_map.insert("outerWidth".into(), cv_js::Value::Number(vw_px as f64));
     window_map.insert("outerHeight".into(), cv_js::Value::Number(vh_px as f64));
-    window_map.insert("devicePixelRatio".into(), cv_js::Value::Number(1.0));
+    // window.devicePixelRatio — the real per-monitor DPI scale (physical px ÷
+    // CSS px) for the window's current monitor (CSSOM View). Read live from the
+    // window layer (GetDpiForWindow/96, gated by CV_HIDPI; 1.0 on a 100% monitor
+    // or when HiDPI is off). Re-seeded on resize / WM_DPICHANGED via
+    // `reevaluate_media_query_lists`, which also keeps the `matchMedia`
+    // (resolution) verdicts in lockstep with this value (Chrome behaviour).
+    window_map.insert(
+        "devicePixelRatio".into(),
+        cv_js::Value::Number(device_pixel_ratio() as f64),
+    );
     window_map.insert("scrollX".into(), cv_js::Value::Number(0.0));
     window_map.insert("scrollY".into(), cv_js::Value::Number(0.0));
     window_map.insert("pageXOffset".into(), cv_js::Value::Number(0.0));
@@ -56470,6 +56534,92 @@ mod tests {
 
         // Restore the default test viewport so we don't perturb sibling tests
         // that share the thread-local.
+        set_layout_viewport_px(1280.0, 800.0);
+    }
+
+    /// HiDPI: the CSS-px layout viewport is the PHYSICAL backing-store size
+    /// divided by the device pixel ratio (Chrome lays out in CSS px, rasters at
+    /// physical px). At dpr=1 this is the identity (default path). At dpr=2 a
+    /// 2560×1600 physical client laps to a 1280×800 CSS viewport.
+    #[test]
+    fn css_viewport_is_physical_over_dpr() {
+        // dpr = 1.0 → identity (the default, byte-stable path).
+        assert_eq!(css_viewport_px(1280, 800, 1.0), (1280.0, 800.0));
+        // dpr = 2.0 → physical / 2 == CSS px.
+        assert_eq!(css_viewport_px(2560, 1600, 2.0), (1280.0, 800.0));
+        // dpr = 1.5 (144 dpi, the common Windows 150% scale).
+        assert_eq!(css_viewport_px(1920, 1200, 1.5), (1280.0, 800.0));
+        // Degenerate dpr (0 / NaN) must NOT divide by zero → falls back to 1.0.
+        assert_eq!(css_viewport_px(800, 600, 0.0), (800.0, 600.0));
+        assert_eq!(css_viewport_px(800, 600, f32::NAN), (800.0, 600.0));
+        // A 0-size client clamps to >= 1 CSS px.
+        assert_eq!(css_viewport_px(0, 0, 2.0), (1.0, 1.0));
+    }
+
+    /// `window.devicePixelRatio` reflects a SIMULATED high-DPI scale, not a
+    /// constant 1.0, and the `matchMedia` resolution features track it:
+    ///   - `(min-resolution: 2dppx)` matches at dpr=2 and NOT at dpr=1,
+    ///   - `window.devicePixelRatio` reads 1.5 at a simulated 144-dpi monitor.
+    /// Driven via the `__cv_mql_reevaluate__(w, h, dpr)` host hook (the same
+    /// path WM_DPICHANGED uses in the live window), so this is real wiring, not
+    /// a constructor-only check.
+    #[test]
+    fn device_pixel_ratio_reflects_simulated_high_dpi() {
+        // Restore cv_css global afterwards (process-global, shared across tests).
+        let saved = cv_css::current_device_pixel_ratio();
+
+        set_layout_viewport_px(1024.0, 768.0);
+        let doc = cv_html::parse("<!doctype html><html><body></body></html>");
+        let mut runtime = LiveInterp::new(&doc, "https://example.com/");
+
+        // At the default (dpr=1): devicePixelRatio==1, (min-resolution:2dppx) false.
+        let lo = runtime
+            .interp
+            .run_completion_value(
+                "window.__cv_mql_reevaluate__(1024, 768, 1); \
+                 window.devicePixelRatio + '|' + \
+                 window.matchMedia('(min-resolution: 2dppx)').matches + '|' + \
+                 window.matchMedia('(max-resolution: 1dppx)').matches",
+            )
+            .expect("dpr=1 eval");
+        assert_eq!(
+            lo.to_display_string(),
+            "1|false|true",
+            "at dpr=1: devicePixelRatio=1, (min-resolution:2dppx)=false, (max-resolution:1dppx)=true"
+        );
+
+        // Simulate a 192-dpi (=2.0) monitor: devicePixelRatio==2,
+        // (min-resolution:2dppx) MUST now be true.
+        let hi = runtime
+            .interp
+            .run_completion_value(
+                "window.__cv_mql_reevaluate__(1024, 768, 2); \
+                 window.devicePixelRatio + '|' + \
+                 window.matchMedia('(min-resolution: 2dppx)').matches + '|' + \
+                 window.matchMedia('(-webkit-min-device-pixel-ratio: 2)').matches",
+            )
+            .expect("dpr=2 eval");
+        assert_eq!(
+            hi.to_display_string(),
+            "2|true|true",
+            "at dpr=2: devicePixelRatio=2, (min-resolution:2dppx)=true, -webkit-min-device-pixel-ratio:2=true"
+        );
+
+        // Simulate a 144-dpi (=1.5) monitor (the common Windows 150% scale).
+        let mid = runtime
+            .interp
+            .run_completion_value(
+                "window.__cv_mql_reevaluate__(1024, 768, 1.5); window.devicePixelRatio",
+            )
+            .expect("dpr=1.5 eval");
+        assert_eq!(
+            mid.to_display_string(),
+            "1.5",
+            "devicePixelRatio must report a simulated 144-dpi as 1.5, not a constant 1.0"
+        );
+
+        // Restore.
+        cv_css::set_device_pixel_ratio(saved.max(0.000_1));
         set_layout_viewport_px(1280.0, 800.0);
     }
 
