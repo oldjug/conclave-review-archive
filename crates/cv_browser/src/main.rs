@@ -572,6 +572,84 @@ fn raf_clock_now() -> f64 {
     })
 }
 
+/// Steady ~60Hz animation frame clock, DECOUPLED from input arrival — the
+/// Blink/`cc::Scheduler` model.
+///
+/// PROBLEM (the divergence this fixes): the renderer loops drive both input
+/// commands AND the animation frame tick off a single `recv_timeout(16ms)`. A
+/// `recv_timeout` resets its countdown every time a command arrives, so a
+/// STEADY stream of input/nav commands means the 16ms timeout NEVER fires and
+/// the animation/rAF frame never advances on schedule — input starves
+/// `BeginFrame`. Chrome's `cc::Scheduler` instead drives `BeginFrame` off a
+/// vsync `BeginFrameSource` on a fixed ~16.6ms cadence that input is processed
+/// against but does NOT reset: the frame deadline is absolute, so a frame fires
+/// when the deadline passes regardless of how much input arrived
+/// (cc/scheduler/scheduler.cc `OnBeginFrameDerivedImpl` / the deadline is
+/// `BeginFrameArgs::frame_time + interval`, not "now + interval after the last
+/// input").
+///
+/// This tracks an ABSOLUTE `next_deadline` instant. Each loop turn waits for a
+/// command only up to the time remaining until that deadline; processing a
+/// command does NOT move the deadline, so the deadline still passes on schedule
+/// and the tick fires. The wait is a real blocking `recv_timeout`, so when
+/// nothing is animating and no command arrives the thread sleeps until the
+/// deadline exactly as the old bare `recv_timeout(16ms)` did — idle CPU and the
+/// ~60Hz idle wake cadence are unchanged (no busy-loop).
+///
+/// `advance()` is catch-up-bounded: it steps the deadline by one interval, but
+/// if a long command (e.g. a heavy navigation) already pushed `now` past the
+/// next deadline it resyncs to `now + interval` instead of replaying a burst of
+/// backlogged frames — Chrome likewise skips missed `BeginFrame`s rather than
+/// firing them back-to-back (`BeginFrameSource` coalesces; the compositor draws
+/// at most one frame per vsync).
+#[derive(Clone, Copy)]
+struct FrameClock {
+    interval: std::time::Duration,
+    next_deadline: std::time::Instant,
+}
+
+impl FrameClock {
+    fn new(now: std::time::Instant, interval: std::time::Duration) -> Self {
+        FrameClock {
+            interval,
+            next_deadline: now + interval,
+        }
+    }
+
+    /// How long the loop should block waiting for a command before the next
+    /// frame deadline. Saturates at zero so a passed deadline yields an
+    /// immediate (non-blocking) poll, never a negative duration.
+    fn wait_timeout(&self, now: std::time::Instant) -> std::time::Duration {
+        self.next_deadline.saturating_duration_since(now)
+    }
+
+    /// Whether a `BeginFrame` is due at `now` (the absolute deadline has passed).
+    fn due(&self, now: std::time::Instant) -> bool {
+        now >= self.next_deadline
+    }
+
+    /// Step the deadline forward after firing a frame. Bounded catch-up: one
+    /// interval normally, but resync to `now + interval` if we already slipped a
+    /// whole interval behind (skip missed frames, never burst).
+    fn advance(&mut self, now: std::time::Instant) {
+        self.next_deadline += self.interval;
+        if self.next_deadline <= now {
+            self.next_deadline = now + self.interval;
+        }
+    }
+}
+
+/// `CV_FRAME_CLOCK` opt-in for the decoupled animation frame clock. Default OFF:
+/// it materially changes the renderer loop's wait shape (absolute-deadline
+/// `recv_timeout` instead of a fixed 16ms one), so it ships behind a flag until
+/// soaked. ON unless the var is unset / 0 / false / off.
+fn frame_clock_enabled() -> bool {
+    matches!(
+        std::env::var("CV_FRAME_CLOCK").as_deref(),
+        Ok("1") | Ok("true") | Ok("on")
+    )
+}
+
 // Windows' default timer granularity is ~15.6ms, so a 16ms `recv_timeout` /
 // sleep actually waits ~31ms → a ~32fps ceiling for the renderer's frame clock
 // (animations capped well below 60Hz). `timeBeginPeriod(1)` raises the system
@@ -2848,13 +2926,26 @@ fn renderer_persistent_loop(args: &RendererArgs) -> Result<(), String> {
     };
 
     let rlog = std::env::var("CV_RENDERLOG").is_ok();
+    // Decoupled animation clock (CV_FRAME_CLOCK), same model as the in-process
+    // renderer loop: the BeginFrame tick fires on an absolute ~16ms deadline a
+    // steady command stream cannot reset (Blink/cc::Scheduler). OFF = legacy
+    // fixed-16ms wait + tick-on-bare-timeout (byte-identical scheduling).
+    let frame_clock_on = frame_clock_enabled();
+    let frame_interval = Duration::from_millis(16);
+    let mut clock = FrameClock::new(std::time::Instant::now(), frame_interval);
     loop {
-        match cmd_rx.recv_timeout(Duration::from_millis(16)) {
+        let wait = if frame_clock_on {
+            clock.wait_timeout(std::time::Instant::now())
+        } else {
+            frame_interval
+        };
+        let mut should_tick = false;
+        match cmd_rx.recv_timeout(wait) {
+            Ok(msg) if !msg.is_valid_for_direction(MsgDirection::BrowserToRenderer) => {
+                // Malformed direction — drop the message, keep serving. Fall
+                // through so the frame deadline below is still honored.
+            }
             Ok(msg) => {
-                if !msg.is_valid_for_direction(MsgDirection::BrowserToRenderer) {
-                    // Malformed direction — drop the message, keep serving.
-                    continue;
-                }
                 match msg {
                     Msg::Shutdown => break,
                     Msg::NavCmd { epoch: e, cmd } => {
@@ -2916,26 +3007,40 @@ fn renderer_persistent_loop(args: &RendererArgs) -> Result<(), String> {
                                     }
                                 }
                             }
-                            Err(_) => continue, // malformed host command → ignore
+                            Err(_) => {} // malformed host command → ignore (fall through)
                         }
                     }
                     // A reconnecting browser may re-handshake; tolerate it.
-                    Msg::Handshake { .. } => continue,
+                    Msg::Handshake { .. } => {}
                     // LayoutRequest is the first-paint smoke path, not used in
                     // the persistent protocol; ignore if it arrives.
-                    Msg::LayoutRequest { .. } => continue,
-                    _ => continue,
+                    Msg::LayoutRequest { .. } => {}
+                    _ => {}
                 }
             }
             Err(RecvTimeoutError::Disconnected) => break, // reader ended → browser gone
             Err(RecvTimeoutError::Timeout) => {
-                // Frame tick: pump the JS event loop + animations and re-commit
-                // if anything changed.
-                if let Some(paint) = (p.ticker)() {
-                    let tabs = p.session.borrow().summaries();
-                    if commit(epoch, paint, tabs).is_err() {
-                        break;
-                    }
+                // Legacy: a bare timeout IS the tick. With the frame clock on,
+                // the absolute-deadline check below fires it instead.
+                if !frame_clock_on {
+                    should_tick = true;
+                }
+            }
+        }
+        // Decoupled BeginFrame: fire on the absolute deadline regardless of how
+        // the loop turn ended (command or timeout). A steady command stream does
+        // not reset the deadline, so the animation still advances on schedule.
+        if frame_clock_on && clock.due(std::time::Instant::now()) {
+            should_tick = true;
+            clock.advance(std::time::Instant::now());
+        }
+        if should_tick {
+            // Frame tick: pump the JS event loop + animations and re-commit if
+            // anything changed.
+            if let Some(paint) = (p.ticker)() {
+                let tabs = p.session.borrow().summaries();
+                if commit(epoch, paint, tabs).is_err() {
+                    break;
                 }
             }
         }
@@ -7483,8 +7588,24 @@ fn offmain_renderer(
         };
 
     let rlog = std::env::var("CV_RENDERLOG").is_ok();
+    // Decoupled animation clock (CV_FRAME_CLOCK). When ON, the frame tick fires
+    // on an ABSOLUTE ~16ms deadline that a steady command stream does not reset
+    // (Blink/cc::Scheduler) — input no longer starves BeginFrame. When OFF, the
+    // wait is the legacy fixed 16ms and the tick fires only on a bare timeout
+    // (byte-identical scheduling to before this change).
+    let frame_clock_on = frame_clock_enabled();
+    let frame_interval = Duration::from_millis(16);
+    let mut clock = FrameClock::new(std::time::Instant::now(), frame_interval);
     loop {
-        match rx.recv_timeout(Duration::from_millis(16)) {
+        let wait = if frame_clock_on {
+            clock.wait_timeout(std::time::Instant::now())
+        } else {
+            frame_interval
+        };
+        // Whether a BeginFrame is due this turn (set by a bare timeout in legacy
+        // mode, or by the absolute deadline having passed in frame-clock mode).
+        let mut should_tick = false;
+        match rx.recv_timeout(wait) {
             Ok(cv_ui::ToPage::Cmd { epoch: e, cmd }) => {
                 epoch = e;
                 if rlog {
@@ -7544,18 +7665,35 @@ fn offmain_renderer(
             Ok(cv_ui::ToPage::Shutdown) => break,
             Err(RecvTimeoutError::Disconnected) => break,
             Err(RecvTimeoutError::Timeout) => {
-                // Frame tick: pump the JS event loop (time-sliced inside the
-                // ticker closure) and re-paint if anything changed.
-                let t0 = std::time::Instant::now();
-                if let Some(paint) = (p.ticker)() {
-                    let tabs = p.session.borrow().summaries();
-                    send_commit(&tx, epoch, paint, tabs);
+                // Legacy path: a bare timeout IS the frame tick. With the frame
+                // clock on, the deadline check below fires the tick instead (a
+                // timeout here just means no command arrived before the deadline).
+                if !frame_clock_on {
+                    should_tick = true;
                 }
-                if rlog {
-                    let ms = t0.elapsed().as_millis();
-                    if ms > 50 {
-                        cv_js::diag_log(&format!("[RENDER] slow tick {ms}ms"));
-                    }
+            }
+        }
+        // Decoupled BeginFrame: fire when the absolute deadline has passed,
+        // regardless of whether we got here via a command or a timeout. A steady
+        // command stream therefore still advances the animation on schedule
+        // (the command did NOT reset the deadline). `advance` skips missed
+        // frames rather than bursting.
+        if frame_clock_on && clock.due(std::time::Instant::now()) {
+            should_tick = true;
+            clock.advance(std::time::Instant::now());
+        }
+        if should_tick {
+            // BeginFrame: pump the JS event loop (time-sliced inside the ticker
+            // closure) and re-paint if anything changed.
+            let t0 = std::time::Instant::now();
+            if let Some(paint) = (p.ticker)() {
+                let tabs = p.session.borrow().summaries();
+                send_commit(&tx, epoch, paint, tabs);
+            }
+            if rlog {
+                let ms = t0.elapsed().as_millis();
+                if ms > 50 {
+                    cv_js::diag_log(&format!("[RENDER] slow tick {ms}ms"));
                 }
             }
         }
@@ -75686,5 +75824,310 @@ mod async_io_e2e_tests {
         assert!(xref.lookup(2).unwrap().in_use, "pages root in use");
         // One page in, one page out for this short doc.
         assert_eq!(pages.len(), 1, "short doc = single page");
+    }
+}
+
+/// ORACLE for the decoupled animation frame clock (CV_FRAME_CLOCK).
+///
+/// The renderer loop's scheduling policy is exercised here against a SYNTHETIC
+/// monotonic clock so the test is deterministic (no real sleeping, no channel
+/// jitter). `simulate_loop` reproduces EXACTLY the policy the live loop runs:
+///   - wait for a command only up to `clock.wait_timeout(now)`,
+///   - a command arriving does NOT move the deadline,
+///   - a BeginFrame fires when `clock.due(now)` (the absolute deadline passed),
+///   - `clock.advance(now)` steps the deadline (bounded catch-up).
+///
+/// The properties proven are the Blink/cc::Scheduler invariants:
+///   1. STEADY CADENCE UNDER CONTINUOUS INPUT — a command every few ms (so the
+///      legacy bare `recv_timeout(16ms)` would NEVER time out) still produces
+///      ~T/16 frames over T ms. This is the bug fix.
+///   2. IDLE STAYS IDLE — with NO commands, exactly the scheduled number of
+///      frames fire (one per interval), never a busy-loop burst.
+///   3. A COMMAND DOES NOT RESET THE DEADLINE — back-to-back commands inside one
+///      interval still yield exactly one frame for that interval.
+///   4. BOUNDED CATCH-UP — a single long command that overruns several intervals
+///      fires at most ONE make-up frame, then resyncs (no backlog burst).
+#[cfg(test)]
+mod frame_clock_tests {
+    use super::FrameClock;
+    use std::time::{Duration, Instant};
+
+    /// One scheduled event on the synthetic timeline: a command arriving at
+    /// `at_ms` (relative to start), and the cost in ms of HANDLING it (advances
+    /// the virtual clock — models a heavy nav blocking the loop).
+    struct Cmd {
+        at_ms: u64,
+        cost_ms: u64,
+    }
+
+    /// Run the live loop's scheduling policy over `[0, total_ms]` on a virtual
+    /// clock seeded at `start`. Returns (frame_fire_offsets_ms, commands_handled)
+    /// where each entry is the ms-since-start at which a frame fired.
+    ///
+    /// This mirrors the real loop turn:
+    ///   wait = clock.wait_timeout(now)
+    ///   if next command is within `wait`: jump to it, handle it (cost), no deadline reset
+    ///   else: jump to the deadline (the `recv_timeout` Timeout case)
+    ///   if clock.due(now): fire a frame, clock.advance(now)
+    fn simulate_loop(
+        start: Instant,
+        interval: Duration,
+        total_ms: u64,
+        mut cmds: std::collections::VecDeque<Cmd>,
+    ) -> (Vec<u64>, u64) {
+        let mut clock = FrameClock::new(start, interval);
+        let end = start + Duration::from_millis(total_ms);
+        let mut now = start;
+        let mut frame_offsets = Vec::new();
+        let mut handled = 0u64;
+        // Cap iterations so a policy bug (e.g. wait==0 forever) fails loudly
+        // instead of hanging — a real busy-loop would blow past this.
+        let mut guard = 0u64;
+        let guard_max = total_ms * 4 + 1000;
+        while now < end {
+            guard += 1;
+            assert!(guard < guard_max, "scheduling busy-looped (no progress)");
+            let wait = clock.wait_timeout(now);
+            let deadline = now + wait;
+            // Will a command arrive before the deadline?
+            let next_cmd_at = cmds
+                .front()
+                .map(|c| start + Duration::from_millis(c.at_ms));
+            match next_cmd_at {
+                Some(cmd_at) if cmd_at <= deadline => {
+                    // A command arrives first. Jump to it and "handle" it — its
+                    // cost advances the clock. Crucially the deadline is NOT reset.
+                    now = cmd_at;
+                    let c = cmds.pop_front().unwrap();
+                    now += Duration::from_millis(c.cost_ms);
+                    handled += 1;
+                }
+                _ => {
+                    // No command before the deadline → the recv_timeout Timeout
+                    // case. Jump to the deadline.
+                    now = deadline;
+                }
+            }
+            // Absolute-deadline BeginFrame check (identical to the live loop).
+            if clock.due(now) {
+                frame_offsets.push((now - start).as_millis() as u64);
+                clock.advance(now);
+            }
+        }
+        (frame_offsets, handled)
+    }
+
+    /// Frame COUNT over the window (convenience).
+    fn simulate_count(
+        start: Instant,
+        interval: Duration,
+        total_ms: u64,
+        cmds: std::collections::VecDeque<Cmd>,
+    ) -> (u64, u64) {
+        let (offs, handled) = simulate_loop(start, interval, total_ms, cmds);
+        (offs.len() as u64, handled)
+    }
+
+    /// Property 1: a STEADY command stream (one every 4ms — far faster than the
+    /// 16ms frame interval, so the legacy bare `recv_timeout(16ms)` would never
+    /// time out and the animation would NEVER advance) still ticks ~60Hz.
+    #[test]
+    fn steady_input_does_not_starve_begin_frame() {
+        let start = Instant::now();
+        let interval = Duration::from_millis(16);
+        let total = 1000u64; // 1 second
+        // A command every 4ms with negligible (1ms) handling cost: 250 commands.
+        let mut cmds = std::collections::VecDeque::new();
+        let mut t = 0u64;
+        while t < total {
+            cmds.push_back(Cmd { at_ms: t, cost_ms: 1 });
+            t += 4;
+        }
+        let n_cmds = cmds.len() as u64;
+        let (frames, handled) = simulate_count(start, interval, total, cmds);
+        // All commands were processed (input stays prompt).
+        assert_eq!(handled, n_cmds, "every command handled");
+        // ~1000/16 ≈ 62 frames. Assert the animation clock genuinely advanced on
+        // schedule DESPITE continuous input — the whole point of the decouple.
+        // (Lower bound 55 leaves slack for boundary rounding; a starved loop
+        // under the legacy policy would produce ~0.)
+        assert!(
+            frames >= 55 && frames <= 64,
+            "expected ~62 frames over 1s under steady input, got {frames}"
+        );
+    }
+
+    /// Property 2: with NO commands, the clock fires exactly one frame per
+    /// interval — idle does not busy-loop or over-fire.
+    #[test]
+    fn idle_fires_exactly_one_frame_per_interval() {
+        let start = Instant::now();
+        let interval = Duration::from_millis(16);
+        let total = 1600u64; // exactly 100 intervals
+        let (frames, handled) =
+            simulate_count(start, interval, total, std::collections::VecDeque::new());
+        assert_eq!(handled, 0, "no commands");
+        // 1600/16 = 100 deadlines fall strictly before `end` (the deadline at
+        // 1600 == end is not < end), so exactly 100 frames.
+        assert_eq!(frames, 100, "exactly one frame per 16ms interval when idle");
+    }
+
+    /// Property 3: a command does NOT reset the deadline. Several commands land
+    /// inside a single interval; that interval still yields exactly one frame.
+    #[test]
+    fn command_does_not_reset_deadline() {
+        let start = Instant::now();
+        let interval = Duration::from_millis(16);
+        // Three commands at 2ms, 6ms, 10ms — all inside the first 16ms interval,
+        // each cheap (1ms). Run for exactly two intervals.
+        let cmds = std::collections::VecDeque::from(vec![
+            Cmd { at_ms: 2, cost_ms: 1 },
+            Cmd { at_ms: 6, cost_ms: 1 },
+            Cmd { at_ms: 10, cost_ms: 1 },
+        ]);
+        let (frames, handled) = simulate_count(start, interval, 32, cmds);
+        assert_eq!(handled, 3, "all three commands handled");
+        // Deadlines fall at 16 and 32 over the 32ms window — exactly what an IDLE
+        // run produces over the same window (see idle test). The three early
+        // commands did NOT each spawn a frame and did NOT reset the 16ms
+        // deadline: clustered input yields the same 2 frames idle would, never 3+.
+        assert_eq!(frames, 2, "clustered commands do not add or reset frames");
+    }
+
+    /// Property 4: bounded catch-up. A single long command (handling cost 50ms)
+    /// overruns ~3 intervals. The hazard a naive "next_deadline += interval until
+    /// caught up" loop has is a BURST: firing the 16/32/48 make-up frames all at
+    /// the SAME instant the stall ends (3 instant frames). `advance`'s resync
+    /// must instead fire at most ONE make-up frame for the stall, then space
+    /// subsequent frames a full interval apart (Chrome skips missed BeginFrames).
+    #[test]
+    fn long_command_does_not_burst_makeup_frames() {
+        let start = Instant::now();
+        let interval = Duration::from_millis(16);
+        // One command at t=1ms that takes 50ms to handle (>3 intervals), then
+        // quiet. Run 200ms so we observe the post-stall cadence too.
+        let cmds = std::collections::VecDeque::from(vec![Cmd { at_ms: 1, cost_ms: 50 }]);
+        let (offsets, _handled) = simulate_loop(start, interval, 200, cmds);
+        // No two frames may fire at the same instant (a burst). Equivalently:
+        // every consecutive frame gap is >= the interval (no backlog replay).
+        assert!(!offsets.is_empty(), "frames did fire after the stall");
+        for w in offsets.windows(2) {
+            let gap = w[1] - w[0];
+            assert!(
+                gap >= 16,
+                "frames must be >= one interval apart (no burst); got gap {gap}ms in {offsets:?}"
+            );
+        }
+        // The first frame is the single make-up for the 50ms stall (fires once
+        // the command finishes, ~51ms), NOT three stacked make-ups.
+        assert!(
+            offsets[0] >= 50 && offsets[0] <= 52,
+            "exactly one make-up frame at stall end (~51ms), got {}",
+            offsets[0]
+        );
+    }
+
+    /// Model of the LEGACY policy (CV_FRAME_CLOCK OFF / pre-change loop): the
+    /// frame tick fires ONLY on a bare `recv_timeout(16ms)` timeout, and a
+    /// command RESETS the wait (the next wait is a fresh 16ms). Used to prove the
+    /// bug is real (legacy starves under steady input) and that the fix's
+    /// idle behavior is identical (same frame count when no input).
+    fn simulate_legacy(
+        start: Instant,
+        interval: Duration,
+        total_ms: u64,
+        mut cmds: std::collections::VecDeque<Cmd>,
+    ) -> (u64, u64) {
+        let end = start + Duration::from_millis(total_ms);
+        let mut now = start;
+        let mut frames = 0u64;
+        let mut handled = 0u64;
+        let mut guard = 0u64;
+        let guard_max = total_ms * 4 + 1000;
+        while now < end {
+            guard += 1;
+            assert!(guard < guard_max, "legacy busy-looped");
+            // Legacy always waits a FRESH full interval (a command reset it).
+            let deadline = now + interval;
+            let next_cmd_at = cmds
+                .front()
+                .map(|c| start + Duration::from_millis(c.at_ms));
+            match next_cmd_at {
+                Some(cmd_at) if cmd_at <= deadline => {
+                    now = cmd_at;
+                    let c = cmds.pop_front().unwrap();
+                    now += Duration::from_millis(c.cost_ms);
+                    handled += 1;
+                    // No tick — only a bare timeout ticks in legacy. The wait
+                    // restarts next turn (deadline resets relative to `now`).
+                }
+                _ => {
+                    // Bare timeout → the legacy frame tick.
+                    now = deadline;
+                    frames += 1;
+                }
+            }
+        }
+        (frames, handled)
+    }
+
+    /// ORACLE (idle equivalence): with NO input, the decoupled clock and the
+    /// legacy policy fire the SAME number of frames — the fix does not change
+    /// idle cadence or idle CPU (no extra wakes, no busy-loop).
+    #[test]
+    fn idle_cadence_identical_to_legacy() {
+        let start = Instant::now();
+        let interval = Duration::from_millis(16);
+        for total in [160u64, 320, 1600, 5000] {
+            let (new_frames, _) =
+                simulate_count(start, interval, total, std::collections::VecDeque::new());
+            let (legacy_frames, _) =
+                simulate_legacy(start, interval, total, std::collections::VecDeque::new());
+            assert_eq!(
+                new_frames, legacy_frames,
+                "idle frame cadence diverged from legacy at total={total}ms"
+            );
+        }
+    }
+
+    /// MUTATION PROOF (the bug is real + the test is non-vacuous): under the same
+    /// steady command stream that the decoupled clock ticks ~60Hz through
+    /// (`steady_input_does_not_starve_begin_frame`), the LEGACY policy STARVES —
+    /// it fires essentially zero frames because every command resets the 16ms
+    /// wait. If this ever stopped being true the steady-input test would be
+    /// testing nothing.
+    #[test]
+    fn legacy_starves_under_steady_input() {
+        let start = Instant::now();
+        let interval = Duration::from_millis(16);
+        let total = 1000u64;
+        let mut cmds = std::collections::VecDeque::new();
+        let mut t = 0u64;
+        while t < total {
+            cmds.push_back(Cmd { at_ms: t, cost_ms: 1 });
+            t += 4; // every 4ms < 16ms interval → wait never elapses
+        }
+        let (legacy_frames, _) = simulate_legacy(start, interval, total, cmds);
+        // Legacy fires only when a 16ms gap opens; with a command every 4ms the
+        // wait is reset before it elapses, so the animation is starved.
+        assert!(
+            legacy_frames <= 2,
+            "legacy must starve under steady input (proves the bug); got {legacy_frames}"
+        );
+    }
+
+    /// `wait_timeout` saturates (never panics / never negative) once the deadline
+    /// has passed — the loop must poll, not underflow.
+    #[test]
+    fn wait_timeout_saturates_past_deadline() {
+        let start = Instant::now();
+        let clock = FrameClock::new(start, Duration::from_millis(16));
+        // Before the deadline: a positive wait near the interval.
+        assert!(clock.wait_timeout(start) <= Duration::from_millis(16));
+        assert!(clock.wait_timeout(start) > Duration::from_millis(0));
+        // Past the deadline: zero (immediate poll), never a panic.
+        let past = start + Duration::from_millis(100);
+        assert_eq!(clock.wait_timeout(past), Duration::from_millis(0));
+        assert!(clock.due(past));
     }
 }
