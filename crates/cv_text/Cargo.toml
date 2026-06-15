@@ -11,3 +11,4 @@ workspace = true
 
 [dependencies]
 cv_compression = { path = "../cv_compression" }
+cv_unicode = { path = "../cv_unicode" }

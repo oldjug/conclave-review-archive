@@ -20,6 +20,8 @@
 pub mod cjk;
 pub mod color_font;
 pub mod gpos;
+pub mod indic;
+pub mod shape_text;
 pub mod shaping;
 pub mod variable_font;
 pub mod woff2;
@@ -30,6 +32,11 @@ pub use shaping::{
     apply_substitutions, arabic_lam_alef_ligatures, arabic_positional_forms, cmap_lookup,
     find_table, joining_type, parse_cmap, parse_feature_list, parse_table_dir, presentation_form,
     shape_arabic_to_presentation_forms,
+};
+
+pub use indic::{IndicCategory, indic_category, is_devanagari, reorder_devanagari};
+pub use shape_text::{
+    ShapedGlyph, is_combining_mark, shape_paragraph, shape_to_visual_string,
 };
 
 use core::ffi::c_void;

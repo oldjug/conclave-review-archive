@@ -30900,61 +30900,45 @@ fn build_crypto_object() -> cv_js::Value {
     cv_js::Value::Object(Rc::new(RefCell::new(crypto_map)))
 }
 
-/// Apply bidi reordering + Arabic shaping to a text run before paint.
+/// Apply bidi reordering + complex-script shaping to a text run before
+/// paint, returning the codepoints in visual (left-to-right paint)
+/// order for the `DrawTextW` cursor.
 ///
-/// Pure-ASCII runs short-circuit. For runs containing any RTL strong
-/// codepoint, we:
-///   1. Compute the paragraph base level (P2/P3).
-///   2. Resolve embedding levels for each codepoint (W/N/I rules).
-///   3. Apply Arabic positional shaping so connecting letters take
-///      their initial/medial/final/isolated FE80..FEFC presentation
-///      forms.
-///   4. Reorder odd-level runs (L2) so right-to-left glyphs render
-///      in visual order under DrawTextW's left-to-right cursor.
+/// Pure-ASCII runs short-circuit. Otherwise this runs the unified
+/// `cv_text::shape_paragraph` pipeline (UAX #9 bidi level resolution →
+/// per-run script shaping → UAX #9 L2 visual reordering). Per script:
+///   * **Arabic** — contextual joining (init/medial/final/isolated
+///     FE80..FEFC presentation forms) + lam-alef ligature.
+///   * **Devanagari** — initial reordering: the pre-base I-matra moves
+///     before the base consonant and the reph (initial Ra+Halant) moves
+///     after the base (MS/HarfBuzz Indic reordering).
+///   * **Combining marks** stay attached to their base across RTL
+///     reversal and render non-spacing (stacked).
+///
+/// This replaces the old hand-rolled path that remapped bidi levels by
+/// proportional sampling after ligature collapse — that approximation
+/// assigned wrong levels to glyphs near a collapsed ligature; the
+/// pipeline now tracks each glyph's true embedding level.
 fn shape_for_render(text: &str) -> String {
     // Fast path: pure ASCII never needs bidi or shaping.
     if text.is_ascii() {
         return text.to_string();
     }
-    let has_rtl = text.chars().any(|c| {
+    // Only pay for the full pipeline when the run contains a script that
+    // actually needs reordering/shaping: any RTL strong codepoint
+    // (Arabic/Hebrew), Devanagari, or a combining mark. Plain Latin-1 /
+    // CJK / accented text with no marks is left untouched.
+    let needs_shaping = text.chars().any(|c| {
         matches!(
             cv_unicode::bidi_class(c),
             cv_unicode::BidiClass::R | cv_unicode::BidiClass::Al
-        )
+        ) || cv_text::is_devanagari(c)
+            || cv_text::is_combining_mark(c)
     });
-    if !has_rtl {
+    if !needs_shaping {
         return text.to_string();
     }
-    let base = cv_unicode::paragraph_level(text);
-    let levels = cv_unicode::resolve_paragraph(text, base);
-    // First, apply Arabic shaping so connecting letters take their
-    // presentation forms before we reorder.
-    let shaped = cv_text::shape_arabic_to_presentation_forms(text);
-    // Apply lam-alef ligatures (FEDD+FE8D → FEFB, etc.) — the most
-    // common Arabic 2→1 substitution. Real fonts ship this via GSUB
-    // type 4 lookups; we hard-code the canonical 4 forms.
-    let glyphs: Vec<u32> = shaped.chars().map(|c| c as u32).collect();
-    let ligated = cv_text::apply_ligatures(&glyphs, &cv_text::arabic_lam_alef_ligatures());
-    // Build (char, level) pairs and reorder per UBA L2.
-    let shaped_chars: Vec<char> = ligated.iter().filter_map(|g| char::from_u32(*g)).collect();
-    // Resolve levels for the post-shaping char count by sampling
-    // proportionally. (Ligature collapses change the char count.)
-    let n_shaped = shaped_chars.len();
-    let segs: Vec<(char, u8)> = shaped_chars
-        .iter()
-        .enumerate()
-        .map(|(i, &c)| {
-            let src_idx = if n_shaped == 0 {
-                0
-            } else {
-                i * levels.len() / n_shaped
-            };
-            let lvl = levels.get(src_idx).map(|l| l.0).unwrap_or(base);
-            (c, lvl)
-        })
-        .collect();
-    let visual = cv_unicode::reorder_line(&segs);
-    visual.into_iter().collect()
+    cv_text::shape_to_visual_string(text)
 }
 
 /// Hinnant's "civil_from_days" — converts Unix-epoch day count into

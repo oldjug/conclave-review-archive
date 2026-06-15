@@ -219,6 +219,7 @@ name = "cv_text"
 version = "0.0.1"
 dependencies = [
  "cv_compression",
+ "cv_unicode",
 ]
 
 [[package]]
