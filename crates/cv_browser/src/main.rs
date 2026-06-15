@@ -19983,6 +19983,11 @@ fn build_layout_tree(
     flatten_inline_runs(&mut styled);
     let mut lb = cv_layout::layout(&styled, cfg);
     apply_persisted_scroll_offsets(&mut lb);
+    // `position: sticky` (CSS Position 3 §3.4): shift sticky boxes per the
+    // live scroll offset just applied above. Must run AFTER scroll offsets
+    // are in the tree so each sticky box reacts to its scroll container's
+    // current position; recomputed every rebuild (scroll re-renders).
+    cv_layout::apply_sticky_offsets(&mut lb);
     lb
 }
 
@@ -20020,6 +20025,8 @@ fn build_layout_tree_arena(
     flatten_inline_runs(&mut styled);
     let mut lb = cv_layout::layout(&styled, cfg);
     apply_persisted_scroll_offsets(&mut lb);
+    // `position: sticky` — see note in `build_layout_tree`. Same seam.
+    cv_layout::apply_sticky_offsets(&mut lb);
     report_layout_stats();
     lb
 }
@@ -63500,6 +63507,74 @@ var el = document.getElementById('el');
             );
             clear_scroll_offsets();
         }
+    }
+
+    // ───────── position: sticky end-to-end (HTML→CSS→scroll store→layout) ─────────
+
+    /// END-TO-END through the production build path: a `position:sticky;
+    /// top:0` header inside an `overflow:auto` scroll container, with a
+    /// scroll offset persisted in the store, must paint PINNED to the
+    /// visible container top after the rebuild applies the offset and the
+    /// sticky pass. Proves `apply_sticky_offsets` runs after the PHASE-0
+    /// scroll offsets in `build_layout_tree`. CSS Position 3 §3.4.
+    #[test]
+    fn e2e_sticky_header_pins_after_scroll() {
+        clear_scroll_offsets();
+        let html = "<!doctype html><html><head><style>\
+            #s{overflow:auto;width:200px;height:300px;padding:0}\
+            #spacer{height:50px;width:200px}\
+            #hdr{position:sticky;top:0;height:40px;width:200px}\
+            #body{height:1000px;width:200px}\
+            </style></head><body>\
+            <div id=s><div id=spacer></div><div id=hdr></div>\
+            <div id=body></div></div></body></html>";
+        let mut doc = cv_html::parse(html);
+        assign_node_ids(&mut doc.root);
+        let mut sheets = vec![parse_user_agent_stylesheet()];
+        sheets.extend(collect_stylesheets(&doc));
+        let cfg = cv_layout::LayoutConfig {
+            viewport_w: 800.0,
+            viewport_h: 600.0,
+            ..cv_layout::LayoutConfig::default()
+        };
+        // Helpers to find the scroller and the sticky header in a tree.
+        fn scroller<'a>(b: &'a cv_layout::LayoutBox) -> Option<&'a cv_layout::LayoutBox> {
+            if b.is_scroll_container() {
+                return Some(b);
+            }
+            b.children.iter().find_map(scroller)
+        }
+        fn sticky<'a>(b: &'a cv_layout::LayoutBox) -> Option<&'a cv_layout::LayoutBox> {
+            if matches!(b.position, cv_layout::Position::Sticky) {
+                return Some(b);
+            }
+            b.children.iter().find_map(sticky)
+        }
+        // Build #1 (no scroll): sticky header sits at its natural flow slot.
+        let l0 = build_layout_tree(&doc, &sheets, "https://sticky.test/", &cfg, &Default::default());
+        let content_top = scroller(&l0).unwrap().content.y;
+        let natural = sticky(&l0).unwrap().border_rect().y;
+        assert!(
+            (natural - (content_top + 50.0)).abs() < 1.0,
+            "unscrolled header at flow slot content_top+50 ({}), got {natural}",
+            content_top + 50.0
+        );
+        // Persist an 80px scroll into the store keyed by the scroller's id,
+        // then rebuild — the production path applies the offset AND sticky.
+        let sc_id = scroller(&l0).unwrap().node_id.expect("scroller has node id");
+        set_scroll_offset(sc_id, 0.0, 80.0);
+        let l1 = build_layout_tree(&doc, &sheets, "https://sticky.test/", &cfg, &Default::default());
+        let pinned = sticky(&l1).unwrap().border_rect().y;
+        let expect = content_top + 80.0; // pinned to visible scrollport top
+        assert!(
+            (pinned - expect).abs() < 1.0,
+            "after 80px scroll the sticky header pins to container top {expect}, got {pinned}"
+        );
+        assert!(
+            pinned > natural + 1.0,
+            "the header moved DOWN from its flow slot ({natural} -> {pinned})"
+        );
+        clear_scroll_offsets();
     }
 
     // ───────── full N-stop CSS gradient: end-to-end paint (HTML→CSS→box→pixel) ─────────

@@ -1418,8 +1418,9 @@ pub struct Style {
     /// stretch the bitmap to the padding box, which made any small
     /// pattern explode into a giant smudge.
     pub background_repeat: BackgroundRepeat,
-    /// CSS `position`. For V1 we honour `relative` (offset after normal
-    /// flow) and ignore static/absolute/fixed/sticky distinctions.
+    /// CSS `position`. `relative` (offset after normal flow), `absolute`/
+    /// `fixed` (out-of-flow placement against the containing block), and
+    /// `sticky` (scroll-aware constraint — see `apply_sticky_offsets`).
     pub position: Option<Position>,
     /// CSS `z-index`. None = auto. Stored alongside other CSS state so
     /// `build_box` can carry it onto `LayoutBox.z_index`.
@@ -1534,10 +1535,10 @@ pub enum Display {
     None,
 }
 
-/// CSS `position`. We honour `relative` (offset after normal flow);
-/// `absolute`/`fixed`/`sticky` are treated like `relative` for V1 —
-/// they still take their original flow slot, but `top`/`left` shift
-/// them. Out-of-flow positioning lands later.
+/// CSS `position`. `relative` shifts after normal flow; `absolute`/
+/// `fixed` are placed out-of-flow against their containing block;
+/// `sticky` keeps its flow slot but is shifted by the scroll-aware
+/// `apply_sticky_offsets` pass (CSS Position 3 §3.4).
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
 pub enum Position {
     #[default]
@@ -2397,12 +2398,14 @@ fn layout_once(root: &StyledNode, cfg: &LayoutConfig) -> LayoutBox {
 /// out-of-flow pass inside `place()`. Re-shifting them here would
 /// double-apply the offset.
 fn apply_positioned_offsets(b: &mut LayoutBox) {
-    // `position: sticky` falls back to `relative` for V1. Real sticky
-    // depends on scroll state, which we don't thread through layout
-    // yet — but relative-shift gives a sane default (the box ends up
-    // at its specified offset within its parent), which is closer to
-    // Chrome than the static-default-no-shift fallback we had before.
-    let is_relative = matches!(b.position, Position::Relative | Position::Sticky);
+    // `position: sticky` is handled by a separate, scroll-aware pass
+    // (`apply_sticky_offsets`), NOT here. A sticky box sits at its
+    // normal-flow position until its scroll container scrolls past its
+    // inset threshold (CSS Position 3 §3.4); shifting it like `relative`
+    // here would wrongly pin it before any scroll AND double-apply on
+    // top of the sticky pass. So sticky is excluded from the relative
+    // shift — only `position: relative` shifts in this pass.
+    let is_relative = matches!(b.position, Position::Relative);
     let has_offset =
         b.top_px.is_some() || b.left_px.is_some() || b.right_px.is_some() || b.bottom_px.is_some();
     if is_relative && has_offset {
@@ -2426,6 +2429,181 @@ fn apply_positioned_offsets(b: &mut LayoutBox) {
     for c in &mut b.children {
         apply_positioned_offsets(c);
     }
+}
+
+/// Apply `position: sticky` offsets (CSS Position 3 §3.4 — Blink
+/// `StickyPositionScrollingConstraints::ComputeStickyOffset`).
+///
+/// A sticky box is laid out in normal flow, then shifted so it stays
+/// within its scroll container's *sticky view rectangle* (the visible
+/// scrollport inset by the box's top/right/bottom/left insets), but
+/// NEVER escapes its containing block. It sticks once the scroll
+/// position crosses the inset threshold and releases at the
+/// containing-block edge.
+///
+/// This is a scroll-aware pass: it reads the current `scroll_offset_*`
+/// off the nearest scroll-container ancestor (the PHASE-0 element-scroll
+/// offsets), so it MUST run after those offsets are applied to the tree
+/// and re-runs every frame (cheap tree walk). It is the sticky analogue
+/// of the paint-time scroll translation — Blink also recomputes sticky
+/// constraints from the live scroll offset rather than re-laying-out.
+///
+/// All math is in the un-scrolled document coordinate space the layout
+/// tree uses: the box's natural rect is fixed there; the *visible*
+/// scrollport moves by `+scroll_offset` (scrolling down reveals content
+/// further down). The shift is applied with `shift_box` exactly like a
+/// relative offset (visual only — siblings keep their slots).
+pub fn apply_sticky_offsets(root: &mut LayoutBox) {
+    // `containing_block` is the content box of the nearest ancestor that
+    // is a block container / establishes a containing block. For our flow
+    // model the sticky box's containing block is its parent's content box.
+    // `scrollport` is the padding box of the nearest *scroll container*
+    // ancestor, shifted by its current scroll offset to the visible region.
+    fn walk(
+        b: &mut LayoutBox,
+        // Nearest scroll-container ancestor's visible scrollport (document
+        // coords, already shifted by the live scroll offset). `None` until
+        // we descend through a scroll container — a sticky box with no
+        // scrolling ancestor uses the viewport, which we don't track here,
+        // so it simply stays at its flow position (offset 0).
+        scrollport: Option<Rect>,
+        // Nearest containing block's content box (document coords).
+        containing_block: Rect,
+    ) {
+        // Compute this box's children's scrollport/containing-block FIRST
+        // using its CURRENT (pre-shift) geometry, then shift this box if
+        // it is sticky. Shifting moves the subtree, but a sticky box's
+        // descendants ride along with it (shift_box recurses), so we must
+        // capture child contexts before the shift and then translate the
+        // shift into the descendants via shift_box (not via re-walking).
+        let child_cb = b.content;
+        let child_scrollport = if b.is_scroll_container() {
+            // Visible scrollport = padding box, with origin moved down/right
+            // by the scroll offset (content scrolled up reveals lower rows).
+            let pr = b.padding_rect();
+            Some(Rect {
+                x: pr.x + b.scroll_offset_x,
+                y: pr.y + b.scroll_offset_y,
+                w: b.client_width(),
+                h: b.client_height(),
+            })
+        } else {
+            scrollport
+        };
+        for c in &mut b.children {
+            walk(c, child_scrollport, child_cb);
+        }
+        if matches!(b.position, Position::Sticky) {
+            if let Some(vp) = scrollport {
+                let (dx, dy) = sticky_offset(b, vp, containing_block);
+                if dx != 0.0 || dy != 0.0 {
+                    shift_box(b, dx, dy);
+                }
+            }
+        }
+    }
+    // Root containing block = the root box's own content; root has no
+    // scroll-container ancestor.
+    let root_cb = root.content;
+    walk(root, None, root_cb);
+}
+
+/// Per-axis sticky constraint solve for one box. Returns the (dx, dy)
+/// visual shift that keeps the box inside the sticky view rectangle while
+/// clamped to its containing block. Public for unit testing the exact
+/// offsets at given scroll positions.
+///
+/// `scrollport` is the visible scrollport in document coords (padding box
+/// of the scroll container, already offset by the live scroll position).
+/// `cb` is the containing block's content box in document coords.
+///
+/// Spec (CSS Position 3 §3.4): the inset properties are insets from the
+/// scrollport edges, forming the sticky view rectangle. For each side
+/// with a non-`auto` inset, if the box's border edge would be outside
+/// that view-rectangle edge, shift it inward — "insofar as it can while
+/// its position box remains contained within its containing block".
+pub fn sticky_offset(b: &LayoutBox, scrollport: Rect, cb: Rect) -> (f32, f32) {
+    // The box's natural border box in document coords (insets reference
+    // the border edge per spec, "corresponding border edge of the box").
+    let bb = b.border_rect();
+    let dx = sticky_axis(
+        bb.x,
+        bb.x + bb.w,
+        scrollport.x,
+        scrollport.x + scrollport.w,
+        cb.x,
+        cb.x + cb.w,
+        b.left_px.map(|s| s.resolve(scrollport.w)),
+        b.right_px.map(|s| s.resolve(scrollport.w)),
+    );
+    let dy = sticky_axis(
+        bb.y,
+        bb.y + bb.h,
+        scrollport.y,
+        scrollport.y + scrollport.h,
+        cb.y,
+        cb.y + cb.h,
+        b.top_px.map(|s| s.resolve(scrollport.h)),
+        b.bottom_px.map(|s| s.resolve(scrollport.h)),
+    );
+    (dx, dy)
+}
+
+/// One axis of the sticky solve. All values are along a single axis in
+/// document coords. `start`/`end` are the box's border-edge positions
+/// (e.g. top/bottom or left/right); `vp_start`/`vp_end` the scrollport
+/// edges; `cb_start`/`cb_end` the containing-block content edges.
+/// `start_inset` = top/left inset, `end_inset` = bottom/right inset
+/// (`None` = `auto`, treated as no constraint on that edge).
+///
+/// Mirrors Blink's `ComputeStickyOffset` axis logic: apply the
+/// start-edge pin, then the end-edge pin, then clamp the resulting shift
+/// so the box stays within the containing block.
+#[allow(clippy::too_many_arguments)]
+fn sticky_axis(
+    start: f32,
+    end: f32,
+    vp_start: f32,
+    vp_end: f32,
+    cb_start: f32,
+    cb_end: f32,
+    start_inset: Option<f32>,
+    end_inset: Option<f32>,
+) -> f32 {
+    let mut shift = 0.0f32;
+    // Start-edge (top/left) pin: the sticky view-rect edge is
+    // vp_start + start_inset. If the box's start edge would sit before
+    // it (i.e. scrolled past it), push the box forward to meet it.
+    if let Some(inset) = start_inset {
+        let target = vp_start + inset;
+        if start + shift < target {
+            shift = target - start;
+        }
+    }
+    // End-edge (bottom/right) pin: the view-rect edge is vp_end - inset.
+    // If the box's end edge would sit after it, push the box back.
+    // (Spec: if both insets apply and the view rect is smaller than the
+    // box, the start pin wins because it was applied first — matching
+    // Blink, which applies top/left before bottom/right.)
+    if let Some(inset) = end_inset {
+        let target = vp_end - inset;
+        if end + shift > target {
+            shift = target - end;
+        }
+    }
+    // Containing-block clamp: the box can only move within its CB. The
+    // start edge can't go before cb_start (min shift) and the end edge
+    // can't go past cb_end (max shift). This is what releases the box at
+    // the containing-block edge as you keep scrolling.
+    let min_shift = cb_start - start; // box start pinned to CB start
+    let max_shift = cb_end - end; // box end pinned to CB end
+    // CB may be smaller than the box (degenerate); keep the range ordered.
+    let (lo, hi) = if min_shift <= max_shift {
+        (min_shift, max_shift)
+    } else {
+        (max_shift, min_shift)
+    };
+    shift.clamp(lo, hi)
 }
 
 /// True if this box participates in normal flow. `position: absolute`
@@ -9616,6 +9794,345 @@ mod tests {
         // Both report a positive max scrollTop.
         assert!(chain[0].max_top > 0.0 && chain[1].max_top > 0.0);
         let _ = outer_box;
+    }
+
+    // ─────────────────────── position: sticky (§3.4) ───────────────────
+    // These assert the COMPUTED sticky offset (geometry) at known scroll
+    // positions, per CSS Position 3 §3.4 / Blink ComputeStickyOffset.
+    // Not "doesn't panic" — exact pinned offsets and release behavior.
+
+    /// A 300px-tall `overflow:auto` scroll container holding:
+    ///   [0..50)   a 50px spacer (so the sticky box has flow above it)
+    ///   [50..90)  a 40px `position: sticky; top: 0` header
+    ///   [90..1090) a 1000px tall body
+    /// Returns the laid-out root (the page wrapper). The scroll container
+    /// is the first scroll container found; its single sticky child is the
+    /// header. No padding so document coords are easy to reason about.
+    fn sticky_scroller() -> LayoutBox {
+        let spacer = block(
+            "div",
+            Style {
+                display: Some(Display::Block),
+                width: Some(LengthSpec::Px(200.0)),
+                height: Some(LengthSpec::Px(50.0)),
+                ..Style::default()
+            },
+            vec![],
+        );
+        let header = block(
+            "div",
+            Style {
+                display: Some(Display::Block),
+                width: Some(LengthSpec::Px(200.0)),
+                height: Some(LengthSpec::Px(40.0)),
+                position: Some(Position::Sticky),
+                top_px: Some(LengthSpec::Px(0.0)),
+                ..Style::default()
+            },
+            vec![],
+        );
+        let body = block(
+            "div",
+            Style {
+                display: Some(Display::Block),
+                width: Some(LengthSpec::Px(200.0)),
+                height: Some(LengthSpec::Px(1000.0)),
+                ..Style::default()
+            },
+            vec![],
+        );
+        let scroller = block(
+            "div",
+            Style {
+                display: Some(Display::Block),
+                width: Some(LengthSpec::Px(200.0)),
+                height: Some(LengthSpec::Px(300.0)),
+                overflow_y: Overflow::Auto,
+                overflow_x: Overflow::Auto,
+                ..Style::default()
+            },
+            vec![spacer, header, body],
+        );
+        layout(&scroller, &LayoutConfig::default())
+    }
+
+    fn find_scroller_box(b: &LayoutBox) -> Option<&LayoutBox> {
+        if b.is_scroll_container() {
+            return Some(b);
+        }
+        for c in &b.children {
+            if let Some(s) = find_scroller_box(c) {
+                return Some(s);
+            }
+        }
+        None
+    }
+    fn find_scroller_box_mut(b: &mut LayoutBox) -> Option<&mut LayoutBox> {
+        if b.is_scroll_container() {
+            return Some(b);
+        }
+        for c in &mut b.children {
+            if let Some(s) = find_scroller_box_mut(c) {
+                return Some(s);
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn sticky_unscrolled_sits_at_normal_flow_position() {
+        // At scroll 0 a sticky box has ZERO offset — it sits exactly where
+        // normal flow put it. The header's natural top is its flow slot
+        // (spacer height below the scroller content top).
+        let mut root = sticky_scroller();
+        let natural_top = {
+            let sc = find_scroller_box(&root).unwrap();
+            sc.children[1].border_rect().y
+        };
+        apply_sticky_offsets(&mut root);
+        let sc = find_scroller_box(&root).unwrap();
+        let now_top = sc.children[1].border_rect().y;
+        assert!(
+            (now_top - natural_top).abs() < 0.01,
+            "unscrolled sticky stays at flow position {natural_top}, got {now_top}"
+        );
+    }
+
+    #[test]
+    fn sticky_top_pins_to_container_top_once_scrolled_past() {
+        // Scroll the container down 80px. The header's flow slot starts at
+        // (content_top + 50). After scrolling 80px, that slot would be 30px
+        // ABOVE the visible top, so `top:0` pins the header's border-top to
+        // the visible scrollport top — i.e. its document-space top becomes
+        // (content_top + scroll_offset). Assert the exact pinned offset.
+        let mut root = sticky_scroller();
+        let (content_top, natural_top) = {
+            let sc = find_scroller_box(&root).unwrap();
+            (sc.content.y, sc.children[1].border_rect().y)
+        };
+        {
+            let sc = find_scroller_box_mut(&mut root).unwrap();
+            sc.scroll_offset_y = 80.0;
+            sc.clamp_scroll();
+        }
+        apply_sticky_offsets(&mut root);
+        let sc = find_scroller_box(&root).unwrap();
+        let pinned_top = sc.children[1].border_rect().y;
+        // Pinned: header border-top == visible scrollport top == content_top
+        // + scroll_offset (top:0 inset). With content_top + 80.
+        let expect = content_top + 80.0;
+        assert!(
+            (pinned_top - expect).abs() < 0.5,
+            "sticky top:0 pins to container top {expect}, got {pinned_top}"
+        );
+        // And it MOVED from its natural slot by (80 - 50) = 30px down.
+        let shift = pinned_top - natural_top;
+        assert!(
+            (shift - 30.0).abs() < 0.5,
+            "header shifted down by scroll-minus-spacer (30px), got {shift}"
+        );
+    }
+
+    #[test]
+    fn sticky_releases_at_containing_block_bottom_edge() {
+        // Scroll FAR past the end. A `top:0` sticky box can't escape its
+        // containing block (the scroll container content box, bottom =
+        // content_top + 1090). The header's border-bottom must stop at the
+        // CB bottom: header_top + 40 <= cb_bottom. So the maximum pinned
+        // top is cb_bottom - 40, NOT content_top + scroll_offset.
+        let mut root = sticky_scroller();
+        let (content_top, cb_bottom) = {
+            let sc = find_scroller_box(&root).unwrap();
+            (sc.content.y, sc.content.y + sc.content.h)
+        };
+        {
+            let sc = find_scroller_box_mut(&mut root).unwrap();
+            sc.scroll_offset_y = 99999.0; // way past the end
+            sc.clamp_scroll();
+        }
+        apply_sticky_offsets(&mut root);
+        let sc = find_scroller_box(&root).unwrap();
+        let bb = sc.children[1].border_rect();
+        let release_top = cb_bottom - 40.0;
+        assert!(
+            (bb.y - release_top).abs() < 0.5,
+            "released sticky stops with bottom at CB bottom: top {release_top}, got {}",
+            bb.y
+        );
+        // It must NOT have kept pinning to the (now far-below) scrollport top.
+        let naive_pin = content_top + sc.scroll_offset_y;
+        assert!(
+            bb.y < naive_pin - 1.0,
+            "sticky released BELOW the naive scrollport pin (didn't escape CB)"
+        );
+        // Border-bottom is exactly at the CB bottom (the release edge).
+        assert!(
+            ((bb.y + bb.h) - cb_bottom).abs() < 0.5,
+            "header bottom rests on CB bottom {cb_bottom}, got {}",
+            bb.y + bb.h
+        );
+    }
+
+    #[test]
+    fn sticky_pure_offset_math_top_axis() {
+        // Directly exercise the axis solver with hand-computed coordinates.
+        // Box border [start=100,end=140] (40px tall). Scrollport [0,300].
+        // Containing block [0,1090]. top inset = 0, bottom = auto.
+        // Scrollport scrolled so vp_start = 130 (>100): pin pushes box to
+        // 130 → shift +30. Clamp range [cb_start-start, cb_end-end] =
+        // [-100, 950] — 30 is inside, so shift = +30.
+        let shift = sticky_axis(100.0, 140.0, 130.0, 130.0 + 300.0, 0.0, 1090.0, Some(0.0), None);
+        assert!((shift - 30.0).abs() < 1e-3, "top-pin shift +30, got {shift}");
+        // Not yet past the inset (vp_start=80 < box start 100): no shift.
+        let none = sticky_axis(100.0, 140.0, 80.0, 80.0 + 300.0, 0.0, 1090.0, Some(0.0), None);
+        assert!(none.abs() < 1e-3, "before threshold, no shift, got {none}");
+        // Past the CB: vp_start = 2000 would want shift +1900, but the box
+        // end can't pass cb_end=1090 → max shift = 1090-140 = 950.
+        let clamped = sticky_axis(100.0, 140.0, 2000.0, 2000.0 + 300.0, 0.0, 1090.0, Some(0.0), None);
+        assert!((clamped - 950.0).abs() < 1e-3, "CB clamp caps shift at 950, got {clamped}");
+    }
+
+    #[test]
+    fn sticky_bottom_inset_pins_to_scrollport_bottom() {
+        // bottom:0 axis. Box border [start=500,end=540]. Scrollport
+        // [0,300] (vp_end=300). CB [0,1090]. The box end (540) is BELOW
+        // vp_end (300) → pin pushes box UP so end meets vp_end: shift =
+        // 300-540 = -240. Clamp range [cb_start-start, cb_end-end] =
+        // [-500, 550] — -240 inside → shift -240.
+        let shift = sticky_axis(500.0, 540.0, 0.0, 300.0, 0.0, 1090.0, None, Some(0.0));
+        assert!((shift + 240.0).abs() < 1e-3, "bottom-pin shift -240, got {shift}");
+        // If the box already sits above vp_end (end=200 < 300): no shift.
+        let none = sticky_axis(160.0, 200.0, 0.0, 300.0, 0.0, 1090.0, None, Some(0.0));
+        assert!(none.abs() < 1e-3, "box above bottom inset: no shift, got {none}");
+    }
+
+    #[test]
+    fn sticky_left_inset_pins_horizontally() {
+        // Full end-to-end on the X axis: a `left:0` sticky cell inside a
+        // horizontally-scrolled container pins to the visible left edge.
+        let cell = block(
+            "div",
+            Style {
+                display: Some(Display::Block),
+                width: Some(LengthSpec::Px(60.0)),
+                height: Some(LengthSpec::Px(40.0)),
+                position: Some(Position::Sticky),
+                left_px: Some(LengthSpec::Px(0.0)),
+                ..Style::default()
+            },
+            vec![],
+        );
+        // A wide track forces horizontal overflow so the container scrolls.
+        let track = block(
+            "div",
+            Style {
+                display: Some(Display::Block),
+                width: Some(LengthSpec::Px(2000.0)),
+                height: Some(LengthSpec::Px(40.0)),
+                ..Style::default()
+            },
+            vec![cell],
+        );
+        let scroller = block(
+            "div",
+            Style {
+                display: Some(Display::Block),
+                width: Some(LengthSpec::Px(300.0)),
+                height: Some(LengthSpec::Px(100.0)),
+                overflow_x: Overflow::Auto,
+                overflow_y: Overflow::Auto,
+                ..Style::default()
+            },
+            vec![track],
+        );
+        let mut root = layout(&scroller, &LayoutConfig::default());
+        let content_left = find_scroller_box(&root).unwrap().content.x;
+        // Scroll right 120px; the cell (left:0) pins to the visible left.
+        {
+            let sc = find_scroller_box_mut(&mut root).unwrap();
+            sc.scroll_offset_x = 120.0;
+            sc.clamp_scroll();
+        }
+        apply_sticky_offsets(&mut root);
+        // Locate the sticky cell (nested under track).
+        fn find_sticky(b: &LayoutBox) -> Option<&LayoutBox> {
+            if matches!(b.position, Position::Sticky) {
+                return Some(b);
+            }
+            for c in &b.children {
+                if let Some(s) = find_sticky(c) {
+                    return Some(s);
+                }
+            }
+            None
+        }
+        let cell = find_sticky(&root).unwrap();
+        let expect_x = content_left + 120.0;
+        assert!(
+            (cell.border_rect().x - expect_x).abs() < 0.5,
+            "left:0 sticky pins to visible left {expect_x}, got {}",
+            cell.border_rect().x
+        );
+    }
+
+    #[test]
+    fn sticky_with_no_scroll_container_does_not_move() {
+        // A sticky box outside any scroll container has no scrollport to
+        // stick to — it must stay at its flow position (offset 0). Guards
+        // against the pass treating it like relative.
+        let header = block(
+            "div",
+            Style {
+                display: Some(Display::Block),
+                width: Some(LengthSpec::Px(200.0)),
+                height: Some(LengthSpec::Px(40.0)),
+                position: Some(Position::Sticky),
+                top_px: Some(LengthSpec::Px(10.0)),
+                ..Style::default()
+            },
+            vec![],
+        );
+        let page = block(
+            "div",
+            Style {
+                display: Some(Display::Block),
+                width: Some(LengthSpec::Px(200.0)),
+                ..Style::default()
+            },
+            vec![header],
+        );
+        let mut root = layout(&page, &LayoutConfig::default());
+        let before = {
+            fn find_sticky(b: &LayoutBox) -> Option<&LayoutBox> {
+                if matches!(b.position, Position::Sticky) {
+                    return Some(b);
+                }
+                for c in &b.children {
+                    if let Some(s) = find_sticky(c) {
+                        return Some(s);
+                    }
+                }
+                None
+            }
+            find_sticky(&root).unwrap().border_rect().y
+        };
+        apply_sticky_offsets(&mut root);
+        fn find_sticky(b: &LayoutBox) -> Option<&LayoutBox> {
+            if matches!(b.position, Position::Sticky) {
+                return Some(b);
+            }
+            for c in &b.children {
+                if let Some(s) = find_sticky(c) {
+                    return Some(s);
+                }
+            }
+            None
+        }
+        let after = find_sticky(&root).unwrap().border_rect().y;
+        assert!(
+            (after - before).abs() < 0.01,
+            "sticky with no scroll ancestor stays put: {before} -> {after}"
+        );
     }
 
     // ───────────────────────── 3D transform (Mat4) ─────────────────────
