@@ -49451,6 +49451,12 @@ fn bench_reset_render_thread_locals() {
     CURRENT_STYLE_CACHE.with(|c| *c.borrow_mut() = None);
     CURRENT_RENDER_ARENA.with(|c| *c.borrow_mut() = None);
     cv_layout::set_layout_cache(None, None, 0);
+    // Drop the text-measurement width cache so each measured build is a true
+    // COLD first-load (the within-pass redundant-measure reduction is the only
+    // win it can show — not cross-document reuse). The realized-font cache is
+    // deliberately kept (it holds only a handful of fonts and is a one-time GDI
+    // realization cost, exactly like a process-global font table).
+    cv_ui::clear_measure_width_cache();
 }
 
 /// Cap on cached subtree entries; on overflow the cache is left as-is (new

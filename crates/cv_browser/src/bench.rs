@@ -811,6 +811,62 @@ mod tests {
         }
     }
 
+    /// ORACLE for the text-measurement memoization win: the laid-out box tree of
+    /// a full real build must be BYTE-IDENTICAL whether the measure-width cache is
+    /// cold or warm. We build the page once (cold cache) and capture its layout
+    /// tree's Debug serialization (every geometry field), then build it AGAIN with
+    /// the width cache still warm, and assert the two serializations are equal.
+    /// Then we CLEAR the width cache and build a third time (cold again) and assert
+    /// it still matches — proving the cache is a pure memo, not a different answer.
+    /// This is the geometry-unchanged gate the perf win is required to pass.
+    fn layout_debug(paint: &cv_ui::PaintData) -> String {
+        match paint.layout_root.as_ref() {
+            Some(lb) => format!("{lb:?}"),
+            None => "<none>".to_string(),
+        }
+    }
+
+    fn build_layout_debug(html: &str, label: &str, cfg: &cv_layout::LayoutConfig) -> String {
+        crate::bench_reset_render_thread_locals();
+        let (_rt, _doc, _sheets, paint) =
+            crate::build_runtime_and_first_paint(html, label, cfg, "").expect("build");
+        layout_debug(&paint)
+    }
+
+    #[test]
+    fn measure_cache_preserves_byte_identical_layout_geometry() {
+        let cfg = cfg();
+        for name in ["medium_dom.html", "small_static.html"] {
+            let html = read_input(name).unwrap();
+            let label = "file:///oracle";
+
+            // Build 1: cold width cache (bench_reset clears it). Capture geometry.
+            let cold = build_layout_debug(&html, label, &cfg);
+
+            // Build 2: width cache WARM from build 1 (do NOT clear it here — call
+            // build_runtime_and_first_paint directly so the warm cache is used).
+            // Reset only the style/layout caches the live nav resets, keeping the
+            // measure cache warm, then assert identical geometry.
+            crate::CURRENT_STYLE_CACHE.with(|c| *c.borrow_mut() = None);
+            crate::CURRENT_RENDER_ARENA.with(|c| *c.borrow_mut() = None);
+            cv_layout::set_layout_cache(None, None, 0);
+            let (_rt, _doc, _sheets, paint_warm) =
+                crate::build_runtime_and_first_paint(&html, label, &cfg, "").expect("warm build");
+            let warm = layout_debug(&paint_warm);
+            assert_eq!(
+                cold, warm,
+                "{name}: warm-measure-cache layout geometry diverged from cold"
+            );
+
+            // Build 3: clear the width cache (fully cold) and rebuild — still equal.
+            let cold2 = build_layout_debug(&html, label, &cfg);
+            assert_eq!(
+                cold, cold2,
+                "{name}: second cold build geometry diverged (non-deterministic measure?)"
+            );
+        }
+    }
+
     #[test]
     fn ttfp_measures_real_build_with_stable_work_counter() {
         let cfg = cfg();

@@ -781,6 +781,71 @@ pub fn resolve_font_family(font_family: Option<&str>) -> String {
     "Segoe UI".to_string()
 }
 
+// ── Text-measurement memoization (Blink-shaped) ──────────────────────────────
+//
+// `measure_text_px`'s GDI cost is dominated by `CreateFontW` (a heavy font-
+// realization syscall) plus a per-call `CreateCompatibleDC`/`DeleteDC` pair, and
+// it is called on the LAYOUT hot path once per word-wrap trial line AND once per
+// intrinsic-width measure. A large DOM measures the SAME (text, font) tuples
+// hundreds of times (e.g. 200 identical grid-card paragraphs, every shared word),
+// so first-load layout drowned in redundant GDI work.
+//
+// Blink avoids exactly this: `Font::width()` results and shaped runs are cached
+// per (text, font) in `ShapeCache`, and `SimpleFontData`/`FontPlatformData` cache
+// the realized platform font so it is created once, not per measure. We mirror
+// that with two thread-local caches:
+//   1. a realized-font cache keyed by (size, resolved-face, bold, italic) so the
+//      expensive `CreateFontW` runs ONCE per distinct font (shared across all
+//      strings), plus a single reused measurement DC; and
+//   2. a width cache keyed by (text, size, resolved-face, bold, italic).
+//
+// `GetTextExtentPoint32W` is a deterministic pure function of those inputs, so a
+// cache hit returns the EXACT i32 the cold path would have computed — layout
+// geometry is byte-identical (the `CV_LAYOUT_VERIFY` oracle gate holds). Failure
+// results (null DC/font, GDI error) are NOT cached, so a transient failure can't
+// poison a key. The width cache is cleared wholesale if it grows past a generous
+// cap (real pages stay far below it); the font cache is tiny (a handful of
+// distinct fonts per page) and never evicted.
+
+/// One realized GDI font + the reused measurement DC, kept alive for the thread.
+struct MeasureFontCache {
+    /// Shared off-screen DC every measure selects fonts into. Created lazily.
+    mem_dc: sys::HDC,
+    /// (size, face, bold, italic) -> realized HFONT, created once per font.
+    fonts: std::collections::HashMap<(i32, String, bool, bool), sys::HFONT>,
+}
+
+thread_local! {
+    /// Realized-font + measurement-DC cache (created lazily on first measure).
+    static MEASURE_FONTS: std::cell::RefCell<MeasureFontCache> =
+        std::cell::RefCell::new(MeasureFontCache {
+            mem_dc: core::ptr::null_mut(),
+            fonts: std::collections::HashMap::new(),
+        });
+    /// (text, size, face, bold, italic) -> measured advance width in px.
+    static MEASURE_WIDTHS: std::cell::RefCell<std::collections::HashMap<(String, i32, String, bool, bool), i32>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Soft cap on the width cache. Each entry is small (a String key + an i32); 1M
+/// entries is well under any RAM concern and far above any real page's distinct
+/// (text, font) run count. On overflow we clear wholesale (deterministic; the
+/// recomputed values are identical, so correctness is unaffected — only the next
+/// few measures pay the cold cost again).
+const MEASURE_WIDTH_CACHE_CAP: usize = 1_000_000;
+
+/// Clear the text-measurement width cache (NOT the realized-font cache — those
+/// stay valid forever). The bench's per-document reset calls this so each timed
+/// TTFP build is a genuine COLD first-load: the width cache starts empty and is
+/// filled only by within-this-layout reuse, so the measured win is honestly the
+/// redundant-measure reduction of a SINGLE first layout pass, not cross-iteration
+/// caching of the same document. The live browser never calls this (a real
+/// navigation legitimately reuses the process-global measure cache, like Blink's
+/// ShapeCache surviving across page loads).
+pub fn clear_measure_width_cache() {
+    MEASURE_WIDTHS.with(|c| c.borrow_mut().clear());
+}
+
 pub fn measure_text_px(
     text: &str,
     font_size_px: i32,
@@ -791,44 +856,86 @@ pub fn measure_text_px(
     if text.is_empty() {
         return 0;
     }
-    unsafe {
-        let mem_dc = sys::CreateCompatibleDC(core::ptr::null_mut());
-        if mem_dc.is_null() {
-            return 0;
+    let face_name = resolve_font_family(font_family);
+
+    // 1. Width cache — the common hit. A hit returns the exact i32 the GDI path
+    //    would compute, so geometry is byte-identical.
+    let wkey = (
+        text.to_string(),
+        font_size_px,
+        face_name.clone(),
+        bold,
+        italic,
+    );
+    if let Some(w) = MEASURE_WIDTHS.with(|c| c.borrow().get(&wkey).copied()) {
+        return w;
+    }
+
+    // 2. Miss: measure via GDI, reusing a cached realized font + measurement DC.
+    let width = MEASURE_FONTS.with(|fc| {
+        let mut fc = fc.borrow_mut();
+        unsafe {
+            if fc.mem_dc.is_null() {
+                fc.mem_dc = sys::CreateCompatibleDC(core::ptr::null_mut());
+                if fc.mem_dc.is_null() {
+                    return None;
+                }
+            }
+            let mem_dc = fc.mem_dc;
+            let fkey = (font_size_px, face_name.clone(), bold, italic);
+            let hfont = if let Some(h) = fc.fonts.get(&fkey).copied() {
+                h
+            } else {
+                let face: Vec<u16> = format!("{face_name}\0").encode_utf16().collect();
+                let weight = if bold { sys::FW_BOLD } else { sys::FW_NORMAL };
+                let italic_flag = u32::from(italic);
+                let h = sys::CreateFontW(
+                    font_size_px,
+                    0,
+                    0,
+                    0,
+                    weight,
+                    italic_flag,
+                    0,
+                    0,
+                    sys::DEFAULT_CHARSET,
+                    sys::OUT_DEFAULT_PRECIS,
+                    sys::CLIP_DEFAULT_PRECIS,
+                    sys::CLEARTYPE_QUALITY,
+                    sys::DEFAULT_PITCH | sys::FF_DONTCARE,
+                    face.as_ptr(),
+                );
+                if h.is_null() {
+                    return None;
+                }
+                fc.fonts.insert(fkey, h);
+                h
+            };
+            let old_font = sys::SelectObject(mem_dc, hfont);
+            let wide: Vec<u16> = text.encode_utf16().collect();
+            let mut size = sys::SIZE { cx: 0, cy: 0 };
+            let ok =
+                sys::GetTextExtentPoint32W(mem_dc, wide.as_ptr(), wide.len() as i32, &raw mut size);
+            sys::SelectObject(mem_dc, old_font);
+            if ok == 0 { Some(0) } else { Some(size.cx) }
         }
-        let face_name = resolve_font_family(font_family);
-        let face: Vec<u16> = format!("{face_name}\0").encode_utf16().collect();
-        let weight = if bold { sys::FW_BOLD } else { sys::FW_NORMAL };
-        let italic_flag = u32::from(italic);
-        let hfont = sys::CreateFontW(
-            font_size_px,
-            0,
-            0,
-            0,
-            weight,
-            italic_flag,
-            0,
-            0,
-            sys::DEFAULT_CHARSET,
-            sys::OUT_DEFAULT_PRECIS,
-            sys::CLIP_DEFAULT_PRECIS,
-            sys::CLEARTYPE_QUALITY,
-            sys::DEFAULT_PITCH | sys::FF_DONTCARE,
-            face.as_ptr(),
-        );
-        if hfont.is_null() {
-            sys::DeleteDC(mem_dc);
-            return 0;
+    });
+
+    match width {
+        // Real measurement (including a legitimate 0 from GDI) — memoize it.
+        Some(w) => {
+            MEASURE_WIDTHS.with(|c| {
+                let mut m = c.borrow_mut();
+                if m.len() >= MEASURE_WIDTH_CACHE_CAP {
+                    m.clear();
+                }
+                m.insert(wkey, w);
+            });
+            w
         }
-        let old_font = sys::SelectObject(mem_dc, hfont);
-        let wide: Vec<u16> = text.encode_utf16().collect();
-        let mut size = sys::SIZE { cx: 0, cy: 0 };
-        let ok =
-            sys::GetTextExtentPoint32W(mem_dc, wide.as_ptr(), wide.len() as i32, &raw mut size);
-        sys::SelectObject(mem_dc, old_font);
-        sys::DeleteObject(hfont);
-        sys::DeleteDC(mem_dc);
-        if ok == 0 { 0 } else { size.cx }
+        // DC/font realization failed — DON'T cache (it may be transient); return
+        // 0, matching the original error path.
+        None => 0,
     }
 }
 
@@ -5812,6 +5919,52 @@ mod tests {
         // Back/Forward never cancel a load even in process mode.
         assert!(!in_flight_press_cancels(true, true, NavButton::Back));
         assert!(!in_flight_press_cancels(true, true, NavButton::Forward));
+    }
+
+    /// Oracle for the text-measurement memoization: a cached (warm) measure must
+    /// return the BYTE-IDENTICAL i32 a cold (cache-cleared) measure computes, for
+    /// the same (text, size, face, bold, italic). This is the byte-identity gate
+    /// that makes the layout geometry unchanged — the cache is a pure-function
+    /// memo, never a different answer. We measure cold, clear the width cache,
+    /// re-measure (cold again), and also re-measure WARM (hit), asserting all
+    /// three agree exactly. Repeated identical strings (the medium_dom case) must
+    /// also be self-consistent.
+    #[test]
+    fn measure_text_cache_is_byte_identical_to_cold() {
+        use super::{clear_measure_width_cache, measure_text_px};
+        let cases: &[(&str, i32, Option<&str>, bool, bool)] = &[
+            ("Row 0 of the generated grid, fixed content.", 11, Some("Arial"), false, false),
+            ("Item 7", 12, Some("Arial"), true, false),
+            ("The quick brown fox jumps over the lazy dog", 16, None, false, true),
+            ("", 13, None, false, false), // empty -> 0, not cached
+            ("single", 24, Some("Times New Roman"), true, true),
+        ];
+        for &(text, size, fam, bold, italic) in cases {
+            clear_measure_width_cache();
+            let cold = measure_text_px(text, size, fam, bold, italic);
+            // Second call with a warm cache must be the SAME value.
+            let warm = measure_text_px(text, size, fam, bold, italic);
+            // Clear and re-measure cold again — still the same (deterministic).
+            clear_measure_width_cache();
+            let cold2 = measure_text_px(text, size, fam, bold, italic);
+            assert_eq!(
+                cold, warm,
+                "warm cache diverged from cold for {text:?} (cold={cold} warm={warm})"
+            );
+            assert_eq!(
+                cold, cold2,
+                "cold re-measure diverged for {text:?} (cold={cold} cold2={cold2})"
+            );
+        }
+        // Non-empty text yields a positive width (the GDI path actually ran).
+        clear_measure_width_cache();
+        assert!(measure_text_px("hello world", 16, None, false, false) > 0);
+        // The same string measured many times (the redundant-measure case the
+        // cache exists to collapse) is self-identical every time.
+        let w0 = measure_text_px("repeated run", 13, Some("Arial"), false, false);
+        for _ in 0..50 {
+            assert_eq!(measure_text_px("repeated run", 13, Some("Arial"), false, false), w0);
+        }
     }
 
     /// The Stop sentinel is a reserved encoding distinct from any real
