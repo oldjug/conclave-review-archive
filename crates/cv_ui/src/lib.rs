@@ -335,6 +335,36 @@ pub enum TextAlign {
     Right,
 }
 
+/// One color stop of a text-fill gradient (CSS `background-clip: text`).
+/// Mirrors `cv_gfx::AbstractStop` but kept as a `cv_ui`-local POD so the
+/// crate stays free of a hard `cv_gfx` gradient-type dependency in its
+/// public API. Positions follow CSS Images 3: `pos_frac` is a fraction
+/// of the gradient line (0..1); `pos_px` is an absolute length resolved
+/// against the line length at paint. At most one is `Some`.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct TextGradientStop {
+    pub r: u8,
+    pub g: u8,
+    pub b: u8,
+    pub a: u8,
+    pub pos_frac: Option<f32>,
+    pub pos_px: Option<f32>,
+}
+
+/// A linear gradient used to fill text glyphs for the
+/// `background-clip: text` ("gradient text") idiom. Carried on a
+/// [`TextItem`]; the painter clips it to the glyph coverage mask via
+/// `cv_gfx::Bitmap::blit_text_run_gradient`. Only the linear form is
+/// carried — radial/conic clip-text is vanishingly rare; those still
+/// fall back to a solid colour fill.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TextGradient {
+    /// CSS angle (0° = up, +clockwise), already resolved.
+    pub angle_deg: f32,
+    pub stops: Vec<TextGradientStop>,
+    pub repeating: bool,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct TextItem {
     pub x: i32,
@@ -370,6 +400,11 @@ pub struct TextItem {
     /// producing the "some items go up, some stay" effect on every
     /// scroll.
     pub is_chrome: bool,
+    /// `background-clip: text` gradient fill. When `Some`, the glyphs are
+    /// painted with this linear gradient clipped to the glyph coverage
+    /// mask (the "gradient text" idiom) instead of the flat `color_rgb`.
+    /// `None` ⇒ ordinary flat-coloured text (the overwhelming default).
+    pub text_gradient: Option<TextGradient>,
 }
 
 #[derive(Clone, Debug)]
@@ -425,6 +460,10 @@ pub struct PaintData {
     /// paint time, so blink doesn't trigger re-rendering — just a
     /// 2×height pixel `FillRect` after the bitmap blit.
     pub caret_rect: Option<(i32, i32, i32, i32)>,
+    /// `caret-color` (CSS UI 4) of the focused editable element as packed
+    /// `(r, g, b)`. `None` ⇒ the UA default caret colour. The WM_PAINT
+    /// caret overlay paints with this when present, otherwise the default.
+    pub caret_color: Option<(u8, u8, u8)>,
     /// Property trees from the last layout pass. When a CSS animation
     /// only modifies compositor properties (transform/opacity), the
     /// compositor can update layer positions without re-rasterizing by
@@ -451,6 +490,20 @@ pub struct PaintData {
     /// `bitmap.height` (full-document bitmap). For a band bitmap this is LARGER
     /// than the bitmap, so scroll clamp / scrollbar use THIS not the bitmap.
     pub document_h: u32,
+    /// CSS Scrollbars 1 theming for the viewport (root) scrollbar, taken
+    /// from the document root's computed `scrollbar-width` / `scrollbar-color`.
+    /// `width_mode`: 0 = auto, 1 = thin, 2 = none (hidden). `colors`:
+    /// `Some((thumb_rgb, track_rgb))` overrides the UA greys; `None` ⇒ default.
+    pub scrollbar_theme: ScrollbarTheme,
+}
+
+/// Resolved viewport-scrollbar theming (CSS Scrollbars 1) for the root.
+#[derive(Copy, Clone, Debug, PartialEq, Default)]
+pub struct ScrollbarTheme {
+    /// 0 = auto, 1 = thin, 2 = none (scrollbar hidden).
+    pub width_mode: u8,
+    /// `(thumb_rgb, track_rgb)` when `scrollbar-color` is set, else `None`.
+    pub colors: Option<((u8, u8, u8), (u8, u8, u8))>,
 }
 
 impl PaintData {
@@ -1157,7 +1210,38 @@ pub fn bake_content_text_into_bitmap_clipped(
                 blit_copy
             }
         };
-        blit_text_run_clipped(bitmap, &run_to_blit, t.x, t.y, t.color_rgb, t.color_alpha, clip);
+        if let Some(grad) = &t.text_gradient {
+            // background-clip:text — paint the glyphs with the gradient
+            // clipped to the cached glyph coverage mask. The run box used
+            // for the gradient ramp is the rasterized run's footprint
+            // (run.width × run.height) at (t.x, t.y), so the gradient runs
+            // across the whole word, matching Chrome's fill-then-clip.
+            let stops: Vec<cv_gfx::AbstractStop> = grad
+                .stops
+                .iter()
+                .map(|s| cv_gfx::AbstractStop {
+                    color: cv_gfx::Color { r: s.r, g: s.g, b: s.b, a: s.a },
+                    pos_frac: s.pos_frac,
+                    pos_px: s.pos_px,
+                })
+                .collect();
+            bitmap.blit_text_run_gradient(
+                t.x,
+                t.y,
+                run_to_blit.width as i32,
+                run_to_blit.height as i32,
+                &run_to_blit.alpha,
+                run_to_blit.width as i32,
+                run_to_blit.height as i32,
+                grad.angle_deg,
+                &stops,
+                grad.repeating,
+                t.color_alpha,
+                clip,
+            );
+        } else {
+            blit_text_run_clipped(bitmap, &run_to_blit, t.x, t.y, t.color_rgb, t.color_alpha, clip);
+        }
     }
 
     // Skip the old GDI bake path entirely — the atlas blits above
@@ -2476,6 +2560,19 @@ fn scrollbar_thumb_rect(
     content_h: i32,
     scroll_y: i32,
 ) -> Option<(i32, i32, i32, i32)> {
+    scrollbar_thumb_rect_w(client_w, client_h, chrome_h, content_h, scroll_y, SCROLLBAR_W)
+}
+
+/// `scrollbar_thumb_rect` parameterized by the bar width (CSS Scrollbars 1
+/// `scrollbar-width: thin` draws a narrower bar). Default width = `SCROLLBAR_W`.
+fn scrollbar_thumb_rect_w(
+    client_w: i32,
+    client_h: i32,
+    chrome_h: i32,
+    content_h: i32,
+    scroll_y: i32,
+    bar_w: i32,
+) -> Option<(i32, i32, i32, i32)> {
     let track_h = (client_h - chrome_h).max(0); // the viewport region height
     if content_h <= track_h || track_h <= 0 {
         return None; // fits — no scrollbar
@@ -2487,8 +2584,8 @@ fn scrollbar_thumb_rect(
     let thumb_h = thumb_h.min(track_h);
     let travel = (track_h - thumb_h).max(0);
     let thumb_y = chrome_h + ((sy as i64 * travel as i64) / max_scroll as i64) as i32;
-    let x = client_w - SCROLLBAR_W;
-    Some((x, thumb_y, SCROLLBAR_W, thumb_h))
+    let x = client_w - bar_w;
+    Some((x, thumb_y, bar_w, thumb_h))
 }
 
 /// Draw the custom vertical scrollbar (track + thumb) into the presented BGRA
@@ -2503,14 +2600,22 @@ fn draw_scrollbar_into_frame(
     chrome_h: i32,
     content_h: i32,
     scroll_y: i32,
+    theme: ScrollbarTheme,
 ) {
-    let thumb = match scrollbar_thumb_rect(client_w, client_h, chrome_h, content_h, scroll_y) {
+    // CSS Scrollbars 1 §3 `scrollbar-width: none` ⇒ no scrollbar at all.
+    if theme.width_mode == 2 {
+        return;
+    }
+    // `thin` draws a narrower bar (Chrome ≈ 9px vs ~14px auto).
+    let bar_w = if theme.width_mode == 1 { 9 } else { SCROLLBAR_W };
+    let thumb = match scrollbar_thumb_rect_w(client_w, client_h, chrome_h, content_h, scroll_y, bar_w)
+    {
         Some(t) => t,
         None => return,
     };
     let fw = client_w.max(0) as usize;
     let track_top = chrome_h.max(0);
-    let track_x = (client_w - SCROLLBAR_W).max(0);
+    let track_x = (client_w - bar_w).max(0);
     let fill = |frame: &mut [u32], x0: i32, y0: i32, w: i32, h: i32, color: u32| {
         for yy in y0..(y0 + h) {
             if yy < 0 || yy >= client_h {
@@ -2527,10 +2632,16 @@ fn draw_scrollbar_into_frame(
             }
         }
     };
-    // Track: subtle dark groove. Thumb: lighter grey, rounded-ish (flat is fine).
-    fill(frame, track_x, track_top, SCROLLBAR_W, client_h - track_top, 0xFF1E_1E22);
+    // CSS Scrollbars 1 §2 `scrollbar-color: <thumb> <track>` overrides the
+    // UA greys (track: subtle dark groove; thumb: lighter grey).
+    let pack = |(r, g, b): (u8, u8, u8)| 0xFF00_0000 | ((r as u32) << 16) | ((g as u32) << 8) | b as u32;
+    let (thumb_c, track_c) = match theme.colors {
+        Some((thumb_rgb, track_rgb)) => (pack(thumb_rgb), pack(track_rgb)),
+        None => (0xFF5A_5A64, 0xFF1E_1E22),
+    };
+    fill(frame, track_x, track_top, bar_w, client_h - track_top, track_c);
     let (tx, ty, tw, th) = thumb;
-    fill(frame, tx + 2, ty, tw - 3, th, 0xFF5A_5A64);
+    fill(frame, tx + 2, ty, tw - 3, th, thumb_c);
 }
 
 /// Centralised paint swap: install `new_paint` and update the window
@@ -3991,6 +4102,7 @@ unsafe extern "system" fn wnd_proc(
                         chrome_h,
                         guard.paint.bitmap.height as i32,
                         scroll_y,
+                        guard.paint.scrollbar_theme,
                     );
                     let presented = if let Some(ref mut hw) = guard.hw_presenter {
                         hw.present_u32(&frame, client_w as u32, client_h as u32)
@@ -4276,7 +4388,11 @@ unsafe extern "system" fn wnd_proc(
                                 right: cx + cw,
                                 bottom: (draw_y + ch).min(client_h),
                             };
-                            let brush = unsafe { sys::CreateSolidBrush(sys::rgb(16, 16, 16)) };
+                            // CSS UI 4 caret-color: use the authored colour
+                            // when present, else the UA default near-black.
+                            let (cr, cg, cb) =
+                                guard.paint.caret_color.unwrap_or((16, 16, 16));
+                            let brush = unsafe { sys::CreateSolidBrush(sys::rgb(cr, cg, cb)) };
                             unsafe {
                                 sys::FillRect(hdc, &raw const r, brush);
                                 sys::DeleteObject(brush);
@@ -5800,6 +5916,8 @@ mod tests {
             chrome_h: 66,
             viewport_h: 800,
             caret_rect: None,
+            caret_color: None,
+            scrollbar_theme: crate::ScrollbarTheme::default(),
             property_trees: None,
             retained: None,
             content_origin_y: 0,
@@ -5853,6 +5971,8 @@ mod tests {
             chrome_h: 66,
             viewport_h: h.saturating_sub(66),
             caret_rect: None,
+            caret_color: None,
+            scrollbar_theme: crate::ScrollbarTheme::default(),
             property_trees: None,
             retained: None,
             content_origin_y: 0,

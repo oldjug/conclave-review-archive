@@ -669,6 +669,14 @@ pub struct ComputedStyle {
     /// what real sites use this idiom for (branded wordmarks with a
     /// gradient fill on the letters).
     pub background_clip_text: bool,
+    /// `scrollbar-width` (CSS Scrollbars 1 §3): `auto` (0, default) /
+    /// `thin` (1) / `none` (2). On a scroll container's root this themes
+    /// the viewport scrollbar — `none` hides it entirely, `thin` draws a
+    /// narrower bar.
+    pub scrollbar_width: u8,
+    /// `scrollbar-color` (CSS Scrollbars 1 §2) — `(thumb, track)` colours.
+    /// `None` ⇒ `auto` (the UA default groove/thumb greys).
+    pub scrollbar_color: Option<(Color, Color)>,
     /// `object-fit` value — `fill` / `contain` / `cover` / `none` /
     /// `scale-down`. Plumbed through to the layout `Style` so the
     /// painter knows how to map the source bitmap into the box.
@@ -2328,6 +2336,30 @@ where
             anc = a.parent();
         }
     }
+    // CSS UI 4 §5.3 `accent-color`: a CHECKED checkbox/radio fills with the
+    // control's accent colour (Chrome paints the box in the accent and a
+    // white tick/dot on top). We realise the accent FILL by setting the
+    // box background to the resolved accent — reusing the ordinary box
+    // background painter — so a checked control reads as accent-coloured
+    // instead of an empty white square. `accent-color: auto` (unset)
+    // resolves to a representative Chrome accent blue. The white tick mark
+    // itself is drawn by the form-control glyph layer; the FILL is the
+    // user-visible accent change this property controls.
+    if tag.eq_ignore_ascii_case("input") {
+        let ty = element.attr("type").unwrap_or("");
+        let is_check = ty.eq_ignore_ascii_case("checkbox") || ty.eq_ignore_ascii_case("radio");
+        if is_check && element.attr("checked").is_some() {
+            // Chrome's default UA accent (the system-blue used for
+            // form controls when `accent-color: auto`).
+            let accent = style.accent_color.unwrap_or(Color {
+                r: 0x1a,
+                g: 0x73,
+                b: 0xe8,
+                a: 255,
+            });
+            style.background_color = Some(accent);
+        }
+    }
 }
 
 pub fn compute_with_index_inheriting<'a, E>(
@@ -3412,8 +3444,6 @@ fn is_silent_unknown(name: &str) -> bool {
             | "appearance"
             | "user-select"
             | "user-drag"
-            | "scrollbar-width"
-            | "scrollbar-color"
             | "scroll-behavior"
             | "scroll-snap-type"
             | "scroll-snap-align"
@@ -5651,8 +5681,6 @@ fn apply_declaration(style: &mut ComputedStyle, d: &Declaration) {
         | "scroll-margin-inline-end"
         | "scroll-margin-block-start"
         | "scroll-margin-block-end"
-        | "scrollbar-color"
-        | "scrollbar-width"
         | "scrollbar-gutter"
         | "overscroll-behavior"
         | "overscroll-behavior-x"
@@ -5829,6 +5857,63 @@ fn apply_declaration(style: &mut ComputedStyle, d: &Declaration) {
         "caret-color" => {
             if let Some(c) = Color::from_tokens(toks) {
                 style.caret_color = Some(c);
+            }
+        }
+        "scrollbar-width" => {
+            // CSS Scrollbars 1 §3: auto | thin | none.
+            if let Some(CssToken::Ident(kw)) =
+                toks.iter().find(|t| !matches!(t, CssToken::Whitespace))
+            {
+                style.scrollbar_width = match kw.to_ascii_lowercase().as_str() {
+                    "thin" => 1,
+                    "none" => 2,
+                    _ => 0, // auto (default)
+                };
+            }
+        }
+        "scrollbar-color" => {
+            // CSS Scrollbars 1 §2: `auto` | <thumb-color> <track-color>.
+            // `auto` leaves the UA default (None). Otherwise two colours
+            // separated by top-level whitespace (functions keep their own
+            // internal whitespace via paren-depth tracking).
+            let first = toks.iter().find(|t| !matches!(t, CssToken::Whitespace));
+            if let Some(CssToken::Ident(kw)) = first {
+                if kw.eq_ignore_ascii_case("auto") {
+                    style.scrollbar_color = None;
+                    return;
+                }
+            }
+            // Split into top-level groups.
+            let mut groups: Vec<Vec<CssToken>> = Vec::new();
+            let mut cur: Vec<CssToken> = Vec::new();
+            let mut depth: i32 = 0;
+            for t in toks {
+                match t {
+                    CssToken::Function(_) => {
+                        depth += 1;
+                        cur.push(t.clone());
+                    }
+                    CssToken::RightParen => {
+                        depth -= 1;
+                        cur.push(t.clone());
+                    }
+                    CssToken::Whitespace if depth == 0 => {
+                        if !cur.is_empty() {
+                            groups.push(std::mem::take(&mut cur));
+                        }
+                    }
+                    _ => cur.push(t.clone()),
+                }
+            }
+            if !cur.is_empty() {
+                groups.push(cur);
+            }
+            if groups.len() >= 2 {
+                let thumb = Color::from_tokens(&groups[0]);
+                let track = Color::from_tokens(&groups[1]);
+                if let (Some(thumb), Some(track)) = (thumb, track) {
+                    style.scrollbar_color = Some((thumb, track));
+                }
             }
         }
         "color-scheme" => {
@@ -9722,6 +9807,103 @@ mod tests {
             cs.color_scheme,
             cs.view_transition_name,
         );
+    }
+
+    /// CSS UI 4 §5.3: a CHECKED checkbox is filled with the accent colour.
+    /// When `accent-color` is authored, the box background becomes that
+    /// colour; when unset, the UA default accent. An UNCHECKED checkbox is
+    /// NOT accent-filled (keeps its white UA background).
+    #[test]
+    fn accent_color_fills_checked_checkbox() {
+        #[derive(Copy, Clone)]
+        struct Input<'a> {
+            ty: &'a str,
+            checked: bool,
+        }
+        impl<'a> ElementView<'a> for Input<'a> {
+            fn tag_name(&self) -> Option<&'a str> {
+                Some("input")
+            }
+            fn id(&self) -> Option<&'a str> {
+                None
+            }
+            fn has_class(&self, _: &str) -> bool {
+                false
+            }
+            fn parent(&self) -> Option<Self> {
+                None
+            }
+            fn attr(&self, name: &str) -> Option<&'a str> {
+                match name.to_ascii_lowercase().as_str() {
+                    "type" => Some(self.ty),
+                    "checked" if self.checked => Some(""),
+                    _ => None,
+                }
+            }
+        }
+
+        // Authored accent-color on a checked checkbox → box fills with it.
+        let sheets = [parse_stylesheet("input { accent-color: #00ff00; }")];
+        let idx = SelectorIndex::build(&sheets);
+        let checked = Input { ty: "checkbox", checked: true };
+        let cs = compute_with_index(&idx, checked, &[], &[]);
+        assert_eq!(
+            cs.background_color,
+            Some(Color { r: 0, g: 255, b: 0, a: 255 }),
+            "checked checkbox must fill with the authored accent-color"
+        );
+
+        // UNCHECKED with same accent → NOT accent-filled.
+        let unchecked = Input { ty: "checkbox", checked: false };
+        let cs2 = compute_with_index(&idx, unchecked, &[], &[]);
+        assert_ne!(
+            cs2.background_color,
+            Some(Color { r: 0, g: 255, b: 0, a: 255 }),
+            "unchecked checkbox must NOT be accent-filled"
+        );
+
+        // Checked WITHOUT authored accent → UA default accent (Chrome blue).
+        let sheets3 = [parse_stylesheet("")];
+        let idx3 = SelectorIndex::build(&sheets3);
+        let default_checked = Input { ty: "radio", checked: true };
+        let cs3 = compute_with_index(&idx3, default_checked, &[], &[]);
+        assert_eq!(
+            cs3.background_color,
+            Some(Color { r: 0x1a, g: 0x73, b: 0xe8, a: 255 }),
+            "checked control with accent-color:auto uses the UA default accent"
+        );
+    }
+
+    /// CSS Scrollbars 1 §3 + §2: `scrollbar-width` and `scrollbar-color`
+    /// parse into the computed style (auto/thin/none + thumb/track colours).
+    #[test]
+    fn scrollbar_width_and_color_parse() {
+        let html = || Fake { tag: "html", id: None, classes: &[] };
+        // scrollbar-width: none → mode 2.
+        let cs = compute(&[parse_stylesheet("html { scrollbar-width: none; }")], html());
+        assert_eq!(cs.scrollbar_width, 2, "scrollbar-width:none → 2");
+
+        // scrollbar-width: thin → mode 1.
+        let cs = compute(&[parse_stylesheet("html { scrollbar-width: thin; }")], html());
+        assert_eq!(cs.scrollbar_width, 1, "scrollbar-width:thin → 1");
+
+        // scrollbar-color: <thumb> <track> with hex + rgb() forms.
+        let cs = compute(
+            &[parse_stylesheet("html { scrollbar-color: #ff0000 rgb(0, 0, 255); }")],
+            html(),
+        );
+        assert_eq!(
+            cs.scrollbar_color,
+            Some((
+                Color { r: 255, g: 0, b: 0, a: 255 },
+                Color { r: 0, g: 0, b: 255, a: 255 },
+            )),
+            "scrollbar-color parses (thumb, track), function form intact"
+        );
+
+        // scrollbar-color: auto → None (UA default).
+        let cs = compute(&[parse_stylesheet("html { scrollbar-color: auto; }")], html());
+        assert_eq!(cs.scrollbar_color, None, "scrollbar-color:auto → None");
     }
 
     #[test]

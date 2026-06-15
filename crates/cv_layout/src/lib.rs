@@ -827,6 +827,28 @@ pub struct LayoutBox {
     /// Full N-stop gradient (linear/radial/conic + repeating). When set,
     /// the painter rasterizes this instead of the 2-stop approximations.
     pub background_gradient_full: Option<GradientSpec>,
+    /// `background-clip: text` gradient fill. When `Some`, the box's text
+    /// glyphs are painted with this gradient clipped to the glyph
+    /// coverage mask (the "gradient text" idiom). The box background
+    /// paint is suppressed. CSS Backgrounds 3 `background-clip` + the
+    /// `-webkit-text-fill-color: transparent` convention. Carries the
+    /// FULL N-stop gradient so the ramp is exact across the word, not a
+    /// flattened midpoint colour.
+    pub text_fill_gradient: Option<GradientSpec>,
+    /// `caret-color` (CSS UI 4 §5.1) — the insertion caret colour for an
+    /// editable element. `None` ⇒ `auto` (≈ `currentColor`), so the
+    /// painter falls back to the text colour. Carried to the painter so
+    /// the focused-input caret overlay uses the authored colour.
+    pub caret_color: Option<Color>,
+    /// `accent-color` (CSS UI 4 §5.3) — the UA accent for form controls
+    /// (checkbox tick / fill, radio dot, etc.). `None` ⇒ `auto` (the UA
+    /// default accent). Consulted by the form-control painter.
+    pub accent_color: Option<Color>,
+    /// `scrollbar-width` (CSS Scrollbars 1): 0 = auto, 1 = thin, 2 = none.
+    /// On the root box this themes the viewport scrollbar.
+    pub scrollbar_width: u8,
+    /// `scrollbar-color` (CSS Scrollbars 1) — `(thumb, track)`; `None` ⇒ auto.
+    pub scrollbar_color: Option<(Color, Color)>,
     /// `background-image: url(...)` URL string (unresolved). Painter
     /// looks this up in the image cache to draw the background bitmap.
     pub background_image_url: Option<String>,
@@ -1460,6 +1482,18 @@ pub struct Style {
     pub background_radial_gradient: Option<LinearGradientSpec>,
     /// Full N-stop gradient — rasterized verbatim by the painter.
     pub background_gradient_full: Option<GradientSpec>,
+    /// `background-clip: text` gradient fill (the "gradient text" idiom).
+    /// When set, the painter clips this gradient to the text glyph mask
+    /// and suppresses the box background. CSS Backgrounds 3.
+    pub text_fill_gradient: Option<GradientSpec>,
+    /// `caret-color` (CSS UI 4) — insertion caret colour; `None` ⇒ auto.
+    pub caret_color: Option<Color>,
+    /// `accent-color` (CSS UI 4) — form-control accent; `None` ⇒ auto.
+    pub accent_color: Option<Color>,
+    /// `scrollbar-width` (CSS Scrollbars 1): 0 auto / 1 thin / 2 none.
+    pub scrollbar_width: u8,
+    /// `scrollbar-color` (CSS Scrollbars 1) — `(thumb, track)`; `None` ⇒ auto.
+    pub scrollbar_color: Option<(Color, Color)>,
     /// `background-image: url(...)` URL, passed through to the painter
     /// so it can resolve against the document base URL and look up the
     /// bitmap in the image cache.
@@ -3735,6 +3769,11 @@ fn build_box_inner(node: &StyledNode, cfg: &LayoutConfig) -> LayoutBox {
                 background_gradient: node.style.background_gradient,
                 background_radial_gradient: node.style.background_radial_gradient,
                 background_gradient_full: node.style.background_gradient_full.clone(),
+                text_fill_gradient: node.style.text_fill_gradient.clone(),
+                caret_color: node.style.caret_color,
+                accent_color: node.style.accent_color,
+                scrollbar_width: node.style.scrollbar_width,
+                scrollbar_color: node.style.scrollbar_color,
                 background_image_url: node.style.background_image_url.clone(),
                 background_repeat: node.style.background_repeat,
                 position: node.style.position.unwrap_or(Position::Static),
@@ -3886,6 +3925,11 @@ fn build_box_inner(node: &StyledNode, cfg: &LayoutConfig) -> LayoutBox {
             background_gradient: None,
             background_radial_gradient: None,
             background_gradient_full: None,
+            text_fill_gradient: None,
+            caret_color: None,
+            accent_color: None,
+            scrollbar_width: 0,
+            scrollbar_color: None,
             background_image_url: None,
             background_repeat: BackgroundRepeat::default(),
             position: Position::Static,

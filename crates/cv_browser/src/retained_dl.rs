@@ -1796,10 +1796,34 @@ fn gen_text(
             align,
             letter_spacing_px: b.letter_spacing_px.round() as i32,
             is_chrome: false,
+            text_gradient: None,
         };
         texts.push(ti.clone());
         my_texts.push(ti);
     }
+    // background-clip:text gradient fill (CSS Backgrounds 3) — carry the
+    // linear gradient through the retained display list so the incremental
+    // raster paints gradient text identically to the full-bake path.
+    let text_gradient = match b.text_fill_gradient.as_ref() {
+        Some(cv_layout::GradientSpec::Linear { angle_deg, stops, repeating }) => {
+            Some(cv_ui::TextGradient {
+                angle_deg: *angle_deg,
+                repeating: *repeating,
+                stops: stops
+                    .iter()
+                    .map(|s| cv_ui::TextGradientStop {
+                        r: s.color.r,
+                        g: s.color.g,
+                        b: s.color.b,
+                        a: s.color.a,
+                        pos_frac: s.pos_frac,
+                        pos_px: s.pos_px,
+                    })
+                    .collect(),
+            })
+        }
+        _ => None,
+    };
     let main_ti = TextItem {
         x: b.content.x as i32 + ox,
         y: b.content.y as i32 + oy,
@@ -1816,6 +1840,7 @@ fn gen_text(
         align,
         letter_spacing_px: b.letter_spacing_px.round() as i32,
         is_chrome: false,
+        text_gradient,
     };
     texts.push(main_ti.clone());
     my_texts.push(main_ti);
@@ -2952,6 +2977,11 @@ mod tests {
             background_gradient: None,
             background_radial_gradient: None,
             background_gradient_full: None,
+            text_fill_gradient: None,
+            caret_color: None,
+            accent_color: None,
+            scrollbar_width: 0,
+            scrollbar_color: None,
             background_image_url: None,
             background_repeat: BackgroundRepeat::Repeat,
             top_px: None,

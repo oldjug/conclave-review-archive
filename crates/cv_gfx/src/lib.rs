@@ -844,6 +844,108 @@ impl Bitmap {
         }
     }
 
+    /// Paint a CSS **linear-gradient clipped to a text glyph mask** —
+    /// the real `background-clip: text` / "gradient text" idiom (CSS
+    /// Backgrounds 3 §3.2 `background-clip`, combined with
+    /// `-webkit-text-fill-color: transparent`).
+    ///
+    /// Chrome/Skia render this by painting the element's background fill
+    /// normally and then clipping it to the union of the text's glyph
+    /// outlines (`SkCanvas::clipPath(textBlobPath)` →
+    /// `drawPaint(gradientShader)`, see `TextPainter::Paint` →
+    /// `GraphicsContext::ClipPath` in
+    /// `third_party/blink/renderer/core/paint/text_painter.cc`). The box
+    /// background paint itself is suppressed (the clip is the glyphs).
+    ///
+    /// We mirror that exactly: the gradient is rasterized in the run's
+    /// box coordinate space (so the ramp runs across the whole word, not
+    /// per-glyph), and each pixel's gradient-alpha is multiplied by the
+    /// glyph coverage from `mask`. Where the glyph mask is 0 (between
+    /// letters) nothing is written → transparent, never a solid fill
+    /// block. `mask` is a row-major `mask_w × mask_h` alpha buffer whose
+    /// top-left maps to `(box_x, box_y)`. `angle_deg` follows the CSS
+    /// convention (0° = up, +clockwise). `global_alpha` (0..=255) scales
+    /// the whole run (element `opacity`/inherited text alpha).
+    #[allow(clippy::too_many_arguments)]
+    pub fn blit_text_run_gradient(
+        &mut self,
+        box_x: i32,
+        box_y: i32,
+        box_w: i32,
+        box_h: i32,
+        mask: &[u8],
+        mask_w: i32,
+        mask_h: i32,
+        angle_deg: f32,
+        stops: &[AbstractStop],
+        repeating: bool,
+        global_alpha: u8,
+        clip: Option<(i32, i32, i32, i32)>,
+    ) {
+        if box_w <= 0 || box_h <= 0 || mask_w <= 0 || mask_h <= 0 || global_alpha == 0 {
+            return;
+        }
+        // Gradient line geometry over the RUN BOX — identical math to
+        // `fill_rect_linear_gradient_stops` so the ramp matches a real
+        // box gradient of the same size (single source of truth).
+        let a = angle_deg.to_radians();
+        let (wf, hf) = (box_w as f32, box_h as f32);
+        let line_len = ((wf * a.sin()).abs() + (hf * a.cos()).abs()).max(1e-3);
+        let resolved = resolve_gradient_stops(stops, line_len);
+        if resolved.is_empty() {
+            return;
+        }
+        let dx = a.sin();
+        let dy = -a.cos();
+        let cx = wf * 0.5;
+        let cy = hf * 0.5;
+        let start_x = cx - dir_scaled(dx, line_len);
+        let start_y = cy - dir_scaled(dy, line_len);
+        let (span, smin) = stop_band(&resolved);
+        // Destination span = intersection of (mask footprint at box
+        // origin) ∩ (bitmap) ∩ (optional damage clip R).
+        let mut x0 = box_x.max(0);
+        let mut y0 = box_y.max(0);
+        let mut x1 = (box_x + mask_w).min(self.width as i32);
+        let mut y1 = (box_y + mask_h).min(self.height as i32);
+        if let Some((rx, ry, rw, rh)) = clip {
+            x0 = x0.max(rx);
+            y0 = y0.max(ry);
+            x1 = x1.min(rx + rw);
+            y1 = y1.min(ry + rh);
+        }
+        if x0 >= x1 || y0 >= y1 {
+            return;
+        }
+        let ga = global_alpha as u32;
+        for py in y0..y1 {
+            let my = py - box_y; // mask row (>=0, < mask_h by clip above)
+            let mrow = (my * mask_w) as usize;
+            for px in x0..x1 {
+                let mx = px - box_x;
+                let cov = mask[mrow + mx as usize] as u32;
+                if cov == 0 {
+                    continue; // transparent between glyphs — no fill block
+                }
+                // Sample the gradient at this pixel's projection onto the
+                // gradient line, in the run-box frame.
+                let lx = (px - box_x) as f32 + 0.5 - start_x;
+                let ly = (py - box_y) as f32 + 0.5 - start_y;
+                let mut t = (lx * dx + ly * dy) / line_len;
+                t = map_offset(t, repeating, span, smin);
+                let mut c = sample_stops_offset(&resolved, t);
+                // Multiply gradient alpha by glyph coverage and the run's
+                // global alpha (straight-alpha): a = a_grad * cov * ga.
+                let final_a = (c.a as u32 * cov * ga) / (255 * 255);
+                if final_a == 0 {
+                    continue;
+                }
+                c.a = final_a as u8;
+                self.blend_or_set(px, py, c);
+            }
+        }
+    }
+
     /// Source-over a color onto a pixel (opaque writes hard).
     #[inline]
     fn blend_or_set(&mut self, px: i32, py: i32, c: Color) {
@@ -2063,6 +2165,65 @@ fn unpack_bgra(px: u32) -> Color {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gradient_text_clips_to_glyph_mask_and_ramps() {
+        // background-clip:text idiom: a horizontal red→blue gradient
+        // clipped to a glyph coverage mask. The mask is a 20-px-wide run
+        // with TWO solid "glyph" columns (full coverage at x=2..6 and
+        // x=14..18) and transparent gaps between them.
+        let w = 20i32;
+        let h = 6i32;
+        let mut mask = vec![0u8; (w * h) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                let on = (2..6).contains(&x) || (14..18).contains(&x);
+                if on {
+                    mask[(y * w + x) as usize] = 255;
+                }
+            }
+        }
+        let mut bmp = Bitmap::new(w as u32, h as u32);
+        bmp.clear(Color { r: 0, g: 0, b: 0, a: 0 });
+        // 90° = gradient runs left→right (CSS: 90deg points right).
+        let stops = [
+            AbstractStop { color: Color { r: 255, g: 0, b: 0, a: 255 }, pos_frac: Some(0.0), pos_px: None },
+            AbstractStop { color: Color { r: 0, g: 0, b: 255, a: 255 }, pos_frac: Some(1.0), pos_px: None },
+        ];
+        bmp.blit_text_run_gradient(0, 0, w, h, &mask, w, h, 90.0, &stops, false, 255, None);
+
+        let at = |x: i32, y: i32| Color::from_bgra_u32(bmp.pixels[(y * w + x) as usize]);
+        // Pixel inside the LEFT glyph (x≈3) is mostly red (near start).
+        let left = at(3, 3);
+        assert!(left.a == 255, "left glyph pixel must be opaque, got a={}", left.a);
+        assert!(left.r > 150 && left.b < 105, "left glyph near gradient start = red-ish, got {:?}", left);
+        // Pixel inside the RIGHT glyph (x≈16) is mostly blue (near end).
+        let right = at(16, 3);
+        assert!(right.a == 255, "right glyph pixel must be opaque, got a={}", right.a);
+        assert!(right.b > 150 && right.r < 105, "right glyph near gradient end = blue-ish, got {:?}", right);
+        // BETWEEN the glyphs (x=10) the mask is 0 → pixel stays fully
+        // transparent. This is the whole point: NOT a solid fill block.
+        let gap = at(10, 3);
+        assert_eq!(gap.a, 0, "between-glyph gap must be transparent (a=0), got {:?}", gap);
+    }
+
+    #[test]
+    fn gradient_text_global_alpha_scales_coverage() {
+        // Half global alpha halves the resulting pixel alpha (group opacity).
+        let w = 4i32;
+        let h = 2i32;
+        let mask = vec![255u8; (w * h) as usize];
+        let mut bmp = Bitmap::new(w as u32, h as u32);
+        bmp.clear(Color { r: 0, g: 0, b: 0, a: 0 });
+        let stops = [
+            AbstractStop { color: Color { r: 255, g: 0, b: 0, a: 255 }, pos_frac: Some(0.0), pos_px: None },
+            AbstractStop { color: Color { r: 255, g: 0, b: 0, a: 255 }, pos_frac: Some(1.0), pos_px: None },
+        ];
+        bmp.blit_text_run_gradient(0, 0, w, h, &mask, w, h, 90.0, &stops, false, 128, None);
+        let p = Color::from_bgra_u32(bmp.pixels[0]);
+        // 255 * 255 * 128 / (255*255) = 128.
+        assert_eq!(p.a, 128, "global_alpha=128 over full coverage → a=128, got {}", p.a);
+    }
 
     #[test]
     fn clear_sets_all_pixels() {

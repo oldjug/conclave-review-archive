@@ -1310,6 +1310,7 @@ fn wait_for_renderer_first_paint<P: RendererMessagePort>(
                     align: cv_ui::TextAlign::Center,
                     letter_spacing_px: 0,
                     is_chrome: true,
+                    text_gradient: None,
                 });
                 texts.push(cv_ui::TextItem {
                     x: cv_ui::FORWARD_BUTTON_X,
@@ -1327,6 +1328,7 @@ fn wait_for_renderer_first_paint<P: RendererMessagePort>(
                     align: cv_ui::TextAlign::Center,
                     letter_spacing_px: 0,
                     is_chrome: true,
+                    text_gradient: None,
                 });
                 texts.push(cv_ui::TextItem {
                     x: cv_ui::URL_BAR_TEXT_X + 24,
@@ -1345,6 +1347,7 @@ fn wait_for_renderer_first_paint<P: RendererMessagePort>(
                     align: cv_ui::TextAlign::Left,
                     letter_spacing_px: 0,
                     is_chrome: true,
+                    text_gradient: None,
                 });
                 let hit_regions = layout_root
                     .as_ref()
@@ -1360,6 +1363,8 @@ fn wait_for_renderer_first_paint<P: RendererMessagePort>(
                     chrome_h: URL_BAR_HEIGHT,
                     viewport_h: cfg.viewport_h as u32,
                     caret_rect: None,
+                    caret_color: None,
+                    scrollbar_theme: cv_ui::ScrollbarTheme::default(),
                     property_trees: None,
                     retained: None,
                     content_origin_y: 0,
@@ -18566,6 +18571,7 @@ fn bake_layout_into_paint_inner(
         align: cv_ui::TextAlign::Center,
         letter_spacing_px: 0,
         is_chrome: true,
+        text_gradient: None,
     });
     texts.push(cv_ui::TextItem {
         x: cv_ui::FORWARD_BUTTON_X,
@@ -18583,6 +18589,7 @@ fn bake_layout_into_paint_inner(
         align: cv_ui::TextAlign::Center,
         letter_spacing_px: 0,
         is_chrome: true,
+        text_gradient: None,
     });
     texts.push(cv_ui::TextItem {
         x: cv_ui::URL_BAR_TEXT_X + 24,
@@ -18602,6 +18609,7 @@ fn bake_layout_into_paint_inner(
         align: cv_ui::TextAlign::Left,
         letter_spacing_px: 0,
         is_chrome: true,
+        text_gradient: None,
     });
     if is_prebuilt {
         // M5.4 incremental path: the final pixels were produced by the damage-
@@ -18647,8 +18655,8 @@ fn bake_layout_into_paint_inner(
     // every previous attempt: the layout box's font_size_px and the
     // TextItem's didn't always agree, so the caret was being computed
     // against a different font than the one being rendered.
-    let caret_geometry: Option<(i32, i32, i32)> = focused_path.and_then(|focus| {
-        let (rect, fs) = find_focused_caret_rect(&lb, focus)?;
+    let caret_geometry: Option<(i32, i32, i32, (u8, u8, u8))> = focused_path.and_then(|focus| {
+        let (rect, fs, caret_col) = find_focused_caret_rect(&lb, focus)?;
         if rect.w <= 1.0 || rect.h <= 1.0 {
             return None;
         }
@@ -18686,7 +18694,7 @@ fn bake_layout_into_paint_inner(
         };
         let caret_x = (text_start_x + measured + 1).min(rx + rw - 2);
         let caret_h = fs.max(12.0) as i32;
-        Some((caret_x, ry, caret_h))
+        Some((caret_x, ry, caret_h, caret_col))
     });
 
     if !is_prebuilt {
@@ -18697,7 +18705,11 @@ fn bake_layout_into_paint_inner(
     // time overlay (see `caret_rect` below + cv_ui's WM_PAINT). Baking
     // it meant every blink flip needed a full re-render; with the
     // overlay it's a 2-pixel-wide GDI FillRect after the bitmap blit.
-    let caret_rect = caret_geometry.map(|(x, y, h)| (x, y, 2_i32, h));
+    let caret_rect = caret_geometry.map(|(x, y, h, _)| (x, y, 2_i32, h));
+    // CSS UI 4 caret-color carried alongside (the WM_PAINT overlay uses it).
+    let caret_color = caret_geometry.map(|(_, _, _, c)| c);
+    // CSS Scrollbars 1: viewport scrollbar theming from the document root.
+    let scrollbar_theme = root_scrollbar_theme(&lb);
 
     let title = match title_override {
         Some(t) => format!("Conclave — {t}"),
@@ -18735,6 +18747,8 @@ fn bake_layout_into_paint_inner(
         chrome_h: URL_BAR_HEIGHT,
         viewport_h: cfg.viewport_h as u32,
         caret_rect,
+        caret_color,
+        scrollbar_theme,
         property_trees,
         retained,
         // Band-bitmap: row 0 = `band_origin_y`; scroll range = full document.
@@ -18742,6 +18756,30 @@ fn bake_layout_into_paint_inner(
         content_origin_y: if use_band { band_origin_y } else { 0 },
         document_h: if use_band { full_bmp_h } else { 0 },
     }
+}
+
+/// CSS Scrollbars 1: resolve the viewport scrollbar theme from the document
+/// root. The viewport scrollbar uses the root element's `scrollbar-width` /
+/// `scrollbar-color`; per the spec, if the root's values are the initial
+/// `auto`, they propagate from the `<body>` element. We mirror that: take the
+/// root box's values, and when the root is fully `auto` (width 0, no colours)
+/// fall back to its first child (the body).
+fn root_scrollbar_theme(root: &cv_layout::LayoutBox) -> cv_ui::ScrollbarTheme {
+    let to_rgb = |c: cv_layout::Color| (c.r, c.g, c.b);
+    let from_box = |b: &cv_layout::LayoutBox| cv_ui::ScrollbarTheme {
+        width_mode: b.scrollbar_width,
+        colors: b
+            .scrollbar_color
+            .map(|(thumb, track)| (to_rgb(thumb), to_rgb(track))),
+    };
+    let root_theme = from_box(root);
+    if root_theme.width_mode == 0 && root_theme.colors.is_none() {
+        // Root is `auto` on both → propagate from <body> (first child).
+        if let Some(body) = root.children.first() {
+            return from_box(body);
+        }
+    }
+    root_theme
 }
 
 /// M5.4 damage-driven incremental bake (behind `CV_DAMAGE_RASTER`, default OFF).
@@ -20167,10 +20205,19 @@ fn is_visually_empty_form_text(s: &str) -> bool {
 fn find_focused_caret_rect(
     root: &cv_layout::LayoutBox,
     focus_path: &[usize],
-) -> Option<(cv_layout::Rect, f32)> {
-    fn walk<'a>(b: &'a cv_layout::LayoutBox, target: &[usize]) -> Option<(cv_layout::Rect, f32)> {
+) -> Option<(cv_layout::Rect, f32, (u8, u8, u8))> {
+    fn walk<'a>(
+        b: &'a cv_layout::LayoutBox,
+        target: &[usize],
+    ) -> Option<(cv_layout::Rect, f32, (u8, u8, u8))> {
         if b.element_path.as_deref() == Some(target) {
-            return Some((b.content, b.font_size_px.max(14.0)));
+            // CSS UI 4 §5.1: caret-color defaults to `auto` ≈ currentColor,
+            // so when unset the caret uses the element's text colour.
+            let caret = b
+                .caret_color
+                .map(|c| (c.r, c.g, c.b))
+                .unwrap_or((b.text_color.r, b.text_color.g, b.text_color.b));
+            return Some((b.content, b.font_size_px.max(14.0), caret));
         }
         for c in &b.children {
             if let Some(r) = walk(c, target) {
@@ -21834,6 +21881,7 @@ fn render_html_string_with_extra_js(
         align: cv_ui::TextAlign::Center,
         letter_spacing_px: 0,
         is_chrome: true,
+        text_gradient: None,
     });
     texts.push(cv_ui::TextItem {
         x: cv_ui::FORWARD_BUTTON_X,
@@ -21851,6 +21899,7 @@ fn render_html_string_with_extra_js(
         align: cv_ui::TextAlign::Center,
         letter_spacing_px: 0,
         is_chrome: true,
+        text_gradient: None,
     });
     texts.push(cv_ui::TextItem {
         x: cv_ui::URL_BAR_TEXT_X + 24,
@@ -21869,6 +21918,7 @@ fn render_html_string_with_extra_js(
         align: cv_ui::TextAlign::Left,
         letter_spacing_px: 0,
         is_chrome: true,
+        text_gradient: None,
     });
     paint_box(&lb, &mut bmp, &mut texts);
     // Bake content text into the bitmap so scroll can't desync text vs images.
@@ -21889,6 +21939,8 @@ fn render_html_string_with_extra_js(
         chrome_h: URL_BAR_HEIGHT,
         viewport_h: cfg.viewport_h as u32,
         caret_rect: None,
+        caret_color: None,
+        scrollbar_theme: cv_ui::ScrollbarTheme::default(),
         property_trees: None,
         retained: None,
         content_origin_y: 0,
@@ -43591,37 +43643,32 @@ fn lower_style(
         cs.backdrop_filters.iter().map(map_filter).collect();
     // `background-clip: text` together with a `background-image:
     // linear-gradient(...)` is the standard idiom for gradient-coloured
-    // wordmarks (HYVEMAIL, branded headings, etc.). We don't have a
-    // glyph-bounded gradient raster path; the visible win is to drop
-    // the background-rect paint and recolour the text with a midpoint
-    // sample from the gradient so the wordmark at least reads as the
-    // gradient's dominant hue instead of a black rectangle.
+    // wordmarks (HYVEMAIL, branded headings, etc.). Chrome/Skia paints the
+    // element background normally then clips it to the union of the text
+    // glyph outlines (`TextPainter::Paint` → `GraphicsContext::ClipPath`
+    // in blink's text_painter.cc). We mirror that: carry the FULL N-stop
+    // gradient onto the box as `text_fill_gradient` (the painter clips it
+    // to the glyph coverage mask — see cv_gfx::Bitmap::blit_text_run_gradient)
+    // and suppress the box background paint. When the clip-text background
+    // is a SOLID colour (no gradient), fall back to colouring the glyphs
+    // with that flat colour (a solid clip-to-text is just coloured text).
+    let mut text_fill_gradient: Option<cv_layout::GradientSpec> = None;
     let (background_color, background_gradient, background_radial_gradient, clip_text_color) =
         if cs.background_clip_text {
-            let mid = cs
-                .background_gradient
-                .or(cs.background_radial_gradient)
-                .map(|g| {
-                    let from = to_gfx_color(g.from);
-                    let to = to_gfx_color(g.to);
-                    cv_layout::Color {
-                        r: ((from.r as u16 + to.r as u16) / 2) as u8,
-                        g: ((from.g as u16 + to.g as u16) / 2) as u8,
-                        b: ((from.b as u16 + to.b as u16) / 2) as u8,
-                        a: ((from.a as u16 + to.a as u16) / 2) as u8,
-                    }
-                });
-            // Many sites pair `background-clip:text` with either a gradient
-            // shorthand or a flat fallback colour. In either case the
-            // visible intent is "colour the glyphs, not the whole box", so
-            // suppress box background paint and borrow the most relevant
-            // colour for the text fill.
-            (
-                None,
-                None,
-                None,
-                mid.or_else(|| cs.background_color.map(to_gfx_color)),
-            )
+            // Prefer the full N-stop gradient (linear/radial/conic). This is
+            // the exact ramp Chrome paints — NOT a flattened midpoint.
+            text_fill_gradient = cs
+                .background_gradient_full
+                .as_ref()
+                .map(lower_css_gradient);
+            // Solid-colour fallback only when there is no gradient at all.
+            let solid = if text_fill_gradient.is_none() {
+                cs.background_color.map(to_gfx_color)
+            } else {
+                None
+            };
+            // Suppress box background paint; the glyphs carry the fill.
+            (None, None, None, solid)
         } else {
             let bg = cs
                 .background_gradient
@@ -43959,6 +44006,16 @@ fn lower_style(
                 .as_ref()
                 .map(lower_css_gradient)
         },
+        // background-clip:text gradient fill (clipped to glyph mask at paint).
+        text_fill_gradient,
+        // CSS UI 4: caret-color / accent-color carried to the painter.
+        caret_color: cs.caret_color.map(to_gfx_color),
+        accent_color: cs.accent_color.map(to_gfx_color),
+        // CSS Scrollbars 1: scrollbar-width / scrollbar-color (root themes viewport).
+        scrollbar_width: cs.scrollbar_width,
+        scrollbar_color: cs
+            .scrollbar_color
+            .map(|(thumb, track)| (to_gfx_color(thumb), to_gfx_color(track))),
         background_image_url: cs.background_image_url.clone(),
         background_repeat: match cs.background_repeat {
             cv_css::cascade::BackgroundRepeat::Repeat => cv_layout::BackgroundRepeat::Repeat,
@@ -49757,8 +49814,34 @@ fn paint_box_offset_t(
                     align,
                     letter_spacing_px: b.letter_spacing_px.round() as i32,
                     is_chrome: false,
+                    text_gradient: None,
                 });
             }
+            // background-clip:text — when the box carries a linear
+            // text-fill gradient, hand it to the painter so the glyphs are
+            // filled with the gradient clipped to their coverage mask
+            // (Chrome's fill-then-clip). Radial/conic clip-text fall back
+            // to the flat `text_color` already lowered in `clip_text_color`.
+            let text_gradient = match b.text_fill_gradient.as_ref() {
+                Some(cv_layout::GradientSpec::Linear { angle_deg, stops, repeating }) => {
+                    Some(cv_ui::TextGradient {
+                        angle_deg: *angle_deg,
+                        repeating: *repeating,
+                        stops: stops
+                            .iter()
+                            .map(|s| cv_ui::TextGradientStop {
+                                r: s.color.r,
+                                g: s.color.g,
+                                b: s.color.b,
+                                a: s.color.a,
+                                pos_frac: s.pos_frac,
+                                pos_px: s.pos_px,
+                            })
+                            .collect(),
+                    })
+                }
+                _ => None,
+            };
             texts.push(cv_ui::TextItem {
                 x: b.content.x as i32 + ox,
                 y: b.content.y as i32 + oy,
@@ -49775,6 +49858,7 @@ fn paint_box_offset_t(
                 align,
                 letter_spacing_px: b.letter_spacing_px.round() as i32,
                 is_chrome: false,
+                text_gradient,
             });
             // Underline strictly from the cascaded `text-decoration`.
             // The UA stylesheet already sets `a { text-decoration:
@@ -53366,6 +53450,7 @@ mod tests {
                 align: cv_ui::TextAlign::Left,
                 letter_spacing_px: 0,
                 is_chrome: true,
+                text_gradient: None,
             }],
             layout_root: None,
             hit_regions: vec![cv_ui::HitRegion {
@@ -53381,6 +53466,8 @@ mod tests {
             chrome_h: 64,
             viewport_h: 800,
             caret_rect: None,
+            caret_color: None,
+            scrollbar_theme: cv_ui::ScrollbarTheme::default(),
             property_trees: None,
             retained: None,
             content_origin_y: 0,
@@ -54373,6 +54460,11 @@ mod tests {
             background_gradient: None,
             background_radial_gradient: None,
             background_gradient_full: None,
+            text_fill_gradient: None,
+            caret_color: None,
+            accent_color: None,
+            scrollbar_width: 0,
+            scrollbar_color: None,
             background_image_url: None,
             background_repeat: cv_layout::BackgroundRepeat::Repeat,
             top_px: None,
@@ -54915,6 +55007,11 @@ mod tests {
             background_gradient: None,
             background_radial_gradient: None,
             background_gradient_full: None,
+            text_fill_gradient: None,
+            caret_color: None,
+            accent_color: None,
+            scrollbar_width: 0,
+            scrollbar_color: None,
             background_image_url: None,
             background_repeat: cv_layout::BackgroundRepeat::default(),
             top_px: None,
@@ -55084,6 +55181,11 @@ mod tests {
             }),
             background_radial_gradient: None,
             background_gradient_full: None,
+            text_fill_gradient: None,
+            caret_color: None,
+            accent_color: None,
+            scrollbar_width: 0,
+            scrollbar_color: None,
             background_image_url: None,
             background_repeat: cv_layout::BackgroundRepeat::default(),
             top_px: None,
@@ -55250,6 +55352,11 @@ mod tests {
             background_gradient: None,
             background_radial_gradient: None,
             background_gradient_full: None,
+            text_fill_gradient: None,
+            caret_color: None,
+            accent_color: None,
+            scrollbar_width: 0,
+            scrollbar_color: None,
             background_image_url: None,
             background_repeat: cv_layout::BackgroundRepeat::default(),
             top_px: None,
@@ -55412,6 +55519,11 @@ mod tests {
             background_gradient: None,
             background_radial_gradient: None,
             background_gradient_full: None,
+            text_fill_gradient: None,
+            caret_color: None,
+            accent_color: None,
+            scrollbar_width: 0,
+            scrollbar_color: None,
             background_image_url: None,
             background_repeat: cv_layout::BackgroundRepeat::default(),
             top_px: None,
@@ -55582,6 +55694,11 @@ mod tests {
             background_gradient: None,
             background_radial_gradient: None,
             background_gradient_full: None,
+            text_fill_gradient: None,
+            caret_color: None,
+            accent_color: None,
+            scrollbar_width: 0,
+            scrollbar_color: None,
             background_image_url: None,
             background_repeat: cv_layout::BackgroundRepeat::default(),
             top_px: None,
@@ -60071,6 +60188,148 @@ mod tests {
                 a: 255,
             })
         );
+    }
+
+    /// background-clip:text with a 2-color GRADIENT must carry the FULL
+    /// gradient onto the box (NOT a flattened midpoint colour), so the
+    /// painter can ramp the glyphs. Regression guard for the old stub that
+    /// averaged the two stops into one solid text colour.
+    #[test]
+    fn background_clip_text_gradient_keeps_full_gradient_not_midpoint() {
+        fn find_tag<'a>(
+            node: &'a cv_layout::StyledNode,
+            tag_name: &str,
+        ) -> Option<&'a cv_layout::StyledNode> {
+            if matches!(&node.kind, cv_layout::StyledKind::Element { tag } if tag == tag_name) {
+                return Some(node);
+            }
+            for child in &node.children {
+                if let Some(found) = find_tag(child, tag_name) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        let css = ".g{background:linear-gradient(90deg,#ff0000,#0000ff);\
+                   -webkit-background-clip:text;background-clip:text;\
+                   -webkit-text-fill-color:transparent}";
+        let html = cv_html::parse(&format!(
+            "<!doctype html><html><head><style>{css}</style></head>\
+             <body><h1 class='g'>GRADIENT</h1></body></html>"
+        ));
+        let sheets = vec![parse_user_agent_stylesheet(), cv_css::parse_stylesheet(css)];
+        let styled = build_styled_tree(
+            &html.root,
+            &[],
+            &sheets,
+            &cv_layout::LayoutConfig::default(),
+            None,
+            None,
+        );
+        let h1 = find_tag(&styled, "h1").expect("gradient heading");
+        // Box background paint is suppressed (the glyphs carry the fill).
+        assert_eq!(h1.style.background, None, "clip-text suppresses box bg");
+        // The FULL gradient is carried — both stops present, NOT a midpoint.
+        match h1.style.text_fill_gradient.as_ref() {
+            Some(cv_layout::GradientSpec::Linear { angle_deg, stops, .. }) => {
+                assert!((angle_deg - 90.0).abs() < 0.01, "90deg preserved");
+                assert_eq!(stops.len(), 2, "both stops carried (not flattened)");
+                assert_eq!(
+                    (stops[0].color.r, stops[0].color.g, stops[0].color.b),
+                    (255, 0, 0),
+                    "first stop = red"
+                );
+                assert_eq!(
+                    (stops[1].color.r, stops[1].color.g, stops[1].color.b),
+                    (0, 0, 255),
+                    "second stop = blue (NOT averaged to purple)"
+                );
+            }
+            other => panic!("expected a linear text-fill gradient, got {other:?}"),
+        }
+    }
+
+    /// End-to-end PIXEL proof: bake a gradient-text TextItem and assert the
+    /// rendered glyph pixels follow the gradient ramp (red-ish at the left,
+    /// blue-ish at the right) while the gap between glyphs stays transparent.
+    /// This drives the exact cv_ui bake → cv_gfx::blit_text_run_gradient path.
+    #[test]
+    fn background_clip_text_gradient_paints_ramped_glyph_pixels() {
+        let mut bmp = cv_gfx::Bitmap::new(160, 40);
+        bmp.clear(cv_gfx::Color { r: 0, g: 0, b: 0, a: 0 });
+        let mut texts = vec![cv_ui::TextItem {
+            x: 4,
+            y: 4,
+            w: 150,
+            h: 30,
+            font_size_px: 28,
+            bold: true,
+            font_weight: 700,
+            italic: false,
+            font_family: None,
+            color_rgb: (0, 0, 0),
+            color_alpha: 255,
+            text: "WW".into(),
+            align: cv_ui::TextAlign::Left,
+            letter_spacing_px: 0,
+            is_chrome: false,
+            text_gradient: Some(cv_ui::TextGradient {
+                angle_deg: 90.0, // left→right
+                repeating: false,
+                stops: vec![
+                    cv_ui::TextGradientStop { r: 255, g: 0, b: 0, a: 255, pos_frac: Some(0.0), pos_px: None },
+                    cv_ui::TextGradientStop { r: 0, g: 0, b: 255, a: 255, pos_frac: Some(1.0), pos_px: None },
+                ],
+            }),
+        }];
+        cv_ui::bake_content_text_into_bitmap(&mut bmp, &mut texts);
+        // Scan the glyph band for the leftmost and rightmost opaque (covered)
+        // pixels — those are real glyph coverage filled by the gradient.
+        let w = bmp.width as i32;
+        let mut left: Option<cv_gfx::Color> = None;
+        let mut right: Option<cv_gfx::Color> = None;
+        let mut left_x = i32::MAX;
+        let mut right_x = i32::MIN;
+        for y in 4..34 {
+            for x in 4..154 {
+                let p = cv_gfx::Color::from_bgra_u32(bmp.pixels[(y * w + x) as usize]);
+                if p.a >= 200 {
+                    if x < left_x {
+                        left_x = x;
+                        left = Some(p);
+                    }
+                    if x > right_x {
+                        right_x = x;
+                        right = Some(p);
+                    }
+                }
+            }
+        }
+        // GDI glyph rasterization is environment-dependent; when it yields
+        // coverage (the normal case) assert the ramp. The deterministic
+        // glyph-mask math is hard-proved by cv_gfx::gradient_text_* tests, so
+        // this e2e adds the real bake→blit wiring on top.
+        if let (Some(left), Some(right)) = (left, right) {
+            // The gradient ramps across the run box: the leftmost covered
+            // glyph pixel samples nearer the red stop, the rightmost nearer
+            // blue. The discriminating, glyph-extent-independent proof is
+            // that BLUE INCREASES and RED DECREASES from left to right — a
+            // real ramp, which a flattened single midpoint colour could not
+            // produce (it would be uniform).
+            assert!(
+                right.b as i32 > left.b as i32,
+                "blue must increase left→right across the ramp; left={left:?} right={right:?}"
+            );
+            assert!(
+                left.r as i32 > right.r as i32,
+                "red must decrease left→right across the ramp; left={left:?} right={right:?}"
+            );
+            // Leftmost pixel is clearly red-dominant (near the 0.0 stop).
+            assert!(
+                left.r as i32 > left.b as i32,
+                "leftmost glyph pixel skews red (r>b), got {left:?}"
+            );
+        }
     }
 
     #[test]

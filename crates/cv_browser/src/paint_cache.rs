@@ -653,7 +653,9 @@ pub mod disk {
     const MAGIC: &[u8; 4] = b"TBPC";
     /// On-disk schema version. BUMP this on ANY format change so an engine update
     /// invalidates every stale file (they fail the version guard on load ⇒ miss).
-    const DISK_VERSION: u32 = 1;
+    /// v2: added text-item `text_gradient` (background-clip:text) + PaintData
+    /// `caret_color` (caret-color) to the serialized record.
+    const DISK_VERSION: u32 = 2;
 
     /// Disk byte budget. Default 512 MB; override via
     /// `CV_PAINT_CACHE_DISK_BUDGET_MB`. A `0` / unparseable value uses the default.
@@ -812,6 +814,30 @@ pub mod disk {
             }
             None => out.push(0),
         }
+        // CSS UI 4 caret-color.
+        match p.caret_color {
+            Some((cr, cg, cb)) => {
+                out.push(1);
+                out.push(cr);
+                out.push(cg);
+                out.push(cb);
+            }
+            None => out.push(0),
+        }
+        // CSS Scrollbars 1 viewport theme: width_mode byte + optional colours.
+        out.push(p.scrollbar_theme.width_mode);
+        match p.scrollbar_theme.colors {
+            Some(((tr, tg, tb), (kr, kg, kb))) => {
+                out.push(1);
+                out.push(tr);
+                out.push(tg);
+                out.push(tb);
+                out.push(kr);
+                out.push(kg);
+                out.push(kb);
+            }
+            None => out.push(0),
+        }
         // Bitmap: width, height, then width*height raw BGRA u32 little-endian.
         let bmp = &p.bitmap;
         wr_u32(&mut out, bmp.width);
@@ -843,6 +869,40 @@ pub mod disk {
             out.push(align_byte(t.align));
             wr_i32(&mut out, t.letter_spacing_px);
             out.push(u8::from(t.is_chrome));
+            // background-clip:text gradient fill (CSS Backgrounds 3). Most
+            // items have none → a single 0 byte. When present, serialize the
+            // angle (f32 via bits), the repeating flag, and the N stops so a
+            // cache hit re-paints the gradient text identically.
+            match &t.text_gradient {
+                None => out.push(0u8),
+                Some(g) => {
+                    out.push(1u8);
+                    wr_u32(&mut out, g.angle_deg.to_bits());
+                    out.push(u8::from(g.repeating));
+                    wr_u32(&mut out, g.stops.len() as u32);
+                    for s in &g.stops {
+                        out.push(s.r);
+                        out.push(s.g);
+                        out.push(s.b);
+                        out.push(s.a);
+                        // pos_frac: tag byte then bits (NaN-safe via to_bits).
+                        match s.pos_frac {
+                            Some(v) => {
+                                out.push(1u8);
+                                wr_u32(&mut out, v.to_bits());
+                            }
+                            None => out.push(0u8),
+                        }
+                        match s.pos_px {
+                            Some(v) => {
+                                out.push(1u8);
+                                wr_u32(&mut out, v.to_bits());
+                            }
+                            None => out.push(0u8),
+                        }
+                    }
+                }
+            }
         }
         // Hit regions.
         wr_u32(&mut out, p.hit_regions.len() as u32);
@@ -941,6 +1001,24 @@ pub mod disk {
         } else {
             Some((r.rd_i32()?, r.rd_i32()?, r.rd_i32()?, r.rd_i32()?))
         };
+        let caret_color = if r.rd_u8()? == 0 {
+            None
+        } else {
+            Some((r.rd_u8()?, r.rd_u8()?, r.rd_u8()?))
+        };
+        let sb_width_mode = r.rd_u8()?;
+        let sb_colors = if r.rd_u8()? == 0 {
+            None
+        } else {
+            Some((
+                (r.rd_u8()?, r.rd_u8()?, r.rd_u8()?),
+                (r.rd_u8()?, r.rd_u8()?, r.rd_u8()?),
+            ))
+        };
+        let scrollbar_theme = cv_ui::ScrollbarTheme {
+            width_mode: sb_width_mode,
+            colors: sb_colors,
+        };
         // Bitmap.
         let width = r.rd_u32()?;
         let height = r.rd_u32()?;
@@ -984,6 +1062,44 @@ pub mod disk {
             let align = align_from_byte(r.rd_u8()?);
             let letter_spacing_px = r.rd_i32()?;
             let is_chrome = r.rd_u8()? != 0;
+            // background-clip:text gradient (see encode side).
+            let text_gradient = if r.rd_u8()? != 0 {
+                let angle_deg = f32::from_bits(r.rd_u32()?);
+                let repeating = r.rd_u8()? != 0;
+                let nstops = r.rd_u32()? as usize;
+                let mut stops = Vec::with_capacity(nstops.min(1 << 12));
+                for _ in 0..nstops {
+                    let sr = r.rd_u8()?;
+                    let sg = r.rd_u8()?;
+                    let sb = r.rd_u8()?;
+                    let sa = r.rd_u8()?;
+                    let pos_frac = if r.rd_u8()? != 0 {
+                        Some(f32::from_bits(r.rd_u32()?))
+                    } else {
+                        None
+                    };
+                    let pos_px = if r.rd_u8()? != 0 {
+                        Some(f32::from_bits(r.rd_u32()?))
+                    } else {
+                        None
+                    };
+                    stops.push(cv_ui::TextGradientStop {
+                        r: sr,
+                        g: sg,
+                        b: sb,
+                        a: sa,
+                        pos_frac,
+                        pos_px,
+                    });
+                }
+                Some(cv_ui::TextGradient {
+                    angle_deg,
+                    stops,
+                    repeating,
+                })
+            } else {
+                None
+            };
             texts.push(cv_ui::TextItem {
                 x,
                 y,
@@ -1000,6 +1116,7 @@ pub mod disk {
                 align,
                 letter_spacing_px,
                 is_chrome,
+                text_gradient,
             });
         }
         // Hit regions.
@@ -1047,6 +1164,8 @@ pub mod disk {
             chrome_h,
             viewport_h,
             caret_rect,
+            caret_color,
+            scrollbar_theme,
             property_trees: None,
             retained: None,
             content_origin_y: 0,
@@ -1930,7 +2049,7 @@ mod tests {
             // Build a minimal valid header then a deliberately wrong npix:
             let mut h: Vec<u8> = Vec::new();
             h.extend_from_slice(b"TBPC");
-            h.extend_from_slice(&1u32.to_le_bytes()); // version
+            h.extend_from_slice(&2u32.to_le_bytes()); // version (DISK_VERSION)
             h.extend_from_slice(&key.url_hash.to_le_bytes());
             h.extend_from_slice(&key.dom_structural_hash.to_le_bytes());
             h.extend_from_slice(&key.vw.to_le_bytes());
@@ -1942,7 +2061,10 @@ mod tests {
             h.extend_from_slice(&0u32.to_le_bytes()); // viewport_h
             h.extend_from_slice(&0u32.to_le_bytes()); // title len = 0
             h.extend_from_slice(&0u32.to_le_bytes()); // current_url len = 0
-            h.push(0); // caret None
+            h.push(0); // caret_rect None
+            h.push(0); // caret_color None
+            h.push(0); // scrollbar width_mode = auto
+            h.push(0); // scrollbar colors None
             h.extend_from_slice(&2u32.to_le_bytes()); // bmp width = 2
             h.extend_from_slice(&2u32.to_le_bytes()); // bmp height = 2 → w*h = 4
             h.extend_from_slice(&3u64.to_le_bytes()); // npix = 3 (≠ 4) → guard fires

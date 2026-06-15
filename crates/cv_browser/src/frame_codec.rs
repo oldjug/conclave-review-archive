@@ -48,7 +48,8 @@ use cv_ipc::{Decode, DecodeError, Encode, Reader, Writer};
 /// (`cv_ipc::PROTOCOL_VERSION`) gate compatibility. Carried at the front of
 /// every frame payload so a stale decoder fails loudly rather than
 /// misreading fields.
-const FRAME_CODEC_VERSION: u32 = 1;
+// v2: added the CSS UI 4 `caret_color` field after `caret_rect`.
+const FRAME_CODEC_VERSION: u32 = 2;
 
 /// Mirror of `cv_ipc::renderer_proto`'s pixel-buffer guard so an attacker
 /// (or a corrupt frame) cannot drive an unbounded `Bitmap` allocation in
@@ -196,6 +197,11 @@ fn decode_text_item(r: &mut Reader<'_>) -> Result<cv_ui::TextItem, DecodeError> 
         align,
         letter_spacing_px,
         is_chrome,
+        // Only browser-CHROME text overlays (URL bar, nav glyphs) cross this
+        // codec; content gradient text (`background-clip:text`) is already
+        // baked into the BGRA `bitmap` upstream and never travels as a text
+        // item, so `None` here is lossless. See module docs ("chrome texts").
+        text_gradient: None,
     })
 }
 
@@ -347,6 +353,30 @@ pub fn encode_frame(paint: &cv_ui::PaintData, tabs: &[cv_ui::TabSummary]) -> Vec
         }
         None => w.write_bool(false),
     }
+    // CSS UI 4 caret-color (the WM_PAINT overlay tints with this).
+    match paint.caret_color {
+        Some((cr, cg, cb)) => {
+            w.write_bool(true);
+            w.write_u8(cr);
+            w.write_u8(cg);
+            w.write_u8(cb);
+        }
+        None => w.write_bool(false),
+    }
+    // CSS Scrollbars 1 viewport theme (browser draws the scrollbar overlay).
+    w.write_u8(paint.scrollbar_theme.width_mode);
+    match paint.scrollbar_theme.colors {
+        Some(((tr, tg, tb), (kr, kg, kb))) => {
+            w.write_bool(true);
+            w.write_u8(tr);
+            w.write_u8(tg);
+            w.write_u8(tb);
+            w.write_u8(kr);
+            w.write_u8(kg);
+            w.write_u8(kb);
+        }
+        None => w.write_bool(false),
+    }
 
     w.write_u32(tabs.len() as u32);
     for t in tabs {
@@ -390,6 +420,24 @@ pub fn decode_frame(bytes: &[u8]) -> Result<CommittedFrame, DecodeError> {
     } else {
         None
     };
+    let caret_color = if r.read_bool()? {
+        Some((r.read_u8()?, r.read_u8()?, r.read_u8()?))
+    } else {
+        None
+    };
+    let sb_width_mode = r.read_u8()?;
+    let sb_colors = if r.read_bool()? {
+        Some((
+            (r.read_u8()?, r.read_u8()?, r.read_u8()?),
+            (r.read_u8()?, r.read_u8()?, r.read_u8()?),
+        ))
+    } else {
+        None
+    };
+    let scrollbar_theme = cv_ui::ScrollbarTheme {
+        width_mode: sb_width_mode,
+        colors: sb_colors,
+    };
 
     let tab_count = r.read_u32()? as usize;
     let mut tabs = Vec::with_capacity(tab_count.min(4096));
@@ -407,6 +455,8 @@ pub fn decode_frame(bytes: &[u8]) -> Result<CommittedFrame, DecodeError> {
         chrome_h,
         viewport_h,
         caret_rect,
+        caret_color,
+        scrollbar_theme,
         property_trees: None,
         retained: None,
         // Off-main IPC frames are always full-document bitmaps today (band
@@ -450,6 +500,7 @@ mod tests {
                     align: cv_ui::TextAlign::Center,
                     letter_spacing_px: 1,
                     is_chrome: true,
+                    text_gradient: None,
                 },
                 cv_ui::TextItem {
                     x: 100,
@@ -467,6 +518,7 @@ mod tests {
                     align: cv_ui::TextAlign::Left,
                     letter_spacing_px: 0,
                     is_chrome: false,
+                    text_gradient: None,
                 },
             ],
             layout_root: None,
@@ -493,6 +545,11 @@ mod tests {
             chrome_h: 64,
             viewport_h: 900,
             caret_rect: Some((12, 34, 2, 18)),
+            caret_color: Some((220, 30, 90)),
+            scrollbar_theme: cv_ui::ScrollbarTheme {
+                width_mode: 1,
+                colors: Some(((200, 100, 50), (20, 20, 20))),
+            },
             property_trees: None,
             retained: None,
             content_origin_y: 0,
@@ -510,6 +567,8 @@ mod tests {
         assert_eq!(a.chrome_h, b.chrome_h);
         assert_eq!(a.viewport_h, b.viewport_h);
         assert_eq!(a.caret_rect, b.caret_rect);
+        assert_eq!(a.caret_color, b.caret_color);
+        assert_eq!(a.scrollbar_theme, b.scrollbar_theme);
         assert_eq!(a.hit_regions.len(), b.hit_regions.len());
         for (x, y) in a.hit_regions.iter().zip(&b.hit_regions) {
             assert_eq!((x.x, x.y, x.w, x.h), (y.x, y.y, y.w, y.h));
