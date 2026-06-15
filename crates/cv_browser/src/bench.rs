@@ -208,6 +208,17 @@ struct AnimResult {
 struct JsResult {
     cold_ms: Vec<f64>,
     warm_ms: Vec<f64>,
+    /// Total native (optimizing-tier) executions across ALL tiers (P6 + T1 + T3 +
+    /// T2). This is the honest "did the JIT actually run" guard: >0 means some
+    /// optimizing tier executed the hot function as native machine code. The
+    /// hot-numeric benches tier under P6 (tried first), so the old T2-only count
+    /// read 0 — an ATTRIBUTION bug, not a "JIT didn't engage" bug. Reading every
+    /// tier fixes it.
+    native_exec_count: u64,
+    /// Per-tier breakdown so the source of the native execs is visible.
+    p6_exec_count: u64,
+    t1_exec_count: u64,
+    t3_exec_count: u64,
     t2_exec_count: u64,
     t2_enabled: bool,
 }
@@ -415,6 +426,9 @@ fn measure_js(file: &str, result_global: &str) -> Result<JsResult, String> {
 
     let mut cold_ms = Vec::with_capacity(ITERS);
     let mut warm_ms = Vec::with_capacity(ITERS);
+    let mut last_p6 = 0u64;
+    let mut last_t1 = 0u64;
+    let mut last_t3 = 0u64;
     let mut last_t2 = 0u64;
 
     // Warmup iters (not timed) — primes any process-global JIT machinery so the
@@ -427,6 +441,14 @@ fn measure_js(file: &str, result_global: &str) -> Result<JsResult, String> {
     for _ in 0..ITERS {
         // COLD: fresh interp, first run of this function.
         let mut rt = LiveInterp::new(&doc, label);
+        // Reset EVERY optimizing-tier exec counter so the post-run reads attribute
+        // native execution to whichever tier actually ran. The hot-numeric benches
+        // tier under P6 (tried before T2 in try_call_fn_via_bytecode), so a
+        // T2-only read would (wrongly) report 0 native execs even though the
+        // function runs as native machine code.
+        cv_js::reset_p6_exec_count();
+        cv_js::reset_t1_exec_count();
+        cv_js::reset_t3_exec_count();
         cv_js::reset_t2_exec_count();
         let tc = Instant::now();
         rt.interp
@@ -455,14 +477,23 @@ fn measure_js(file: &str, result_global: &str) -> Result<JsResult, String> {
             .map_err(|e| format!("js warm run {file}: {e:?}"))?;
         warm_ms.push(tw.elapsed().as_secs_f64() * 1000.0);
 
-        // The t2 exec count accumulated over BOTH runs on this interp — the
-        // honesty guard. Reported verbatim — never massaged.
+        // Native-tier exec counts accumulated over BOTH runs on this interp — the
+        // honesty guard. Reported verbatim across every tier — never massaged. The
+        // total (native_exec_count) >0 proves an optimizing tier ran the hot code
+        // as native machine code; the per-tier split shows which one.
+        last_p6 = cv_js::p6_exec_count();
+        last_t1 = cv_js::t1_exec_count();
+        last_t3 = cv_js::t3_exec_count();
         last_t2 = cv_js::t2_exec_count();
     }
 
     Ok(JsResult {
         cold_ms,
         warm_ms,
+        native_exec_count: last_p6 + last_t1 + last_t3 + last_t2,
+        p6_exec_count: last_p6,
+        t1_exec_count: last_t1,
+        t3_exec_count: last_t3,
         t2_exec_count: last_t2,
         t2_enabled: cv_js::t2_heap_enabled(),
     })
@@ -654,6 +685,15 @@ fn js_json(r: &JsResult) -> J {
     J::Obj(vec![
         ("cold_ms_median", J::F(median(&r.cold_ms))),
         ("warm_ms_median", J::F(median(&r.warm_ms))),
+        // Total native (optimizing-tier) executions across ALL tiers — the honest
+        // "did the JIT engage" guard. >0 == some tier ran the hot fn natively.
+        ("native_exec_count", J::I(r.native_exec_count as i64)),
+        // Per-tier breakdown (P6 numeric JIT is tried first, so hot-numeric work
+        // lands here, not in t2).
+        ("p6_exec_count", J::I(r.p6_exec_count as i64)),
+        ("t1_exec_count", J::I(r.t1_exec_count as i64)),
+        ("t3_exec_count", J::I(r.t3_exec_count as i64)),
+        // Kept for continuity with the prior baseline JSON.
         ("t2_exec_count", J::I(r.t2_exec_count as i64)),
         ("t2_enabled", J::Bool(r.t2_enabled)),
     ])

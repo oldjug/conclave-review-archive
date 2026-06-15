@@ -1013,6 +1013,26 @@ struct JitEntry {
 thread_local! {
     static JIT_CACHE: RefCell<std::collections::HashMap<usize, JitEntry>> =
         RefCell::new(std::collections::HashMap::new());
+    /// Count of function invocations that ran as P6 (f64 numeric) native code on
+    /// this thread since the last reset. Mirrors `T2_EXEC_COUNT`/`T1_EXEC_COUNT`/
+    /// `T3_EXEC_COUNT` so the bench + oracle can attribute native execution to the
+    /// tier that actually ran. P6 is tried FIRST in `try_call_fn_via_bytecode`, so
+    /// for an all-numeric hot function this — not `t2_exec_count` — is the counter
+    /// that goes up. Bumped only on a real native return (try_jit_numeric's
+    /// `Some(Value::Number)` path), so it reflects true native runs.
+    static P6_EXEC_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Number of P6 (f64 numeric machine-code) function executions on this thread
+/// since the last reset. The P6 JIT is tried before T2/T3/T1, so for all-numeric
+/// hot functions this is the counter that proves native execution engaged.
+pub fn p6_exec_count() -> u64 {
+    P6_EXEC_COUNT.with(|c| c.get())
+}
+
+/// Reset the P6 exec counter (call before a measured run).
+pub fn reset_p6_exec_count() {
+    P6_EXEC_COUNT.with(|c| c.set(0));
 }
 
 /// Call count at which a function is compiled to native code.
@@ -20115,14 +20135,26 @@ impl Interp {
         // Phase 2 (outside borrow): run native code only when args are numeric.
         if numeric {
             if let Some(jf) = jit_fn {
-                let fargs: Vec<f64> = args
-                    .iter()
-                    .map(|a| match a {
-                        Value::Number(n) => *n,
-                        _ => 0.0,
-                    })
-                    .collect();
-                let r = unsafe { jf.call_f64_args(&fargs) };
+                // Box the (≤4) numeric args into a STACK array, not a heap `Vec`.
+                // This path runs once per JITted call (1.5M× in the jit bench), so
+                // the per-call heap allocation the old `Vec` did was pure dispatch
+                // overhead around a tiny native body. `numeric` already guarantees
+                // `args.len() <= 4` and all-`Value::Number`, so the fixed buffer is
+                // always large enough and the `0.0` default is never observed (the
+                // native callee reads only `args[0..len]`). Result is unchanged.
+                let mut fbuf = [0.0f64; 4];
+                let n = args.len();
+                for (slot, a) in fbuf.iter_mut().zip(args.iter()) {
+                    if let Value::Number(v) = a {
+                        *slot = *v;
+                    }
+                }
+                let r = unsafe { jf.call_f64_args(&fbuf[..n]) };
+                // Attribute this native run to P6 (the tier that actually ran).
+                // Bumped only here, on a genuine native return — not on deopt /
+                // decline — so `p6_exec_count` reflects true native executions,
+                // mirroring the T1/T2/T3 exec counters.
+                P6_EXEC_COUNT.with(|c| c.set(c.get() + 1));
                 return Some(Value::Number(r));
             }
         }

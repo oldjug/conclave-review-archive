@@ -89,13 +89,17 @@ pub use ab_oracle::{
 };
 pub use interp::{
     ACCESSOR_GET, ACCESSOR_SET, BankRootGuard, ForcedTier, Interp, JsBigInt, JsError, NativeFn,
-    NativeFnBody, PROTO_KEY, TierGuard, Value, current_native_this, diag_log, forced_tier,
+    NativeFnBody, NoP6JitGuard, PROTO_KEY, TierGuard, Value, current_native_this, diag_log,
+    forced_tier,
     gc_enabled, gc_live_object_count, gc_register_array, gc_register_object, gen_gc_enabled,
     is_symbol_key, jit_bank_registry_len,
     js_stack_snapshot, make_pending_promise, make_settled_promise, make_temporal_error, native_ctor,
-    native_ctor_pure, native_fn, native_fn_n, native_fn_with_interp, parse_bigint_from_string,
+    native_ctor_pure, native_fn, native_fn_n, native_fn_with_interp, p6_exec_count,
+    parse_bigint_from_string,
     register_jit_bank, resolve_promise,
-    reset_bc_fn_cache, reset_t2_exec_count, set_force_tier, t2_exec_count, t2_heap_enabled,
+    reset_bc_fn_cache, reset_p6_exec_count, reset_t1_exec_count, reset_t2_exec_count,
+    reset_t3_exec_count, set_force_tier, t1_exec_count, t2_exec_count, t2_heap_enabled,
+    t3_exec_count,
 };
 pub use lexer::{Keyword, Punct, Token, TokenKind, tokenize};
 pub use parser::{ParseError, parse_program};
