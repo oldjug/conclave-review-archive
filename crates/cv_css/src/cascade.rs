@@ -16,6 +16,44 @@ pub enum WhiteSpace {
     BreakSpaces,
 }
 
+/// One CSS transform function, preserving its un-resolved arguments
+/// (CSS Transforms 2 §11). The painter composes a list of these into a
+/// single 4×4 matrix, in order, with each later function multiplied on the
+/// right. Angles are stored already-converted to **degrees**; translate
+/// components keep their [`crate::properties::Length`] so px/em/rem/% can
+/// be resolved against the right environment at layout/paint time.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Transform3DOp {
+    /// translate(x, y) / translateX / translateY — x or y may be `%`.
+    Translate(crate::properties::Length, crate::properties::Length),
+    /// translate3d(x, y, z) / translateZ — z is a `<length>` (no `%`).
+    Translate3d(
+        crate::properties::Length,
+        crate::properties::Length,
+        crate::properties::Length,
+    ),
+    /// scale(sx, sy) / scaleX / scaleY.
+    Scale(f32, f32),
+    /// scale3d(sx, sy, sz) / scaleZ.
+    Scale3d(f32, f32, f32),
+    /// rotate / rotateZ(angle_deg).
+    RotateZ(f32),
+    /// rotateX(angle_deg).
+    RotateX(f32),
+    /// rotateY(angle_deg).
+    RotateY(f32),
+    /// rotate3d(x, y, z, angle_deg).
+    Rotate3d(f32, f32, f32, f32),
+    /// matrix(a, b, c, d, e, f) — 2D affine.
+    Matrix2d([f32; 6]),
+    /// matrix3d(m11..m44) — 16 column-major values.
+    Matrix3d([f32; 16]),
+    /// perspective(d) — `d` is a `<length>` (px-resolved at the bridge).
+    Perspective(crate::properties::Length),
+    /// skew(ax, ay) / skewX / skewY — angles in degrees.
+    Skew(f32, f32),
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TextTransform {
     None,
@@ -338,6 +376,29 @@ pub struct ComputedStyle {
     /// `50% 50%` (border-box centre). Reuses [`BgPos`] for keyword/px/%.
     /// `None` means the default centre was not overridden.
     pub transform_origin: Option<(BgPos, BgPos)>,
+    /// Ordered list of transform functions (CSS Transforms 2 §11) — set
+    /// ONLY when the `transform` list contains a 3D primitive (rotateX/Y,
+    /// rotate3d, translate3d/Z, scale3d/Z, matrix3d, perspective). 2D-only
+    /// transforms continue to use the scalar fields above and their cheap
+    /// fast paths, so this is strictly additive. Lengths are preserved so
+    /// translate x/y/z resolve against em/rem/viewport (and x/y % against
+    /// the box) at the layout bridge / paint time. When present this
+    /// supersedes the scalar 2D fields (the painter composes a 4×4 from
+    /// this list and projects the box's quad through it).
+    pub transform_ops: Option<Vec<Transform3DOp>>,
+    /// `perspective` PROPERTY (distinct from the `perspective()` function):
+    /// establishes a perspective for this element's preserve-3d children.
+    /// Resolved px; `None` = `none` (no perspective). `<1px` clamps to 1px.
+    pub perspective_px: Option<f32>,
+    /// `perspective-origin` — vanishing point for the `perspective` property.
+    /// Default `50% 50%`. `None` = default centre.
+    pub perspective_origin: Option<(BgPos, BgPos)>,
+    /// `transform-style: preserve-3d` — keep descendants in a shared 3D
+    /// rendering context rather than flattening to this element's plane.
+    pub transform_style_preserve_3d: bool,
+    /// `backface-visibility: hidden` — cull the element when its back face
+    /// is toward the viewer (CSS Transforms 2 §10).
+    pub backface_visibility_hidden: bool,
     /// `grid-template-columns` — track sizing for the column axis.
     pub grid_template_columns: Option<Vec<GridTrack>>,
     /// `grid-template-rows` — track sizing for the row axis. If absent
@@ -2914,8 +2975,7 @@ fn is_silent_unknown(name: &str) -> bool {
             | "orphans" | "widows"
             // Misc rendering hints that don't change layout.
             | "shape-rendering" | "interpolation-mode"
-            | "image-rendering" | "backface-visibility"
-            | "transform-style" | "perspective" | "perspective-origin"
+            | "image-rendering"
             | "overflow-style" | "overflow-scrolling"
             | "zoom" | "key"
             // SVG gradient stop attributes set via CSS.
@@ -3035,7 +3095,13 @@ fn reset_property_to_initial(name: &str, style: &mut ComputedStyle) {
             style.scale_x = None;
             style.scale_y = None;
             style.rotate_deg = None;
+            style.matrix_2d = None;
+            style.transform_ops = None;
         }
+        "transform-style" => style.transform_style_preserve_3d = false,
+        "backface-visibility" => style.backface_visibility_hidden = false,
+        "perspective" => style.perspective_px = None,
+        "perspective-origin" => style.perspective_origin = None,
         "box-shadow" => style.box_shadow = None,
         "text-shadow" => style.text_shadow = None,
         "flex-direction" => style.flex_direction = None,
@@ -4307,110 +4373,93 @@ fn apply_declaration(style: &mut ComputedStyle, d: &Declaration) {
             }
         }
         "transform" => {
-            // Walk the value looking for translate / translateX /
-            // translateY function calls; sum them into a single (x, y)
-            // offset that the painter applies at draw time. Other
-            // transforms (rotate/scale/matrix) parse but stay no-op.
-            let mut tx: Option<Length> = None;
-            let mut ty: Option<Length> = None;
-            let add = |opt: &mut Option<Length>, v: Length| {
-                *opt = Some(match *opt {
-                    Some(existing) => add_lengths(existing, v),
-                    None => v,
-                });
-            };
-            let mut i = 0;
-            while i < toks.len() {
-                if let CssToken::Function(name) = &toks[i] {
-                    let lc = name.to_ascii_lowercase();
-                    if let Some(end) = find_matching_paren_in_value(toks, i + 1) {
-                        let args = &toks[i + 1..end];
-                        match lc.as_str() {
-                            "translate" => {
-                                let parts = split_top_level_commas(args);
-                                if let Some(p) = parts.first() {
-                                    if let Some(l) = Length::from_tokens(p) {
-                                        add(&mut tx, l);
-                                    }
-                                }
-                                if let Some(p) = parts.get(1) {
-                                    if let Some(l) = Length::from_tokens(p) {
-                                        add(&mut ty, l);
-                                    }
-                                }
+            // Parse the WHOLE transform function list into an ordered op
+            // list (CSS Transforms 2 §11), detecting whether any 3D
+            // primitive is present. When the list is pure-2D we ALSO fill
+            // the scalar fields below so the cheap 2D fast paths
+            // (translate offset, scale geometry-bake, rotate/matrix affine
+            // layer) keep working unchanged — no regression. When ANY 3D
+            // primitive appears we instead carry the full op list so the
+            // painter composes a real 4×4 matrix and projects the quad.
+            let ops = parse_transform_function_list(toks);
+            let has_3d = ops.iter().any(|op| matches!(op,
+                Transform3DOp::Translate3d(..)
+                | Transform3DOp::Scale3d(..)
+                | Transform3DOp::RotateX(_)
+                | Transform3DOp::RotateY(_)
+                | Transform3DOp::Rotate3d(..)
+                | Transform3DOp::Matrix3d(_)
+                | Transform3DOp::Perspective(_)));
+            if has_3d {
+                // 3D path: carry the op list; the painter builds the 4×4.
+                // Clear the scalar 2D fields so a stale 2D affine doesn't
+                // also fire (the op list is the single source of truth).
+                style.transform_ops = Some(ops);
+                style.translate_x = None;
+                style.translate_y = None;
+                style.scale_x = None;
+                style.scale_y = None;
+                style.rotate_deg = None;
+                style.matrix_2d = None;
+            } else {
+                // Pure-2D path — preserve the legacy scalar behaviour
+                // exactly (sum translates, last scale/rotate/matrix wins).
+                let mut tx: Option<Length> = None;
+                let mut ty: Option<Length> = None;
+                let add = |opt: &mut Option<Length>, v: Length| {
+                    *opt = Some(match *opt {
+                        Some(existing) => add_lengths(existing, v),
+                        None => v,
+                    });
+                };
+                // A `Length::Zero` component is the identity for the
+                // translate SUM and is what `translateX`/`translateY`
+                // synthesise for the unspecified axis — skip it so e.g.
+                // `translateX(42px)` leaves `translate_y` untouched (None),
+                // matching the pre-3D behaviour and CSSOM expectations.
+                let is_zero = |l: &Length| matches!(l, Length::Zero);
+                for op in &ops {
+                    match op {
+                        Transform3DOp::Translate(x, y) => {
+                            if !is_zero(x) {
+                                add(&mut tx, *x);
                             }
-                            "translatex" => {
-                                if let Some(l) = Length::from_tokens(args) {
-                                    add(&mut tx, l);
-                                }
+                            if !is_zero(y) {
+                                add(&mut ty, *y);
                             }
-                            "translatey" => {
-                                if let Some(l) = Length::from_tokens(args) {
-                                    add(&mut ty, l);
-                                }
-                            }
-                            "scale" => {
-                                let parts = split_top_level_commas(args);
-                                let sx = parts.first().and_then(|p| first_number(p));
-                                let sy = parts.get(1).and_then(|p| first_number(p)).or(sx);
-                                if let Some(v) = sx {
-                                    style.scale_x = Some(v as f32);
-                                }
-                                if let Some(v) = sy {
-                                    style.scale_y = Some(v as f32);
-                                }
-                            }
-                            "scalex" => {
-                                if let Some(v) = first_number(args) {
-                                    style.scale_x = Some(v as f32);
-                                }
-                            }
-                            "scaley" => {
-                                if let Some(v) = first_number(args) {
-                                    style.scale_y = Some(v as f32);
-                                }
-                            }
-                            "rotate" | "rotatez" => {
-                                if let Some(deg) = first_angle_degrees(args) {
-                                    style.rotate_deg = Some(deg as f32);
-                                }
-                            }
-                            "matrix" => {
-                                let parts = split_top_level_commas(args);
-                                if parts.len() == 6 {
-                                    let mut m = [0f32; 6];
-                                    let mut ok = true;
-                                    for (i, p) in parts.iter().enumerate() {
-                                        if let Some(v) = first_number(p) {
-                                            m[i] = v as f32;
-                                        } else {
-                                            ok = false;
-                                            break;
-                                        }
-                                    }
-                                    if ok {
-                                        style.matrix_2d = Some(m);
-                                    }
-                                }
-                            }
-                            "skew" | "skewx" | "skewy" => {
-                                // Skew is folded into matrix_2d when used
-                                // directly — for now we leave the box
-                                // unrotated. Real impl matrix-multiplies.
-                            }
-                            _ => {}
                         }
-                        i = end + 1;
-                        continue;
+                        Transform3DOp::Scale(sx, sy) => {
+                            style.scale_x = Some(*sx);
+                            style.scale_y = Some(*sy);
+                        }
+                        Transform3DOp::RotateZ(deg) => {
+                            style.rotate_deg = Some(*deg);
+                        }
+                        Transform3DOp::Matrix2d(m) => {
+                            style.matrix_2d = Some(*m);
+                        }
+                        // skew currently has no 2D-scalar slot; if a skew
+                        // appears alongside other 2D fns we promote the
+                        // whole list to the matrix path so it isn't lost.
+                        Transform3DOp::Skew(ax, ay) if *ax != 0.0 || *ay != 0.0 => {
+                            style.transform_ops = Some(ops.clone());
+                            style.translate_x = None;
+                            style.translate_y = None;
+                            style.scale_x = None;
+                            style.scale_y = None;
+                            style.rotate_deg = None;
+                            style.matrix_2d = None;
+                            return;
+                        }
+                        _ => {}
                     }
                 }
-                i += 1;
-            }
-            if tx.is_some() {
-                style.translate_x = tx;
-            }
-            if ty.is_some() {
-                style.translate_y = ty;
+                if tx.is_some() {
+                    style.translate_x = tx;
+                }
+                if ty.is_some() {
+                    style.translate_y = ty;
+                }
             }
         }
         // CSS Transforms L2 §3.4 individual transform longhands:
@@ -4645,6 +4694,42 @@ fn apply_declaration(style: &mut ComputedStyle, d: &Declaration) {
             if let Some(origin) = parse_background_position(toks) {
                 style.transform_origin = Some(origin);
             }
+        }
+        // CSS Transforms 2 §6: the `perspective` PROPERTY. `none` = no
+        // perspective; otherwise a <length> (resolved px at the bridge).
+        "perspective" => {
+            let is_none = toks
+                .iter()
+                .any(|t| matches!(t, CssToken::Ident(s) if s.eq_ignore_ascii_case("none")));
+            if is_none {
+                style.perspective_px = None;
+            } else if let Some(l) = crate::properties::Length::from_tokens(toks) {
+                // Most real uses are px; resolve em/rem later if needed.
+                // Store as px here using a neutral em (16) since the
+                // `perspective` property is almost always authored in px.
+                if let Some(px) = l.resolve_px(16.0, 16.0, 0.0) {
+                    style.perspective_px = Some(px.max(1.0));
+                }
+            }
+        }
+        // CSS Transforms 2 §6: vanishing point for the `perspective`
+        // property. Default 50% 50%.
+        "perspective-origin" => {
+            if let Some(origin) = parse_background_position(toks) {
+                style.perspective_origin = Some(origin);
+            }
+        }
+        // CSS Transforms 2 §5: `transform-style: flat | preserve-3d`.
+        "transform-style" => {
+            style.transform_style_preserve_3d = toks
+                .iter()
+                .any(|t| matches!(t, CssToken::Ident(s) if s.eq_ignore_ascii_case("preserve-3d")));
+        }
+        // CSS Transforms 2 §10: `backface-visibility: visible | hidden`.
+        "backface-visibility" => {
+            style.backface_visibility_hidden = toks
+                .iter()
+                .any(|t| matches!(t, CssToken::Ident(s) if s.eq_ignore_ascii_case("hidden")));
         }
         // Properties we parse silently as "noted but not visualised yet".
         // Without these branches the unknown-property path leaves them
@@ -5841,6 +5926,166 @@ fn split_top_level_commas(toks: &[CssToken]) -> Vec<Vec<CssToken>> {
         parts.push(cur);
     }
     parts
+}
+
+/// Parse a CSS `transform` value (the whole function list) into an ordered
+/// [`Transform3DOp`] list (CSS Transforms 2 §11). Unknown / unparseable
+/// functions are skipped (matching prior lenient behaviour). Angles are
+/// converted to degrees; translate args keep their `Length` so the bridge
+/// can resolve px/em/rem/% in the right environment.
+fn parse_transform_function_list(toks: &[CssToken]) -> Vec<Transform3DOp> {
+    use crate::properties::Length;
+    let mut ops: Vec<Transform3DOp> = Vec::new();
+    let mut i = 0;
+    while i < toks.len() {
+        if let CssToken::Function(name) = &toks[i] {
+            let lc = name.to_ascii_lowercase();
+            if let Some(end) = find_matching_paren_in_value(toks, i + 1) {
+                let args = &toks[i + 1..end];
+                match lc.as_str() {
+                    "translate" => {
+                        let parts = split_top_level_commas(args);
+                        let x = parts.first().and_then(|p| Length::from_tokens(p)).unwrap_or(Length::Zero);
+                        let y = parts.get(1).and_then(|p| Length::from_tokens(p)).unwrap_or(Length::Zero);
+                        ops.push(Transform3DOp::Translate(x, y));
+                    }
+                    "translatex" => {
+                        let x = Length::from_tokens(args).unwrap_or(Length::Zero);
+                        ops.push(Transform3DOp::Translate(x, Length::Zero));
+                    }
+                    "translatey" => {
+                        let y = Length::from_tokens(args).unwrap_or(Length::Zero);
+                        ops.push(Transform3DOp::Translate(Length::Zero, y));
+                    }
+                    "translatez" => {
+                        let z = Length::from_tokens(args).unwrap_or(Length::Zero);
+                        ops.push(Transform3DOp::Translate3d(Length::Zero, Length::Zero, z));
+                    }
+                    "translate3d" => {
+                        let parts = split_top_level_commas(args);
+                        let x = parts.first().and_then(|p| Length::from_tokens(p)).unwrap_or(Length::Zero);
+                        let y = parts.get(1).and_then(|p| Length::from_tokens(p)).unwrap_or(Length::Zero);
+                        let z = parts.get(2).and_then(|p| Length::from_tokens(p)).unwrap_or(Length::Zero);
+                        ops.push(Transform3DOp::Translate3d(x, y, z));
+                    }
+                    "scale" => {
+                        let parts = split_top_level_commas(args);
+                        let sx = parts.first().and_then(|p| first_number(p)).unwrap_or(1.0);
+                        let sy = parts.get(1).and_then(|p| first_number(p)).unwrap_or(sx);
+                        ops.push(Transform3DOp::Scale(sx as f32, sy as f32));
+                    }
+                    "scalex" => {
+                        let sx = first_number(args).unwrap_or(1.0);
+                        ops.push(Transform3DOp::Scale(sx as f32, 1.0));
+                    }
+                    "scaley" => {
+                        let sy = first_number(args).unwrap_or(1.0);
+                        ops.push(Transform3DOp::Scale(1.0, sy as f32));
+                    }
+                    "scalez" => {
+                        let sz = first_number(args).unwrap_or(1.0);
+                        ops.push(Transform3DOp::Scale3d(1.0, 1.0, sz as f32));
+                    }
+                    "scale3d" => {
+                        let parts = split_top_level_commas(args);
+                        let sx = parts.first().and_then(|p| first_number(p)).unwrap_or(1.0);
+                        let sy = parts.get(1).and_then(|p| first_number(p)).unwrap_or(1.0);
+                        let sz = parts.get(2).and_then(|p| first_number(p)).unwrap_or(1.0);
+                        ops.push(Transform3DOp::Scale3d(sx as f32, sy as f32, sz as f32));
+                    }
+                    "rotate" | "rotatez" => {
+                        if let Some(deg) = first_angle_degrees(args) {
+                            ops.push(Transform3DOp::RotateZ(deg as f32));
+                        }
+                    }
+                    "rotatex" => {
+                        if let Some(deg) = first_angle_degrees(args) {
+                            ops.push(Transform3DOp::RotateX(deg as f32));
+                        }
+                    }
+                    "rotatey" => {
+                        if let Some(deg) = first_angle_degrees(args) {
+                            ops.push(Transform3DOp::RotateY(deg as f32));
+                        }
+                    }
+                    "rotate3d" => {
+                        let parts = split_top_level_commas(args);
+                        if parts.len() == 4 {
+                            let x = first_number(&parts[0]).unwrap_or(0.0) as f32;
+                            let y = first_number(&parts[1]).unwrap_or(0.0) as f32;
+                            let z = first_number(&parts[2]).unwrap_or(0.0) as f32;
+                            let deg = first_angle_degrees(&parts[3]).unwrap_or(0.0) as f32;
+                            ops.push(Transform3DOp::Rotate3d(x, y, z, deg));
+                        }
+                    }
+                    "matrix" => {
+                        let parts = split_top_level_commas(args);
+                        if parts.len() == 6 {
+                            let mut m = [0f32; 6];
+                            let mut ok = true;
+                            for (k, p) in parts.iter().enumerate() {
+                                if let Some(v) = first_number(p) {
+                                    m[k] = v as f32;
+                                } else {
+                                    ok = false;
+                                    break;
+                                }
+                            }
+                            if ok {
+                                ops.push(Transform3DOp::Matrix2d(m));
+                            }
+                        }
+                    }
+                    "matrix3d" => {
+                        let parts = split_top_level_commas(args);
+                        if parts.len() == 16 {
+                            let mut m = [0f32; 16];
+                            let mut ok = true;
+                            for (k, p) in parts.iter().enumerate() {
+                                if let Some(v) = first_number(p) {
+                                    m[k] = v as f32;
+                                } else {
+                                    ok = false;
+                                    break;
+                                }
+                            }
+                            if ok {
+                                ops.push(Transform3DOp::Matrix3d(m));
+                            }
+                        }
+                    }
+                    "perspective" => {
+                        // perspective(none) => identity (skip). Otherwise a length.
+                        let is_none = args.iter().any(|t| matches!(t, CssToken::Ident(s) if s.eq_ignore_ascii_case("none")));
+                        if !is_none {
+                            if let Some(l) = Length::from_tokens(args) {
+                                ops.push(Transform3DOp::Perspective(l));
+                            }
+                        }
+                    }
+                    "skew" => {
+                        let parts = split_top_level_commas(args);
+                        let ax = parts.first().and_then(|p| first_angle_degrees(p)).unwrap_or(0.0) as f32;
+                        let ay = parts.get(1).and_then(|p| first_angle_degrees(p)).unwrap_or(0.0) as f32;
+                        ops.push(Transform3DOp::Skew(ax, ay));
+                    }
+                    "skewx" => {
+                        let ax = first_angle_degrees(args).unwrap_or(0.0) as f32;
+                        ops.push(Transform3DOp::Skew(ax, 0.0));
+                    }
+                    "skewy" => {
+                        let ay = first_angle_degrees(args).unwrap_or(0.0) as f32;
+                        ops.push(Transform3DOp::Skew(0.0, ay));
+                    }
+                    _ => {}
+                }
+                i = end + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    ops
 }
 
 /// Encode a synthetic rule index for an `@media`-nested rule: pack the
@@ -9237,5 +9482,103 @@ mod tests {
             cs.background_gradient_full.is_none(),
             "solid background must clear the full gradient"
         );
+    }
+
+    // ───────────────────────── 3D transform parse ──────────────────────
+
+    #[test]
+    fn transform_rotatex_parses_into_3d_op_list_not_swallowed() {
+        // rotateX(45deg) must populate transform_ops (the 3D path) and NOT
+        // leak into the scalar 2D rotate field — previously it parsed
+        // without error but produced no visual effect (a stub).
+        let ss = parse_stylesheet("div { transform: rotateX(45deg); }");
+        let el = Fake { tag: "div", id: None, classes: &[] };
+        let cs = compute(&[ss], el);
+        let ops = cs.transform_ops.as_ref().expect("rotateX takes the 3D path");
+        assert_eq!(ops.len(), 1);
+        assert!(matches!(ops[0], Transform3DOp::RotateX(a) if (a - 45.0).abs() < 1e-3));
+        assert!(cs.rotate_deg.is_none(), "must not fall into the 2D scalar rotate");
+    }
+
+    #[test]
+    fn transform_translate3d_and_translatez_parse() {
+        let ss = parse_stylesheet("div { transform: translate3d(10px, 20px, 30px); }");
+        let el = Fake { tag: "div", id: None, classes: &[] };
+        let cs = compute(&[ss], el);
+        let ops = cs.transform_ops.as_ref().expect("translate3d takes the 3D path");
+        assert!(matches!(
+            ops[0],
+            Transform3DOp::Translate3d(
+                crate::properties::Length::Px(x),
+                crate::properties::Length::Px(y),
+                crate::properties::Length::Px(z),
+            ) if (x - 10.0).abs() < 1e-3 && (y - 20.0).abs() < 1e-3 && (z - 30.0).abs() < 1e-3
+        ));
+
+        let ss2 = parse_stylesheet("div { transform: translateZ(50px); }");
+        let cs2 = compute(&[ss2], el);
+        let ops2 = cs2.transform_ops.as_ref().expect("translateZ takes the 3D path");
+        assert!(matches!(
+            ops2[0],
+            Transform3DOp::Translate3d(_, _, crate::properties::Length::Px(z)) if (z - 50.0).abs() < 1e-3
+        ));
+    }
+
+    #[test]
+    fn transform_matrix3d_16_values_parse() {
+        let ss = parse_stylesheet(
+            "div { transform: matrix3d(1,0,0,0, 0,1,0,0, 0,0,1,0, 5,6,7,1); }",
+        );
+        let el = Fake { tag: "div", id: None, classes: &[] };
+        let cs = compute(&[ss], el);
+        let ops = cs.transform_ops.as_ref().expect("matrix3d takes the 3D path");
+        match ops[0] {
+            Transform3DOp::Matrix3d(m) => {
+                assert!((m[12] - 5.0).abs() < 1e-3, "m41 (tx) = 5");
+                assert!((m[13] - 6.0).abs() < 1e-3, "m42 (ty) = 6");
+                assert!((m[14] - 7.0).abs() < 1e-3, "m43 (tz) = 7");
+            }
+            _ => panic!("expected Matrix3d"),
+        }
+    }
+
+    #[test]
+    fn transform_combined_3d_keeps_function_order() {
+        // perspective(800px) rotateY(30deg) — both 3D; the op list must
+        // preserve left-to-right order (perspective first, rotate second).
+        let ss = parse_stylesheet("div { transform: perspective(800px) rotateY(30deg); }");
+        let el = Fake { tag: "div", id: None, classes: &[] };
+        let cs = compute(&[ss], el);
+        let ops = cs.transform_ops.as_ref().expect("3D path");
+        assert_eq!(ops.len(), 2);
+        assert!(matches!(ops[0], Transform3DOp::Perspective(_)));
+        assert!(matches!(ops[1], Transform3DOp::RotateY(a) if (a - 30.0).abs() < 1e-3));
+    }
+
+    #[test]
+    fn pure_2d_transform_still_uses_scalar_fields_no_regression() {
+        // A 2D-only transform must STILL fill the scalar fields (so the 2D
+        // fast paths fire) and must NOT create a transform_ops list.
+        let ss = parse_stylesheet("div { transform: translate(10px, 20px) rotate(45deg) scale(2); }");
+        let el = Fake { tag: "div", id: None, classes: &[] };
+        let cs = compute(&[ss], el);
+        assert!(cs.transform_ops.is_none(), "2D-only must not take the 3D path");
+        assert_eq!(cs.translate_x, Some(crate::properties::Length::Px(10.0)));
+        assert_eq!(cs.translate_y, Some(crate::properties::Length::Px(20.0)));
+        assert_eq!(cs.rotate_deg, Some(45.0));
+        assert_eq!(cs.scale_x, Some(2.0));
+    }
+
+    #[test]
+    fn backface_visibility_transform_style_perspective_parse() {
+        let ss = parse_stylesheet(
+            "div { backface-visibility: hidden; transform-style: preserve-3d; perspective: 600px; perspective-origin: 25% 75%; }",
+        );
+        let el = Fake { tag: "div", id: None, classes: &[] };
+        let cs = compute(&[ss], el);
+        assert!(cs.backface_visibility_hidden, "backface-visibility:hidden parsed");
+        assert!(cs.transform_style_preserve_3d, "transform-style:preserve-3d parsed");
+        assert_eq!(cs.perspective_px, Some(600.0), "perspective property px");
+        assert!(cs.perspective_origin.is_some(), "perspective-origin parsed");
     }
 }

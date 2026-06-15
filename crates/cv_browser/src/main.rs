@@ -18361,6 +18361,16 @@ thread_local! {
     /// transparent layer); the OUTER call composites that layer over the page
     /// with the blend formula. Without this guard the box would recurse forever.
     static MIX_BLEND_ROOT_DONE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+
+    /// Nearest ancestor `perspective` PROPERTY in effect, as
+    /// `(distance_px, origin_doc_x, origin_doc_y)` (CSS Transforms 2 §6).
+    /// A box with a 3D `transform` reads the TOP of this stack and applies
+    /// the perspective projection about that vanishing point, so that
+    /// `.scene { perspective: 800px } .card { transform: rotateY(45deg) }`
+    /// foreshortens the card the way Chrome does. Pushed when entering a
+    /// box that sets `perspective`, popped on exit.
+    static PERSPECTIVE_STACK: std::cell::RefCell<Vec<(f32, f32, f32)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// Whether interest-rect (viewport-bounded) rastering is enabled. Default OFF
@@ -43505,6 +43515,79 @@ fn lower_style(
     // is carried RAW so the painter can build the full affine (including
     // rotation/skew) via the layer-composite path — no lossy fold.
     let matrix_2d = cs.matrix_2d;
+    // CSS Transforms 2 §11: when the transform list had a 3D primitive,
+    // compose the ordered op list into a 4×4 matrix here, where em/rem/
+    // viewport are known. This is the pure function composition taken
+    // about the box ORIGIN; the painter wraps it with the
+    // transform-origin translate at paint (where the border box size is
+    // known), exactly mirroring the 2D affine path. Translate x/y % can't
+    // be resolved without the box width yet, so they resolve to 0 here
+    // (rare in 3D; px/em/rem/z resolve exactly).
+    let transform_mat4: Option<cv_layout::Mat4> = cs.transform_ops.as_ref().map(|ops| {
+        let resolve_len = |l: cv_css::properties::Length| -> f32 {
+            match l {
+                cv_css::properties::Length::Percent(_) => 0.0,
+                other => other
+                    .resolve_px_with_viewport(em_px, rem_px, 0.0, cfg.viewport_w, cfg.viewport_h)
+                    .unwrap_or(0.0),
+            }
+        };
+        let mut acc = cv_layout::Mat4::identity();
+        for op in ops {
+            let step = match *op {
+                cv_css::cascade::Transform3DOp::Translate(x, y) => {
+                    cv_layout::Mat4::translate3d(resolve_len(x), resolve_len(y), 0.0)
+                }
+                cv_css::cascade::Transform3DOp::Translate3d(x, y, z) => {
+                    cv_layout::Mat4::translate3d(resolve_len(x), resolve_len(y), resolve_len(z))
+                }
+                cv_css::cascade::Transform3DOp::Scale(sx, sy) => {
+                    cv_layout::Mat4::scale3d(sx, sy, 1.0)
+                }
+                cv_css::cascade::Transform3DOp::Scale3d(sx, sy, sz) => {
+                    cv_layout::Mat4::scale3d(sx, sy, sz)
+                }
+                cv_css::cascade::Transform3DOp::RotateZ(d) => {
+                    cv_layout::Mat4::rotate_z(d.to_radians())
+                }
+                cv_css::cascade::Transform3DOp::RotateX(d) => {
+                    cv_layout::Mat4::rotate_x(d.to_radians())
+                }
+                cv_css::cascade::Transform3DOp::RotateY(d) => {
+                    cv_layout::Mat4::rotate_y(d.to_radians())
+                }
+                cv_css::cascade::Transform3DOp::Rotate3d(x, y, z, d) => {
+                    cv_layout::Mat4::rotate3d(x, y, z, d.to_radians())
+                }
+                cv_css::cascade::Transform3DOp::Matrix2d(m) => cv_layout::Mat4::from_affine2d(m),
+                cv_css::cascade::Transform3DOp::Matrix3d(m) => cv_layout::Mat4::from_matrix3d(m),
+                cv_css::cascade::Transform3DOp::Perspective(l) => {
+                    let d = match l {
+                        cv_css::properties::Length::Percent(_) => 1.0,
+                        other => other
+                            .resolve_px_with_viewport(em_px, rem_px, 0.0, cfg.viewport_w, cfg.viewport_h)
+                            .unwrap_or(1.0),
+                    };
+                    cv_layout::Mat4::perspective(d)
+                }
+                cv_css::cascade::Transform3DOp::Skew(ax, ay) => {
+                    // skew(ax, ay): x' = x + tan(ax)·y ; y' = y + tan(ay)·x.
+                    // As a 2D affine [a,b,c,d,e,f] = [1, tan(ay), tan(ax), 1, 0, 0].
+                    cv_layout::Mat4::from_affine2d([
+                        1.0,
+                        ay.to_radians().tan(),
+                        ax.to_radians().tan(),
+                        1.0,
+                        0.0,
+                        0.0,
+                    ])
+                }
+            };
+            // Each later function multiplies on the right (apply first).
+            acc = acc.mul(&step);
+        }
+        acc
+    });
     let (translate_x_px, translate_x_percent) = match cs.translate_x {
         Some(cv_css::properties::Length::Percent(p)) => (Some(0.0), Some(p)),
         Some(l) => (
@@ -43682,6 +43765,17 @@ fn lower_style(
             };
             (conv(x), conv(y))
         }),
+        transform_mat4,
+        perspective_px: cs.perspective_px,
+        perspective_origin: cs.perspective_origin.map(|(x, y)| {
+            let conv = |p: cv_css::cascade::BgPos| match p {
+                cv_css::cascade::BgPos::Px(v) => cv_layout::BgPos::Px(v),
+                cv_css::cascade::BgPos::Pct(v) => cv_layout::BgPos::Pct(v),
+            };
+            (conv(x), conv(y))
+        }),
+        transform_style_preserve_3d: cs.transform_style_preserve_3d,
+        backface_visibility_hidden: cs.backface_visibility_hidden,
         box_shadow,
         text_shadow,
         filters,
@@ -48228,6 +48322,82 @@ fn paint_box_offset_t(
         // Oversized layer: fall through and paint normally (blend ignored)
         // rather than allocate gigabytes — visually wrong but safe.
     }
+    // ── CSS 3D transform: rotateX/Y, translate3d/Z, scale3d/Z, matrix3d,
+    //    perspective — real 4×4 projection (CSS Transforms 2 §11/§13). We
+    //    raster the box's subtree into a transparent layer at its
+    //    UNtransformed position, build the full 4×4 in document space
+    //    (about the transform-origin, wrapped by any ancestor `perspective`
+    //    property), project the layer's four corners through it with the
+    //    homogeneous w-divide, cull the back face if `backface-visibility:
+    //    hidden`, then warp the layer onto the projected quad. This handles
+    //    perspective foreshortening (a rotateX collapses height) — not a 2D
+    //    approximation.
+    if !suppress_self_transform && b.has_3d_transform() {
+        let br = b.border_rect();
+        // Resolve transform-origin (default 50% 50%) in document coords.
+        let (origin_xp, origin_yp) = match b.transform_origin {
+            Some((xp, yp)) => (xp, yp),
+            None => (cv_layout::BgPos::Pct(50.0), cv_layout::BgPos::Pct(50.0)),
+        };
+        let ox_doc = br.x + origin_xp.resolve(br.w, 0.0);
+        let oy_doc = br.y + origin_yp.resolve(br.h, 0.0);
+        // Nearest ancestor `perspective` property (already in doc space).
+        let parent_persp = PERSPECTIVE_STACK.with(|s| s.borrow().last().copied());
+        let full = b.transform_mat4_doc(ox_doc, oy_doc, parent_persp);
+        // Backface-visibility:hidden — cull when the transformed back face
+        // points at the viewer (Chrome gfx::Transform::IsBackFaceVisible).
+        if b.backface_visibility_hidden && full.is_back_face_visible() {
+            return;
+        }
+        // The four border-box corners in document coords (TL,TR,BR,BL).
+        let corners_doc = [
+            (br.x, br.y),
+            (br.x + br.w, br.y),
+            (br.x + br.w, br.y + br.h),
+            (br.x, br.y + br.h),
+        ];
+        // Project each corner via the 4×4 + w-divide. If any corner can't
+        // be projected (w<=0, behind the viewer), fall through to the 2D
+        // fast path rather than render a garbage quad.
+        let mut projected: [(f32, f32); 4] = [(0.0, 0.0); 4];
+        let mut ok = true;
+        for (i, (cx, cy)) in corners_doc.iter().enumerate() {
+            match full.project_2d(*cx, *cy) {
+                Some((px, py)) => projected[i] = (px + parent_off_x, py + parent_off_y),
+                None => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if ok {
+            // Raster the (untransformed) subtree into a layer covering its
+            // border box. We sample the layer's whole rect onto the quad,
+            // so the layer is exactly the border box (no padding — the warp
+            // maps unit square → quad). Use subtree_bounds to capture
+            // overflow, but the quad maps the BORDER box; descendants that
+            // overflow the border box are clamped (acceptable for 3D).
+            let lw = br.w.ceil().max(1.0);
+            let lh = br.h.ceil().max(1.0);
+            const MAX_LAYER_DIM_3D: f32 = 4096.0;
+            if lw <= MAX_LAYER_DIM_3D && lh <= MAX_LAYER_DIM_3D {
+                let mut layer = cv_gfx::Bitmap::new(lw as u32, lh as u32);
+                layer.clear(cv_gfx::Color { r: 0, g: 0, b: 0, a: 0 });
+                let mut layer_texts: Vec<cv_ui::TextItem> = Vec::new();
+                // Paint subtree at layer-local coords: doc point P → P - br.{x,y}.
+                let prev_collect = AFFINE_COLLECTING.with(|c| c.replace(false));
+                paint_box_offset_t(b, &mut layer, &mut layer_texts, -br.x, -br.y, None, true);
+                AFFINE_COLLECTING.with(|c| c.set(prev_collect));
+                cv_ui::bake_content_text_into_bitmap(&mut layer, &mut layer_texts);
+                // Warp the layer (its full rect = border box) onto the
+                // projected quad. Corner order matches: layer TL,TR,BR,BL.
+                bmp.blit_quad_projective(&layer, projected, 1.0);
+                return;
+            }
+        }
+        // Could not project (behind viewer) or oversized: fall through to
+        // the 2D path so the box still renders something sensible.
+    }
     // ── CSS 2D transform: rotate()/matrix() — affine layer composite ──
     // scale()/translate() are handled cheaply (geometry-bake + offset),
     // but rotation/skew can't be baked into axis-aligned geometry. We
@@ -49582,6 +49752,26 @@ fn paint_box_offset_t(
     if scroll_active {
         SCROLL_PAINT_DEPTH.with(|c| c.set(c.get() + 1));
     }
+    // CSS Transforms 2 §6: if this box sets the `perspective` PROPERTY,
+    // push its vanishing point so 3D-transformed descendants project
+    // through it. Stored in PURE DOCUMENT coords (no paint offset): the
+    // 3D-child branch composes its own transform in document coords too
+    // and only adds the cumulative paint offset to the FINAL projected
+    // corners, so both must share the un-offset document space here.
+    // Popped after children paint.
+    let pushed_perspective = if let Some(d) = b.perspective_px {
+        let br = b.border_rect();
+        let (pox_p, poy_p) = match b.perspective_origin {
+            Some((xp, yp)) => (xp, yp),
+            None => (cv_layout::BgPos::Pct(50.0), cv_layout::BgPos::Pct(50.0)),
+        };
+        let pox = br.x + pox_p.resolve(br.w, 0.0);
+        let poy = br.y + poy_p.resolve(br.h, 0.0);
+        PERSPECTIVE_STACK.with(|s| s.borrow_mut().push((d.max(1.0), pox, poy)));
+        true
+    } else {
+        false
+    };
     let needs_sort =
         b.children.iter().any(|c| effective_z(c).is_some()) || b.children.iter().any(is_positioned);
     if needs_sort {
@@ -49630,6 +49820,11 @@ fn paint_box_offset_t(
         for c in &b.children {
             paint_box_offset(c, bmp, texts, off_x, off_y, next_clip);
         }
+    }
+    if pushed_perspective {
+        PERSPECTIVE_STACK.with(|s| {
+            s.borrow_mut().pop();
+        });
     }
     if scroll_active {
         SCROLL_PAINT_DEPTH.with(|c| c.set(c.get().saturating_sub(1)));
@@ -53921,6 +54116,11 @@ mod tests {
             rotate_deg: 0.0,
             matrix_2d: None,
             transform_origin: None,
+            transform_mat4: None,
+            perspective_px: None,
+            perspective_origin: None,
+            transform_style_preserve_3d: false,
+            backface_visibility_hidden: false,
             position: cv_layout::Position::Static,
             z_index: None,
             float_side: cv_layout::FloatSide::None,
@@ -54446,6 +54646,11 @@ mod tests {
             rotate_deg: 0.0,
             matrix_2d: None,
             transform_origin: None,
+            transform_mat4: None,
+            perspective_px: None,
+            perspective_origin: None,
+            transform_style_preserve_3d: false,
+            backface_visibility_hidden: false,
             position: cv_layout::Position::Static,
             z_index: None,
             box_shadow: None,
@@ -54585,6 +54790,11 @@ mod tests {
             rotate_deg: 0.0,
             matrix_2d: None,
             transform_origin: None,
+            transform_mat4: None,
+            perspective_px: None,
+            perspective_origin: None,
+            transform_style_preserve_3d: false,
+            backface_visibility_hidden: false,
             position: cv_layout::Position::Static,
             z_index: None,
             box_shadow: None,
@@ -54749,6 +54959,11 @@ mod tests {
             rotate_deg: 0.0,
             matrix_2d: None,
             transform_origin: None,
+            transform_mat4: None,
+            perspective_px: None,
+            perspective_origin: None,
+            transform_style_preserve_3d: false,
+            backface_visibility_hidden: false,
             position: cv_layout::Position::Static,
             z_index: None,
             box_shadow: None,
@@ -54895,6 +55110,11 @@ mod tests {
             rotate_deg: 0.0,
             matrix_2d: None,
             transform_origin: None,
+            transform_mat4: None,
+            perspective_px: None,
+            perspective_origin: None,
+            transform_style_preserve_3d: false,
+            backface_visibility_hidden: false,
             position: cv_layout::Position::Static,
             z_index: None,
             box_shadow: None,
@@ -55049,6 +55269,11 @@ mod tests {
             rotate_deg: 0.0,
             matrix_2d: None,
             transform_origin: None,
+            transform_mat4: None,
+            perspective_px: None,
+            perspective_origin: None,
+            transform_style_preserve_3d: false,
+            backface_visibility_hidden: false,
             position: cv_layout::Position::Static,
             z_index: None,
             box_shadow: None,
@@ -55246,6 +55471,135 @@ mod tests {
         // Opaque red image overwrites the gray color via source-over -> red.
         let (r, g, bch, _) = px_at(&bmp, 5, 5);
         assert_eq!((r, g, bch), (255, 0, 0), "normal bg image is opaque red");
+    }
+
+    // ───────────── 3D transform paint pipeline (real pixels) ─────────────
+
+    /// `matrix3d` identity must paint byte-identically to NO transform — the
+    /// don't-regress gate for the new 3D path (it must not warp an identity).
+    #[test]
+    fn transform3d_matrix3d_identity_paints_like_no_transform() {
+        let red = cv_layout::Color { r: 255, g: 0, b: 0, a: 255 };
+        // Baseline: no transform.
+        let plain = blend_template_box(red, 30.0, 30.0);
+        let mut base = cv_gfx::Bitmap::new(40, 40);
+        base.clear(cv_gfx::Color { r: 255, g: 255, b: 255, a: 255 });
+        let mut t0 = Vec::new();
+        paint_box_offset(&plain, &mut base, &mut t0, 0.0, 0.0, None);
+        // With identity matrix3d.
+        let mut b = blend_template_box(red, 30.0, 30.0);
+        b.transform_mat4 = Some(cv_layout::Mat4::from_matrix3d([
+            1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+        ]));
+        let mut got = cv_gfx::Bitmap::new(40, 40);
+        got.clear(cv_gfx::Color { r: 255, g: 255, b: 255, a: 255 });
+        let mut t1 = Vec::new();
+        paint_box_offset(&b, &mut got, &mut t1, 0.0, 0.0, None);
+        // The interior must match the plain fill (red). Sample several.
+        for (x, y) in [(5, 5), (15, 15), (25, 25)] {
+            let p = px_at(&got, x, y);
+            assert_eq!(p.0, 255, "identity matrix3d keeps red at ({x},{y})");
+            assert_eq!(p, px_at(&base, x, y), "identity == no transform at ({x},{y})");
+        }
+    }
+
+    /// `rotateY(180deg)` + `backface-visibility: hidden` must HIDE the
+    /// element — zero red pixels (CSS Transforms 2 §10). A front-facing
+    /// `rotateY(0)` with the same property still renders.
+    #[test]
+    fn transform3d_backface_hidden_culls_back_facing_element() {
+        let red = cv_layout::Color { r: 255, g: 0, b: 0, a: 255 };
+        // Back-facing: rotateY(180) + backface-visibility:hidden → hidden.
+        let mut back = blend_template_box(red, 30.0, 30.0);
+        back.transform_mat4 = Some(cv_layout::Mat4::rotate_y(180.0f32.to_radians()));
+        back.backface_visibility_hidden = true;
+        let mut bmp = cv_gfx::Bitmap::new(40, 40);
+        bmp.clear(cv_gfx::Color { r: 255, g: 255, b: 255, a: 255 });
+        let mut texts = Vec::new();
+        paint_box_offset(&back, &mut bmp, &mut texts, 0.0, 0.0, None);
+        let red_count = bmp
+            .pixels
+            .iter()
+            .filter(|&&p| ((p >> 16) & 0xFF) == 255 && (p & 0xFF) == 0)
+            .count();
+        assert_eq!(red_count, 0, "back-facing hidden element paints NO red pixels");
+
+        // Front-facing same property → renders (sanity that the cull is
+        // conditional on facing, not a blanket skip).
+        let mut front = blend_template_box(red, 30.0, 30.0);
+        front.transform_mat4 = Some(cv_layout::Mat4::rotate_y(0.0));
+        front.backface_visibility_hidden = true;
+        let mut bmp2 = cv_gfx::Bitmap::new(40, 40);
+        bmp2.clear(cv_gfx::Color { r: 255, g: 255, b: 255, a: 255 });
+        let mut t2 = Vec::new();
+        paint_box_offset(&front, &mut bmp2, &mut t2, 0.0, 0.0, None);
+        let red2 = bmp2
+            .pixels
+            .iter()
+            .filter(|&&p| ((p >> 16) & 0xFF) == 255 && (p & 0xFF) == 0)
+            .count();
+        assert!(red2 > 100, "front-facing element still renders (got {red2} red px)");
+    }
+
+    /// `rotateX(80deg)` under perspective foreshortens the box: its painted
+    /// VERTICAL extent shrinks well below the laid-out 30px (CSS T2 §13.1),
+    /// while it stays roughly full width. Proves real perspective projection,
+    /// not a 2D approximation (which would keep height ≈ 30).
+    #[test]
+    fn transform3d_rotatex_under_perspective_foreshortens_height() {
+        let red = cv_layout::Color { r: 255, g: 0, b: 0, a: 255 };
+        let mut b = blend_template_box(red, 30.0, 30.0);
+        // Position the box away from the top so the projected quad has room.
+        b.content = cv_layout::Rect { x: 20.0, y: 20.0, w: 30.0, h: 30.0 };
+        b.transform_mat4 = Some(cv_layout::Mat4::rotate_x(80.0f32.to_radians()));
+        b.perspective_px = None; // perspective supplied by an ancestor below.
+
+        // Wrap in a parent that sets `perspective` so the child projects.
+        let mut parent = blend_template_box(
+            cv_layout::Color { r: 255, g: 255, b: 255, a: 0 },
+            200.0,
+            200.0,
+        );
+        parent.content = cv_layout::Rect { x: 0.0, y: 0.0, w: 200.0, h: 200.0 };
+        parent.perspective_px = Some(300.0);
+        parent.children = vec![b];
+
+        let mut bmp = cv_gfx::Bitmap::new(120, 120);
+        bmp.clear(cv_gfx::Color { r: 255, g: 255, b: 255, a: 255 });
+        let mut texts = Vec::new();
+        paint_box_offset(&parent, &mut bmp, &mut texts, 0.0, 0.0, None);
+
+        // Measure painted red extent.
+        let mut min_y = u32::MAX;
+        let mut max_y = 0u32;
+        let mut min_x = u32::MAX;
+        let mut max_x = 0u32;
+        let mut any = false;
+        for y in 0..bmp.height {
+            for x in 0..bmp.width {
+                let p = bmp.pixels[(y * bmp.width + x) as usize];
+                if ((p >> 16) & 0xFF) > 200 && (p & 0xFF) < 60 && ((p >> 8) & 0xFF) < 60 {
+                    any = true;
+                    min_y = min_y.min(y);
+                    max_y = max_y.max(y);
+                    min_x = min_x.min(x);
+                    max_x = max_x.max(x);
+                }
+            }
+        }
+        assert!(any, "rotateX(80)+perspective still paints SOME red");
+        let painted_h = (max_y - min_y) as f32 + 1.0;
+        let painted_w = (max_x - min_x) as f32 + 1.0;
+        // Foreshortened: height collapses well below the 30px laid-out box.
+        assert!(
+            painted_h < 20.0,
+            "rotateX(80)+perspective foreshortens height (got {painted_h}, want <20 of 30)"
+        );
+        // Width stays substantial (the x-axis is barely affected by rotateX).
+        assert!(
+            painted_w > 20.0,
+            "width stays near full (got {painted_w} of 30)"
+        );
     }
 
     #[test]

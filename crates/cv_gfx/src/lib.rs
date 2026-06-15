@@ -1062,6 +1062,142 @@ impl Bitmap {
         }
     }
 
+    /// Composite `src` onto `self` through a projective (perspective) quad
+    /// mapping: the source rectangle's four corners — top-left `(0,0)`,
+    /// top-right `(sw,0)`, bottom-right `(sw,sh)`, bottom-left `(0,sh)` —
+    /// map to the four destination points `dst_corners` (same TL,TR,BR,BL
+    /// order). Unlike `blit_affine` this supports a non-affine (perspective)
+    /// warp, which is what CSS 3D transforms with perspective produce after
+    /// the w-divide (CSS Transforms 2 §13.1) — e.g. rotateX foreshortening.
+    ///
+    /// Implementation: compute the inverse homography mapping destination
+    /// pixels back to the unit square, scale to source pixels, bilinearly
+    /// sample, alpha-blend. The destination region is the bounding box of
+    /// the four corners. This is the Skia `SkMatrix`/`drawImageRect` model
+    /// for a perspective texture map, done on the CPU.
+    pub fn blit_quad_projective(
+        &mut self,
+        src: &Bitmap,
+        dst_corners: [(f32, f32); 4],
+        group_alpha: f32,
+    ) {
+        if group_alpha <= 0.0 || src.width == 0 || src.height == 0 {
+            return;
+        }
+        let ga = group_alpha.clamp(0.0, 1.0);
+        let (sw, sh) = (src.width as f32, src.height as f32);
+        // Forward homography H mapping the UNIT square (u,v)∈[0,1]² to the
+        // destination quad. Standard 4-point construction (Heckbert 1989,
+        // "Fundamentals of Texture Mapping"). Corner order: (0,0),(1,0),
+        // (1,1),(0,1) → dst[0],dst[1],dst[2],dst[3].
+        let (x0, y0) = dst_corners[0];
+        let (x1, y1) = dst_corners[1];
+        let (x2, y2) = dst_corners[2];
+        let (x3, y3) = dst_corners[3];
+        let dx1 = x1 - x2;
+        let dx2 = x3 - x2;
+        let dx3 = x0 - x1 + x2 - x3;
+        let dy1 = y1 - y2;
+        let dy2 = y3 - y2;
+        let dy3 = y0 - y1 + y2 - y3;
+        let (a, b, c, d, e, f, g, h);
+        if dx3.abs() < 1e-9 && dy3.abs() < 1e-9 {
+            // Affine (parallelogram) case.
+            a = x1 - x0;
+            b = x2 - x1;
+            c = x0;
+            d = y1 - y0;
+            e = y2 - y1;
+            f = y0;
+            g = 0.0;
+            h = 0.0;
+        } else {
+            let den = dx1 * dy2 - dx2 * dy1;
+            if den.abs() < 1e-12 {
+                return;
+            }
+            g = (dx3 * dy2 - dx2 * dy3) / den;
+            h = (dx1 * dy3 - dx3 * dy1) / den;
+            a = x1 - x0 + g * x1;
+            b = x3 - x0 + h * x3;
+            c = x0;
+            d = y1 - y0 + g * y1;
+            e = y3 - y0 + h * y3;
+            f = y0;
+        }
+        // Invert H (3×3) to map destination (X,Y,1) back to (u,v,w).
+        let m = [a, b, c, d, e, f, g, h, 1.0];
+        let det = m[0] * (m[4] * m[8] - m[5] * m[7])
+            - m[1] * (m[3] * m[8] - m[5] * m[6])
+            + m[2] * (m[3] * m[7] - m[4] * m[6]);
+        if det.abs() < 1e-12 {
+            return;
+        }
+        let inv_det = 1.0 / det;
+        let inv = [
+            (m[4] * m[8] - m[5] * m[7]) * inv_det,
+            (m[2] * m[7] - m[1] * m[8]) * inv_det,
+            (m[1] * m[5] - m[2] * m[4]) * inv_det,
+            (m[5] * m[6] - m[3] * m[8]) * inv_det,
+            (m[0] * m[8] - m[2] * m[6]) * inv_det,
+            (m[2] * m[3] - m[0] * m[5]) * inv_det,
+            (m[3] * m[7] - m[4] * m[6]) * inv_det,
+            (m[1] * m[6] - m[0] * m[7]) * inv_det,
+            (m[0] * m[4] - m[1] * m[3]) * inv_det,
+        ];
+        // Destination bounding box.
+        let minx = x0.min(x1).min(x2).min(x3);
+        let maxx = x0.max(x1).max(x2).max(x3);
+        let miny = y0.min(y1).min(y2).min(y3);
+        let maxy = y0.max(y1).max(y2).max(y3);
+        let px0 = (minx.floor() as i32).max(0);
+        let py0 = (miny.floor() as i32).max(0);
+        let px1 = (maxx.ceil() as i32).min(self.width as i32);
+        let py1 = (maxy.ceil() as i32).min(self.height as i32);
+        for dy in py0..py1 {
+            for dx in px0..px1 {
+                let fx = dx as f32 + 0.5;
+                let fy = dy as f32 + 0.5;
+                // (u', v', w) = inv · (fx, fy, 1)
+                let up = inv[0] * fx + inv[1] * fy + inv[2];
+                let vp = inv[3] * fx + inv[4] * fy + inv[5];
+                let wp = inv[6] * fx + inv[7] * fy + inv[8];
+                if wp.abs() < 1e-9 {
+                    continue;
+                }
+                let u = up / wp;
+                let v = vp / wp;
+                if u < 0.0 || v < 0.0 || u > 1.0 || v > 1.0 {
+                    continue;
+                }
+                let sx = u * sw;
+                let sy = v * sh;
+                // Clamp into the sampling range so edge pixels render.
+                let sx = sx.clamp(0.0, sw - 1e-3);
+                let sy = sy.clamp(0.0, sh - 1e-3);
+                let sample = src.sample_bilinear(sx, sy);
+                let sa = ((sample >> 24) & 0xFF) as f32;
+                if sa == 0.0 {
+                    continue;
+                }
+                let final_a = (sa * ga).round() as u8;
+                if final_a == 0 {
+                    continue;
+                }
+                let di = (dy as usize) * (self.width as usize) + dx as usize;
+                self.pixels[di] = blend_bgra(
+                    self.pixels[di],
+                    Color {
+                        b: (sample & 0xFF) as u8,
+                        g: ((sample >> 8) & 0xFF) as u8,
+                        r: ((sample >> 16) & 0xFF) as u8,
+                        a: final_a,
+                    },
+                );
+            }
+        }
+    }
+
     /// Blit a BGRA u32 image at `(x, y)`. Clips to the destination bounds.
     /// Fully transparent source pixels are skipped; fully opaque pixels
     /// overwrite; semi-transparent pixels alpha-blend over the current
@@ -2497,5 +2633,94 @@ mod tests {
         let (rx, ry) = radial_radii(200.0, 100.0, 100.0, 50.0,
             GfxRadialShape::Ellipse, GfxRadialSize::ExplicitPx { rx: 30.0, ry: 70.0 });
         assert!((rx - 30.0).abs() < 1e-3 && (ry - 70.0).abs() < 1e-3);
+    }
+
+    // ──────────────── projective (perspective) quad warp ────────────────
+
+    /// Solid 16×16 red source on transparent — corners TL,TR,BR,BL.
+    fn red_src() -> Bitmap {
+        let mut src = Bitmap::new(16, 16);
+        src.clear(Color { r: 0, g: 0, b: 0, a: 0 });
+        src.fill_rect(0, 0, 16, 16, Color { r: 255, g: 0, b: 0, a: 255 });
+        src
+    }
+
+    #[test]
+    fn quad_identity_maps_source_in_place() {
+        // Mapping the unit square to a rect at (10,10)-(26,26) reproduces
+        // the source there; outside stays white. (Identity-style sanity.)
+        let src = red_src();
+        let mut dst = Bitmap::new(40, 40);
+        dst.blit_quad_projective(
+            &src,
+            [(10.0, 10.0), (26.0, 10.0), (26.0, 26.0), (10.0, 26.0)],
+            1.0,
+        );
+        let inside = dst.pixels[18 * 40 + 18];
+        assert_eq!((inside >> 16) & 0xFF, 255, "centre of quad is red");
+        assert_eq!((inside >> 24) & 0xFF, 255, "opaque");
+        assert_eq!(dst.pixels[2 * 40 + 2], 0xFFFFFFFF, "outside stays white");
+    }
+
+    #[test]
+    fn quad_foreshortening_collapses_height_toward_an_edge() {
+        // A trapezoid where the TOP edge is full width but the BOTTOM edge
+        // collapses to a point at the centre — like rotateX viewed under
+        // perspective. Pixels near the top row are covered; pixels near the
+        // (collapsed) bottom are sparse. Assert: top-centre is red, and the
+        // bottom corners (outside the trapezoid) are NOT red.
+        let src = red_src();
+        let mut dst = Bitmap::new(60, 60);
+        // TL(10,10) TR(50,10) BR(30,40) BL(30,40) — bottom collapsed to (30,40).
+        dst.blit_quad_projective(
+            &src,
+            [(10.0, 10.0), (50.0, 10.0), (30.0, 40.0), (30.0, 40.0)],
+            1.0,
+        );
+        // Top edge centre — inside.
+        let top = dst.pixels[12 * 60 + 30];
+        assert_eq!((top >> 16) & 0xFF, 255, "top of trapezoid is red");
+        // Bottom-left CORNER of the bounding box (10,40) is OUTSIDE the
+        // collapsed trapezoid → stays white (height foreshortened away).
+        assert_eq!(dst.pixels[39 * 60 + 11], 0xFFFFFFFF, "collapsed corner not painted");
+    }
+
+    #[test]
+    fn quad_half_width_samples_whole_source() {
+        // Map the source onto a 8-wide × 16-tall rect: the FULL 16px-wide
+        // source is squeezed into 8 dest px (downscale). The whole dest
+        // rect is covered (red), and one column outside is untouched.
+        let src = red_src();
+        let mut dst = Bitmap::new(40, 40);
+        dst.blit_quad_projective(
+            &src,
+            [(5.0, 5.0), (13.0, 5.0), (13.0, 21.0), (5.0, 21.0)],
+            1.0,
+        );
+        // Sample several points across the squeezed width — all red.
+        for x in [6, 9, 12] {
+            let p = dst.pixels[12 * 40 + x];
+            assert_eq!((p >> 16) & 0xFF, 255, "squeezed quad covers x={x}");
+        }
+        assert_eq!(dst.pixels[12 * 40 + 20], 0xFFFFFFFF, "outside the quad is white");
+    }
+
+    #[test]
+    fn quad_group_alpha_scales_coverage() {
+        // group_alpha=0.5 halves the source alpha at composite, so a red
+        // source over white yields a pink (blend of red over white at 50%).
+        let src = red_src();
+        let mut dst = Bitmap::new(20, 20);
+        dst.blit_quad_projective(
+            &src,
+            [(2.0, 2.0), (18.0, 2.0), (18.0, 18.0), (2.0, 18.0)],
+            0.5,
+        );
+        let p = dst.pixels[10 * 20 + 10];
+        let r = (p >> 16) & 0xFF;
+        let g = (p >> 8) & 0xFF;
+        // Red over white at 0.5: R stays ~255, G/B ~127 (pink), not 0 or 255.
+        assert!(r > 200, "red channel high: {r}");
+        assert!(g > 100 && g < 160, "green channel ~half (pink): {g}");
     }
 }

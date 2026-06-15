@@ -10,6 +10,261 @@
 
 use core::fmt;
 
+/// A 4×4 transformation matrix for CSS 3D transforms (CSS Transforms 2
+/// §11). Stored **column-major** to match `matrix3d()` argument order and
+/// Chrome's `gfx::Transform` / Skia `SkM44`: element `m[col][row]`. A point
+/// `(x, y, z, w)` transforms as `out_i = Σ_c m[c][i] · p_c`.
+///
+/// We use this as the canonical 3D transform once a transform list contains
+/// any 3D primitive (rotateX/Y, translate3d/Z, scale3d/Z, matrix3d,
+/// perspective). The pure-2D fast paths (translate offset, scale geometry
+/// bake, rotate/matrix affine layer) are unchanged for 2D-only transforms,
+/// so this is strictly additive and cannot regress existing rendering.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct Mat4 {
+    /// Column-major: `m[col][row]`.
+    pub m: [[f32; 4]; 4],
+}
+
+impl Default for Mat4 {
+    fn default() -> Self {
+        Mat4::identity()
+    }
+}
+
+impl Mat4 {
+    pub fn identity() -> Self {
+        Mat4 {
+            m: [
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+        }
+    }
+
+    /// Build directly from the 16 column-major values of `matrix3d(...)`
+    /// (CSS Transforms 2 §11). Argument order is m11,m12,m13,m14 (first
+    /// column) … m41,m42,m43,m44 (last column).
+    pub fn from_matrix3d(v: [f32; 16]) -> Self {
+        Mat4 {
+            m: [
+                [v[0], v[1], v[2], v[3]],
+                [v[4], v[5], v[6], v[7]],
+                [v[8], v[9], v[10], v[11]],
+                [v[12], v[13], v[14], v[15]],
+            ],
+        }
+    }
+
+    /// Embed a 2D affine `[a,b,c,d,e,f]` (CSS `matrix()` order, where a
+    /// point maps (x,y)→(a·x+c·y+e, b·x+d·y+f)) into a 4×4 matrix. Per CSS
+    /// Transforms 2 §6.1 the equivalent matrix3d is
+    /// `(a, b, 0, 0, c, d, 0, 0, 0, 0, 1, 0, e, f, 0, 1)`.
+    pub fn from_affine2d(a: [f32; 6]) -> Self {
+        Mat4 {
+            m: [
+                [a[0], a[1], 0.0, 0.0],
+                [a[2], a[3], 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+                [a[4], a[5], 0.0, 1.0],
+            ],
+        }
+    }
+
+    pub fn translate3d(tx: f32, ty: f32, tz: f32) -> Self {
+        let mut m = Mat4::identity();
+        m.m[3][0] = tx;
+        m.m[3][1] = ty;
+        m.m[3][2] = tz;
+        m
+    }
+
+    pub fn scale3d(sx: f32, sy: f32, sz: f32) -> Self {
+        let mut m = Mat4::identity();
+        m.m[0][0] = sx;
+        m.m[1][1] = sy;
+        m.m[2][2] = sz;
+        m
+    }
+
+    /// rotateX(angle) — CSS Transforms 2 §11. Rotation about the x-axis.
+    pub fn rotate_x(rad: f32) -> Self {
+        let (s, c) = rad.sin_cos();
+        let mut m = Mat4::identity();
+        // Affects rows/cols y,z. Column-major m[col][row]:
+        // y' =  c·y - s·z ; z' = s·y + c·z
+        m.m[1][1] = c;
+        m.m[1][2] = s;
+        m.m[2][1] = -s;
+        m.m[2][2] = c;
+        m
+    }
+
+    /// rotateY(angle) — rotation about the y-axis.
+    pub fn rotate_y(rad: f32) -> Self {
+        let (s, c) = rad.sin_cos();
+        let mut m = Mat4::identity();
+        // x' = c·x + s·z ; z' = -s·x + c·z
+        m.m[0][0] = c;
+        m.m[0][2] = -s;
+        m.m[2][0] = s;
+        m.m[2][2] = c;
+        m
+    }
+
+    /// rotateZ(angle) — rotation about the z-axis (== 2D rotate()).
+    pub fn rotate_z(rad: f32) -> Self {
+        let (s, c) = rad.sin_cos();
+        let mut m = Mat4::identity();
+        // x' = c·x - s·y ; y' = s·x + c·y
+        m.m[0][0] = c;
+        m.m[0][1] = s;
+        m.m[1][0] = -s;
+        m.m[1][1] = c;
+        m
+    }
+
+    /// rotate3d(x, y, z, angle) — rotation about an arbitrary axis
+    /// (CSS Transforms 2 §11). The axis is normalized first; a zero-length
+    /// axis is treated as identity per spec.
+    pub fn rotate3d(ax: f32, ay: f32, az: f32, rad: f32) -> Self {
+        let len = (ax * ax + ay * ay + az * az).sqrt();
+        if len < 1e-9 {
+            return Mat4::identity();
+        }
+        let (x, y, z) = (ax / len, ay / len, az / len);
+        let (s, c) = rad.sin_cos();
+        let t = 1.0 - c;
+        // Standard Rodrigues rotation matrix, written column-major
+        // (m[col][row]). out_i = Σ_c m[c][i]·p_c.
+        Mat4 {
+            m: [
+                [t * x * x + c, t * x * y + s * z, t * x * z - s * y, 0.0],
+                [t * x * y - s * z, t * y * y + c, t * y * z + s * x, 0.0],
+                [t * x * z + s * y, t * y * z - s * x, t * z * z + c, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+        }
+    }
+
+    /// perspective(d) — the `perspective()` transform FUNCTION
+    /// (CSS Transforms 2 §11). `d` < 1px is clamped to 1px; `None`/infinite
+    /// is identity. The matrix puts `-1/d` in row 4, col 3 so that a point
+    /// further along +z (toward the viewer is −z in CSS) divides down.
+    pub fn perspective(d: f32) -> Self {
+        let d = d.max(1.0);
+        let mut m = Mat4::identity();
+        m.m[2][3] = -1.0 / d;
+        m
+    }
+
+    /// Matrix product `self · rhs` (apply `rhs` first, then `self`), the
+    /// CSS convention for composing a transform list left-to-right where
+    /// each later function multiplies on the right.
+    pub fn mul(&self, rhs: &Mat4) -> Mat4 {
+        let mut out = [[0.0f32; 4]; 4];
+        for col in 0..4 {
+            for row in 0..4 {
+                let mut sum = 0.0;
+                for k in 0..4 {
+                    // self[k][row] · rhs[col][k]
+                    sum += self.m[k][row] * rhs.m[col][k];
+                }
+                out[col][row] = sum;
+            }
+        }
+        Mat4 { m: out }
+    }
+
+    /// Transform a homogeneous point, returning `(x, y, z, w)` BEFORE the
+    /// perspective divide.
+    pub fn transform_point(&self, x: f32, y: f32, z: f32, w: f32) -> (f32, f32, f32, f32) {
+        let p = [x, y, z, w];
+        let mut out = [0.0f32; 4];
+        for row in 0..4 {
+            let mut sum = 0.0;
+            for k in 0..4 {
+                sum += self.m[k][row] * p[k];
+            }
+            out[row] = sum;
+        }
+        (out[0], out[1], out[2], out[3])
+    }
+
+    /// Project a point on the z=0 plane to 2D screen coords via the
+    /// homogeneous (w) divide (CSS Transforms 2 §13.1). Returns `None`
+    /// when the point is at/behind the viewer (`w <= 0`) — a corner that
+    /// can't be projected; callers fall back to the un-projected path.
+    pub fn project_2d(&self, x: f32, y: f32) -> Option<(f32, f32)> {
+        let (px, py, _pz, pw) = self.transform_point(x, y, 0.0, 1.0);
+        if pw <= 1e-6 {
+            return None;
+        }
+        Some((px / pw, py / pw))
+    }
+
+    /// True when this matrix has no 3D component (z row/col are identity and
+    /// there's no perspective term), so it can be handled by the 2D affine
+    /// path with no loss.
+    pub fn is_2d(&self) -> bool {
+        let m = &self.m;
+        m[0][2].abs() < 1e-6
+            && m[0][3].abs() < 1e-6
+            && m[1][2].abs() < 1e-6
+            && m[1][3].abs() < 1e-6
+            && (m[2][0]).abs() < 1e-6
+            && (m[2][1]).abs() < 1e-6
+            && (m[2][2] - 1.0).abs() < 1e-6
+            && (m[2][3]).abs() < 1e-6
+            && (m[3][2]).abs() < 1e-6
+            && (m[3][3] - 1.0).abs() < 1e-6
+    }
+
+    /// Collapse to a 2D affine `[a,b,c,d,e,f]` (CSS `matrix()` order). Only
+    /// meaningful when `is_2d()`; used to route a 3D matrix that happens to
+    /// be 2D back through the cheap affine layer path.
+    pub fn to_affine2d(&self) -> [f32; 6] {
+        let m = &self.m;
+        [m[0][0], m[0][1], m[1][0], m[1][1], m[3][0], m[3][1]]
+    }
+
+    /// Whether the element's back face is toward the viewer (CSS Transforms
+    /// 2 §10, `backface-visibility`). Chrome's `gfx::Transform::
+    /// IsBackFaceVisible()` transforms the surface normal `(0,0,1)` by the
+    /// inverse-transpose of the matrix and checks the sign of its z; an
+    /// element with `backface-visibility: hidden` is culled when this is
+    /// true. For the common flat-element case this is equivalent to the
+    /// spec's "m33 < 0" but is robust under composed/perspective matrices.
+    pub fn is_back_face_visible(&self) -> bool {
+        // The transformed normal's z-component is the cofactor C33 of the
+        // matrix (the 3×3 determinant of the upper-left block minus the
+        // perspective-influenced terms). Equivalently it is the (2,2)
+        // entry of the inverse-transpose scaled by det; we only need its
+        // sign, so compute the cofactor directly. Using full 4×4 cofactor
+        // C[2][2] (delete row 2, col 2) matches Chrome's projection test.
+        let m = &self.m;
+        // Build the 3×3 minor by removing column index 2 and row index 2,
+        // in (row, col) terms of the conceptual matrix M[row][col] where
+        // M[r][c] = m[c][r].
+        let mm = |r: usize, c: usize| m[c][r];
+        let rows = [0usize, 1, 3];
+        let cols = [0usize, 1, 3];
+        let a = mm(rows[0], cols[0]);
+        let b = mm(rows[0], cols[1]);
+        let c = mm(rows[0], cols[2]);
+        let d = mm(rows[1], cols[0]);
+        let e = mm(rows[1], cols[1]);
+        let f = mm(rows[1], cols[2]);
+        let g = mm(rows[2], cols[0]);
+        let h = mm(rows[2], cols[1]);
+        let i = mm(rows[2], cols[2]);
+        let cofactor33 = a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g);
+        cofactor33 < 0.0
+    }
+}
+
 #[derive(Copy, Clone, Debug, Default, PartialEq)]
 pub struct Rect {
     pub x: f32,
@@ -466,6 +721,22 @@ pub struct LayoutBox {
     /// Expressed as (x, y) [`BgPos`] values that are resolved to pixels
     /// against the border-box at paint time.
     pub transform_origin: Option<(BgPos, BgPos)>,
+    /// Full 3D transform (CSS Transforms 2 §11), composed column-major.
+    /// `Some` ONLY when the `transform` list had a 3D primitive; supersedes
+    /// the scalar 2D fields. The painter projects the box's quad through it
+    /// (with any ancestor perspective) using the homogeneous w-divide.
+    /// Translate x/y % are NOT yet baked here (resolved against em/rem/px at
+    /// the bridge); a translate3d depending on box % size resolves at paint.
+    pub transform_mat4: Option<Mat4>,
+    /// `perspective` PROPERTY in px (vanishing distance for preserve-3d
+    /// children). `None` = `none`.
+    pub perspective_px: Option<f32>,
+    /// `perspective-origin` (vanishing point). `None` = default 50% 50%.
+    pub perspective_origin: Option<(BgPos, BgPos)>,
+    /// `transform-style: preserve-3d`.
+    pub transform_style_preserve_3d: bool,
+    /// `backface-visibility: hidden`.
+    pub backface_visibility_hidden: bool,
     pub position: Position,
     /// CSS `z-index`. `None` = `auto` (participates in parent stacking
     /// context). `Some(n)` = explicit stacking order: lower n paints
@@ -634,6 +905,13 @@ impl LayoutBox {
         }
     }
 
+    /// True when this box carries a full 3D transform (rotateX/Y,
+    /// translate3d/Z, scale3d/Z, matrix3d, perspective). These need the
+    /// projective quad paint path, not the 2D affine layer.
+    pub fn has_3d_transform(&self) -> bool {
+        self.transform_mat4.is_some()
+    }
+
     /// True when this box needs the affine (layer-composite) paint path
     /// rather than the cheap translate-offset / geometry-scale paths —
     /// i.e. it rotates or carries a non-identity `matrix()`. Pure
@@ -684,6 +962,40 @@ impl LayoutBox {
             self.translate_x_px,
             self.translate_y_px,
         ]
+    }
+
+    /// Build the full 3D matrix applied in document coordinates about the
+    /// transform-origin (CSS Transforms 2 §7): `M_doc = T(O) · P · M ·
+    /// T(−O)`, where `O` is the transform-origin pixel point in document
+    /// space, `M` is the box's own composed 3D transform
+    /// (`transform_mat4`), and `P` is the optional ancestor perspective
+    /// (the `perspective` property on the parent, applied about the
+    /// perspective-origin). `parent_perspective` is `Some((d, ox, oy))`
+    /// with `d` the perspective distance px and `(ox,oy)` the perspective
+    /// origin in document space; `None` = no ancestor perspective.
+    pub fn transform_mat4_doc(
+        &self,
+        origin_doc_x: f32,
+        origin_doc_y: f32,
+        parent_perspective: Option<(f32, f32, f32)>,
+    ) -> Mat4 {
+        let m = match self.transform_mat4 {
+            Some(m) => m,
+            None => Mat4::identity(),
+        };
+        // About the transform-origin: T(O)·M·T(−O).
+        let to = Mat4::translate3d(origin_doc_x, origin_doc_y, 0.0);
+        let from = Mat4::translate3d(-origin_doc_x, -origin_doc_y, 0.0);
+        let mut full = to.mul(&m).mul(&from);
+        // Ancestor perspective is applied OUTSIDE the element's transform,
+        // about the perspective-origin: T(Po)·Persp·T(−Po)·full.
+        if let Some((d, pox, poy)) = parent_perspective {
+            let pto = Mat4::translate3d(pox, poy, 0.0);
+            let pfrom = Mat4::translate3d(-pox, -poy, 0.0);
+            let persp = pto.mul(&Mat4::perspective(d)).mul(&pfrom);
+            full = persp.mul(&full);
+        }
+        full
     }
 
     /// Union of this box's visually painted bounds with every descendant's
@@ -1047,6 +1359,17 @@ pub struct Style {
     pub matrix_2d: Option<[f32; 6]>,
     /// `transform-origin` pivot for 2D transforms. None = default 50% 50%.
     pub transform_origin: Option<(BgPos, BgPos)>,
+    /// Full 3D transform composed from a `transform` list with a 3D
+    /// primitive (CSS Transforms 2 §11). Supersedes the scalar 2D fields.
+    pub transform_mat4: Option<Mat4>,
+    /// `perspective` property (px). None = none.
+    pub perspective_px: Option<f32>,
+    /// `perspective-origin`. None = default 50% 50%.
+    pub perspective_origin: Option<(BgPos, BgPos)>,
+    /// `transform-style: preserve-3d`.
+    pub transform_style_preserve_3d: bool,
+    /// `backface-visibility: hidden`.
+    pub backface_visibility_hidden: bool,
     /// `box-shadow: Xpx Ypx [blur] [spread] color`. V1 ignores blur and
     /// spread; the painter just blits a solid colored rect offset by
     /// (X, Y) underneath the box's normal background. Reads as a
@@ -3097,6 +3420,11 @@ fn build_box_inner(node: &StyledNode, cfg: &LayoutConfig) -> LayoutBox {
                 translate_x_percent: node.style.translate_x_percent,
                 matrix_2d: node.style.matrix_2d,
                 transform_origin: node.style.transform_origin,
+                transform_mat4: node.style.transform_mat4,
+                perspective_px: node.style.perspective_px,
+                perspective_origin: node.style.perspective_origin,
+                transform_style_preserve_3d: node.style.transform_style_preserve_3d,
+                backface_visibility_hidden: node.style.backface_visibility_hidden,
                 scale_x: node.style.scale_x.unwrap_or(1.0),
                 scale_y: node.style.scale_y.unwrap_or(1.0),
                 rotate_deg: node.style.rotate_deg.unwrap_or(0.0),
@@ -3237,6 +3565,11 @@ fn build_box_inner(node: &StyledNode, cfg: &LayoutConfig) -> LayoutBox {
             rotate_deg: 0.0,
             matrix_2d: None,
             transform_origin: None,
+            transform_mat4: None,
+            perspective_px: None,
+            perspective_origin: None,
+            transform_style_preserve_3d: false,
+            backface_visibility_hidden: false,
             box_shadow: None,
             text_shadow: None,
             filters: Vec::new(),
@@ -9283,5 +9616,179 @@ mod tests {
         // Both report a positive max scrollTop.
         assert!(chain[0].max_top > 0.0 && chain[1].max_top > 0.0);
         let _ = outer_box;
+    }
+
+    // ───────────────────────── 3D transform (Mat4) ─────────────────────
+    // These assert the COMPUTED 4×4 geometry / projected vertices, per
+    // CSS Transforms 2 §11/§13. Not "doesn't panic" — exact coordinates.
+
+    #[test]
+    fn mat4_identity_and_matrix3d_identity_are_no_op() {
+        // matrix3d identity == identity == no transform. Projecting any
+        // point through it yields the same point (CSS Transforms 2 §11).
+        let id = Mat4::from_matrix3d([
+            1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+        ]);
+        assert!(id.is_2d(), "identity matrix3d collapses to 2D");
+        let (x, y) = id.project_2d(37.0, 91.0).unwrap();
+        assert!((x - 37.0).abs() < 1e-4 && (y - 91.0).abs() < 1e-4, "identity moves nothing: {x},{y}");
+        assert_eq!(id.to_affine2d(), [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn mat4_translate3d_z_alone_does_not_move_2d_without_perspective() {
+        // translateZ with NO perspective: z has no projected effect (the
+        // w-divide is 1), so the 2D position is unchanged (CSS T2 §13.1).
+        let m = Mat4::translate3d(0.0, 0.0, 100.0);
+        let (x, y) = m.project_2d(10.0, 20.0).unwrap();
+        assert!((x - 10.0).abs() < 1e-4 && (y - 20.0).abs() < 1e-4, "translateZ w/o perspective: {x},{y}");
+    }
+
+    #[test]
+    fn mat4_translatez_under_perspective_scales_projected_position() {
+        // perspective(d) · translateZ(tz): a point at distance moves toward
+        // the vanishing point. With d=1000, tz=+200 (toward viewer), the
+        // projected coordinate scales by d/(d - tz) about the origin.
+        // Build perspective about origin (0,0): P · Tz.
+        let d = 1000.0f32;
+        let tz = 200.0f32;
+        let m = Mat4::perspective(d).mul(&Mat4::translate3d(0.0, 0.0, tz));
+        // Point at (100, 0). After Tz: (100,0,200,1). After P: w = 1 - z/d
+        // = 1 - 200/1000 = 0.8 → x' = 100/0.8 = 125.
+        let (x, y) = m.project_2d(100.0, 0.0).unwrap();
+        let expected = 100.0 * d / (d - tz); // 125
+        assert!((x - expected).abs() < 0.1, "translateZ+perspective x: got {x} want {expected}");
+        assert!(y.abs() < 1e-3, "y stays 0 on the axis: {y}");
+    }
+
+    #[test]
+    fn mat4_rotatey_45_perspective_projects_vertex_to_expected_coord() {
+        // A unit-ish quad rotated rotateY(45deg) under perspective(1000),
+        // about the element ORIGIN at (0,0). The right edge (x=100) rotates
+        // BACK in z (away), so it projects CLOSER to the center than 100;
+        // the left edge (x=-100) rotates FORWARD (toward viewer), projecting
+        // farther. Verify the exact projected x of the +x vertex.
+        let d = 1000.0f32;
+        let ry = Mat4::rotate_y(45.0f32.to_radians());
+        let m = Mat4::perspective(d).mul(&ry);
+        // Vertex (100, 0, 0, 1). rotateY: x' = cos45·100 = 70.7107,
+        // z' = sin45·100 = 70.7107 (our rotate_y: x'=c·x + ... ; z'=s·x).
+        // Wait: our rotate_y maps z' = m[0][2]·x = -s·x → z' = -70.71, so
+        // the +x corner goes to NEGATIVE z (away from a +z viewer). w-divide
+        // uses w = 1 - z/d. z=-70.71 → w = 1 + 70.71/1000 = 1.0707.
+        let c = (45.0f32.to_radians()).cos();
+        let s = (45.0f32.to_radians()).sin();
+        let zx = -s * 100.0; // our rotate_y z component for +x
+        let w = 1.0 - zx / d;
+        let expected_x = (c * 100.0) / w;
+        let (x, _y) = m.project_2d(100.0, 0.0).unwrap();
+        assert!(
+            (x - expected_x).abs() < 0.05,
+            "rotateY(45)+persp +x vertex: got {x} want {expected_x}"
+        );
+        // Foreshortening: |projected x| < 100 (the rotated edge is nearer
+        // the axis than its flat position).
+        assert!(x.abs() < 100.0, "rotateY foreshortens the +x edge: {x}");
+    }
+
+    #[test]
+    fn mat4_rotatex_90_collapses_height_under_perspective() {
+        // rotateX(90deg) lays the box flat (edge-on to the viewer): its top
+        // and bottom edges collapse toward the horizon. Under perspective,
+        // the projected vertical extent of the border box shrinks toward 0
+        // (foreshortening). About origin (0,0): persp · rotateX(90).
+        let d = 1000.0f32;
+        let m = Mat4::perspective(d).mul(&Mat4::rotate_x(90.0f32.to_radians()));
+        // Box corners y=0 (top) and y=100 (bottom), x=0.
+        let top = m.project_2d(0.0, 0.0);
+        let bottom = m.project_2d(0.0, 100.0);
+        // rotateX(90): a point (0,100,0) → y'=cos90·100=0, z'=sin90·100=100
+        // → with our rotate_x (z' = m[1][2]·y = +s·y) z=+100, w=1-100/1000
+        // = 0.9, projected y = 0/0.9 = 0. So top and bottom BOTH project to
+        // y≈0 → height collapses to ~0.
+        let ty = top.unwrap().1;
+        let by = bottom.unwrap().1;
+        assert!(
+            (by - ty).abs() < 1.0,
+            "rotateX(90) collapses height: top.y={ty} bottom.y={by} (want ~0 gap)"
+        );
+    }
+
+    #[test]
+    fn mat4_rotatey_180_is_back_facing() {
+        // rotateY(180deg) flips the element to show its back — the front
+        // normal (0,0,1) now points away from the viewer. backface-
+        // visibility:hidden must cull it (CSS Transforms 2 §10). A 0deg
+        // rotation (front-facing) must NOT be culled.
+        let back = Mat4::rotate_y(180.0f32.to_radians());
+        assert!(back.is_back_face_visible(), "rotateY(180) shows the back face");
+        let front = Mat4::rotate_y(0.0);
+        assert!(!front.is_back_face_visible(), "no rotation is front-facing");
+        let small = Mat4::rotate_y(30.0f32.to_radians());
+        assert!(!small.is_back_face_visible(), "rotateY(30) still front-facing");
+        let past = Mat4::rotate_y(120.0f32.to_radians());
+        assert!(past.is_back_face_visible(), "rotateY(120) is past edge-on → back");
+    }
+
+    #[test]
+    fn mat4_doc_applies_transform_about_origin() {
+        // A box transformed about its own centre keeps the centre fixed.
+        // rotateY(45) about origin (50,50): the centre projects to itself.
+        let kid = block(
+            "div",
+            Style {
+                display: Some(Display::Block),
+                width: Some(LengthSpec::Px(100.0)),
+                height: Some(LengthSpec::Px(100.0)),
+                ..Style::default()
+            },
+            vec![],
+        );
+        let mut bx = layout(&kid, &LayoutConfig::default());
+        bx.transform_mat4 = Some(Mat4::rotate_y(45.0f32.to_radians()));
+        let full = bx.transform_mat4_doc(50.0, 50.0, None);
+        let (cx, cy) = full.project_2d(50.0, 50.0).unwrap();
+        assert!(
+            (cx - 50.0).abs() < 1e-3 && (cy - 50.0).abs() < 1e-3,
+            "transform-origin centre is a fixed point: {cx},{cy}"
+        );
+    }
+
+    #[test]
+    fn mat4_doc_perspective_foreshortens_rotatey_quad_width() {
+        // End-to-end: a 100×100 box at doc (0,0) with rotateY(60deg) about
+        // its centre, under an ANCESTOR perspective(600) whose vanishing
+        // point is the box centre. The projected quad's top edge is no
+        // longer 100px wide (one side recedes, one approaches) — verify the
+        // projected width differs from 100 (real perspective, not affine).
+        let kid = block(
+            "div",
+            Style {
+                display: Some(Display::Block),
+                width: Some(LengthSpec::Px(100.0)),
+                height: Some(LengthSpec::Px(100.0)),
+                ..Style::default()
+            },
+            vec![],
+        );
+        let mut bx = layout(&kid, &LayoutConfig::default());
+        bx.transform_mat4 = Some(Mat4::rotate_y(60.0f32.to_radians()));
+        // perspective about the box centre (50,50), distance 600.
+        let full = bx.transform_mat4_doc(50.0, 50.0, Some((600.0, 50.0, 50.0)));
+        let tl = full.project_2d(0.0, 0.0).unwrap();
+        let tr = full.project_2d(100.0, 0.0).unwrap();
+        let proj_w = (tr.0 - tl.0).abs();
+        assert!(
+            (proj_w - 100.0).abs() > 5.0,
+            "perspective must change projected width from 100: got {proj_w}"
+        );
+        // And the two top corners have DIFFERENT y (the receding side sits
+        // higher/lower) — a hallmark of a non-affine perspective warp.
+        assert!(
+            (tr.1 - tl.1).abs() > 0.5,
+            "perspective tilts the top edge: tl.y={} tr.y={}",
+            tl.1,
+            tr.1
+        );
     }
 }
