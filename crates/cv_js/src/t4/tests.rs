@@ -175,6 +175,103 @@ mod windows_engagement {
         );
     }
 
+    // ── P4 — REDUNDANCY / LOAD / CHECK ELIMINATION (this phase). ──
+
+    /// P4 ENGAGEMENT + BYTE-IDENTITY (single-function path): an intermediate-heavy
+    /// numeric function (whose redundant subexpressions read PROVEN-NUMERIC operands
+    /// — results of prior arith ops) runs on T4 byte-identical to the VM, AND the P4
+    /// redundancy pass actually folds ≥1 op (`redundancy_rewrite_count` > 0). This is
+    /// the non-vacuity gate for the single-fn `OnlyNumericOperands` mode.
+    #[test]
+    fn t4_p4_redundancy_engages_and_matches_vm() {
+        use crate::ab_oracle::assert_tiers_agree_t4_redundancy_engaged;
+        // r=a+b (proven numeric); then r*r recomputed twice (CSE), and a copy reused.
+        // The single-fn path proves r numeric (it's an Add result) so CSE fires.
+        let src = "function g(a,b){ var r = a + b; var p = r*r; var q = r*r; \
+                   var c = p + q; var d = r*r; return c + d - r; } \
+                   var s = 0; for (var i = 0; i < 60; i = i+1) { s = s + g(i, i+1); } s;";
+        assert_tiers_agree_t4_redundancy_engaged(src)
+            .expect("T4 P4 must match the VM AND fold ≥1 redundant op on the single-fn path");
+    }
+
+    /// P4 store-to-load forwarding (copy propagation): a copied-then-reused value
+    /// runs byte-identical and engages the pass (the copy forwards count > 0).
+    #[test]
+    fn t4_p4_copy_forwarding_engages_and_matches_vm() {
+        use crate::ab_oracle::assert_tiers_agree_t4_redundancy_engaged;
+        let src = "function g(a){ var b = a; var c = b + b; var d = b * c; return c + d + b; } \
+                   var s = 0; for (var i = 0; i < 60; i = i+1) { s = s + g(i); } s;";
+        assert_tiers_agree_t4_redundancy_engaged(src)
+            .expect("T4 P4 copy-forwarding must match the VM AND engage");
+    }
+
+    /// P4 must not change the result of the existing float-dense / corpus snippets —
+    /// re-run the whole P2/P3 corpus through the oracle with P4 active (it is always
+    /// active under CV_T4 now). Pure regression guard for byte-identity.
+    #[test]
+    fn t4_p4_corpus_still_byte_identical() {
+        let corpus = [
+            "function f(x){ return ((x*x*0.5 + x*3.0 - 1.0) * (x - 2.0) + x*x*x*0.25) \
+             / (x + 1.0) - x*0.5 + x*x*0.125 - x*7.0; } \
+             var s = 0; for (var i = 0; i < 300; i = i+1) { s = s + f(i); } s;",
+            "function g(x){ var a=x*2.0; var b=a+x; var c=b*a; var d=c-b; var e=d*c; \
+             var f2=e+d; return f2*e - a + b - c; } g(3.0) + g(0.0) + g(-2.0);",
+            "function s(n){ var a=0; for(var i=0;i<n;i=i+1){ a = a + i*i - i; } return a; } s(40);",
+            "function pick(x){ if (x < 10) return x*2.0; if (x >= 100) return x-1.0; return x+5.0; } \
+             pick(5)+pick(50)+pick(250)+pick(9.5);",
+        ];
+        for src in corpus {
+            assert_tiers_agree(src)
+                .unwrap_or_else(|d| panic!("T4 P4 corpus diverged on {src:?}: {d}"));
+        }
+    }
+
+    /// P4 DEOPT (natural): a P4-folded function CALLED with a non-number arg deopts
+    /// to the VM and produces the byte-identical result. Folding a recomputation must
+    /// not corrupt the deopt frame — the bank is still the complete pre-op image.
+    #[test]
+    fn t4_p4_deopt_on_non_number_is_byte_identical() {
+        let cases = [
+            "function g(a,b){ var r=a+b; var p=r*r; var q=r*r; return p+q; } \
+             var z=0; for(var i=0;i<30;i=i+1){ z = g(i,i+1); } g('5', 1);",
+            "function g(a,b){ var r=a+b; var p=r*r; var q=r*r; return p+q; } \
+             var z=0; for(var i=0;i<30;i=i+1){ z = g(i,i+1); } g(true, 2);",
+            "function g(a){ var b=a; var c=b+b; return c*c; } \
+             var z=0; for(var i=0;i<30;i=i+1){ z = g(i); } g(undefined);",
+        ];
+        for src in cases {
+            assert_tiers_agree(src)
+                .unwrap_or_else(|d| panic!("T4 P4 deopt diverged on {src:?}: {d}"));
+            let vm = run_completion(src, ForcedTier::Vm);
+            let t4 = run_completion(src, ForcedTier::T4);
+            assert!(same(&vm, &t4), "T4 P4 deopt result != VM on {src:?}\n  vm={vm:?}\n  t4={t4:?}");
+        }
+    }
+
+    /// P4 NON-VACUITY (the mutation hook): with `force_unsafe_cse` set, the pass
+    /// folds an expression ACROSS a redefinition of one of its operands — a WRONG
+    /// result the A/B oracle MUST catch (T4 != VM). With the hook OFF the same corpus
+    /// is byte-identical. Proves the kill-on-clobber logic is load-bearing (the
+    /// oracle is not vacuously green). Mirrors the T3 wrong-fold mutation gate.
+    #[test]
+    fn t4_p4_unsafe_cse_mutation_reddens_the_oracle() {
+        // A function where an operand IS redefined between two identical exprs, so the
+        // unsafe fold (skipping the clobber kill) produces a stale, wrong value.
+        // r=a; p=r*r; r=r+b (clobbers r); q=r*r  → q must be the NEW r squared.
+        let src = "function g(a,b){ var r=a; var p=r*r; r=r+b; var q=r*r; return p+q; } \
+                   var s=0; for(var i=0;i<60;i=i+1){ s = s + g(i, i+1); } s;";
+        // Clean: byte-identical.
+        assert_tiers_agree(src).expect("clean P4 must be byte-identical to the VM");
+        // Hook ON: the unsafe fold must DIVERGE (proves the kill is non-vacuous).
+        let _g = crate::t4::redundancy::UnsafeCseGuard::new(true);
+        let diverged = assert_tiers_agree(src).is_err();
+        assert!(
+            diverged,
+            "the unsafe-CSE mutation hook MUST redden the oracle (the kill-on-clobber \
+             is load-bearing); if this passes, the P4 oracle is vacuous"
+        );
+    }
+
     fn run_completion(src: &str, tier: ForcedTier) -> Result<Value, String> {
         let _g = TierGuard::new(tier);
         crate::interp::reset_bc_fn_cache();

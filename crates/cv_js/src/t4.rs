@@ -44,6 +44,8 @@
 
 use crate::bytecode::{BcFunction, Module, Op};
 
+pub mod redundancy;
+
 // ======================================================================
 // T4 (Maglev-class) PHASE P3 — CROSS-FUNCTION INLINING (the jit.js keystone).
 //
@@ -482,7 +484,32 @@ pub fn try_compile_t4_status(module: &Module, fn_idx: usize) -> T4CompileStatus 
     // pointer roots aren't all bank-resident is declined (never installed). For
     // the numeric subset the map carries no pointer roots, so this always passes;
     // it becomes load-bearing when T4 widens to heap ops (P3 inlining).
-    let (optimized, _stats, safepoints) = match crate::t3::optimize_with_safepoints(f) {
+    // P4 — REDUNDANCY / LOAD / CHECK ELIMINATION over the T4-specialized graph.
+    //
+    // CSE MUST run BEFORE T3's linear-scan register allocator (exactly V8 Maglev's
+    // ordering: redundancy/check elimination over the SSA value graph precedes
+    // register allocation). Regalloc aggressively REUSES registers and inserts
+    // copies, which DESTROYS the value-availability CSE needs — a recomputed `r*r`
+    // whose dominating result has already been overwritten into a reused register
+    // can no longer be reused. So we run the pass on the PRE-regalloc body (the
+    // ORIGINAL `f`), where value identity is intact; the redundant pure expressions
+    // fold to copies (dropping the arithmetic AND its implicit operand checks), then
+    // T3's own copy-prop + DCE clean up the introduced `Move`s and the now-dead
+    // recomputations, and regalloc renumbers the smaller result. Register-preserving
+    // is unnecessary here (T3 renumbers afterward anyway), but op-count preservation
+    // keeps the body well-formed for T3.
+    //
+    // The resume module is the T3-OPTIMIZED body, so CSE is gated by
+    // `OnlyNumericOperands`: a folded recomputation the VM would re-run as a `Move`
+    // must not skip a `valueOf`/`toString` side effect, so its operands must be
+    // proven numeric. Store-to-load forwarding (copy prop) is unconditionally safe.
+    // The A/B oracle proves byte-identity; the unsafe-CSE mutation hook proves the
+    // kill-on-clobber is load-bearing.
+    let mut pre = f.clone();
+    let redun =
+        redundancy::redundancy_eliminate_fn(&mut pre, redundancy::Allow::OnlyNumericOperands);
+    bump_redundancy(&redun);
+    let (optimized, _stats, safepoints) = match crate::t3::optimize_with_safepoints(&pre) {
         Ok(x) => x,
         Err(_) => return T4CompileStatus::Decline,
     };
@@ -561,6 +588,27 @@ thread_local! {
     static INLINE_COMPILE_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
+/// P4 honesty guard — total number of redundancy-elimination rewrites (CSE folds +
+/// copy forwards) applied across T4 compiles. Lets the oracle/tests prove the P4
+/// pass is NON-VACUOUS (a green P4 oracle that never actually eliminated anything
+/// would be a lie). Bumped by `try_compile_t4_status` / `try_compile_t4_inlined_status`;
+/// the default build (T4 off) never touches it.
+pub fn redundancy_rewrite_count() -> u64 {
+    REDUNDANCY_REWRITE_COUNT.with(|c| c.get())
+}
+pub fn reset_redundancy_rewrite_count() {
+    REDUNDANCY_REWRITE_COUNT.with(|c| c.set(0));
+}
+fn bump_redundancy(st: &redundancy::RedundancyStats) {
+    let n = (st.cse_folded + st.copies_forwarded) as u64;
+    if n > 0 {
+        REDUNDANCY_REWRITE_COUNT.with(|c| c.set(c.get() + n));
+    }
+}
+thread_local! {
+    static REDUNDANCY_REWRITE_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 /// P3 — compile `module.fns[fn_idx]` WITH cross-function inlining. Inlines the first
 /// inlinable monomorphic `CallFn` (depth 1), compiles the FUSED body through the
 /// representation-aware backend with a resume-pc map routing every guard's deopt to
@@ -585,10 +633,30 @@ pub fn try_compile_t4_inlined_status(module: &Module, fn_idx: usize) -> T4Compil
     if fn_idx != 0 {
         return T4CompileStatus::Decline;
     }
-    let result = match inline_first_call(module, fn_idx) {
+    let mut result = match inline_first_call(module, fn_idx) {
         Some(r) => r,
         None => return T4CompileStatus::Decline, // nothing to inline → single-fn path.
     };
+    // P4 — REDUNDANCY / LOAD / CHECK ELIMINATION over the FUSED body. Runs IN PLACE
+    // and register-PRESERVING, so the `bc_pc_map` (fused op index → caller resume
+    // op) and the per-op `DeoptSite.bc_pc` stay aligned by construction — the pass
+    // never inserts/deletes/reorders ops, only rewrites an op (e.g. a redundant
+    // `Mul dst x x` → `Move dst prev`) or an operand read in place. The inlined-
+    // fused deopt resumes the VM on the PRISTINE ORIGINAL caller (`t4_deopt_module`,
+    // which re-runs the un-inlined `f` — every side effect performed), so CSE here
+    // is UNCONDITIONALLY safe (`Allow::Always`): folding a recomputation can never
+    // drop a side effect the resuming VM would otherwise perform. This is the jit.js
+    // win — `f(x)`'s repeated `x*x` (and `x*x*x` reusing `x*x`) fold to copies,
+    // dropping both the arithmetic AND its implicit operand checks. The inlined-
+    // frame deopt fuzzer + the A/B oracle prove byte-identity after the fold.
+    let redun =
+        redundancy::redundancy_eliminate_fn(&mut result.fused, redundancy::Allow::Always);
+    bump_redundancy(&redun);
+    debug_assert_eq!(
+        result.fused.code.len(),
+        result.bc_pc_map.len(),
+        "P4 redundancy elim must preserve the op count (and thus the resume-pc map)"
+    );
     // VERIFY every inlined-region resume target is a real op in the ORIGINAL caller
     // (the inlined-frame analogue of the SafepointMap UAF gate). A guard whose
     // mapped bc_pc is out of the caller's code range would resume at a garbage op;

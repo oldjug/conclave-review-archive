@@ -12664,6 +12664,101 @@ mod tests {
         }
     }
 
+    /// P4 KEYSTONE GATE — REDUNDANCY / CHECK ELIMINATION over an INLINED fused body.
+    /// A callee with REDUNDANT pure expressions (the jit.js `y*y` shape, recomputed)
+    /// is inlined; the P4 pass (running under `Allow::Always` on the fused body)
+    /// folds the recomputation to a copy AND removes its implicit operand checks.
+    /// THE GATE: (1) the fold actually fired (non-vacuity — the fused body has FEWER
+    /// arith ops than the un-folded splice would); (2) the inlined T4 result is
+    /// byte-identical to the un-inlined VM; (3) a forced deopt at EVERY fused op
+    /// (including the folded `Move`s) resumes the ORIGINAL pristine caller and is
+    /// byte-identical to the VM — proving the fold never corrupts the deopt frame.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn t4_p4_inline_redundancy_folds_and_deopts_byte_identical() {
+        let empty: std::cell::RefCell<HashMap<String, Value>> =
+            std::cell::RefCell::new(HashMap::new());
+        // caller f(x): r1 = call g(x); return r1 + 1.
+        let f = BcFunction {
+            name: "f".into(),
+            n_params: 1,
+            rest_reg: None,
+            n_regs: 4,
+            consts: vec![Value::Number(1.0)],
+            code: vec![
+                Op::CallFn { dst: 1, fn_idx: 1, first_arg: 0, n_args: 1 },
+                Op::LoadConst { dst: 2, k: 0 },
+                Op::Add { dst: 3, lhs: 1, rhs: 2 },
+                Op::Ret { src: 3 },
+            ],
+            ic: std::cell::RefCell::new(Vec::new()),
+            feedback: std::cell::RefCell::new(Vec::new()),
+        };
+        // callee g(y): p = y*y; q = y*y; s = y*y; return p + q + s.  (THREE y*y —
+        // two are redundant and fold to copies of the first under P4.)
+        let g = BcFunction {
+            name: "g".into(),
+            n_params: 1,
+            rest_reg: None,
+            n_regs: 6,
+            consts: vec![],
+            code: vec![
+                Op::Mul { dst: 1, lhs: 0, rhs: 0 }, // p = y*y
+                Op::Mul { dst: 2, lhs: 0, rhs: 0 }, // q = y*y  (redundant)
+                Op::Mul { dst: 3, lhs: 0, rhs: 0 }, // s = y*y  (redundant)
+                Op::Add { dst: 4, lhs: 1, rhs: 2 }, // p + q
+                Op::Add { dst: 5, lhs: 4, rhs: 3 }, // + s
+                Op::Ret { src: 5 },
+            ],
+            ic: std::cell::RefCell::new(Vec::new()),
+            feedback: std::cell::RefCell::new(Vec::new()),
+        };
+        let m = Module { fns: vec![f, g] };
+
+        // NON-VACUITY: the inliner + P4 fold leave FEWER `Mul` ops in the fused body
+        // than the raw splice (which would have all three y*y). Count Muls before/after.
+        let raw = crate::t4::inline_first_call(&m, 0).expect("inlines the redundant callee");
+        let raw_muls = raw.fused.code.iter().filter(|op| matches!(op, Op::Mul { .. })).count();
+        // The raw splice keeps all three y*y muls (P4 has not run on `inline_first_call`'s
+        // output — it runs inside try_compile_t4_inlined_status). Confirm the shape.
+        assert!(raw_muls >= 3, "the raw inlined splice has all three y*y muls (got {raw_muls})");
+        crate::t4::reset_redundancy_rewrite_count();
+        let native = compile_t4_inlined_for_fuzz(&m).expect("the redundant inlined body compiles");
+        assert!(
+            crate::t4::redundancy_rewrite_count() >= 2,
+            "P4 must fold the two redundant y*y (non-vacuous); folded={}",
+            crate::t4::redundancy_rewrite_count()
+        );
+        assert!(native.t4_deopt_module().is_some(), "inlined T4 carries the pristine caller resume");
+
+        let n_fused = raw.fused.code.len();
+        for x in [5.0, 0.0, -2.5, 100.0, f64::NAN, -0.0, 1e160] {
+            let args = [Value::Number(x)];
+            let mut r0 = refuse_with_interp;
+            let oracle = run_function(&m, 0, &args, &Value::Undefined, &empty, None, &mut r0);
+            let mut r1 = refuse_with_interp;
+            let t4 = run_t4_call(&native, &args, &Value::Undefined, &empty, &mut r1);
+            assert!(
+                fuzz_results_eq(&t4, &oracle),
+                "P4 inline-folded result diverged (x={x})\n  t4={t4:?}\n  vm={oracle:?}"
+            );
+            // DEOPT-FUZZ every fused op (the folded Moves included).
+            for force_pc in 0..n_fused {
+                let _gd = ForceDeoptGuard::new(Some(force_pc));
+                let nat = match compile_t4_inlined_for_fuzz(&m) {
+                    Some(n) => n,
+                    None => continue,
+                };
+                let mut r2 = refuse_with_interp;
+                let t4d = run_t4_call(&nat, &args, &Value::Undefined, &empty, &mut r2);
+                assert!(
+                    fuzz_results_eq(&t4d, &oracle),
+                    "P4 inline-folded deopt@{force_pc} diverged (x={x})\n  t4={t4d:?}\n  vm={oracle:?}"
+                );
+            }
+        }
+    }
+
     // ════════════════════════════════════════════════════════════════════════
     // B3 — SAFEPOINT STACK MAPS + JIT-VALUE ROOTING (the UAF keystone).
     //

@@ -108,6 +108,9 @@ fn run_one_tier(src: &str, tier: ForcedTier) -> TierOutcome {
     // engagement counter, so a prior tier's T4 decision / count can't leak in).
     crate::interp::reset_t4_cache();
     crate::interp::reset_t4_exec_count();
+    // P4 redundancy-elimination rewrite counter (so a P4 engagement assertion
+    // measures THIS run's CSE/copy folds, not a prior tier's).
+    crate::t4::reset_redundancy_rewrite_count();
     // T2→T2 native-to-native registry + counter (so a prior tier's installed
     // callee code can't be resolved by a later tier's caller).
     crate::interp::reset_t2_module_registry();
@@ -378,6 +381,59 @@ pub fn assert_tiers_agree_t4_engaged(src: &str) -> Result<(), Divergence> {
             path: "<t4-engagement>".to_string(),
             tree_walk: "expected T4 to execute ≥1 function natively".to_string(),
             vm: "T4 executed 0 functions (vacuously green — FAIL)".to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// T4 P4 oracle — like [`assert_tiers_agree_t4_engaged`], but ALSO requires the
+/// P4 REDUNDANCY/LOAD/CHECK ELIMINATION pass to have genuinely rewritten ≥1 op
+/// (`redundancy_rewrite_count` > 0) on this snippet, so a green P4 oracle can never
+/// be vacuously green (T4 engaging but the redundancy pass folding nothing). The
+/// byte-identity (T4 == VM == tree-walk) gate is exactly `assert_tiers_agree_t4_engaged`;
+/// this adds the non-vacuity engagement check for P4 specifically. Use on a corpus
+/// with KNOWN redundancy (a repeated `x*x`, a copied-then-reused value).
+pub fn assert_tiers_agree_t4_redundancy_engaged(src: &str) -> Result<(), Divergence> {
+    let a = run_one_tier(src, ForcedTier::TreeWalk);
+    let b = run_one_tier(src, ForcedTier::Vm);
+    compare_outcomes(&a, &b, "tree-walk", "vm")?;
+    let (outcome, t4_execed, redun) = {
+        let _guard = TierGuard::new(ForcedTier::T4);
+        crate::interp::reset_bc_fn_cache();
+        crate::interp::reset_t4_cache();
+        crate::interp::reset_t4_exec_count();
+        crate::t4::reset_redundancy_rewrite_count();
+        let mut interp = Interp::new();
+        interp.install_basic_globals();
+        let result = match interp.run_completion_value(src) {
+            Ok(v) => Ok(v),
+            Err(e) => Err(reduce_thrown(&e)),
+        };
+        let outcome = TierOutcome {
+            result,
+            output: interp.output.clone(),
+        };
+        (
+            outcome,
+            crate::interp::t4_exec_count(),
+            crate::t4::redundancy_rewrite_count(),
+        )
+    };
+    compare_outcomes(&a, &outcome, "tree-walk", "t4")?;
+    if t4_execed == 0 {
+        return Err(Divergence {
+            kind: DivergenceKind::SideEffect,
+            path: "<t4-engagement>".to_string(),
+            tree_walk: "expected T4 to execute ≥1 function natively".to_string(),
+            vm: "T4 executed 0 functions (vacuously green — FAIL)".to_string(),
+        });
+    }
+    if redun == 0 {
+        return Err(Divergence {
+            kind: DivergenceKind::SideEffect,
+            path: "<t4-p4-redundancy-engagement>".to_string(),
+            tree_walk: "expected the P4 redundancy pass to rewrite ≥1 op".to_string(),
+            vm: "P4 redundancy pass folded 0 ops (vacuously green — FAIL)".to_string(),
         });
     }
     Ok(())
