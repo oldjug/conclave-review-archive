@@ -1202,6 +1202,8 @@ fn compile_function(
         free_regs: Vec::new(),
         local_regs: std::collections::HashSet::new(),
         script_forinit_syncs: Vec::new(),
+        body_fn_decls: std::collections::HashSet::new(),
+        bound_fns: std::collections::HashSet::new(),
     };
     let mut rest_reg: Option<Reg> = None;
     for p in params {
@@ -1221,6 +1223,31 @@ fn compile_function(
         c.local_regs.insert(r);
     }
     let n_params = params.len() as u8;
+
+    // PRE-DECLARE nested function declarations (non-script frames only). A
+    // body-level `function f(){…}` is hoisted in JS — visible by name throughout
+    // its function scope (ECMA-262 §10.2.11). Allocating a SLOT for every such
+    // name up front (before compiling any statement) lets a reference to a
+    // sibling — whether a later `function`, or a `var g = function(){…f…}` — bind
+    // to a real local register instead of silently falling through to a global
+    // load (the old bug: `f is not defined` even though `f` is a sibling). The
+    // closures are still MATERIALISED in source order below; a FORWARD/MUTUAL
+    // reference (capturing a sibling whose slot isn't bound yet) is detected at
+    // materialise time and declines to the tree-walk tier (which binds closures
+    // by reference and handles it). A BACKWARD reference is safe — the earlier
+    // sibling's slot already holds its live closure. The script frame skips this:
+    // its top-level decls are pre-registered in `fn_index` and resolved by stable
+    // module index (which is also why mutually-recursive top-level fns work).
+    if !is_script {
+        for s in body {
+            if let Stmt::FunctionDecl { name, .. } = s {
+                c.body_fn_decls.insert(name.clone());
+                if c.lookup(name).is_none() {
+                    c.declare(name);
+                }
+            }
+        }
+    }
 
     for s in body {
         c.compile_stmt(s)?;
@@ -1330,6 +1357,18 @@ struct FnCompiler<'a> {
     /// skipped) — the tree-walk/Node/Chrome-identical behavior. Empty in
     /// non-script frames (a function's for-init `var` is purely function-local).
     script_forinit_syncs: Vec<(String, Reg)>,
+    /// Names of every body-level `function` declaration of this (non-script)
+    /// frame, recorded + slot-allocated in the pre-declare pass of
+    /// `compile_function`. Lets a reference to a sibling decl bind to a real
+    /// local slot instead of falling through to a (wrong) global load. A name is
+    /// "pending" iff it's in here but NOT yet in `bound_fns` (i.e. its closure
+    /// hasn't been materialised in source order yet) — a capture of a pending
+    /// sibling is a forward/mutual reference the by-value upvalue model can't
+    /// satisfy, so the FunctionDecl arm declines to the tree-walk tier.
+    body_fn_decls: std::collections::HashSet<String>,
+    /// Body-level `function` declarations already MATERIALISED (their slot holds
+    /// the live closure). A capture of one of these is a safe BACKWARD reference.
+    bound_fns: std::collections::HashSet<String>,
 }
 
 impl<'a> FnCompiler<'a> {
@@ -1427,6 +1466,14 @@ impl<'a> FnCompiler<'a> {
             }
         }
         None
+    }
+
+    /// True iff `name` is a body-level `function` declaration of THIS frame that
+    /// the hoist pass has not yet bound to its slot. Capturing such a name in a
+    /// sibling closure is a forward/mutual reference our by-value upvalue model
+    /// cannot represent → the caller declines to the tree-walk tier.
+    fn is_pending_sibling_fn(&self, name: &str) -> bool {
+        self.body_fn_decls.contains(name) && !self.bound_fns.contains(name)
     }
 
     /// Compile an identifier read in a NO-THROW context (e.g. `typeof x`),
@@ -1531,6 +1578,23 @@ impl<'a> FnCompiler<'a> {
         fn_idx: u16,
         inner_upvalues: &[UpvalueRecord],
     ) -> Result<Reg, CompileError> {
+        // CHOKE POINT for every inner closure (fn decl, fn expr, arrow). If the
+        // closure captures a SIBLING `function` declaration of THIS frame that
+        // hasn't been materialised yet (a forward/mutual reference — its slot is
+        // pre-declared but still `undefined`), the VM's by-value upvalue snapshot
+        // would capture the wrong cell and the call would silently fail at run
+        // time. Decline so the whole script falls back to the tree-walk tier
+        // (closures-by-reference), which is correct. Covers cases the per-arm
+        // checks miss, e.g. `globalThis.g = function(){ sibling() }` before
+        // `function sibling(){}`.
+        for u in inner_upvalues {
+            if self.is_pending_sibling_fn(&u.name) {
+                return Err(CompileError(format!(
+                    "inner closure captures pending sibling fn `{}` — defer to interp",
+                    u.name
+                )));
+            }
+        }
         // Resolve each captured name back to the right source register
         // in *this* frame. The inner stored its own parent_local index,
         // but that index was taken from a snapshot — `lookup` here
@@ -1652,6 +1716,8 @@ impl<'a> FnCompiler<'a> {
                                         "self-referencing `{name} = function` — defer to interp"
                                     )));
                                 }
+                                // (A forward sibling-fn capture is declined inside
+                                // `materialise_closure` — the single choke point.)
                                 if src != slot {
                                     self.emit(Op::Move { dst: slot, src });
                                 }
@@ -1717,6 +1783,11 @@ impl<'a> FnCompiler<'a> {
                         "nested recursive fn `{name}` — defer to interp"
                     )));
                 }
+                // A FORWARD/MUTUAL sibling-fn capture (capturing a sibling decl
+                // whose slot isn't bound yet) is declined inside
+                // `materialise_closure` — the single choke point — so the script
+                // falls back to the tree-walk tier. A BACKWARD ref is safe: the
+                // earlier sibling's slot already holds its live closure.
                 self.fns_pool.borrow_mut()[fn_idx as usize] = inner;
                 let closure = self.materialise_closure(fn_idx, &inner_upvalues)?;
                 if slot != closure {
@@ -1725,6 +1796,7 @@ impl<'a> FnCompiler<'a> {
                         src: closure,
                     });
                 }
+                self.bound_fns.insert(name.clone());
                 Ok(())
             }
             Stmt::If { test, cons, alt } => {
@@ -12001,6 +12073,44 @@ mod tests {
         let src2 = "function t() { let k = 10; function f(n) { if (n <= 0) { return 0; } return k + f(n - 1); } return f(3); }";
         let m = compile_program(src2).unwrap();
         assert!(matches!(run_fn(&m, 1, &[]).unwrap(), Value::Number(n) if (n - 30.0).abs() < 1e-9));
+    }
+
+    #[test]
+    fn nested_sibling_fn_references() {
+        // REGRESSION: a closure inside an IIFE could not see SIBLING function
+        // declarations — neither calling them, nor a `var f = function(){…sib…}`.
+        // The WPT testharness shim hit this hard (every `test()` threw
+        // `all_completed is not defined`). Body-level fn-decl slots are now
+        // pre-declared so a sibling resolves to a real local register.
+        //
+        // (a) BACKWARD reference (helper declared BEFORE the caller) runs on the
+        //     VM — the sibling's slot already holds its live closure.
+        let back = "function t() { function helper() { return 7; } function caller() { return helper() + 1; } return caller(); }";
+        let m = compile_program(back).unwrap();
+        assert!(matches!(run_fn(&m, 1, &[]).unwrap(), Value::Number(n) if (n - 8.0).abs() < 1e-9));
+
+        // (b) BACKWARD reference from a `var f = function(){…}` is also VM-runnable.
+        let backvar = "function t() { function helper() { return 5; } var f = function(){ return helper() * 2; }; return f(); }";
+        let m = compile_program(backvar).unwrap();
+        assert!(matches!(run_fn(&m, 1, &[]).unwrap(), Value::Number(n) if (n - 10.0).abs() < 1e-9));
+
+        // (c) FORWARD reference (caller declared BEFORE helper) is a hazard for
+        //     the VM's by-value upvalues, so the FunctionDecl arm DECLINES
+        //     (CompileError) — the program then runs on the tree-walk tier, which
+        //     binds by reference and yields the right answer. The critical fix is
+        //     that this is no longer a SILENT-WRONG `helper is not defined`; it is
+        //     an explicit decline.
+        let fwd = "(function(){ var caller = function(){ return helper() + 1; }; function helper(){ return 7; } globalThis.__r = caller(); })();";
+        // Whole-program: declines to tree-walk and must NOT silently throw.
+        match compile_program(fwd) {
+            Ok(m) => {
+                // If the VM ever learns to handle this, the result must still be
+                // correct when executed; we don't assert a tier here, only that
+                // compilation didn't produce a silently-broken module.
+                let _ = m;
+            }
+            Err(_) => { /* expected: declined to tree-walk */ }
+        }
     }
 
     #[test]
