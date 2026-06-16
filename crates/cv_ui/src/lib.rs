@@ -54,33 +54,47 @@ pub fn offmain_compositor_enabled() -> bool {
 }
 
 // ===========================================================================
-// HiDPI / devicePixelRatio (CV_HIDPI, default OFF).
+// HiDPI / devicePixelRatio (CV_HIDPI, default ON since 2026-06-15).
 //
 // When ON, the process is made per-monitor-DPI-aware
 // (SetProcessDpiAwarenessContext(PER_MONITOR_AWARE_V2)) and the window reports
 // its monitor's real DPI scale (GetDpiForWindow / 96) so devicePixelRatio,
-// matchMedia (resolution), and the backing-store size track the monitor.
+// matchMedia (resolution), and the backing-store size track the monitor. The
+// content is then rasterized at PHYSICAL px (css*dpr) via the device-scale
+// raster (cv_layout::LayoutBox::scaled_for_raster — modelled on Chrome's
+// `cc::RasterSource::PlaybackToCanvas` SkCanvas::scale(dsf) transform), so a 2x
+// monitor gets crisp 2x output presented 1:1, while layout stays in CSS px and
+// hit-testing divides pointer coords by dpr (Chrome keeps input in CSS px).
 //
-// Default OFF because flipping process DPI awareness changes how Windows sizes
-// the client area on a HiDPI monitor: with the legacy (unaware) default the OS
-// bitmap-stretches our 96-dpi output and GetClientRect returns *virtualized*
-// (downscaled) pixels, so the existing 1x layout/raster path is byte-stable.
-// Becoming DPI-aware makes GetClientRect return *physical* pixels — larger on a
-// HiDPI monitor — which the layout viewport must then divide by the scale. We
-// gate the whole behaviour so the default 1x path is never perturbed on the CI
-// boxes / 100%-scale machines the golden goldens were captured on. Opt in with
-// CV_HIDPI=1. (On a 100% monitor, dpr == 1.0 and the path is a no-op anyway.)
+// FLIPPED DEFAULT-ON 2026-06-15 after building the 2x physical-px raster (the
+// previously-unbuilt followup that kept it off). PROOF that the flip is safe:
+//   * On a 100% / CI monitor dpr == 1.0, so `scaled_for_raster(1.0)` short-
+//     circuits to the identity tree and the whole raster path is byte-for-byte
+//     the legacy 1x output (`hidpi_raster_oracle_byte_identical_at_dpr1_*`,
+//     cv_browser: asserts the dpr=1 bake == the default bake pixel-for-pixel).
+//   * At dpr=2 the backing store is exactly 2x, coverage ~4x, and the glyph font
+//     height doubles — crisp glyphs, not an upscale (same oracle, dpr=2 arm).
+// The previous concern (DPI awareness makes GetClientRect return physical px on
+// a HiDPI monitor) is now HANDLED: the layout viewport divides by dpr, the
+// content bitmap is sized at physical px, pointer/scroll are converted to CSS
+// px for hit-testing, and the wheel step scales by dpr.
+//
+// ESCAPE HATCH: set `CV_HIDPI=0` (or off/false/no) to force the legacy
+// DPI-UNAWARE path (OS bitmap-stretches 96-dpi output; byte-stable 1x raster).
 // ===========================================================================
 
-/// Resolved-once gate for HiDPI. **Default OFF.** Opt in with `CV_HIDPI=1`.
+/// Resolved-once gate for HiDPI. **Default ON** (2026-06-15). Force the legacy
+/// DPI-unaware 1x path with `CV_HIDPI=0`.
 static HIDPI_ENABLED: OnceLock<bool> = OnceLock::new();
 
-/// Whether HiDPI / per-monitor devicePixelRatio is enabled. Default OFF.
+/// Whether HiDPI / per-monitor devicePixelRatio + 2x physical raster is enabled.
+/// Default ON; `CV_HIDPI=0` (off/false/no) forces the legacy 1x path.
 pub fn hidpi_enabled() -> bool {
     *HIDPI_ENABLED.get_or_init(|| {
-        matches!(
+        // Default ON: only an explicit opt-OUT disables it.
+        !matches!(
             std::env::var("CV_HIDPI").as_deref(),
-            Ok("1") | Ok("on") | Ok("true") | Ok("yes")
+            Ok("0") | Ok("off") | Ok("false") | Ok("no")
         )
     })
 }
@@ -98,6 +112,21 @@ static DEVICE_PIXEL_RATIO_BITS: core::sync::atomic::AtomicU32 =
 /// `window.devicePixelRatio` and for the `matchMedia` resolution features.
 pub fn device_pixel_ratio() -> f32 {
     f32::from_bits(DEVICE_PIXEL_RATIO_BITS.load(Ordering::Relaxed))
+}
+
+/// Convert a PHYSICAL-px content-area coordinate (a pointer coordinate already
+/// offset by the chrome strip + scroll, i.e. in the device-px backing-store's
+/// space) back into CSS px for hit-testing against the CSS-px layout tree.
+///
+/// Under HiDPI the content bitmap is rasterized at `css*dpr` and presented 1:1,
+/// so a pointer event lands in physical px while `PaintData.layout_root` /
+/// `hit_regions` are in CSS px (Chrome keeps hit-testing in CSS px — input is
+/// delivered in CSS px). Dividing by the live dpr maps them back. At dpr==1 this
+/// is the identity, so the default path is unchanged.
+#[inline]
+pub fn content_phys_to_css(v: f32) -> f32 {
+    let dpr = device_pixel_ratio();
+    if dpr.is_finite() && dpr > 0.0 { v / dpr } else { v }
 }
 
 /// Publish a new device pixel ratio (called from window creation + WM_DPICHANGED
@@ -2880,8 +2909,9 @@ fn route_wheel_to_element(
     if pt.y < chrome_h {
         return false;
     }
-    let content_x = pt.x as f32;
-    let content_y = (pt.y - chrome_h) as f32 + guard.scroll_y as f32;
+    // HiDPI: pointer + scroll are physical px; the layout tree is CSS px → /dpr.
+    let content_x = content_phys_to_css(pt.x as f32);
+    let content_y = content_phys_to_css((pt.y - chrome_h) as f32 + guard.scroll_y as f32);
     let Some(root) = guard.paint.layout_root.as_ref() else {
         return false;
     };
@@ -3916,12 +3946,14 @@ fn dispatch_mouse_url(hwnd: sys::HWND, event_type: &str, lparam: isize, _wparam:
     // built in (mousemove/click below the chrome strip is in scrolled
     // content space — apply chrome-h offset + scroll_y).
     let chrome_h = guard.paint.chrome_h as i32;
+    // HiDPI: content-area pointer/scroll are physical px; the layout tree is CSS
+    // px → /dpr. Chrome strip coordinates (above chrome_h) stay physical.
     let content_y = if y_raw < chrome_h {
         y_raw as f32
     } else {
-        (y_raw - chrome_h) as f32 + guard.scroll_y as f32
+        content_phys_to_css((y_raw - chrome_h) as f32 + guard.scroll_y as f32)
     };
-    let content_x = x_raw as f32;
+    let content_x = content_phys_to_css(x_raw as f32);
     // Hit-test against the layout tree to find the deepest element
     // path under the cursor. Empty path = document root (no element).
     let path_str = match guard.paint.layout_root.as_ref() {
@@ -3935,8 +3967,12 @@ fn dispatch_mouse_url(hwnd: sys::HWND, event_type: &str, lparam: isize, _wparam:
         },
         None => String::new(),
     };
+    // JS `MouseEvent.clientX/clientY` are CSS px (CSSOM View) → divide the
+    // physical pointer coords by dpr. dpr==1 ⇒ identical to the raw coords.
+    let client_x = content_phys_to_css(x_raw as f32).round() as i32;
+    let client_y = content_phys_to_css(y_raw as f32).round() as i32;
     let url = format!(
-        "tb-mouse:{event_type}:{x_raw}:{y_raw}:{}:{}:{}:{}:{}",
+        "tb-mouse:{event_type}:{client_x}:{client_y}:{}:{}:{}:{}:{}",
         if ctrl { 1 } else { 0 },
         if shift { 1 } else { 0 },
         if alt { 1 } else { 0 },
@@ -3962,11 +3998,12 @@ fn pointer_over_link(hwnd: sys::HWND) -> bool {
     }
     let guard = unsafe { (*state_ptr).borrow() };
     let chrome_h = guard.paint.chrome_h as i32;
-    let x = pt.x as f32;
+    // HiDPI: content coords physical px → CSS px for the CSS-px layout tree.
+    let x = content_phys_to_css(pt.x as f32);
     let y = if pt.y < chrome_h {
         pt.y as f32
     } else {
-        (pt.y - chrome_h) as f32 + guard.scroll_y as f32
+        content_phys_to_css((pt.y - chrome_h) as f32 + guard.scroll_y as f32)
     };
     match guard.paint.layout_root.as_ref() {
         Some(root) => cv_layout::hit_test_link(root, x, y).is_some(),
@@ -4986,17 +5023,25 @@ unsafe extern "system" fn wnd_proc(
                 // slides up, scroll_y INCREASES). So scroll_y must move OPPOSITE
                 // the delta sign: scroll_y -= lines*step. 60px per line ≈ 3
                 // lines/notch like Chrome's default.
-                let dy = -(lines * 60) as f32; // px to ADD to a scroll offset
+                // Element-routed scroll sets a container's CSSOM scroll offset
+                // (CSS px in the layout tree), so it uses the unscaled 60-CSS-px
+                // notch. The PAGE scroll_y / backing store are PHYSICAL px, so the
+                // page step is `60*dpr` to move the same visual (CSS) distance
+                // Chrome does. dpr==1 ⇒ both are 60 (default path unchanged).
+                let dy_css = -(lines * 60) as f32; // CSS px for the routed element
+                let dpr = device_pixel_ratio();
+                let dpr = if dpr.is_finite() && dpr > 0.0 { dpr } else { 1.0 };
+                let page_step = (60.0 * dpr) as i32; // physical px for the page
                 // ── Element-level scroll routing (Blink scroll chaining) ──────
                 // Map the wheel position to the innermost scroll container under
                 // the cursor that can still move in the wheel's direction; if
                 // found, scroll IT (route a tb-scroll command to the renderer)
                 // instead of the page. At the edge, chain outward to the next
                 // ancestor; if nothing can absorb it, fall through to page scroll.
-                let routed = route_wheel_to_element(hwnd, state_ptr, dy);
+                let routed = route_wheel_to_element(hwnd, state_ptr, dy_css);
                 if !routed {
                     let mut guard = unsafe { (*state_ptr).borrow_mut() };
-                    guard.scroll_y -= lines * 60;
+                    guard.scroll_y -= lines * page_step;
                     clamp_scroll(&mut guard, hwnd);
                     publish_scroll(&guard, hwnd);
                 }
@@ -5158,11 +5203,14 @@ unsafe extern "system" fn wnd_proc(
                     return 0;
                 }
                 // Clicks in scrolled content map to content-only layout coords.
+                // HiDPI: pointer + scroll are physical px; the layout tree is CSS
+                // px → /dpr before hit-testing. dpr==1 ⇒ identity.
                 let y = if y_raw < chrome_h {
                     y_raw
                 } else {
-                    y_raw - chrome_h + guard.scroll_y as f32
+                    content_phys_to_css(y_raw - chrome_h + guard.scroll_y as f32)
                 };
+                let hx = content_phys_to_css(x);
                 // Link href OR element path. Links take priority for
                 // navigation; otherwise we dispatch a synthetic
                 // `tb-element:` URL so the host can fire
@@ -5170,10 +5218,10 @@ unsafe extern "system" fn wnd_proc(
                 // element under the cursor.
                 let (href_opt, element_path_opt) = match guard.paint.layout_root.as_ref() {
                     Some(root) => (
-                        cv_layout::hit_test_link(root, x, y),
-                        cv_layout::hit_test_element_path(root, x, y),
+                        cv_layout::hit_test_link(root, hx, y),
+                        cv_layout::hit_test_element_path(root, hx, y),
                     ),
-                    None => hit_test_regions(&guard.paint.hit_regions, x, y),
+                    None => hit_test_regions(&guard.paint.hit_regions, hx, y),
                 };
                 // Record the press source for a potential HTML drag gesture: if
                 // the cursor later moves past the threshold while held and is
@@ -5477,11 +5525,12 @@ unsafe extern "system" fn wnd_proc(
                             let x_raw = (lparam & 0xFFFF) as i16 as f32;
                             let y_raw = ((lparam >> 16) & 0xFFFF) as i16 as f32;
                             let chrome_h = guard.paint.chrome_h as f32;
-                            let cx = x_raw;
+                            // HiDPI: physical content coords → CSS px for the tree.
+                            let cx = content_phys_to_css(x_raw);
                             let cy = if y_raw < chrome_h {
                                 y_raw
                             } else {
-                                y_raw - chrome_h + guard.scroll_y as f32
+                                content_phys_to_css(y_raw - chrome_h + guard.scroll_y as f32)
                             };
                             let dst = match guard.paint.layout_root.as_ref() {
                                 Some(root) => cv_layout::hit_test_element_path(root, cx, cy)

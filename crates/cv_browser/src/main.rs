@@ -9622,8 +9622,8 @@ fn build_browser_session(target: &str) -> Result<BrowserParts, String> {
         // the DPI-aware window). The layout viewport is CSS px = physical ÷ dpr
         // so `@media (max-width:)` breakpoints + `window.innerWidth` stay in CSS
         // px even on a HiDPI monitor (Chrome lays out in CSS px, rasters at
-        // physical px). dpr == 1.0 unless CV_HIDPI=1, so the default path divides
-        // by 1 and is byte-identical to before.
+        // physical px). CV_HIDPI is default-on, but dpr == 1.0 on a 100% monitor
+        // (and with CV_HIDPI=0), so that path divides by 1 and is byte-identical.
         let dpr = device_pixel_ratio();
         let (viewport_w, viewport_h) = css_viewport_px(viewport_w, viewport_h, dpr);
         *viewport_for_resize.borrow_mut() = (viewport_w, viewport_h);
@@ -19813,7 +19813,35 @@ fn bake_layout_into_paint_inner(
     prebuilt: Option<cv_gfx::Bitmap>,
     prebuilt_retained: Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
 ) -> cv_ui::PaintData {
-    let bmp_w = cfg.viewport_w as u32;
+    let is_prebuilt = prebuilt.is_some();
+    // ── HiDPI 2x physical-px raster (CV_HIDPI) ───────────────────────────────
+    // Chrome reference: `cc::RasterSource::PlaybackToCanvas` applies the device-
+    // scale-factor as a `SkCanvas::scale(dsf, dsf)` transform to the recorded
+    // display list before playback — layout/paint geometry is recorded in CSS px
+    // and Skia's matrix maps it to PHYSICAL px during raster, so a 2x monitor
+    // gets a 2x-crisp backing store. We do the same uniform scale on the recorded
+    // geometry (the LayoutBox tree is our display list): allocate the content
+    // bitmap at `css*dpr`, paint a `scaled_for_raster(dpr)` clone of the box tree
+    // (font-size scaled ⇒ crisp GDI glyphs), and the present blits 1:1 to the
+    // physical client. `device_pixel_ratio()` is `1.0` on a 100% monitor (or with
+    // CV_HIDPI=0), so that path scales by 1.0 ⇒ byte-identical.
+    //
+    // Only the FULL bake scales: the prebuilt (M5.4 damage) bitmap is already in
+    // device px from the bake that seeded it; the layout_root kept in PaintData
+    // stays the UNSCALED CSS-px tree so hit-testing / CSSOM / JS read CSS px.
+    // The off-main compositor present path is not yet device-scale-aware, so HiDPI
+    // scaling only engages on the (default) non-compositor full-bake path. dpr is
+    // still published for window.devicePixelRatio / matchMedia in both modes.
+    let device_scale = if is_prebuilt || compositor_enabled() {
+        1.0
+    } else {
+        device_pixel_ratio()
+    };
+    let ds = if device_scale.is_finite() && device_scale > 0.0 { device_scale } else { 1.0 };
+    let scaled = ds != 1.0;
+    // Content bitmap width is the CSS viewport width × dpr (physical px). Chrome
+    // text geometry below keeps the LOGICAL width (`cfg.viewport_w`).
+    let bmp_w = (cfg.viewport_w * ds).round().max(1.0) as u32;
     let layout_bottom = lb.content.y + lb.content.h;
     let document_h = layout_bottom.max(cfg.viewport_h);
     // 100K pixel ceiling on the offscreen scroll bitmap. At 1024 wide
@@ -19821,9 +19849,9 @@ fn bake_layout_into_paint_inner(
     // long articles run 60-80k after the wrap-width floor compaction;
     // capping at 32k (the previous value) clipped most of the body
     // and made the article appear to "stop" halfway through.
+    // The ceiling is in PHYSICAL px so a 2x doc still gets the full 100k rows.
     let max_bitmap_h: u32 = 100_000;
-    let full_bmp_h = (document_h as u32).min(max_bitmap_h).max(1);
-    let is_prebuilt = prebuilt.is_some();
+    let full_bmp_h = ((document_h * ds) as u32).min(max_bitmap_h).max(1);
     // ── Band-sized raster (Chrome interest rect) ─────────────────────────────
     // When interest-rect is on (and not the prebuilt/damage-raster path, which
     // assumes a full-document bitmap), raster ONLY the visible band into a
@@ -19831,7 +19859,12 @@ fn bake_layout_into_paint_inner(
     // walk is offset by `-band_origin_y`; the present path blits from
     // `scroll_y - content_origin_y`. This turns a 12000px full-doc raster into a
     // ~viewport+margin raster (the keystone for 60Hz animation on long pages).
-    let use_band = interest_rect_enabled() && !is_prebuilt && !compositor_enabled();
+    // Band raster operates in CSS-px DOCUMENT space; under a device scale the band
+    // origin/offset would need its own scaling pass, so the scaled (HiDPI) bake
+    // takes the always-correct full-document raster. The default (dpr==1) path is
+    // unaffected.
+    let use_band =
+        interest_rect_enabled() && !is_prebuilt && !compositor_enabled() && !scaled;
     let (band_origin_y, bmp_h) = if use_band {
         let (top, bottom) = current_interest_band(cfg);
         let top_u = (top.floor().max(0.0) as u32).min(full_bmp_h.saturating_sub(1));
@@ -19919,6 +19952,17 @@ fn bake_layout_into_paint_inner(
         is_chrome: true,
         text_gradient: None,
     });
+    // HiDPI: paint a device-scaled clone of the box tree (geometry × dpr) into the
+    // physical-px bitmap; the original `lb` (CSS px) is preserved for layout_root /
+    // hit-testing / CSSOM below. At dpr==1 `scaled_for_raster` short-circuits to a
+    // clone of the identical tree, but we avoid even that by borrowing `lb`.
+    let scaled_tree;
+    let paint_tree: &cv_layout::LayoutBox = if scaled {
+        scaled_tree = lb.scaled_for_raster(ds);
+        &scaled_tree
+    } else {
+        &lb
+    };
     if is_prebuilt {
         // M5.4 incremental path: the final pixels were produced by the damage-
         // driven composite, which is byte-identical to a full bake. Skip the full
@@ -19932,14 +19976,14 @@ fn bake_layout_into_paint_inner(
         // them across animation frames (step 2 increment 2).
         let _band = InterestBandGuard::install(cfg);
         AFFINE_COLLECTING.with(|c| c.set(true));
-        paint_box(&lb, &mut bmp, &mut texts);
+        paint_box(paint_tree, &mut bmp, &mut texts);
         AFFINE_COLLECTING.with(|c| c.set(false));
         drain_affine_layers(&mut bmp);
     } else {
         let _band = InterestBandGuard::install(cfg);
         // Band-bitmap: offset doc-space paint into band-bitmap rows (paint_oy =
         // -band_origin_y; 0 for a full-document bake).
-        paint_box_offset(&lb, &mut bmp, &mut texts, 0.0, paint_oy, None);
+        paint_box_offset(paint_tree, &mut bmp, &mut texts, 0.0, paint_oy, None);
     }
     // M5.2 (CV_RETAINED_DL): build the retained node_id-keyed display list beside
     // the live bake, optionally oracle-check it (debug / CV_RETAINED_ORACLE), and
@@ -19964,7 +20008,10 @@ fn bake_layout_into_paint_inner(
     // TextItem's didn't always agree, so the caret was being computed
     // against a different font than the one being rendered.
     let caret_geometry: Option<(i32, i32, i32, (u8, u8, u8))> = focused_path.and_then(|focus| {
-        let (rect, fs, caret_col) = find_focused_caret_rect(&lb, focus)?;
+        // Compute against the SAME tree the content was painted from (the device-
+        // scaled tree under HiDPI), so the caret rect lands in the bitmap's
+        // physical-px space alongside the (also device-px) content `texts`.
+        let (rect, fs, caret_col) = find_focused_caret_rect(paint_tree, focus)?;
         if rect.w <= 1.0 || rect.h <= 1.0 {
             return None;
         }
@@ -20036,7 +20083,13 @@ fn bake_layout_into_paint_inner(
             // Incremental path already generated the new RDL — reuse it as the seed
             // (no second generate()).
             Some(pr)
-        } else if retained_dl::damage_raster_enabled() {
+        } else if retained_dl::damage_raster_enabled() && !scaled {
+            // The retained DL is generated from the CSS-px tree + CSS-px viewport;
+            // under a device scale the cached bitmap is physical px, so an
+            // incremental damage raster from a CSS-px RDL would be size-mismatched.
+            // Don't seed under HiDPI ⇒ the next frame always full-bakes (correct,
+            // re-scaled), never an incremental-from-wrong-scale. (HiDPI + damage
+            // raster incremental is a documented follow-up.)
             Some(std::sync::Arc::new(retained_dl::generate(&lb, cfg)))
         } else {
             None
@@ -64383,6 +64436,113 @@ mod tests {
         assert_eq!(css_viewport_px(800, 600, f32::NAN), (800.0, 600.0));
         // A 0-size client clamps to >= 1 CSS px.
         assert_eq!(css_viewport_px(0, 0, 2.0), (1.0, 1.0));
+    }
+
+    // ===================================================================
+    // HiDPI 2x physical-px RASTER oracle (CV_HIDPI). Proves the device-scale
+    // raster is genuinely crisp (not an upscale) AND byte-identical at dpr=1.
+    // ===================================================================
+
+    /// Bake a layout tree into a content bitmap using the REAL live paint path
+    /// (`oracle_live_paint` = the content portion of `bake_layout_into_paint`),
+    /// at a given device scale. Returns the (width, height, non-background pixel
+    /// count). `ds==1.0` paints the unscaled tree; `ds>1.0` paints the
+    /// `scaled_for_raster(ds)` tree into a `viewport*ds` bitmap, exactly as the
+    /// HiDPI bake does.
+    #[cfg(test)]
+    fn hidpi_bake_stats(lb: &cv_layout::LayoutBox, base_cfg: &cv_layout::LayoutConfig, ds: f32)
+        -> (u32, u32, u64, Vec<u32>)
+    {
+        let tree = lb.scaled_for_raster(ds);
+        let cfg = cv_layout::LayoutConfig {
+            viewport_w: base_cfg.viewport_w * ds,
+            viewport_h: base_cfg.viewport_h * ds,
+            ..base_cfg.clone_for_runtime()
+        };
+        let (bmp, _texts) = oracle_live_paint(&tree, &cfg);
+        // Count pixels that differ from the WHITE canvas background — these are
+        // the painted box + rasterized glyph pixels.
+        let white = cv_gfx::Color::WHITE;
+        let white_u32 = ((white.a as u32) << 24)
+            | ((white.r as u32) << 16)
+            | ((white.g as u32) << 8)
+            | (white.b as u32);
+        let painted = bmp.pixels.iter().filter(|&&p| p != white_u32).count() as u64;
+        (bmp.width, bmp.height, painted, bmp.pixels.clone())
+    }
+
+    /// THE HiDPI raster oracle. A page with a known bordered box + text:
+    ///   (1) dpr=1 byte-identical: the dpr=1 bake is BYTE-FOR-BYTE the same
+    ///       pixels as a plain unscaled bake (the default path is unchanged).
+    ///   (2) dpr=2 crisp 2x: the backing store is exactly 2x the dims, and the
+    ///       painted/glyph coverage is ~4x (both axes doubled ⇒ area ×4) — a
+    ///       genuine higher-resolution raster, NOT an upscale of the 1x pixels.
+    #[test]
+    fn hidpi_raster_oracle_byte_identical_at_dpr1_and_crisp_at_dpr2() {
+        let _serial = global_render_state_lock();
+        let html = "<!doctype html><html><body style='margin:0'>\
+            <div style='width:200px;height:80px;border:3px solid black;\
+                        border-radius:8px;font-size:20px;padding:10px'>\
+            HiDPI crisp text test ABCDEFG</div>\
+            </body></html>";
+        let doc = cv_html::parse(html);
+        let mut sheets = vec![parse_user_agent_stylesheet()];
+        sheets.extend(collect_stylesheets(&doc));
+        let cfg = cv_layout::LayoutConfig {
+            viewport_w: 400.0,
+            viewport_h: 300.0,
+            ..cv_layout::LayoutConfig::default()
+        };
+        let lb = build_layout_tree(&doc, &sheets, "https://hidpi.test/", &cfg, &Default::default());
+
+        // ── (1) dpr=1 BYTE-IDENTITY ─────────────────────────────────────────
+        // The HiDPI bake at ds==1 must be byte-for-byte a plain unscaled bake.
+        let (w1, h1, painted1, px1) = hidpi_bake_stats(&lb, &cfg, 1.0);
+        let (bmp_ref, _t) = oracle_live_paint(&lb, &cfg);
+        assert_eq!((w1, h1), (bmp_ref.width, bmp_ref.height), "dpr=1 dims unchanged");
+        assert_eq!(px1, bmp_ref.pixels, "dpr=1 path must be BYTE-IDENTICAL to the default bake");
+        assert!(painted1 > 0, "the box+text must actually paint something");
+
+        // ── (2) dpr=2 CRISP 2x ──────────────────────────────────────────────
+        let (w2, h2, painted2, _px2) = hidpi_bake_stats(&lb, &cfg, 2.0);
+        assert_eq!(w2, w1 * 2, "dpr=2 backing store width is exactly 2x");
+        assert_eq!(h2, h1 * 2, "dpr=2 backing store height is exactly 2x");
+        // Genuine higher-res raster: a 2x-each-axis raster covers ~4x the area.
+        // If this were a dumb upscale the ratio would still be ~4 in PIXELS, but
+        // the glyph EDGES would be blocky; what proves crispness here is that the
+        // GLYPHS are re-rasterized at the 2x font size (font_size_px*2) rather
+        // than nearest-neighbour stretched. We assert the coverage ratio is in a
+        // band consistent with a true quadratic 4x (allowing AA/rounding), AND
+        // (separately, below) that the glyph font size doubled.
+        let ratio = painted2 as f64 / painted1.max(1) as f64;
+        assert!(
+            (3.2..=4.8).contains(&ratio),
+            "dpr=2 painted coverage should be ~4x the 1x coverage (true 2x raster), got {ratio:.2}x \
+             (painted1={painted1}, painted2={painted2})"
+        );
+
+        // ── Glyph is rendered at 2x the FONT SIZE (the crisp-text proof) ─────
+        // Re-bake at dpr=2 collecting the content TextItems; the focused text
+        // item's GDI font height must be exactly 2x the dpr=1 one. That is what
+        // makes the glyphs crisp (drawn at physical size) rather than upscaled.
+        let tree1 = lb.scaled_for_raster(1.0);
+        let tree2 = lb.scaled_for_raster(2.0);
+        let (_b1, texts1) = oracle_live_paint(&tree1, &cfg);
+        let cfg2 = cv_layout::LayoutConfig {
+            viewport_w: cfg.viewport_w * 2.0,
+            viewport_h: cfg.viewport_h * 2.0,
+            ..cfg.clone_for_runtime()
+        };
+        let (_b2, texts2) = oracle_live_paint(&tree2, &cfg2);
+        let fs1 = texts1.iter().find(|t| !t.is_chrome).map(|t| t.font_size_px);
+        let fs2 = texts2.iter().find(|t| !t.is_chrome).map(|t| t.font_size_px);
+        match (fs1, fs2) {
+            (Some(a), Some(b)) => assert_eq!(
+                b, a * 2,
+                "the content glyph font height must DOUBLE at dpr=2 (crisp glyphs, not upscale)"
+            ),
+            _ => panic!("expected a content text item in both bakes (fs1={fs1:?} fs2={fs2:?})"),
+        }
     }
 
     /// `window.devicePixelRatio` reflects a SIMULATED high-DPI scale, not a

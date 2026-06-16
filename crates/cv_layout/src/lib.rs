@@ -1179,6 +1179,197 @@ impl LayoutBox {
         }
     }
 
+    /// HiDPI device-scale raster transform (CV_HIDPI 2x physical raster).
+    ///
+    /// Returns a deep clone of this box subtree with every px-valued GEOMETRY
+    /// field multiplied by the device scale factor `s` (= devicePixelRatio),
+    /// leaving the original CSS-px tree (used for hit-testing / CSSOM / JS)
+    /// untouched. The painter then rasterizes the scaled tree into a backing
+    /// store sized `css_w*s × css_h*s`, so every box, border, shadow, radius,
+    /// gradient stop AND glyph (`font_size_px` is scaled ⇒ the GDI `CreateFontW`
+    /// height is scaled ⇒ crisp glyphs) is drawn at PHYSICAL resolution.
+    ///
+    /// This mirrors Chrome's `cc::RasterSource::PlaybackToCanvas`, which applies
+    /// the device-scale-factor as a `SkCanvas::scale(dsf, dsf)` transform to the
+    /// recorded display list before playback (geometry recorded in layout/CSS px;
+    /// Skia's matrix maps it to device px during raster). We apply the same
+    /// uniform scale to the recorded geometry (the LayoutBox tree IS our display
+    /// list) instead of carrying a matrix in the rasterizer.
+    ///
+    /// At `s == 1.0` this is the identity transform (every multiply is `× 1.0`),
+    /// so the produced tree is bit-for-bit the input ⇒ the default 1x path stays
+    /// byte-identical. Only ANGLES, COLORS, ALPHAS, COUNTS, percentages and
+    /// non-px enums are left alone (a percentage is scale-invariant; an angle
+    /// does not scale; a 2x bigger box resolves a `50%` stop at the 2x extent).
+    pub fn scaled_for_raster(&self, s: f32) -> LayoutBox {
+        // Fast identity: at dpr==1 (the default / 100%-monitor path) skip the
+        // whole walk and hand back an exact clone — guarantees byte-identity.
+        if (s - 1.0).abs() < f32::EPSILON {
+            return self.clone();
+        }
+        let scale_rect = |r: Rect| Rect { x: r.x * s, y: r.y * s, w: r.w * s, h: r.h * s };
+        let scale_edges = |e: EdgeSizes| EdgeSizes {
+            top: e.top * s,
+            right: e.right * s,
+            bottom: e.bottom * s,
+            left: e.left * s,
+        };
+        let scale_shadow = |sh: BoxShadow| BoxShadow {
+            offset_x_px: sh.offset_x_px * s,
+            offset_y_px: sh.offset_y_px * s,
+            blur_px: sh.blur_px * s,
+            spread_px: sh.spread_px * s,
+            color: sh.color,
+            inset: sh.inset,
+        };
+        let scale_bgpos = |p: BgPos| match p {
+            BgPos::Px(v) => BgPos::Px(v * s),
+            BgPos::Pct(_) => p, // percentage resolves against the (already-scaled) box
+        };
+        let scale_bglen = |l: BgLength| match l {
+            BgLength::Px(v) => BgLength::Px(v * s),
+            BgLength::Percent(_) => l,
+        };
+        let scale_gradpos = |p: GradPosAxis| match p {
+            GradPosAxis::Px(v) => GradPosAxis::Px(v * s),
+            GradPosAxis::Pct(_) => p,
+        };
+        let scale_stops = |stops: &[GradientStopSpec]| -> Vec<GradientStopSpec> {
+            stops
+                .iter()
+                .map(|st| GradientStopSpec {
+                    color: st.color,
+                    pos_frac: st.pos_frac, // a fraction is scale-invariant
+                    pos_px: st.pos_px.map(|v| v * s),
+                })
+                .collect()
+        };
+        let scale_gradient = |g: &GradientSpec| -> GradientSpec {
+            match g {
+                GradientSpec::Linear { angle_deg, stops, repeating } => GradientSpec::Linear {
+                    angle_deg: *angle_deg, // angle does not scale
+                    stops: scale_stops(stops),
+                    repeating: *repeating,
+                },
+                GradientSpec::Radial { shape, size, center, stops, repeating } => {
+                    GradientSpec::Radial {
+                        shape: *shape,
+                        size: *size,
+                        center: center.map(|(cx, cy)| (scale_gradpos(cx), scale_gradpos(cy))),
+                        stops: scale_stops(stops),
+                        repeating: *repeating,
+                    }
+                }
+                GradientSpec::Conic { from_deg, center, stops, repeating } => GradientSpec::Conic {
+                    from_deg: *from_deg,
+                    center: center.map(|(cx, cy)| (scale_gradpos(cx), scale_gradpos(cy))),
+                    stops: scale_stops(stops),
+                    repeating: *repeating,
+                },
+            }
+        };
+        let scale_lin_grad = |g: LinearGradientSpec| LinearGradientSpec {
+            from: g.from,
+            to: g.to,
+            angle_deg: g.angle_deg,
+        };
+        let scale_filter = |f: &FilterEffect| -> FilterEffect {
+            match f {
+                // Only the blur RADIUS (px) and drop-shadow geometry are lengths;
+                // every other filter amount is a unitless factor / angle.
+                FilterEffect::Blur(r) => FilterEffect::Blur(r * s),
+                FilterEffect::DropShadow(sh) => FilterEffect::DropShadow(scale_shadow(*sh)),
+                other => other.clone(),
+            }
+        };
+        let scale_clip = |c: &ClipShape| -> ClipShape {
+            match c {
+                ClipShape::Inset { top_px, right_px, bottom_px, left_px } => ClipShape::Inset {
+                    top_px: top_px * s,
+                    right_px: right_px * s,
+                    bottom_px: bottom_px * s,
+                    left_px: left_px * s,
+                },
+                ClipShape::Circle { radius_px, cx_px, cy_px } => ClipShape::Circle {
+                    radius_px: radius_px * s,
+                    cx_px: cx_px * s,
+                    cy_px: cy_px * s,
+                },
+                ClipShape::Polygon(pts) => {
+                    ClipShape::Polygon(pts.iter().map(|(x, y)| (x * s, y * s)).collect())
+                }
+            }
+        };
+        let scale_mat4_translation = |mut m: Mat4| -> Mat4 {
+            // A 3D transform's rotation/scale sub-matrix is unitless; only the
+            // translation column (px) scales with the device factor. Column 3 in
+            // column-major `m[col][row]` holds (tx, ty, tz, w).
+            m.m[3][0] *= s;
+            m.m[3][1] *= s;
+            m.m[3][2] *= s;
+            m
+        };
+
+        let mut out = self.clone();
+        out.content = scale_rect(self.content);
+        out.padding = scale_edges(self.padding);
+        out.margin = scale_edges(self.margin);
+        out.border_width_px = self.border_width_px * s;
+        out.border_widths_per_side =
+            self.border_widths_per_side.map(|w| w.map(|v| v * s));
+        out.font_size_px = self.font_size_px * s;
+        out.letter_spacing_px = self.letter_spacing_px * s;
+        out.line_height_px = self.line_height_px.map(|v| v * s);
+        out.translate_x_px = self.translate_x_px * s;
+        out.translate_y_px = self.translate_y_px * s;
+        // translate_*_percent / scale_* / rotate_deg are scale-invariant.
+        out.scroll_offset_x = self.scroll_offset_x * s;
+        out.scroll_offset_y = self.scroll_offset_y * s;
+        out.border_radius_px = self.border_radius_px * s;
+        // border_radius_percent stays (resolved against the scaled box).
+        out.box_shadow = self.box_shadow.map(scale_shadow);
+        out.text_shadow = self.text_shadow.map(scale_shadow);
+        out.column_rule_width = self.column_rule_width * s;
+        out.multicol_gap = self.multicol_gap * s;
+        out.multicol_used_width = self.multicol_used_width * s;
+        out.multicol_width = self.multicol_width.map(|v| v * s);
+        out.gap_px = self.gap_px * s;
+        out.column_gap_px = self.column_gap_px * s;
+        out.row_gap_px = self.row_gap_px * s;
+        out.perspective_px = self.perspective_px.map(|v| v * s);
+        out.matrix_2d = self.matrix_2d.map(|m| {
+            // [a,b,c,d,e,f]: only e,f (translation px) scale.
+            [m[0], m[1], m[2], m[3], m[4] * s, m[5] * s]
+        });
+        out.transform_mat4 = self.transform_mat4.map(scale_mat4_translation);
+        out.transform_origin = self
+            .transform_origin
+            .map(|(x, y)| (scale_bgpos(x), scale_bgpos(y)));
+        out.perspective_origin = self
+            .perspective_origin
+            .map(|(x, y)| (scale_bgpos(x), scale_bgpos(y)));
+        out.background_position = self
+            .background_position
+            .map(|(x, y)| (scale_bgpos(x), scale_bgpos(y)));
+        out.background_size = self.background_size.as_ref().map(|sz| match sz {
+            BgSize::Cover => BgSize::Cover,
+            BgSize::Contain => BgSize::Contain,
+            BgSize::Explicit(a, b) => {
+                BgSize::Explicit(a.clone().map(scale_bglen), b.clone().map(scale_bglen))
+            }
+        });
+        out.background_gradient = self.background_gradient.map(scale_lin_grad);
+        out.background_radial_gradient = self.background_radial_gradient.map(scale_lin_grad);
+        out.background_gradient_full =
+            self.background_gradient_full.as_ref().map(scale_gradient);
+        out.text_fill_gradient = self.text_fill_gradient.as_ref().map(scale_gradient);
+        out.filters = self.filters.iter().map(scale_filter).collect();
+        out.backdrop_filters = self.backdrop_filters.iter().map(scale_filter).collect();
+        out.clip_shape = self.clip_shape.as_ref().map(scale_clip);
+        out.children = self.children.iter().map(|c| c.scaled_for_raster(s)).collect();
+        out
+    }
+
     // ── Scrolling (CSSOM View §6 + CSS Overflow 3) ──────────────────────────
     // Chrome reference: a box whose computed overflow is `scroll`/`auto`
     // (and that has overflowing content) gets a `PaintLayerScrollableArea`
@@ -11319,5 +11510,138 @@ mod tests {
         let c = &root.children;
         assert!(c[0].content.x.abs() < 0.5 && c[1].content.x.abs() < 0.5, "stays at x=0");
         assert!(c[1].content.y > c[0].content.y + 29.0, "second stacks BELOW the first");
+    }
+
+    // ===================================================================
+    // HiDPI device-scale raster transform (CV_HIDPI 2x physical raster).
+    // ===================================================================
+
+    /// Recursively assert two LayoutBox subtrees have BYTE-EQUAL geometry (the
+    /// fields the painter reads). Used to prove the dpr==1 identity.
+    fn assert_geom_eq(a: &LayoutBox, b: &LayoutBox) {
+        assert_eq!(a.content, b.content, "content");
+        assert_eq!(a.padding, b.padding, "padding");
+        assert_eq!(a.margin, b.margin, "margin");
+        assert_eq!(a.border_width_px, b.border_width_px, "border_width_px");
+        assert_eq!(a.border_widths_per_side, b.border_widths_per_side, "per-side border");
+        assert_eq!(a.font_size_px, b.font_size_px, "font_size_px");
+        assert_eq!(a.letter_spacing_px, b.letter_spacing_px, "letter_spacing");
+        assert_eq!(a.line_height_px, b.line_height_px, "line_height");
+        assert_eq!(a.translate_x_px, b.translate_x_px, "translate_x");
+        assert_eq!(a.translate_y_px, b.translate_y_px, "translate_y");
+        assert_eq!(a.scroll_offset_x, b.scroll_offset_x, "scroll_x");
+        assert_eq!(a.scroll_offset_y, b.scroll_offset_y, "scroll_y");
+        assert_eq!(a.border_radius_px, b.border_radius_px, "border_radius");
+        assert_eq!(a.box_shadow, b.box_shadow, "box_shadow");
+        assert_eq!(a.text_shadow, b.text_shadow, "text_shadow");
+        assert_eq!(a.gap_px, b.gap_px, "gap");
+        assert_eq!(a.background_position, b.background_position, "bg_position");
+        assert_eq!(a.background_gradient_full, b.background_gradient_full, "grad");
+        assert_eq!(a.children.len(), b.children.len(), "child count");
+        for (ca, cb) in a.children.iter().zip(b.children.iter()) {
+            assert_geom_eq(ca, cb);
+        }
+    }
+
+    /// Recursively assert subtree `scaled` is `unscaled` with EVERY px geometry
+    /// field multiplied by `s` (the crisp-2x correctness check).
+    fn assert_geom_scaled(unscaled: &LayoutBox, scaled: &LayoutBox, s: f32) {
+        let eps = 1e-3 * s.max(1.0);
+        let close = |x: f32, y: f32, what: &str| {
+            assert!((x - y).abs() <= eps + (x.abs() + y.abs()) * 1e-5, "{what}: {x} vs {y}");
+        };
+        close(unscaled.content.x * s, scaled.content.x, "content.x");
+        close(unscaled.content.y * s, scaled.content.y, "content.y");
+        close(unscaled.content.w * s, scaled.content.w, "content.w");
+        close(unscaled.content.h * s, scaled.content.h, "content.h");
+        close(unscaled.padding.left * s, scaled.padding.left, "padding.left");
+        close(unscaled.padding.top * s, scaled.padding.top, "padding.top");
+        close(unscaled.border_width_px * s, scaled.border_width_px, "border_w");
+        close(unscaled.font_size_px * s, scaled.font_size_px, "font_size");
+        close(unscaled.border_radius_px * s, scaled.border_radius_px, "radius");
+        // border_rect (the painter's primary geometry) must scale coherently.
+        let ur = unscaled.border_rect();
+        let sr = scaled.border_rect();
+        close(ur.x * s, sr.x, "border_rect.x");
+        close(ur.y * s, sr.y, "border_rect.y");
+        close(ur.w * s, sr.w, "border_rect.w");
+        close(ur.h * s, sr.h, "border_rect.h");
+        assert_eq!(unscaled.children.len(), scaled.children.len(), "child count");
+        for (cu, cs) in unscaled.children.iter().zip(scaled.children.iter()) {
+            assert_geom_scaled(cu, cs, s);
+        }
+    }
+
+    fn hidpi_sample_tree() -> LayoutBox {
+        // A small but representative tree: a padded/bordered/rounded box with a
+        // box-shadow and a text child, plus a sibling.
+        let inner = block(
+            "div",
+            Style {
+                display: Some(Display::Block),
+                width: Some(LengthSpec::Px(120.0)),
+                height: Some(LengthSpec::Px(40.0)),
+                padding: EdgeSizes { top: 8.0, right: 8.0, bottom: 8.0, left: 8.0 },
+                border_width_px: Some(2.0),
+                border_radius_px: Some(6.0),
+                font_size_px: Some(16.0),
+                ..Style::default()
+            },
+            vec![text("Hello HiDPI")],
+        );
+        let sibling = flex_box(60.0, 30.0, 0.0, 0.0);
+        let doc = block(
+            "div",
+            Style { display: Some(Display::Block), width: Some(LengthSpec::Px(400.0)), ..Style::default() },
+            vec![inner, sibling],
+        );
+        layout(&doc, &LayoutConfig::default())
+    }
+
+    #[test]
+    fn scaled_for_raster_identity_at_dpr1_is_byte_equal() {
+        let lb = hidpi_sample_tree();
+        let same = lb.scaled_for_raster(1.0);
+        // The default / 100%-monitor path MUST be byte-identical geometry.
+        assert_geom_eq(&lb, &same);
+    }
+
+    #[test]
+    fn scaled_for_raster_doubles_all_geometry_at_dpr2() {
+        let lb = hidpi_sample_tree();
+        let scaled = lb.scaled_for_raster(2.0);
+        assert_geom_scaled(&lb, &scaled, 2.0);
+        // Spot-check the load-bearing fields explicitly so a future field that
+        // stops scaling is caught here, not in a blurry frame.
+        let inner = &lb.children[0];
+        let inner2 = &scaled.children[0];
+        assert!((inner2.font_size_px - inner.font_size_px * 2.0).abs() < 1e-3);
+        assert!((inner2.padding.left - inner.padding.left * 2.0).abs() < 1e-3);
+        assert!((inner2.border_radius_px - inner.border_radius_px * 2.0).abs() < 1e-3);
+        assert!((inner2.border_width_px - inner.border_width_px * 2.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn scaled_for_raster_fractional_scale_15() {
+        let lb = hidpi_sample_tree();
+        let scaled = lb.scaled_for_raster(1.5);
+        assert_geom_scaled(&lb, &scaled, 1.5);
+    }
+
+    #[test]
+    fn scaled_for_raster_leaves_unscalable_fields_alone() {
+        // Percentages / angles / opacity / counts must NOT scale.
+        let mut lb = hidpi_sample_tree();
+        lb.opacity = 0.5;
+        lb.rotate_deg = 30.0;
+        lb.scale_x = 1.25;
+        lb.border_radius_percent = Some(40.0);
+        lb.translate_x_percent = Some(50.0);
+        let s = lb.scaled_for_raster(2.0);
+        assert_eq!(s.opacity, 0.5, "opacity unscaled");
+        assert_eq!(s.rotate_deg, 30.0, "angle unscaled");
+        assert_eq!(s.scale_x, 1.25, "scale factor unscaled");
+        assert_eq!(s.border_radius_percent, Some(40.0), "percent unscaled");
+        assert_eq!(s.translate_x_percent, Some(50.0), "translate% unscaled");
     }
 }
