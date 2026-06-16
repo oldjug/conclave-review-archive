@@ -94,6 +94,14 @@ pub mod t3;
 /// OFF (byte-identical default build until soak).
 pub mod t4;
 
+/// Differential FUZZER (test-only): a seeded grammar generates thousands of varied
+/// top-level JS programs and diffs the tree-walker against the top-level register-VM
+/// path (`CV_TOPLEVEL_VM`) through the production-faithful oracle. The permanent
+/// regression gate proving the VM tier is byte-identical for the WHOLE construct
+/// grammar, not just a fixed corpus.
+#[cfg(test)]
+mod toplevel_vm_fuzz;
+
 pub use ast::{ArrowBody, Expr, ForInit, Stmt, VarDeclarator, VarKind};
 pub use bytecode::{
     BcFunction, CompileError, InlineLeafGuard, Module, Op, RuntimeError,

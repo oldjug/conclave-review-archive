@@ -2030,6 +2030,86 @@ impl Drop for TopLevelVmGuard {
     }
 }
 
+/// TEST-ONLY FAULT INJECTION — a knob that forces a chosen DIVERGING construct
+/// family to be treated as VM-eligible even though its top-level-VM lowering is
+/// NOT byte-identical to the tree-walker. This is the mechanism the differential
+/// fuzzer's NON-VACUITY proof uses: it "un-declines" a known-divergent construct
+/// (exactly as if the decline had been deleted from source) and shows the fuzzer
+/// catches the resulting divergence. Default is `None` (production behavior — every
+/// decline active). The guard restores the prior value on drop.
+///
+/// This is NOT a stub and NOT reachable in production: the only callers are tests,
+/// and with the knob `None` the eligibility logic is byte-identical to having no
+/// hook at all (the family's normal decline fires).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForceEligibleBug {
+    /// Suppress the `try`/`finally` + abrupt-completion decline (the round-3 bug):
+    /// any `try` with a `finally`, or whose body crosses the boundary abruptly, is
+    /// forced VM-eligible. Re-introduces the dropped-`finally` / swallowed-throw
+    /// divergence the production decline guards against.
+    TryFinally,
+    /// PROBE-ONLY: suppress ONLY the try-BODY abrupt-completion check (so a throw
+    /// caught by the SAME try's own catch, with no finally and no rethrow, stays
+    /// eligible). Used by a diagnostic to measure whether locally-caught throws run
+    /// byte-identically on the VM (i.e. whether the body-abrupt decline can be
+    /// safely tightened). Does NOT suppress the finally check or the catch-body
+    /// abrupt check.
+    LocallyCaughtThrow,
+    /// PROBE-ONLY: suppress the for-init-`var`-loop-inside-a-try decline, to MEASURE
+    /// whether that shape actually diverges on the VM (it does — this confirms the
+    /// decline is non-vacuous and that the existing eligibility-test shape was wrong
+    /// to expect eligibility). Does not affect any other decline.
+    ForInitVarLoopInTry,
+}
+
+thread_local! {
+    /// The currently-forced-eligible diverging construct family (None = production).
+    static FORCE_ELIGIBLE_BUG: std::cell::Cell<Option<ForceEligibleBug>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// True iff the fault-injection hook is suppressing ALL of `try`'s divergence
+/// declines (finally + body-abrupt + catch-abrupt) — the `TryFinally` bug.
+fn try_finally_decline_suppressed() -> bool {
+    FORCE_ELIGIBLE_BUG.with(|c| c.get()) == Some(ForceEligibleBug::TryFinally)
+}
+
+/// True iff the probe hook is suppressing ONLY the try-BODY abrupt-completion check
+/// (a throw caught by the same try's own catch stays eligible).
+fn locally_caught_throw_probe() -> bool {
+    FORCE_ELIGIBLE_BUG.with(|c| c.get()) == Some(ForceEligibleBug::LocallyCaughtThrow)
+}
+
+/// True iff the probe hook is suppressing the for-init-`var`-loop-inside-a-try
+/// decline (to MEASURE that the shape diverges — non-vacuity of the decline).
+fn forinit_var_loop_in_try_probe() -> bool {
+    FORCE_ELIGIBLE_BUG.with(|c| c.get()) == Some(ForceEligibleBug::ForInitVarLoopInTry)
+}
+
+/// RAII guard arming the test-only fault-injection hook for the current thread;
+/// restores the prior value on drop (even on panic / early return).
+#[must_use = "the injection is restored when the guard is dropped; bind it to a name"]
+pub struct ForceEligibleGuard {
+    prev: Option<ForceEligibleBug>,
+}
+
+impl ForceEligibleGuard {
+    pub fn new(bug: ForceEligibleBug) -> Self {
+        let prev = FORCE_ELIGIBLE_BUG.with(|c| {
+            let p = c.get();
+            c.set(Some(bug));
+            p
+        });
+        ForceEligibleGuard { prev }
+    }
+}
+
+impl Drop for ForceEligibleGuard {
+    fn drop(&mut self) {
+        FORCE_ELIGIBLE_BUG.with(|c| c.set(self.prev));
+    }
+}
+
 thread_local! {
     /// Honesty counter: how many times a top-level script actually ran on the VM
     /// (`try_run_toplevel_vm` succeeded), NOT a fall-through to the tree-walker.
@@ -2103,6 +2183,61 @@ fn toplevel_vm_eligible(stmts: &[Stmt]) -> bool {
         return false;
     }
 
+    // ── BLOCK-NESTED FUNCTION DECLARATION DECLINE (Node-verified divergence) ──
+    // A `function f(){}` declared INSIDE a block / loop / if / switch / labeled /
+    // try body (not at the script top level) is, in sloppy mode (Annex B), hoisted
+    // to a GLOBAL binding — `globalThis.f` is callable after the block runs. The
+    // tree-walker does this; the top-level VM module path only binds the SCRIPT-
+    // TOP-LEVEL function declarations as globals (see `try_run_toplevel_vm`), so a
+    // block-nested fn reads back as `undefined` through the global object. Decline
+    // any program containing a non-top-level function declaration — the tree-walk
+    // fallback is byte-identical, and this is never the numeric counted-loop shape.
+    if stmts.iter().any(stmt_contains_nested_fn_decl) {
+        return false;
+    }
+
+    // ── FOR-INIT `var` WRITE-BACK DECLINE (fuzzer-found) ─────────────────────
+    // The top-level-VM bytecode module path has a layout-sensitive bug in the
+    // for-init `var` deferred GLOBAL write-back: the loop variable lives in a fast
+    // VM LOCAL synced to its global slot only at loop exit, and that sync is WRONG
+    // (it can write an unrelated nearby value — a `false`, an if-condition, a
+    // `-Infinity` — or be off by one) for ANY `for (var i = …)` loop that is NOT a
+    // DIRECT top-level script statement. The bug is register-allocation-threshold-
+    // sensitive (a tiny nested loop in isolation may agree, but the same shape in a
+    // realistic module diverges), so a narrow decline is unreliable. The fuzzer
+    // surfaced it for a for-init-var loop nested in a loop, inside a `try`, inside an
+    // `if` with a complex condition, and containing inner loops.
+    //
+    // The SAFE, never-wrong, robust contract — decline a for-init-`var` loop when:
+    //   (a) it PARTICIPATES IN LOOP NESTING (it is inside another loop, or its body
+    //       contains another loop) — the inner↔outer write-back collides; OR
+    //   (b) it CO-OCCURS with a `try` anywhere in the top-level scope chain — the
+    //       try's exception-handler frame perturbs the write-back (whether the try
+    //       contains, is contained by, or merely sits beside the loop).
+    // A for-init-`var` loop that is a DIRECT top-level statement with a loop-free
+    // body and no `try` in the script is the eligible (measured-fast bench) shape.
+    //
+    // ★ This PRESERVES the jit.js / loop.js bench shape: jit.js is a SINGLE direct
+    // top-level counted `for` loop (loop-free body, no `try`), and loop.js is a
+    // direct top-level `for` whose inner loop lives inside the FUNCTION `work` (its
+    // own scope — never scanned here) and has no `try`, so both stay VM-eligible and
+    // the measured speedup is retained.
+    // (Verified by `toplevel_vm_numeric_loop_shape_stays_eligible`.)
+    // (The probe hook can suppress this decline so a diagnostic can MEASURE the
+    // divergence — proving the decline is non-vacuous. Production never suppresses.)
+    if !forinit_var_loop_in_try_probe() {
+        // (a) for-init-var loop participating in loop nesting (either direction), OR
+        // (b) for-init-var loop CO-OCCURRING with a `try` anywhere in the top-level
+        //     scope chain (the try's handler frame perturbs the write-back whether it
+        //     contains, is contained by, or merely sits beside the loop).
+        let nested = stmts.iter().any(|s| stmt_has_nested_forinit_var_loop(s, false));
+        let has_forinit = stmts.iter().any(stmt_subtree_has_toplevel_forinit_var_loop);
+        let has_try = stmts.iter().any(stmt_subtree_has_try);
+        if nested || (has_forinit && has_try) {
+            return false;
+        }
+    }
+
     let mut ctx = DeclineCtx {
         fn_names: &toplevel_fn_names,
         forbidden_in_fn: &forbidden_in_fn,
@@ -2115,6 +2250,14 @@ fn toplevel_vm_eligible(stmts: &[Stmt]) -> bool {
         }
     }
     ctx.ok
+}
+
+/// Test-only public wrapper over the private `toplevel_vm_eligible`, so the
+/// differential fuzzer (a sibling module) can measure the eligibility rate of the
+/// generated grammar (batch non-vacuity).
+#[cfg(test)]
+pub fn toplevel_vm_eligible_for_test(stmts: &[Stmt]) -> bool {
+    toplevel_vm_eligible(stmts)
 }
 
 /// Synthetic desugar-marker identifiers that signal a construct the top-level VM
@@ -2152,6 +2295,145 @@ fn is_method_rebind_key(key: &str) -> bool {
     matches!(key, "call" | "apply" | "bind")
 }
 
+/// True iff a `for (var i = …)` loop appears in a NESTED (non-top-level) position
+/// — anywhere inside a block / if / loop / switch / labeled / try body. `nested`
+/// is whether the current position is already nested (the top-level entry passes
+/// `false`, so a DIRECT top-level for-loop is eligible; descending into ANY
+/// container sets `nested = true`). A for-init-`var` loop found while nested is the
+/// diverging case (its deferred global write-back is unsound outside the direct
+/// top-level position). Scans scope-sharing bodies only — NOT function/arrow bodies
+/// (a loop inside a function has its own scope; loop.js's inner `work` loop must
+/// stay eligible).
+fn stmt_has_nested_forinit_var_loop(s: &Stmt, nested: bool) -> bool {
+    fn any(b: &[Stmt], nested: bool) -> bool {
+        b.iter().any(|st| stmt_has_nested_forinit_var_loop(st, nested))
+    }
+    match s {
+        Stmt::For { init, body, .. } => {
+            let is_var = matches!(
+                init,
+                Some(crate::ast::ForInit::VarDecl { kind: VarKind::Var, .. })
+            );
+            // A for-init-var loop diverges if it is itself nested, OR if its own body
+            // contains ANOTHER loop (the inner loop's deferred write-back collides
+            // with this one's). A DIRECT top-level for whose body has no inner loop
+            // is the eligible (bench) shape.
+            if is_var && (nested || body_has_scope_sharing_loop(body)) {
+                return true;
+            }
+            // The body of any for-loop is a nested position.
+            stmt_has_nested_forinit_var_loop(body, true)
+        }
+        Stmt::While { body, .. } | Stmt::DoWhile { body, .. }
+        | Stmt::ForIn { body, .. } | Stmt::ForOf { body, .. } => {
+            stmt_has_nested_forinit_var_loop(body, true)
+        }
+        Stmt::Block(b) => any(b, true),
+        Stmt::If { cons, alt, .. } => {
+            stmt_has_nested_forinit_var_loop(cons, true)
+                || alt.as_ref().map_or(false, |a| stmt_has_nested_forinit_var_loop(a, true))
+        }
+        Stmt::Labeled { body, .. } => stmt_has_nested_forinit_var_loop(body, true),
+        Stmt::Switch { cases, .. } => cases.iter().any(|c| any(&c.body, true)),
+        Stmt::Try { block, catch_block, finally_block, .. } => {
+            any(block, true)
+                || catch_block.as_ref().map_or(false, |cb| any(cb, true))
+                || finally_block.as_ref().map_or(false, |fb| any(fb, true))
+        }
+        // FunctionDecl / expressions: their loops have their own scope — do NOT
+        // descend (keeps loop.js's in-function inner loop eligible).
+        _ => false,
+    }
+}
+
+/// True iff `s` (transitively, through scope-sharing blocks/ifs/loops/labeled/
+/// switch/try — NOT function/arrow bodies) contains ANY loop (for/while/do/for-in/
+/// for-of). Used to detect a for-init-var loop whose body CONTAINS another loop.
+fn body_has_scope_sharing_loop(s: &Stmt) -> bool {
+    fn any(b: &[Stmt]) -> bool {
+        b.iter().any(body_has_scope_sharing_loop)
+    }
+    match s {
+        Stmt::For { .. }
+        | Stmt::While { .. }
+        | Stmt::DoWhile { .. }
+        | Stmt::ForIn { .. }
+        | Stmt::ForOf { .. } => true,
+        Stmt::Block(b) => any(b),
+        Stmt::If { cons, alt, .. } => {
+            body_has_scope_sharing_loop(cons)
+                || alt.as_ref().map_or(false, |a| body_has_scope_sharing_loop(a))
+        }
+        Stmt::Labeled { body, .. } => body_has_scope_sharing_loop(body),
+        Stmt::Switch { cases, .. } => cases.iter().any(|c| any(&c.body)),
+        Stmt::Try { block, catch_block, finally_block, .. } => {
+            any(block)
+                || catch_block.as_ref().map_or(false, |cb| any(cb))
+                || finally_block.as_ref().map_or(false, |fb| any(fb))
+        }
+        _ => false,
+    }
+}
+
+/// True iff a `for (var i = …)` loop appears anywhere in this statement's TOP-LEVEL
+/// scope chain (scope-sharing bodies) — NOT inside a function/arrow body. Used by
+/// the for-init-var + `try` co-occurrence decline.
+fn stmt_subtree_has_toplevel_forinit_var_loop(s: &Stmt) -> bool {
+    fn any(b: &[Stmt]) -> bool {
+        b.iter().any(stmt_subtree_has_toplevel_forinit_var_loop)
+    }
+    match s {
+        Stmt::For { init, body, .. } => {
+            matches!(
+                init,
+                Some(crate::ast::ForInit::VarDecl { kind: VarKind::Var, .. })
+            ) || stmt_subtree_has_toplevel_forinit_var_loop(body)
+        }
+        Stmt::While { body, .. } | Stmt::DoWhile { body, .. }
+        | Stmt::ForIn { body, .. } | Stmt::ForOf { body, .. } => {
+            stmt_subtree_has_toplevel_forinit_var_loop(body)
+        }
+        Stmt::Block(b) => any(b),
+        Stmt::If { cons, alt, .. } => {
+            stmt_subtree_has_toplevel_forinit_var_loop(cons)
+                || alt.as_ref().map_or(false, |a| stmt_subtree_has_toplevel_forinit_var_loop(a))
+        }
+        Stmt::Labeled { body, .. } => stmt_subtree_has_toplevel_forinit_var_loop(body),
+        Stmt::Switch { cases, .. } => cases.iter().any(|c| any(&c.body)),
+        Stmt::Try { block, catch_block, finally_block, .. } => {
+            any(block)
+                || catch_block.as_ref().map_or(false, |cb| any(cb))
+                || finally_block.as_ref().map_or(false, |fb| any(fb))
+        }
+        _ => false,
+    }
+}
+
+/// True iff a `try` statement appears anywhere in this statement's TOP-LEVEL scope
+/// chain (scope-sharing bodies) — NOT inside a function/arrow body. Used by the
+/// for-init-var + `try` co-occurrence decline.
+fn stmt_subtree_has_try(s: &Stmt) -> bool {
+    fn any(b: &[Stmt]) -> bool {
+        b.iter().any(stmt_subtree_has_try)
+    }
+    match s {
+        Stmt::Try { .. } => true,
+        Stmt::For { body, .. }
+        | Stmt::While { body, .. }
+        | Stmt::DoWhile { body, .. }
+        | Stmt::ForIn { body, .. }
+        | Stmt::ForOf { body, .. }
+        | Stmt::Labeled { body, .. } => stmt_subtree_has_try(body),
+        Stmt::Block(b) => any(b),
+        Stmt::If { cons, alt, .. } => {
+            stmt_subtree_has_try(cons)
+                || alt.as_ref().map_or(false, |a| stmt_subtree_has_try(a))
+        }
+        Stmt::Switch { cases, .. } => cases.iter().any(|c| any(&c.body)),
+        _ => false,
+    }
+}
+
 /// True iff a `try`/`catch` body can complete ABRUPTLY in a way that crosses the
 /// enclosing `try` boundary — a `return`/`throw` anywhere, OR a `break`/`continue`
 /// (labeled or not) that is NOT contained within a loop/switch nested inside the
@@ -2164,6 +2446,80 @@ fn is_method_rebind_key(key: &str) -> bool {
 /// `return`/`break` there belongs to that function, not this try).
 fn block_can_abruptly_complete(body: &[Stmt]) -> bool {
     body.iter().any(stmt_can_abruptly_complete)
+}
+
+/// Like [`block_can_abruptly_complete`], but a `throw` directly in this body is NOT
+/// counted as crossing (it is caught by the try's OWN catch). Only `break`/
+/// `continue`/`return` that exit the construct — and a NESTED `try` (conservative)
+/// — count. Used for the try-BODY check when the try HAS a catch and NO finally: a
+/// throw is handled locally (proven byte-identical on the VM by the fuzzer's
+/// locally-caught-throw coverage), while a break/continue/return still crosses and
+/// must decline. This is the tightened, fuzzer-gated form of the over-conservative
+/// blanket abrupt-completion decline.
+fn block_can_abruptly_complete_nonthrow(body: &[Stmt]) -> bool {
+    body.iter().any(stmt_can_abruptly_complete_nonthrow)
+}
+
+fn stmt_can_abruptly_complete_nonthrow(s: &Stmt) -> bool {
+    match s {
+        // A throw in THIS body is caught by the try's own catch — does not cross.
+        Stmt::Throw(_) => false,
+        // A return always exits the construct (and any enclosing fn) — crosses.
+        Stmt::Return(_) => true,
+        // A bare/labeled break/continue at this level targets something OUTSIDE this
+        // body (no enclosing loop/switch here) — crosses.
+        Stmt::Break(_) | Stmt::Continue(_) => true,
+        // Loops/switch absorb their own unlabeled break/continue; a return or a
+        // labeled jump still escapes. (Throw inside is caught by our catch.)
+        Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => {
+            stmt_escapes_loop_or_switch_nonthrow(body)
+        }
+        Stmt::For { body, .. } | Stmt::ForIn { body, .. } | Stmt::ForOf { body, .. } => {
+            stmt_escapes_loop_or_switch_nonthrow(body)
+        }
+        Stmt::Switch { cases, .. } => cases
+            .iter()
+            .any(|c| c.body.iter().any(stmt_escapes_loop_or_switch_nonthrow)),
+        Stmt::If { cons, alt, .. } => {
+            stmt_can_abruptly_complete_nonthrow(cons)
+                || alt.as_ref().map_or(false, |a| stmt_can_abruptly_complete_nonthrow(a))
+        }
+        Stmt::Block(b) => block_can_abruptly_complete_nonthrow(b),
+        Stmt::Labeled { body, .. } => stmt_can_abruptly_complete_nonthrow(body),
+        // A nested try: conservative — its own body/catch could break/continue/return
+        // across OUR boundary. Decline (treat as crossing).
+        Stmt::Try { .. } => true,
+        _ => false,
+    }
+}
+
+/// Non-throw variant of [`stmt_escapes_loop_or_switch`]: inside a loop/switch body,
+/// an unlabeled break/continue is absorbed and a throw is caught by our catch, but a
+/// return or a LABELED break/continue still escapes to the enclosing try.
+fn stmt_escapes_loop_or_switch_nonthrow(s: &Stmt) -> bool {
+    match s {
+        Stmt::Throw(_) => false,
+        Stmt::Return(_) => true,
+        Stmt::Break(Some(_)) | Stmt::Continue(Some(_)) => true,
+        Stmt::Break(None) | Stmt::Continue(None) => false,
+        Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => {
+            stmt_escapes_loop_or_switch_nonthrow(body)
+        }
+        Stmt::For { body, .. } | Stmt::ForIn { body, .. } | Stmt::ForOf { body, .. } => {
+            stmt_escapes_loop_or_switch_nonthrow(body)
+        }
+        Stmt::Switch { cases, .. } => cases
+            .iter()
+            .any(|c| c.body.iter().any(stmt_escapes_loop_or_switch_nonthrow)),
+        Stmt::If { cons, alt, .. } => {
+            stmt_escapes_loop_or_switch_nonthrow(cons)
+                || alt.as_ref().map_or(false, |a| stmt_escapes_loop_or_switch_nonthrow(a))
+        }
+        Stmt::Block(b) => b.iter().any(stmt_escapes_loop_or_switch_nonthrow),
+        Stmt::Labeled { body, .. } => stmt_escapes_loop_or_switch_nonthrow(body),
+        Stmt::Try { .. } => true,
+        _ => false,
+    }
 }
 
 fn stmt_can_abruptly_complete(s: &Stmt) -> bool {
@@ -2308,15 +2664,41 @@ fn stmt_has_toplevel_vm_divergence(s: &Stmt) -> bool {
             //       `return`/`throw`) — a thrown completion targeting an enclosing
             //       catch, or a break/continue/return exiting through the try, can
             //       diverge. A decline is the tree-walk result, never a wrong one.
-            if finally_block.is_some() {
-                return true;
-            }
-            if block_can_abruptly_complete(block) {
-                return true;
-            }
-            if let Some(cb) = catch_block {
-                if block_can_abruptly_complete(cb) {
+            // TEST-ONLY: the fault-injection hook can SUPPRESS this decline to
+            // re-introduce the round-3 bug (the fuzzer's non-vacuity proof). In
+            // production `try_finally_decline_suppressed()` is always false, so the
+            // decline below fires exactly as before.
+            if !try_finally_decline_suppressed() {
+                if finally_block.is_some() {
                     return true;
+                }
+                // TRY-BODY abrupt-completion check.
+                //
+                // A `throw` caught by the try's OWN catch (no finally, no rethrow)
+                // runs byte-identically ON ITS OWN — BUT a latent VM bug in the
+                // top-level for-init `var` write-back is reachable when such a
+                // throwing-try FOLLOWS a for-loop nested in a while (the trailing
+                // try's exception-handler block perturbs the loop's deferred global
+                // sync, yielding an off-by-one global value). Until that write-back
+                // bug is fixed in the bytecode module path, the SAFE+CORRECT contract
+                // is to keep the BLANKET abrupt-completion decline: ANY try whose body
+                // can complete abruptly (throw OR break/continue/return) declines to
+                // the byte-identical tree-walker. (A decline is the tree-walk result,
+                // never a wrong one; the fuzzer's locally-caught-throw probe records
+                // that the shape is otherwise correct, gating a future tightening.)
+                // The probe hook can relax this to MEASURE that future tightening.
+                let body_crosses = if locally_caught_throw_probe() {
+                    block_can_abruptly_complete_nonthrow(block)
+                } else {
+                    block_can_abruptly_complete(block)
+                };
+                if body_crosses {
+                    return true;
+                }
+                if let Some(cb) = catch_block {
+                    if block_can_abruptly_complete(cb) {
+                        return true;
+                    }
                 }
             }
             block.iter().any(stmt_has_toplevel_vm_divergence)
@@ -2509,6 +2891,66 @@ fn expr_is_class_iife(e: &Expr) -> bool {
         _ => return false,
     };
     body.iter().any(|s| matches!(s, Stmt::FunctionDecl { name, .. } if *name == returned))
+}
+
+/// True iff a TOP-LEVEL statement subtree contains a function declaration in a
+/// NESTED position (inside a block / loop / if / switch / labeled / try body —
+/// anywhere other than the script's own top level). Such a declaration has Annex B
+/// sloppy-mode global-hoisting semantics the top-level-VM module path does not
+/// reproduce (it only binds script-top-level fn decls as globals), so any program
+/// containing one is declined to the byte-identical tree-walker.
+///
+/// Descends ONLY into bodies that SHARE the surrounding function/global scope (the
+/// same rule as `collect_toplevel_forinit_var_names`); it does NOT descend into a
+/// function/arrow body (a fn declared inside another fn is that inner fn's concern,
+/// not the top-level VM's). The top-level `for (init)` of this call is NOT a nested
+/// position, but a `FunctionDecl` is never a valid `ForInit`, so there's nothing to
+/// special-case there.
+fn stmt_contains_nested_fn_decl(s: &Stmt) -> bool {
+    // A `FunctionDecl` reached here is at the position this fn was invoked on. The
+    // top-level caller invokes it on each top-level statement, so a top-level
+    // `FunctionDecl` must NOT count — only ones found while DESCENDING into a body
+    // count. We therefore split: the top-level entry skips a bare top-level decl,
+    // and the descent helper flags ANY decl it finds.
+    match s {
+        Stmt::FunctionDecl { .. } => false, // top-level decl is fine
+        other => stmt_has_descendant_fn_decl(other),
+    }
+}
+
+/// True iff descending into this statement's scope-sharing child bodies finds a
+/// function declaration (a fn decl in ANY descended body is nested-and-diverging).
+fn stmt_has_descendant_fn_decl(s: &Stmt) -> bool {
+    fn block_has(body: &[Stmt]) -> bool {
+        body.iter().any(|st| matches!(st, Stmt::FunctionDecl { .. }) || stmt_has_descendant_fn_decl(st))
+    }
+    match s {
+        Stmt::Block(body) => block_has(body),
+        Stmt::If { cons, alt, .. } => {
+            (matches!(cons.as_ref(), Stmt::FunctionDecl { .. }) || stmt_has_descendant_fn_decl(cons))
+                || alt.as_ref().map_or(false, |a| {
+                    matches!(a.as_ref(), Stmt::FunctionDecl { .. }) || stmt_has_descendant_fn_decl(a)
+                })
+        }
+        Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => {
+            matches!(body.as_ref(), Stmt::FunctionDecl { .. }) || stmt_has_descendant_fn_decl(body)
+        }
+        Stmt::For { body, .. } | Stmt::ForIn { body, .. } | Stmt::ForOf { body, .. } => {
+            matches!(body.as_ref(), Stmt::FunctionDecl { .. }) || stmt_has_descendant_fn_decl(body)
+        }
+        Stmt::Labeled { body, .. } => {
+            matches!(body.as_ref(), Stmt::FunctionDecl { .. }) || stmt_has_descendant_fn_decl(body)
+        }
+        Stmt::Try { block, catch_block, finally_block, .. } => {
+            block_has(block)
+                || catch_block.as_ref().map_or(false, |b| block_has(b))
+                || finally_block.as_ref().map_or(false, |b| block_has(b))
+        }
+        Stmt::Switch { cases, .. } => cases.iter().any(|c| block_has(&c.body)),
+        // Function/arrow bodies have their OWN scope — a fn declared inside is that
+        // function's concern, not the top-level VM's. Do not descend.
+        _ => false,
+    }
 }
 
 /// Walk top-level statements (and nested blocks/loops/branches that share the
@@ -25813,18 +26255,32 @@ mod tests {
     /// `for`-loop + arithmetic leaf (no try) is unaffected. Guards the perf lever.
     #[test]
     fn toplevel_vm_numeric_loop_shape_stays_eligible() {
+        // jit.js shape: a SINGLE top-level counted for-loop, no try → eligible.
         let bench = "function f(x){ return x*x*0.5 + x*3.0 - 1.0; } var acc = 0; for (var i = 0; i < 1000; i++) { acc = acc + f(i); } console.log(acc > 0);";
         assert!(
             super::toplevel_vm_eligible(&crate::parser::parse_program(bench).expect("parse")),
             "numeric counted-loop bench shape must remain VM-eligible"
         );
-        // A plain for-loop containing a try WITHOUT finally and with only LOCAL
-        // (loop-absorbed) break/continue must also stay eligible (common shape).
-        let local_break = "var n = 0; for (var i = 0; i < 10; i++) { try { for (var j = 0; j < 3; j++) { if (j === 1) break; n++; } } catch (e) { n = -1; } } console.log(n);";
+        // loop.js shape: the inner counted loop lives INSIDE the function `work` (its
+        // own scope), called from a single top-level for-loop — the inner loop is NOT
+        // nested-in-a-loop at the top level, and there is no `try`, so it stays
+        // eligible (the for-init-var write-back decline must not over-fire on it).
+        let loop_bench = "function work(n){ var s = 0; for (var k = 0; k < n; k = k + 1) { s = s + k; } return s; } var t = 0; for (var j = 0; j < 100; j = j + 1) { t = t + work(40); } console.log(t > 0);";
         assert!(
-            super::toplevel_vm_eligible(&crate::parser::parse_program(local_break).expect("parse")),
-            "try with only loop-local break/continue (no finally) must stay eligible"
+            super::toplevel_vm_eligible(&crate::parser::parse_program(loop_bench).expect("parse")),
+            "loop.js shape (inner loop inside a function) must remain VM-eligible"
         );
+        // A for-init-var loop NESTED inside a try inside another for-loop is now
+        // DECLINED (the fuzzer found the top-level-VM for-init-var deferred write-back
+        // diverges in this layout); the decline is correct (tree-walk fallback is
+        // byte-identical), so the construct must still AGREE between the two paths.
+        let nested_in_try = "var n = 0; for (var i = 0; i < 10; i++) { try { for (var j = 0; j < 3; j++) { if (j === 1) break; n++; } } catch (e) { n = -1; } } console.log(n);";
+        assert!(
+            !super::toplevel_vm_eligible(&crate::parser::parse_program(nested_in_try).expect("parse")),
+            "for-init-var loop nested in a try-in-loop must DECLINE (write-back diverges)"
+        );
+        crate::ab_oracle::assert_toplevel_vm_agrees(nested_in_try)
+            .expect("declined nested-in-try loop must still agree via the tree-walk fallback");
     }
 
     #[test]
@@ -30283,6 +30739,16 @@ log(probe());
     fn for_of_generator_lazily_driven() {
         // for-of over a generator must NOT materialise all values upfront —
         // early break must work and must not drain the rest.
+        //
+        // The body is an INFINITE generator broken early; lazy driving makes it run
+        // 3 iterations instantly. The wall-clock watchdog here is only an
+        // infinite-loop SAFETY NET, not part of the assertion (correctness is the
+        // `0,1,2` output). Under heavy PARALLEL test load this thread can be
+        // descheduled long enough to trip the default 8s budget on the
+        // (correctly-terminating) run — a starvation flake, not a bug. Give it a
+        // generous explicit budget so the safety net survives CPU contention while
+        // still catching a genuine non-terminating regression. (Restored on exit.)
+        let prev_budget = super::set_js_time_budget_cache_for_test(120_000);
         let (_, out) = run(
             "function* counter() { let n = 0; while(true) { yield n++; } } \
             const gen = counter(); \
@@ -30290,6 +30756,7 @@ log(probe());
             for (const v of gen) { got.push(v); if (v >= 2) break; } \
             console.log(got.join(','));",
         );
+        let _ = super::set_js_time_budget_cache_for_test(prev_budget);
         // Should yield 0, 1, 2 and then break — no infinite loop.
         assert_eq!(out, vec!["0,1,2"]);
     }
