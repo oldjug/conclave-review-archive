@@ -4791,3 +4791,61 @@ fn toplevel_vm_corpus_agrees() {
         assert_toplevel_vm_agrees(src).unwrap_or_else(|d| panic!("{src}\n{d}"));
     }
 }
+
+/// STAGE-3 BENCH (temporary, --ignored): time jit.js + loop.js (flags ON) cold
+/// (first run, fresh interp) + warm (min-of-N), to compare against Chrome warm ~6ms.
+#[test]
+#[ignore]
+fn stage3_bench_jit_and_loop() {
+    use std::time::Instant;
+    // The PRODUCTION shapes (the `run()` path → try_run_toplevel_vm → kernelizer).
+    // End with a `throw` so we capture the result string AND so the script body is
+    // the exact bench shape the top-level VM accepts.
+    let jit_src = "function f(x){ return ((x*x*0.5 + x*3.0 - 1.0) * (x - 2.0) + x*x*x*0.25) / (x + 1.0) - x*0.5 + x*x*0.125 - x*7.0; } var s = 0; for (var i = 0; i < 1500000; i++) { s = s + f(i); } throw 'R=' + s + ' i=' + i;";
+    let loop_src = "function work(n){ var s = 0; for (var i = 0; i < n; i = i + 1) { s = s + i; } return s; } var t = 0; for (var j = 0; j < 6000; j++) { t = t + work(400); } throw 'R=' + t;";
+    let bench = |name: &str, src: &str, trials: u32| {
+        // Flags ON for every run (the production kernelized path via `run()`).
+        let run_once = |src: &str| -> (f64, String, u64, u64) {
+            let _tv = crate::interp::TopLevelVmGuard::new(true);
+            let _il = crate::bytecode::InlineLeafGuard::new(true);
+            crate::interp::reset_bc_fn_cache();
+            crate::interp::reset_p6_exec_count();
+            crate::interp::reset_toplevel_vm_took_count();
+            let mut interp = Interp::new();
+            interp.install_basic_globals();
+            let t0 = Instant::now();
+            let r = interp.run(src);
+            let ns = t0.elapsed().as_nanos() as f64;
+            let msg = match r {
+                Err(crate::interp::JsError::Throw(Value::String(s))) => s.to_string(),
+                other => format!("{other:?}"),
+            };
+            (
+                ns,
+                msg,
+                crate::interp::p6_exec_count(),
+                crate::interp::toplevel_vm_took_count(),
+            )
+        };
+        let (cold_ns, cold_msg, cold_p6, cold_tv) = run_once(src);
+        let mut warm = f64::INFINITY;
+        let mut last_msg = String::new();
+        let mut last_p6 = 0u64;
+        let mut last_tv = 0u64;
+        for _ in 0..trials {
+            let (ns, msg, p6, tv) = run_once(src);
+            warm = warm.min(ns);
+            last_msg = msg;
+            last_p6 = p6;
+            last_tv = tv;
+        }
+        println!(
+            "[stage3 bench] {name}: cold={:.2}ms warm={:.2}ms  result={last_msg:?}  (warm p6_exec={last_p6} toplevel_vm={last_tv})",
+            cold_ns / 1e6,
+            warm / 1e6,
+        );
+        let _ = (cold_msg, cold_p6, cold_tv);
+    };
+    bench("jit.js", jit_src, 12);
+    bench("loop.js", loop_src, 12);
+}

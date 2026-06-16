@@ -606,6 +606,114 @@ impl Emitter {
     }
 
     // ------------------------------------------------------------------
+    // AVX VEX-encoded scalar-double (f64) layer — 3-OPERAND non-destructive
+    // forms. `vop dst, a, b` computes `dst = a OP b` WITHOUT first copying a
+    // into dst (the legacy SSE `op dst, b` requires `dst == a`, forcing a
+    // `movsd dst, a` whenever the destination differs from the first source).
+    // Eliminating that copy halves the instruction count of a register-resident
+    // arithmetic loop, shortening the issue stream so the CPU's out-of-order
+    // window holds more loop iterations in flight (the Stage-3 ILP lever).
+    //
+    // Scalar f64 AVX results are BIT-IDENTICAL to the SSE2 forms (same IEEE-754
+    // operation); only the encoding differs. Caller MUST runtime-detect AVX
+    // (`is_x86_feature_detected!("avx")`) and fall back to the SSE2 path, and
+    // SHOULD emit `vzeroupper` before returning to legacy-SSE code to avoid the
+    // AVX↔SSE transition penalty.
+    //
+    // Encoding: 3-byte VEX `C4 RXB.mmmmm W.vvvv.L.pp opcode modrm`.
+    //   * mmmmm = 0b00001 (0F map);  pp = 0b11 (F2 mandatory prefix);  L = 0 (scalar);
+    //   * W = 0;  vvvv = the SECOND source `a` (1's-complement, non-destructive);
+    //   * reg = dst (VEX.R inverts the extended bit), rm = `b` (VEX.B / .X invert).
+    // We always emit the 3-byte form so any of xmm0..15 works in every operand.
+    // ------------------------------------------------------------------
+
+    /// Emit a VEX 3-operand scalar reg,reg,reg op: `dst = a OP b` (b in ModR/M.rm,
+    /// a in VEX.vvvv, dst in ModR/M.reg). `opcode` is the 0F-map opcode (e.g. 0x58
+    /// addsd). All operands are xmm; L=0 (scalar), pp=F2, W=0.
+    fn vex_rrr(&mut self, opcode: u8, dst: Xmm, a: Xmm, b: Xmm) {
+        let r = !dst.is_extended(); // VEX.R is inverted (1 = not extended)
+        let x = true; // VEX.X unused here → 1
+        let bbit = !b.is_extended(); // VEX.B inverted
+        // Byte 1: C4. Byte 2: R X B mmmmm  (R,X,B are the high 3 bits, inverted).
+        let byte2 = ((r as u8) << 7) | ((x as u8) << 6) | ((bbit as u8) << 5) | 0b00001;
+        // Byte 3: W vvvv L pp.  vvvv = ~a (4 bits), inverted.
+        let vvvv = (!a.idx()) & 0x0F;
+        let byte3 = (0u8 << 7) | (vvvv << 3) | (0u8 << 2) | 0b11;
+        self.code.push(0xC4);
+        self.code.push(byte2);
+        self.code.push(byte3);
+        self.code.push(opcode);
+        self.modrm(0b11, dst.idx() & 0x7, b.idx() & 0x7);
+    }
+
+    /// `vaddsd dst, a, b` → `dst = a + b`. (VEX.NDS.LIG.F2.0F.WIG 58 /r)
+    pub fn vaddsd(&mut self, dst: Xmm, a: Xmm, b: Xmm) {
+        self.vex_rrr(0x58, dst, a, b);
+    }
+    /// `vsubsd dst, a, b` → `dst = a - b`. (5C /r)
+    pub fn vsubsd(&mut self, dst: Xmm, a: Xmm, b: Xmm) {
+        self.vex_rrr(0x5C, dst, a, b);
+    }
+    /// `vmulsd dst, a, b` → `dst = a * b`. (59 /r)
+    pub fn vmulsd(&mut self, dst: Xmm, a: Xmm, b: Xmm) {
+        self.vex_rrr(0x59, dst, a, b);
+    }
+    /// `vdivsd dst, a, b` → `dst = a / b`. (5E /r)
+    pub fn vdivsd(&mut self, dst: Xmm, a: Xmm, b: Xmm) {
+        self.vex_rrr(0x5E, dst, a, b);
+    }
+    /// `vmovsd dst, src` — scalar-double reg→reg copy via the merge form
+    /// `vmovsd dst, src, src`. (VEX.NDS.LIG.F2.0F.WIG 10 /r). Bit-identical to
+    /// `movsd dst, src` for the low lane.
+    pub fn vmovsd_xmm_xmm(&mut self, dst: Xmm, src: Xmm) {
+        self.vex_rrr(0x10, dst, src, src);
+    }
+    /// `vmovq dst_xmm, src_r64` — VEX move 64 bits gpr→xmm (raw bits, for boxing a
+    /// constant). (VEX.128.66.0F.W1 6E /r). The VEX form of `movq_xmm_r64`, so a
+    /// constant load inside an otherwise-VEX body introduces no legacy-SSE op.
+    /// reg = dst_xmm, rm = src_r64, vvvv unused (1111), pp=66, W=1.
+    pub fn vmovq_xmm_r64(&mut self, dst: Xmm, src: R64) {
+        let r = !dst.is_extended();
+        let x = true;
+        let bbit = !src.is_extended();
+        let byte2 = ((r as u8) << 7) | ((x as u8) << 6) | ((bbit as u8) << 5) | 0b00001;
+        // W=1, vvvv=1111 (unused), L=0, pp=01 (66).
+        let byte3 = (1u8 << 7) | (0b1111 << 3) | (0u8 << 2) | 0b01;
+        self.code.push(0xC4);
+        self.code.push(byte2);
+        self.code.push(byte3);
+        self.code.push(0x6E);
+        self.modrm(0b11, dst.idx() & 0x7, src.idx() & 0x7);
+    }
+
+    /// `vucomisd a, b` — VEX unordered compare (sets ZF/PF/CF). Two-operand:
+    /// reg=a, rm=b, vvvv unused (1111). pp=66 (not F2). (VEX.LIG.66.0F.WIG 2E /r)
+    /// VEX form so an all-VEX loop body has NO legacy-SSE op (no per-iteration
+    /// AVX↔SSE transition).
+    pub fn vucomisd(&mut self, a: Xmm, b: Xmm) {
+        let r = !a.is_extended();
+        let x = true;
+        let bbit = !b.is_extended();
+        let byte2 = ((r as u8) << 7) | ((x as u8) << 6) | ((bbit as u8) << 5) | 0b00001;
+        // vvvv unused = 1111; pp = 0b01 (66 prefix); L = 0; W = 0.
+        let byte3 = (0u8 << 7) | (0b1111 << 3) | (0u8 << 2) | 0b01;
+        self.code.push(0xC4);
+        self.code.push(byte2);
+        self.code.push(byte3);
+        self.code.push(0x2E);
+        self.modrm(0b11, a.idx() & 0x7, b.idx() & 0x7);
+    }
+
+    /// `vzeroupper` — zero the upper 128 bits of all ymm registers, clearing the
+    /// AVX↔SSE transition penalty before returning to legacy-SSE code.
+    /// (VEX.128.0F.WIG 77) — 2-byte VEX `C5 F8 77`.
+    pub fn vzeroupper(&mut self) {
+        self.code.push(0xC5);
+        self.code.push(0xF8);
+        self.code.push(0x77);
+    }
+
+    // ------------------------------------------------------------------
     // GPR memory operands — base+disp32 and base+index*scale+disp32.
     //
     // These mirror `sse_rm`'s SIB logic but for plain integer mov/lea: no
@@ -1245,6 +1353,51 @@ mod tests {
         let mut e3 = Emitter::new();
         e3.cmp_r64_mem(R64::Rdx, R64::Rax, 0);
         assert_bytes(&e3, &[0x48, 0x3B, 0x90, 0x00, 0x00, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn vex_scalar_double_3operand_encode() {
+        // vaddsd xmm0, xmm1, xmm2 → 3-byte VEX C4 E1 73 58 C2.
+        //   byte2 = R̄X̄B̄ mmmmm = 1 1 1 00001 = 0xE1 (all low regs → inverted bits set).
+        //   byte3 = W v̄v̄v̄v̄ L pp = 0 1110 0 11 = 0x73 (vvvv = ~1 = 1110).
+        //   opcode 58, modrm 11 000 010 = C2.
+        let mut e = Emitter::new();
+        e.vaddsd(Xmm::Xmm0, Xmm::Xmm1, Xmm::Xmm2);
+        assert_bytes(&e, &[0xC4, 0xE1, 0x73, 0x58, 0xC2]);
+        // vmulsd xmm12, xmm11, xmm3 → extended dst+a, low b.
+        //   R̄=0 (xmm12 ext), X̄=1, B̄=1 (xmm3 low) → byte2 = 0 1 1 00001 = 0x61.
+        //   vvvv = ~11 = ~1011 = 0100; byte3 = 0 0100 0 11 = 0x23. opcode 59.
+        //   modrm = 11 (12&7=100) (3) = 11 100 011 = 0xE3.
+        let mut e2 = Emitter::new();
+        e2.vmulsd(Xmm::Xmm12, Xmm::Xmm11, Xmm::Xmm3);
+        assert_bytes(&e2, &[0xC4, 0x61, 0x23, 0x59, 0xE3]);
+        // vdivsd xmm12, xmm12, xmm13 → dst=a=xmm12 (ext), b=xmm13 (ext).
+        //   R̄=0, X̄=1, B̄=0 (xmm13 ext) → byte2 = 0 1 0 00001 = 0x41.
+        //   vvvv = ~12 = ~1100 = 0011; byte3 = 0 0011 0 11 = 0x1B. opcode 5E.
+        //   modrm = 11 (12&7=100) (13&7=101) = 11 100 101 = 0xE5.
+        let mut e3 = Emitter::new();
+        e3.vdivsd(Xmm::Xmm12, Xmm::Xmm12, Xmm::Xmm13);
+        assert_bytes(&e3, &[0xC4, 0x41, 0x1B, 0x5E, 0xE5]);
+        // vzeroupper → C5 F8 77.
+        let mut e4 = Emitter::new();
+        e4.vzeroupper();
+        assert_bytes(&e4, &[0xC5, 0xF8, 0x77]);
+        // vucomisd xmm0, xmm2 → C4 E1 79 2E C2 (pp=66, vvvv unused=1111).
+        let mut e5 = Emitter::new();
+        e5.vucomisd(Xmm::Xmm0, Xmm::Xmm2);
+        assert_bytes(&e5, &[0xC4, 0xE1, 0x79, 0x2E, 0xC2]);
+        // vmovq xmm3, rax → W=1 pp=66. R̄=1(xmm3 low) X̄=1 B̄=1(rax low) → byte2=0xE1.
+        //   byte3 = W1 vvvv=1111 L0 pp=01 = 1_1111_0_01 = 0xF9. opcode 6E.
+        //   modrm = 11 (xmm3=011) (rax=000) = 11 011 000 = 0xD8.
+        let mut e7 = Emitter::new();
+        e7.vmovq_xmm_r64(Xmm::Xmm3, R64::Rax);
+        assert_bytes(&e7, &[0xC4, 0xE1, 0xF9, 0x6E, 0xD8]);
+        // vmovsd xmm0, xmm12 (copy via merge form vmovsd dst,src,src; opcode 10).
+        //   dst=xmm0 (low), a=b=xmm12 (ext). R̄=1, X̄=1, B̄=0 (xmm12 ext) → 0xC1.
+        //   vvvv=~12=0011; byte3 = 0 0011 0 11 = 0x1B. modrm 11 000 (12&7=100)=0xC4.
+        let mut e6 = Emitter::new();
+        e6.vmovsd_xmm_xmm(Xmm::Xmm0, Xmm::Xmm12);
+        assert_bytes(&e6, &[0xC4, 0xC1, 0x1B, 0x10, 0xC4]);
     }
 
     #[test]

@@ -217,6 +217,13 @@ pub fn compile_f64(ops: &[FJitOp]) -> Result<Vec<u8>, JitError> {
 /// from a recorded bytecode-index→offset table. Bails (None → interpreter) on
 /// anything outside the supported subset, a register > 5, or a jump into a fused
 /// pair. Params arrive in xmm0..xmm3 (= bytecode regs 0..n_params).
+///
+/// STAGE 3: this lowering is op-for-op, so the QUALITY of its native code is a
+/// pure function of the bytecode's quality. The Stage-3 win comes from
+/// `bytecode::optimize_kernel_loop` (LICM constant hoist + CSE + copy-prop) which
+/// hands this function ALREADY-TIGHT bytecode; this function then keeps a tiny
+/// per-op redundant-`movsd` eliminator (`d == a` already holds the lhs) so the
+/// dedup'd ops emit a minimal instruction each.
 pub fn compile_bytecode_f64(
     code: &[crate::bytecode::Op],
     n_params: u8,
@@ -261,11 +268,25 @@ pub fn compile_bytecode_f64(
     let mut consumed = vec![false; n]; // the JmpIfFalse fused into a preceding cmp
     let mut patches: Vec<(usize, usize)> = Vec::new(); // (disp byte offset, target bc index)
 
+    // ── STAGE 3 ILP LEVER — AVX 3-operand codegen. When the CPU has AVX, lower each
+    //    arithmetic op to the non-destructive `vop d, a, b` (no `movsd d, a` copy
+    //    first), and use VEX for the in-loop compare/move too so the whole loop body
+    //    is VEX (no per-iteration AVX↔SSE transition). This ~halves the loop's
+    //    instruction count, so the out-of-order window holds more iterations in
+    //    flight — exposing the cross-iteration ILP the reduction loop allows. Results
+    //    are BIT-IDENTICAL to SSE2 (same IEEE-754 scalar op). No AVX → the SSE2 path.
+    let avx = std::is_x86_feature_detected!("avx");
+
     // Prolog: reserve the frame and save the callee-saved xmm regs we'll use
     // (128-bit movaps, Win64 ABI).
     if frame > 0 {
         em.sub_r64_imm32(R64::Rsp, frame);
         emit_xmm_save(&mut em, max_reg);
+    }
+    // Clear any dirtied upper-YMM state from the (legacy-SSE) caller before the
+    // all-VEX loop body, so the loop runs at full AVX speed (one-time at entry).
+    if avx {
+        em.vzeroupper();
     }
 
     let mut i = 0usize;
@@ -280,18 +301,30 @@ pub fn compile_bytecode_f64(
                 let d = vreg_xmm(dst).ok()?;
                 const NAN_BITS: u64 = 0x7FF8_0000_0000_0000;
                 em.mov_r64_imm64(R64::Rax, NAN_BITS as i64);
-                em.movq_xmm_r64(d, R64::Rax);
+                if avx {
+                    em.vmovq_xmm_r64(d, R64::Rax); // VEX form → no legacy-SSE op in body
+                } else {
+                    em.movq_xmm_r64(d, R64::Rax);
+                }
             }
             Op::LoadConst { dst, k } => {
                 let d = vreg_xmm(dst).ok()?;
                 let f = const_f64(k)?;
                 em.mov_r64_imm64(R64::Rax, f.to_bits() as i64);
-                em.movq_xmm_r64(d, R64::Rax);
+                if avx {
+                    em.vmovq_xmm_r64(d, R64::Rax);
+                } else {
+                    em.movq_xmm_r64(d, R64::Rax);
+                }
             }
             Op::Move { dst, src } => {
                 let (d, s) = (vreg_xmm(dst).ok()?, vreg_xmm(src).ok()?);
                 if d != s {
-                    em.movsd_xmm_xmm(d, s);
+                    if avx {
+                        em.vmovsd_xmm_xmm(d, s);
+                    } else {
+                        em.movsd_xmm_xmm(d, s);
+                    }
                 }
             }
             Op::Add { dst, lhs, rhs } => {
@@ -300,10 +333,14 @@ pub fn compile_bytecode_f64(
                     vreg_xmm(lhs).ok()?,
                     vreg_xmm(rhs).ok()?,
                 );
-                if d != a {
-                    em.movsd_xmm_xmm(d, a);
+                if avx {
+                    em.vaddsd(d, a, b); // d = a + b (no copy)
+                } else {
+                    if d != a {
+                        em.movsd_xmm_xmm(d, a);
+                    }
+                    em.addsd_xmm_xmm(d, b);
                 }
-                em.addsd_xmm_xmm(d, b);
             }
             Op::Sub { dst, lhs, rhs } => {
                 let (d, a, b) = (
@@ -311,10 +348,14 @@ pub fn compile_bytecode_f64(
                     vreg_xmm(lhs).ok()?,
                     vreg_xmm(rhs).ok()?,
                 );
-                if d != a {
-                    em.movsd_xmm_xmm(d, a);
+                if avx {
+                    em.vsubsd(d, a, b); // d = a - b
+                } else {
+                    if d != a {
+                        em.movsd_xmm_xmm(d, a);
+                    }
+                    em.subsd_xmm_xmm(d, b);
                 }
-                em.subsd_xmm_xmm(d, b);
             }
             Op::Mul { dst, lhs, rhs } => {
                 let (d, a, b) = (
@@ -322,10 +363,14 @@ pub fn compile_bytecode_f64(
                     vreg_xmm(lhs).ok()?,
                     vreg_xmm(rhs).ok()?,
                 );
-                if d != a {
-                    em.movsd_xmm_xmm(d, a);
+                if avx {
+                    em.vmulsd(d, a, b); // d = a * b
+                } else {
+                    if d != a {
+                        em.movsd_xmm_xmm(d, a);
+                    }
+                    em.mulsd_xmm_xmm(d, b);
                 }
-                em.mulsd_xmm_xmm(d, b);
             }
             Op::Div { dst, lhs, rhs } => {
                 let (d, a, b) = (
@@ -333,10 +378,14 @@ pub fn compile_bytecode_f64(
                     vreg_xmm(lhs).ok()?,
                     vreg_xmm(rhs).ok()?,
                 );
-                if d != a {
-                    em.movsd_xmm_xmm(d, a);
+                if avx {
+                    em.vdivsd(d, a, b); // d = a / b
+                } else {
+                    if d != a {
+                        em.movsd_xmm_xmm(d, a);
+                    }
+                    em.divsd_xmm_xmm(d, b);
                 }
-                em.divsd_xmm_xmm(d, b);
             }
             // A comparison MUST be immediately consumed by a `JmpIfFalse` on its
             // result — that's the for/while/if shape. Fuse them into a branch.
@@ -352,7 +401,11 @@ pub fn compile_bytecode_f64(
                     _ => return None, // bool not consumed by an immediate JmpIfFalse → bail
                 };
                 let (a, b) = (vreg_xmm(lhs).ok()?, vreg_xmm(rhs).ok()?);
-                em.ucomisd_xmm_xmm(a, b);
+                if avx {
+                    em.vucomisd(a, b); // VEX form → no per-iteration AVX↔SSE transition
+                } else {
+                    em.ucomisd_xmm_xmm(a, b);
+                }
                 // JmpIfFalse jumps when the comparison is FALSE — including the
                 // NaN/unordered case (PF=1), since `<`,`<=` are false for NaN.
                 match code[i] {
@@ -393,7 +446,16 @@ pub fn compile_bytecode_f64(
                 // Capture the result into xmm0 BEFORE restoring callee-saved regs.
                 let r = vreg_xmm(src).ok()?;
                 if r != Xmm::Xmm0 {
-                    em.movsd_xmm_xmm(Xmm::Xmm0, r);
+                    if avx {
+                        em.vmovsd_xmm_xmm(Xmm::Xmm0, r);
+                    } else {
+                        em.movsd_xmm_xmm(Xmm::Xmm0, r);
+                    }
+                }
+                // Clear upper-YMM state before returning to the legacy-SSE caller
+                // (vzeroupper leaves the low 128 bits — the xmm0 result — intact).
+                if avx {
+                    em.vzeroupper();
                 }
                 emit_jit_epilog(&mut em, max_reg, frame);
             }
@@ -405,6 +467,9 @@ pub fn compile_bytecode_f64(
     // Defensive fall-through guard (bytecode always ends in Ret, but never run
     // off the end of the page if it somehow doesn't).
     em.xorpd_xmm_xmm(Xmm::Xmm0, Xmm::Xmm0);
+    if avx {
+        em.vzeroupper();
+    }
     emit_jit_epilog(&mut em, max_reg, frame);
     // A jump may not land inside a fused pair (would skip the ucomisd).
     for (_, t) in &patches {

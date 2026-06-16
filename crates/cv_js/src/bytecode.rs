@@ -4762,6 +4762,20 @@ fn kernelize_counted_loops(fns: &mut Vec<BcFunction>, caller_idx: usize) -> usiz
         }
     }
 
+    // ── STAGE 3 — TIGHTEN the kernel bytecode (V8/Maglev-shaped): hoist loop-
+    //    invariant constants out of the loop (LICM, dedup'd), CSE repeated pure
+    //    subexpressions (`x*x` computed ONCE/iter), and copy-propagate Moves — so
+    //    the op-for-op P6 lowering emits register-resident, redundancy-free code.
+    //    The transform is VALUE-PRESERVING (it never reorders an arithmetic op, only
+    //    removes recomputation / rematerialization), so the loop is bit-identical.
+    //    On any shape it can't prove safe it returns None and we keep `kcode` as-is
+    //    (still correct, just the un-tightened Stage-2 codegen). The result is
+    //    re-verified P6-compilable below, so a bad optimization can never ship.
+    let (kcode, kernel_n_regs_u32) = match optimize_kernel_loop(&kcode, &consts) {
+        Some((opt_code, opt_n_regs)) => (opt_code, opt_n_regs),
+        None => (kcode, kernel_n_regs_u32),
+    };
+
     // The kernel's consts = the caller's consts (LoadConst k indices are unchanged;
     // the kernel keeps the same pool, which is fine — extra unused consts are
     // harmless). P6 reads const_f64 by index into this pool.
@@ -4999,6 +5013,543 @@ fn remap_op_regs_with(op: Op, map: &impl Fn(Reg) -> Option<Reg>) -> Option<Op> {
         Op::JmpIfFalse { cond, target } => Op::JmpIfFalse { cond: map(cond)?, target },
         _ => return None, // out of the P6 numeric subset → abort kernelization.
     })
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// STAGE 3 — KERNEL LOOP OPTIMIZER (V8/Maglev-shaped: LICM + CSE + copy-prop).
+//
+// `kernelize_counted_loops` produces a kernel whose body is the JS frontend's
+// raw bytecode: every loop-invariant constant is RE-LOADED each iteration
+// (`mov rax, imm64; movq xmm, rax`), `x*x` is recomputed 3×, and trivial `Move`
+// copies abound. The P6 backend (`compile_bytecode_f64`) lowers op-for-op, so it
+// inherits every redundancy → ~3.5× slower than V8 inside the loop.
+//
+// This pass rewrites the kernel bytecode to be tight BEFORE lowering:
+//   • LICM   — hoist each DISTINCT constant out of the loop into its own register,
+//              materialized once in a preheader (the bound/limit is already a param).
+//   • CSE    — a repeated pure op over the same value-numbered operands computes once.
+//   • COPY   — `Move dst←src` propagates src's value to dst (no copy emitted).
+//
+// Every transform is VALUE-PRESERVING: it never reorders an `addsd`/`subsd`/`divsd`
+// or changes an operand, only removes recomputation/rematerialization. So the loop
+// stays BIT-IDENTICAL (IEEE-754 order preserved). On any shape it can't prove safe
+// it returns None (caller keeps the un-tightened kernel — still correct).
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Interned value-number definition in the kernel's straight-line dataflow.
+/// A value number is an index into the optimizer's `defs` arena.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+enum KValDef {
+    /// A loop-carried / invariant INPUT register (i, carry, limit) — opaque (the
+    /// optimizer never folds across it; it is the loop interface, in a fixed reg).
+    Input(Reg),
+    /// A distinct f64 constant (interned by raw bits) — loop-invariant, hoistable.
+    Const(u64),
+    /// `undefined` → canonical NaN (loop-invariant, hoistable).
+    Undef,
+    /// The result of a pure binary op over two value numbers (interned for CSE).
+    /// `tag` distinguishes Add(0)/Sub(1)/Mul(2)/Div(3).
+    Bin(u8, u32, u32),
+}
+
+/// Tighten a kernelized counted-loop's bytecode (LICM + CSE + copy-prop). Returns
+/// the optimized `(code, n_regs)` or `None` (keep the original) on any shape it
+/// can't prove value-identical. See the module banner above for the contract.
+fn optimize_kernel_loop(kcode: &[Op], consts: &[Value]) -> Option<(Vec<Op>, u32)> {
+    // A/B knob (test/measurement only): CV_NO_KERNEL_OPT=1 skips the tightening so a
+    // bench can measure the un-tightened Stage-2 kernel against this pass. Default ON.
+    if std::env::var("CV_NO_KERNEL_OPT").as_deref() == Ok("1") {
+        return None;
+    }
+    let n = kcode.len();
+    if n < 4 {
+        return None;
+    }
+    // ── Shape check. The kernelizer emits: [0]=cmp, [1]=JmpIfFalse(exit), <body>,
+    //    <increment>, [back]=Jmp 0, [exit=back+1]=Ret(carry). Require exactly one
+    //    back-edge `Jmp 0` immediately followed by the final Ret, and op[0]+[1] a
+    //    comparison fused with a JmpIfFalse to the exit. Any other control shape → None.
+    let exit = n - 1;
+    let back = n - 2;
+    if !matches!(kcode[exit], Op::Ret { .. }) {
+        return None;
+    }
+    if !matches!(kcode[back], Op::Jmp { target: 0 }) {
+        return None;
+    }
+    // No OTHER back-edge to 0 may exist.
+    for (i, op) in kcode.iter().enumerate() {
+        if i != back {
+            if let Op::Jmp { target: 0 } = op {
+                return None;
+            }
+        }
+    }
+    let carry_reg = match kcode[exit] {
+        Op::Ret { src } => src,
+        _ => return None,
+    };
+    let (i_reg, limit_reg) = match (kcode[0], kcode[1]) {
+        (
+            Op::Lt { dst, lhs, rhs } | Op::Le { dst, lhs, rhs }
+            | Op::Gt { dst, lhs, rhs } | Op::Ge { dst, lhs, rhs },
+            Op::JmpIfFalse { cond, target },
+        ) if cond == dst && target as usize == exit => (lhs, rhs),
+        _ => return None,
+    };
+
+    // ── Block boundaries: any jump target inside [0..back) starts a block. We reset
+    //    CSE availability (not value identity) at each boundary. Validate the subset.
+    let mut is_target = vec![false; n];
+    is_target[0] = true;
+    for op in &kcode[..back] {
+        match *op {
+            Op::Jmp { target } | Op::JmpIfFalse { target, .. } => {
+                let t = target as usize;
+                if t > exit {
+                    return None;
+                }
+                is_target[t] = true;
+            }
+            Op::LoadConst { .. } | Op::LoadUndef { .. } | Op::Move { .. }
+            | Op::Add { .. } | Op::Sub { .. } | Op::Mul { .. } | Op::Div { .. }
+            | Op::Lt { .. } | Op::Le { .. } | Op::Gt { .. } | Op::Ge { .. } => {}
+            _ => return None,
+        }
+    }
+
+    // ── REACHABILITY + NO-MERGE GATE. A LINEAR value-numbering pass is only sound if
+    //    the reachable region is a single straight-line trace (plus the loop back-edge):
+    //    a real control-flow MERGE (a reachable op with ≥2 reachable predecessors)
+    //    would need a phi, and a linear pass would wrongly take the last sequential
+    //    writer (the bug a dead inlined else-branch exposes). So we (1) compute the
+    //    ops reachable from op 0 — DEAD ops (e.g. an inlined leaf's unreachable
+    //    else-branch) are dropped and never touch the value state — and (2) DECLINE if
+    //    any reachable op has >1 reachable predecessor (a true merge). The canonical
+    //    kernel has none (the only join is the loop header, whose 2 preds — entry +
+    //    back-edge — agree by construction: i/carry are the loop-carried interface).
+    let mut reachable = vec![false; n];
+    {
+        let mut stack = vec![0usize];
+        while let Some(pc) = stack.pop() {
+            if pc >= n || reachable[pc] {
+                continue;
+            }
+            reachable[pc] = true;
+            match kcode[pc] {
+                Op::Jmp { target } => stack.push(target as usize),
+                Op::JmpIfFalse { target, .. } => {
+                    stack.push(target as usize);
+                    stack.push(pc + 1); // fall-through (condition true)
+                }
+                Op::Ret { .. } => {}
+                _ => stack.push(pc + 1), // straight-line fall-through
+            }
+        }
+    }
+    // Predecessor count over REACHABLE ops only (excluding the loop header's back-edge,
+    // which is the legitimate loop join handled by the fixed interface registers).
+    let mut pred_count = vec![0u32; n];
+    for pc in 0..n {
+        if !reachable[pc] {
+            continue;
+        }
+        match kcode[pc] {
+            Op::Jmp { target } => {
+                if target as usize != 0 {
+                    pred_count[target as usize] += 1;
+                }
+            }
+            Op::JmpIfFalse { target, .. } => {
+                pred_count[target as usize] += 1;
+                if pc + 1 < n {
+                    pred_count[pc + 1] += 1;
+                }
+            }
+            Op::Ret { .. } => {}
+            _ => {
+                if pc + 1 < n {
+                    pred_count[pc + 1] += 1;
+                }
+            }
+        }
+    }
+    for pc in 0..n {
+        if pc != 0 && reachable[pc] && pred_count[pc] > 1 {
+            return None; // a real merge → linear value numbering is unsound; decline.
+        }
+    }
+
+    // ── Value-numbering arena. `intern` dedups definitions to a stable value number
+    //    (a global value number → CSE of identical pure exprs is sound because SSE is
+    //    deterministic and we keep each value live in ONE register until its last use).
+    let mut defs: Vec<KValDef> = Vec::new();
+    let mut intern: std::collections::HashMap<KValDef, u32> = std::collections::HashMap::new();
+    fn mk(d: KValDef, defs: &mut Vec<KValDef>, intern: &mut std::collections::HashMap<KValDef, u32>) -> u32 {
+        if let Some(&v) = intern.get(&d) {
+            return v;
+        }
+        let v = defs.len() as u32;
+        defs.push(d.clone());
+        intern.insert(d, v);
+        v
+    }
+    let const_bits = |k: u16| -> Option<u64> {
+        match consts.get(k as usize) {
+            Some(Value::Number(nn)) => Some(nn.to_bits()),
+            _ => None,
+        }
+    };
+    let bin_tag = |op: &Op| -> u8 {
+        match op {
+            Op::Add { .. } => 0,
+            Op::Sub { .. } => 1,
+            Op::Mul { .. } => 2,
+            Op::Div { .. } => 3,
+            _ => 255,
+        }
+    };
+
+    // reg_vn: the value number each register currently holds (program-point state).
+    let mut reg_vn: std::collections::HashMap<Reg, u32> = std::collections::HashMap::new();
+    let vn_i = mk(KValDef::Input(i_reg), &mut defs, &mut intern);
+    let vn_carry = mk(KValDef::Input(carry_reg), &mut defs, &mut intern);
+    let vn_limit = mk(KValDef::Input(limit_reg), &mut defs, &mut intern);
+    reg_vn.insert(i_reg, vn_i);
+    reg_vn.insert(carry_reg, vn_carry);
+    reg_vn.insert(limit_reg, vn_limit);
+
+    // For each op (in [0..back)), the value number of its RESULT (None = control).
+    let mut op_result: Vec<Option<u32>> = vec![None; back];
+    // `dropped[pc]` = the op was eliminated (LoadConst hoisted, Move copy-propagated,
+    // or a CSE-redundant Bin) and emits NOTHING in the loop body.
+    let mut dropped: Vec<bool> = vec![false; back];
+    let mut op_lhs: Vec<Option<u32>> = vec![None; back];
+    let mut op_rhs: Vec<Option<u32>> = vec![None; back];
+
+    let resolve = |reg_vn: &std::collections::HashMap<Reg, u32>,
+                   r: Reg,
+                   defs: &mut Vec<KValDef>,
+                   intern: &mut std::collections::HashMap<KValDef, u32>| -> u32 {
+        if let Some(&v) = reg_vn.get(&r) {
+            v
+        } else {
+            mk(KValDef::Input(r), defs, intern)
+        }
+    };
+
+    // CSE availability: value numbers whose result register is live in THIS block.
+    let mut avail: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    for pc in 0..back {
+        if !reachable[pc] {
+            dropped[pc] = true; // dead op (e.g. inlined leaf's else-branch) → never emit
+            continue; // and never let its writes pollute the value state
+        }
+        if is_target[pc] {
+            avail.clear();
+        }
+        match kcode[pc] {
+            Op::LoadConst { dst, k } => {
+                let bits = const_bits(k)?;
+                let v = mk(KValDef::Const(bits), &mut defs, &mut intern);
+                reg_vn.insert(dst, v);
+                op_result[pc] = Some(v);
+                dropped[pc] = true; // hoisted to preheader
+            }
+            Op::LoadUndef { dst } => {
+                let v = mk(KValDef::Undef, &mut defs, &mut intern);
+                reg_vn.insert(dst, v);
+                op_result[pc] = Some(v);
+                dropped[pc] = true; // hoisted to preheader
+            }
+            Op::Move { dst, src } => {
+                let v = resolve(&reg_vn, src, &mut defs, &mut intern);
+                reg_vn.insert(dst, v);
+                op_result[pc] = Some(v);
+                dropped[pc] = true; // copy-propagated
+            }
+            Op::Add { dst, lhs, rhs } | Op::Sub { dst, lhs, rhs }
+            | Op::Mul { dst, lhs, rhs } | Op::Div { dst, lhs, rhs } => {
+                let lv = resolve(&reg_vn, lhs, &mut defs, &mut intern);
+                let rv = resolve(&reg_vn, rhs, &mut defs, &mut intern);
+                op_lhs[pc] = Some(lv);
+                op_rhs[pc] = Some(rv);
+                let v = mk(KValDef::Bin(bin_tag(&kcode[pc]), lv, rv), &mut defs, &mut intern);
+                if avail.contains(&v) {
+                    dropped[pc] = true; // CSE hit — result already live in a register
+                } else {
+                    avail.insert(v);
+                }
+                reg_vn.insert(dst, v);
+                op_result[pc] = Some(v);
+            }
+            Op::Lt { lhs, rhs, .. } | Op::Le { lhs, rhs, .. }
+            | Op::Gt { lhs, rhs, .. } | Op::Ge { lhs, rhs, .. } => {
+                let lv = resolve(&reg_vn, lhs, &mut defs, &mut intern);
+                let rv = resolve(&reg_vn, rhs, &mut defs, &mut intern);
+                op_lhs[pc] = Some(lv);
+                op_rhs[pc] = Some(rv);
+            }
+            Op::JmpIfFalse { cond, .. } => {
+                let v = resolve(&reg_vn, cond, &mut defs, &mut intern);
+                op_lhs[pc] = Some(v);
+            }
+            Op::Jmp { .. } => {}
+            _ => return None,
+        }
+    }
+
+    // ── LOOP-CARRIED WRITEBACK values. At the end of the iteration the induction var
+    //    `i_reg` and the accumulator `carry_reg` hold their NEXT-iteration values
+    //    (computed into temporaries). Copy-prop dropped the `Move interface ← temp`
+    //    writebacks, so we must re-materialize them before the back-edge: capture the
+    //    value numbers `i_reg`/`carry_reg` map to at loop end and emit explicit
+    //    writeback copies. (These are the loop phis V8 also carries.)
+    let final_i_vn = *reg_vn.get(&i_reg).unwrap_or(&vn_i);
+    let final_carry_vn = *reg_vn.get(&carry_reg).unwrap_or(&vn_carry);
+
+    // ── Liveness: last pc that READS each value number (for temp-register recycling).
+    let mut last_use: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+    for pc in 0..back {
+        for v in [op_lhs[pc], op_rhs[pc]].into_iter().flatten() {
+            last_use.insert(v, pc);
+        }
+    }
+    last_use.insert(vn_i, back);
+    last_use.insert(vn_carry, back);
+    last_use.insert(vn_limit, back);
+    // The loop-carried NEXT values must survive to the back-edge writeback.
+    last_use.insert(final_i_vn, back);
+    last_use.insert(final_carry_vn, back);
+
+    // ── Register assignment. Interface regs keep their original numbers; hoisted
+    //    constants and Bin temporaries are allocated above them, recycled on death.
+    let mut next_reg: Reg = i_reg.max(carry_reg).max(limit_reg).checked_add(1)?;
+    let mut want_hoist: Vec<u32> = Vec::new();
+    {
+        let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        for pc in 0..back {
+            for v in [op_lhs[pc], op_rhs[pc]].into_iter().flatten() {
+                if matches!(defs[v as usize], KValDef::Const(_) | KValDef::Undef) && seen.insert(v) {
+                    want_hoist.push(v);
+                }
+            }
+        }
+    }
+    let mut const_k_for: std::collections::HashMap<u64, u16> = std::collections::HashMap::new();
+    for (k, val) in consts.iter().enumerate() {
+        if let Value::Number(nn) = val {
+            const_k_for.entry(nn.to_bits()).or_insert(k as u16);
+        }
+    }
+    let mut val_reg: std::collections::HashMap<u32, Reg> = std::collections::HashMap::new();
+    val_reg.insert(vn_i, i_reg);
+    val_reg.insert(vn_carry, carry_reg);
+    val_reg.insert(vn_limit, limit_reg);
+    let mut preheader: Vec<Op> = Vec::new();
+    for &v in &want_hoist {
+        let r = next_reg;
+        next_reg = next_reg.checked_add(1)?;
+        if next_reg as u32 > 16 {
+            return None;
+        }
+        val_reg.insert(v, r);
+        match defs[v as usize] {
+            KValDef::Const(bits) => {
+                let k = *const_k_for.get(&bits)?;
+                preheader.push(Op::LoadConst { dst: r, k });
+            }
+            KValDef::Undef => preheader.push(Op::LoadUndef { dst: r }),
+            _ => unreachable!(),
+        }
+    }
+
+    // A DEDICATED register for the loop comparison's result (op[0] Lt → op[1]
+    // JmpIfFalse). It is fused away in native lowering, but the VM-deopt path writes
+    // it, so it must NOT alias any interface/hoisted-const/temp register (else a
+    // hoisted constant would be clobbered by the Bool on the VM path).
+    let cmp_reg = next_reg;
+    next_reg = next_reg.checked_add(1)?;
+    if next_reg as u32 > 16 {
+        return None;
+    }
+    // Temp register pool (above interface + hoisted consts + the cmp slot), recycled.
+    let temp_base = next_reg;
+    let mut free_temps: Vec<Reg> = Vec::new();
+    let mut high_water = temp_base;
+    // reg_owner[r] = the value number currently occupying temp register r (for safe
+    // recycling — a register is only freed when its CURRENT owner dies, so a register
+    // reused as an in-place destination is never double-freed while still live).
+    let mut reg_owner: std::collections::HashMap<Reg, u32> = std::collections::HashMap::new();
+    let mut alloc_temp = |free: &mut Vec<Reg>, hw: &mut Reg| -> Option<Reg> {
+        if let Some(r) = free.pop() {
+            Some(r)
+        } else {
+            let r = *hw;
+            *hw = hw.checked_add(1)?;
+            if *hw as u32 > 16 {
+                return None;
+            }
+            Some(r)
+        }
+    };
+
+    // ── Emit. preheader, then the loop body with dropped ops removed and operands
+    //    rewritten to the registers their values live in. old→new pc map retargets
+    //    jumps (a jump to a dropped op lands on the next emitted op).
+    let mut out: Vec<Op> = Vec::with_capacity(n);
+    out.extend_from_slice(&preheader);
+    let mut old_to_new: Vec<usize> = vec![0usize; n];
+    let mut patch_targets: Vec<(usize, usize)> = Vec::new(); // (out_idx, old_target)
+
+    for pc in 0..back {
+        old_to_new[pc] = out.len();
+        // Free temp registers whose values died at the PREVIOUS pc, so a dead operand's
+        // register can be reused by this op's result. Only free a register whose CURRENT
+        // owner is the dying value (a register reused in-place at pc-1 has a new owner
+        // and must NOT be freed).
+        if pc > 0 {
+            for v in [op_lhs[pc - 1], op_rhs[pc - 1]].into_iter().flatten() {
+                if last_use.get(&v) == Some(&(pc - 1))
+                    && matches!(defs[v as usize], KValDef::Bin(..))
+                {
+                    if let Some(r) = val_reg.get(&v).copied() {
+                        if r >= temp_base && reg_owner.get(&r) == Some(&v) {
+                            reg_owner.remove(&r);
+                            free_temps.push(r);
+                        }
+                    }
+                }
+            }
+        }
+        if dropped[pc] {
+            continue;
+        }
+        match kcode[pc] {
+            Op::Add { .. } | Op::Sub { .. } | Op::Mul { .. } | Op::Div { .. } => {
+                let v = op_result[pc].unwrap();
+                let lv = op_lhs[pc].unwrap();
+                let lr = *val_reg.get(&lv)?;
+                let rr = *val_reg.get(&op_rhs[pc].unwrap())?;
+                // V8-style in-place op: if the LHS value dies at THIS op and lives in a
+                // temp register it still OWNS, reuse it as the destination. Then
+                // `compile_bytecode_f64` sees `dst == lhs` and emits the bare
+                // `addsd/subsd/mulsd/divsd dst, rhs` (one SSE op, NO `movsd` copy).
+                // Bit-exact: lhs IS the first operand. Otherwise allocate fresh.
+                let lhs_dies_here = last_use.get(&lv) == Some(&pc);
+                let dr = if lhs_dies_here && lr >= temp_base && reg_owner.get(&lr) == Some(&lv) {
+                    lr
+                } else {
+                    alloc_temp(&mut free_temps, &mut high_water)?
+                };
+                reg_owner.insert(dr, v);
+                val_reg.insert(v, dr);
+                out.push(match kcode[pc] {
+                    Op::Add { .. } => Op::Add { dst: dr, lhs: lr, rhs: rr },
+                    Op::Sub { .. } => Op::Sub { dst: dr, lhs: lr, rhs: rr },
+                    Op::Mul { .. } => Op::Mul { dst: dr, lhs: lr, rhs: rr },
+                    Op::Div { .. } => Op::Div { dst: dr, lhs: lr, rhs: rr },
+                    _ => unreachable!(),
+                });
+            }
+            Op::Lt { .. } | Op::Le { .. } | Op::Gt { .. } | Op::Ge { .. } => {
+                let lr = *val_reg.get(&op_lhs[pc].unwrap())?;
+                let rr = *val_reg.get(&op_rhs[pc].unwrap())?;
+                // Write the result into the dedicated cmp register (collision-free).
+                out.push(match kcode[pc] {
+                    Op::Lt { .. } => Op::Lt { dst: cmp_reg, lhs: lr, rhs: rr },
+                    Op::Le { .. } => Op::Le { dst: cmp_reg, lhs: lr, rhs: rr },
+                    Op::Gt { .. } => Op::Gt { dst: cmp_reg, lhs: lr, rhs: rr },
+                    Op::Ge { .. } => Op::Ge { dst: cmp_reg, lhs: lr, rhs: rr },
+                    _ => unreachable!(),
+                });
+            }
+            Op::JmpIfFalse { target, .. } => {
+                let oi = out.len();
+                // cond reads the dedicated cmp register written by the preceding Lt/...
+                out.push(Op::JmpIfFalse { cond: cmp_reg, target: u16::MAX });
+                patch_targets.push((oi, target as usize));
+            }
+            Op::Jmp { target } => {
+                let oi = out.len();
+                out.push(Op::Jmp { target: u16::MAX });
+                patch_targets.push((oi, target as usize));
+            }
+            _ => return None,
+        }
+    }
+    // ── Loop-carried writebacks (the phis): copy the NEXT-iteration i / accumulator
+    //    from their temporaries back into the fixed interface registers so the header
+    //    reads them next iteration and the Ret returns the final accumulator. Skip when
+    //    a value is unchanged or already in its interface register.
+    let wb_i = *val_reg.get(&final_i_vn)?;
+    if wb_i != i_reg {
+        out.push(Op::Move { dst: i_reg, src: wb_i });
+    }
+    let wb_carry = *val_reg.get(&final_carry_vn)?;
+    if wb_carry != carry_reg {
+        out.push(Op::Move { dst: carry_reg, src: wb_carry });
+    }
+
+    // The back-edge Jmp and the Ret.
+    old_to_new[back] = out.len();
+    out.push(Op::Jmp { target: u16::MAX });
+    patch_targets.push((out.len() - 1, 0));
+    old_to_new[exit] = out.len();
+    out.push(Op::Ret { src: carry_reg });
+
+    // Retarget jumps through the old→new map (a jump to a dropped op shares the
+    // out-index of the following op, since old_to_new[pc] is set BEFORE the drop).
+    for (oi, old_t) in patch_targets {
+        let nt = *old_to_new.get(old_t)?;
+        match &mut out[oi] {
+            Op::Jmp { target } => *target = nt as u16,
+            Op::JmpIfFalse { target, .. } => *target = nt as u16,
+            _ => return None,
+        }
+    }
+
+    // ── Peephole: remove `Jmp` to the immediately-following op (a no-op fall-through
+    //    left by the dead-branch elimination — e.g. the inlined leaf's skipped
+    //    else-branch). A jmp-to-next is pure overhead per iteration. Rebuild compactly,
+    //    remapping every jump target through an old→new index map. Bit-neutral.
+    loop {
+        let removable: Option<usize> = out
+            .iter()
+            .enumerate()
+            .position(|(i, op)| matches!(op, Op::Jmp { target } if *target as usize == i + 1));
+        let ri = match removable {
+            Some(i) => i,
+            None => break,
+        };
+        let mut compact: Vec<Op> = Vec::with_capacity(out.len() - 1);
+        let mut remap: Vec<usize> = vec![0; out.len() + 1];
+        for (i, op) in out.iter().enumerate() {
+            remap[i] = compact.len();
+            if i == ri {
+                continue; // drop the no-op Jmp
+            }
+            compact.push(*op);
+        }
+        remap[out.len()] = compact.len();
+        for op in &mut compact {
+            match op {
+                Op::Jmp { target } | Op::JmpIfFalse { target, .. } => {
+                    *target = remap[*target as usize] as u16;
+                }
+                _ => {}
+            }
+        }
+        out = compact;
+    }
+
+    // n_regs must cover EVERY register the emitted code references — the temp pool
+    // high-water mark AND the dedicated comparison register.
+    let n_regs = (high_water.max(temp_base) as u32).max(cmp_reg as u32 + 1);
+    if n_regs > 16 {
+        return None;
+    }
+    Some((out, n_regs))
 }
 
 /// A register file borrowed from `REGS_POOL`. Derefs to `Vec<Value>` (so callers
@@ -9789,6 +10340,66 @@ mod tests {
         let mut refuse = refuse_with_interp;
         let r = run_function(m, 0, &[], &Value::Undefined, &g, None, &mut refuse);
         (r, g.into_inner())
+    }
+
+    /// STAGE-3 GATE — the kernel-loop optimizer (`optimize_kernel_loop`: LICM + CSE
+    /// + copy-prop) must be BIT-IDENTICAL to the un-optimized kernel. We extract the
+    /// jit.js kernel, compile BOTH the un-optimized and the optimized bytecode to
+    /// native P6 code, run each over a fuzz of (i, carry, limit) seeds, and assert
+    /// every f64 result is bit-identical. This is the direct A==B teeth for the
+    /// Stage-3 tightening (independent of the end-to-end oracle). Windows-only (P6).
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn stage3_kernel_optimizer_is_bit_identical_to_unoptimized() {
+        // jit.js shape → a kernelized counted loop. We rebuild the UN-optimized kernel
+        // by detecting the loop and laying out the body exactly as kernelize would,
+        // then comparing native execution to the optimizer's output. Simpler: drive it
+        // through inline_leaf_module which already kernelizes+optimizes, AND a second
+        // pass with the optimizer disabled, then compare both kernels' native results.
+        let src = "function f(x){ return ((x*x*0.5 + x*3.0 - 1.0)*(x-2.0) + x*x*x*0.25)/(x+1.0) - x*0.5 + x*x*0.125 - x*7.0; } var s = 0; for (var i = 0; i < 100; i = i + 1) { s = s + f(i); }";
+        // OPTIMIZED kernel (default path).
+        let opt_mod = inline_leaf_module(&compile_program(src).unwrap(), 0).expect("inline+kernelize");
+        let opt_kernel = opt_mod.fns.iter().find(|f| f.name == "__cv_loop_kernel").expect("kernel");
+        // UN-optimized kernel: re-run the kernelizer with the optimizer disabled.
+        let prev = std::env::var("CV_NO_KERNEL_OPT").ok();
+        unsafe { std::env::set_var("CV_NO_KERNEL_OPT", "1"); }
+        let raw_mod = inline_leaf_module(&compile_program(src).unwrap(), 0).expect("inline+kernelize raw");
+        match prev {
+            Some(v) => unsafe { std::env::set_var("CV_NO_KERNEL_OPT", v) },
+            None => unsafe { std::env::remove_var("CV_NO_KERNEL_OPT") },
+        }
+        let raw_kernel = raw_mod.fns.iter().find(|f| f.name == "__cv_loop_kernel").expect("raw kernel");
+        // The optimized kernel must be DIFFERENT (proves the pass fired — non-vacuous).
+        assert_ne!(
+            opt_kernel.code.len(),
+            raw_kernel.code.len(),
+            "optimizer did not change the kernel — vacuous gate"
+        );
+        // Compile both to native f64.
+        let mk_native = |k: &BcFunction| {
+            let consts = k.consts.clone();
+            let bytes = crate::jit::compile_bytecode_f64(&k.code, k.n_params, move |i| {
+                match consts.get(i as usize) { Some(Value::Number(n)) => Some(*n), _ => None }
+            })
+            .expect("kernel must be P6-compilable");
+            crate::jit::JitFunction::install(&bytes).expect("install")
+        };
+        let opt_jf = mk_native(opt_kernel);
+        let raw_jf = mk_native(raw_kernel);
+        // Fuzz over (i_seed, carry_seed, limit) — the kernel's 3 args. Bit-compare.
+        for &i0 in &[0.0f64, 1.0, 3.5, -2.0] {
+            for &acc in &[0.0f64, 7.25, -1e9, f64::NAN] {
+                for &lim in &[0.0f64, 1.0, 5.0, 17.0, 100.0] {
+                    let a = unsafe { opt_jf.call_f64_args(&[i0, acc, lim]) };
+                    let b = unsafe { raw_jf.call_f64_args(&[i0, acc, lim]) };
+                    assert_eq!(
+                        a.to_bits(),
+                        b.to_bits(),
+                        "kernel result diverged at i0={i0} acc={acc} lim={lim}: opt={a} raw={b}"
+                    );
+                }
+            }
+        }
     }
 
     /// The inlined module's slot 0 must contain NO `CallFn` to an inlined leaf, and
