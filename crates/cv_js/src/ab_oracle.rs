@@ -360,6 +360,50 @@ pub fn assert_toplevel_vm_agrees(src: &str) -> Result<(), Divergence> {
     let (b, gb) = run_toplevel(src, true);
     // (a)+(b) throw parity, completion (always `undefined` for `run`), side effects.
     compare_outcomes(&a, &b, "toplevel-treewalk", "toplevel-vm")?;
+
+    // (★ PRODUCTION-FAITHFUL OBSERVATION) — the false-green this oracle existed to
+    // miss. `globals_snapshot()` reads the raw bindings table AFTER the top-level
+    // VM has flushed its deferred writeback; but what a PAGE (and the cv_browser
+    // `LiveInterp` host) actually observes is a read THROUGH the `globalThis` /
+    // `window` global OBJECT, which happens DURING the same script execution. Inside
+    // the top-level VM a `globalThis.X` property read does NOT see the VM's pending
+    // `StoreGlobal` writes (they sit in the deferred `globals` cell until the module
+    // finishes) — so a script whose written-back snapshot agrees can STILL diverge
+    // on the value a page reads back through the global object. Reproduce exactly
+    // that production observation here: re-run BOTH paths with a trailing probe that
+    // serializes `globalThis[key]` for every touched key through the real property-
+    // get path (a console line), and require the two paths to agree line-for-line.
+    //
+    // This is what turns the BUG3 / BUG2-with-try-catch cases RED: their snapshot
+    // writeback matches, but `globalThis.i` read inside the VM run yields `undefined`
+    // while the tree-walk path yields the spec value (2 / 3) — exactly the
+    // divergence cv_browser sees with CV_TOPLEVEL_VM=1.
+    {
+        // Candidate keys = the UNION of what either path touched (sorted, deduped),
+        // observed through the global object on each path.
+        let mut keys: Vec<String> = ga.iter().map(|(k, _)| k.clone()).collect();
+        for (k, _) in &gb {
+            if !keys.contains(k) {
+                keys.push(k.clone());
+            }
+        }
+        keys.sort();
+        keys.dedup();
+        if !keys.is_empty() {
+            let obs_tw = observe_globals_through_object(src, false, &keys);
+            let obs_vm = observe_globals_through_object(src, true, &keys);
+            if obs_tw != obs_vm {
+                let (tw, vm, path) = first_output_diff(&obs_tw, &obs_vm);
+                return Err(Divergence {
+                    kind: DivergenceKind::Value,
+                    path: format!("<globalThis-read>{path}"),
+                    tree_walk: format!("toplevel-treewalk: {tw}"),
+                    vm: format!("toplevel-vm: {vm}"),
+                });
+            }
+        }
+    }
+
     // (c) the touched-global SET must match key-for-key, value-for-value.
     if ga.len() != gb.len() {
         return Err(Divergence {
@@ -391,6 +435,84 @@ pub fn assert_toplevel_vm_agrees(src: &str) -> Result<(), Divergence> {
         }
     }
     Ok(())
+}
+
+/// Run `src` through `Interp::run` with the top-level VM gate set to `on`, with a
+/// trailing probe APPENDED TO THE SAME SCRIPT BODY that reads each `keys` entry
+/// back THROUGH the global object (`globalThis[key]`) and emits a stable,
+/// tier-independent serialization as a console line — exactly the read path a page
+/// (or the cv_browser `LiveInterp` host) uses to observe a script's global side
+/// effects.
+///
+/// Returns the captured `__CV_OBS__:…` console lines (one per key). This is THE
+/// production-faithful observation that the rest of the oracle was missing:
+/// `globals_snapshot()` reads the raw bindings table AFTER the top-level VM has
+/// flushed its deferred writeback, but a page reads through `globalThis`/`window`
+/// DURING the same script execution — and inside the top-level VM a `globalThis.X`
+/// property read does NOT see the VM's pending `StoreGlobal` writes (they sit in the
+/// deferred `globals` cell until the module's boundary). Appending the probe to the
+/// SAME body makes the read cross the real [[Get]] path at the same point a page's
+/// `console.log(window.i)` would, so a snapshot-agreeing-but-page-diverging script
+/// (BUG3, BUG2-with-try/catch) is caught.
+///
+/// A top-level throw in the body skips the appended probe on BOTH paths identically
+/// (empty observation sets, which agree) — throw parity is gated separately by the
+/// caller. The serialization (`typeof + ':' + String(value)`) is identical across
+/// tiers, so a divergence in the emitted lines is a genuine observable-value
+/// divergence, never a formatting artifact.
+fn observe_globals_through_object(src: &str, on: bool, keys: &[String]) -> Vec<String> {
+    let _no_tier = crate::interp::set_force_tier(None);
+    crate::interp::reset_bc_fn_cache();
+    crate::interp::reset_t1_cache();
+    crate::interp::reset_t2_cache();
+    crate::interp::reset_t3_cache();
+    crate::interp::reset_t4_cache();
+    let _g = crate::interp::TopLevelVmGuard::new(on);
+    let mut interp = Interp::new();
+    interp.install_basic_globals();
+
+    // Build the probe APPENDED to the same body. Each key is read via a computed
+    // member access on `globalThis` (the real [[Get]] path) and serialized as
+    // `typeof:String(value)`. A throw in one key's read still emits the remaining
+    // keys. JSON-escape the key so an unusual global name can't break the syntax.
+    let mut probe = String::from("\n;(function(){\n");
+    for k in keys {
+        let key_lit = json_string_literal(k);
+        probe.push_str(&format!(
+            "  try {{ var __cv_v = globalThis[{key}]; console.log('__CV_OBS__:' + {key} + '=' + (typeof __cv_v) + ':' + String(__cv_v)); }} catch (__cv_e) {{ console.log('__CV_OBS__:' + {key} + '=THROW:' + String(__cv_e)); }}\n",
+            key = key_lit
+        ));
+    }
+    probe.push_str("})();\n");
+
+    let full = format!("{src}{probe}");
+    let _ = interp.run(&full);
+    interp
+        .output
+        .iter()
+        .filter(|l| l.contains("__CV_OBS__:"))
+        .cloned()
+        .collect()
+}
+
+/// Minimal JSON string-literal encoder for embedding a global name safely into the
+/// probe source (handles quotes/backslashes/control chars). Never panics.
+fn json_string_literal(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 /// Like `assert_toplevel_vm_agrees`, but ALSO requires the top-level VM path to
