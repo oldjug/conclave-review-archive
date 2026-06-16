@@ -16389,24 +16389,36 @@ impl LiveInterp {
                 if first_paint {
                     self.arena.borrow_mut().mark_all_style_dirty();
                 } else {
-                    // Dirty only the OLD and NEW focus/hover subtrees on a change.
+                    // Dirty the OLD and NEW focus/hover element's subtree AND any
+                    // relationship the stylesheets give that state which reaches
+                    // OUTSIDE that subtree — following siblings (`X:state ~/+ .y`)
+                    // and `:has()` anchors (`.z:has(:state)`). Computed from the
+                    // `RuleFeatureSet` (Blink pseudo-state InvalidationSet). Under-
+                    // detecting either would paint a stale frame (the very reason
+                    // CV_STYLE_INVALIDATION was gated off); a superset is correct.
                     let focus_now = focus_path.map(|p| p.to_vec());
                     let hover_now = hover_path.map(|p| p.to_vec());
+                    let fs = &self.feature_set;
                     let mut a = self.arena.borrow_mut();
-                    let mut dirty_path = |p: &Option<Vec<usize>>| {
+                    let path_map = &self.arena_path_map;
+                    let mut dirty_state = |p: &Option<Vec<usize>>, state: cv_css::PseudoState| {
                         if let Some(path) = p {
-                            if let Some(&nid) = self.arena_path_map.get(path) {
-                                a.mark_style_dirty_subtree(nid);
+                            if let Some(&nid) = path_map.get(path) {
+                                dirty_pseudo_state_invalidation(
+                                    &mut a,
+                                    nid,
+                                    fs.pseudo_state_set(state),
+                                );
                             }
                         }
                     };
                     if focus_now != self.prev_focus_path {
-                        dirty_path(&self.prev_focus_path);
-                        dirty_path(&focus_now);
+                        dirty_state(&self.prev_focus_path, cv_css::PseudoState::Focus);
+                        dirty_state(&focus_now, cv_css::PseudoState::Focus);
                     }
                     if hover_now != self.prev_hover_path {
-                        dirty_path(&self.prev_hover_path);
-                        dirty_path(&hover_now);
+                        dirty_state(&self.prev_hover_path, cv_css::PseudoState::Hover);
+                        dirty_state(&hover_now, cv_css::PseudoState::Hover);
                     }
                     drop(a);
                     self.prev_focus_path = focus_now;
@@ -16516,6 +16528,16 @@ impl LiveInterp {
             }
         }
         CURRENT_RENDER_ARENA.with(|c| *c.borrow_mut() = Some(self.arena.clone()));
+        // Publish the hovered/focused arena NodeIds for this render so the arena
+        // cascade applies `:hover`/`:focus*` rules (resolved via `ArenaNodeRef::
+        // is_hovered`/`is_focused`). Map the element paths through the same
+        // `arena_path_map` the invalidator uses, so the styled node a state rule
+        // targets is exactly the one the precise invalidator dirtied.
+        {
+            let hover_id = hover_path.and_then(|p| self.arena_path_map.get(p).copied());
+            let focus_id = focus_path.and_then(|p| self.arena_path_map.get(p).copied());
+            ARENA_HOVER_FOCUS.with(|c| c.set((hover_id, focus_id)));
+        }
         // Publish the style cache only on the incremental (CV_DOM) path; the
         // legacy walker has no stable NodeIds to key on, so leave it `None`
         // (every node recomputes — unchanged behaviour).
@@ -21960,16 +21982,31 @@ fn cv_module_graph_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var("CV_MODULE_GRAPH").as_deref() == Ok("1"))
 }
 
-/// Chrome-audit FIX 1 (gate, default OFF until A/B-oracle soak): precise
-/// pseudo-class style invalidation on a no-DOM-mutation frame, instead of the
-/// blanket `mark_all_style_dirty()` that defeats the style + layout caches for
-/// the whole document every non-structural frame. When ON, a no-mutation frame
-/// re-styles ONLY the first paint (cold cache) + the OLD/NEW :focus/:hover
-/// subtrees, so both caches hit on the common animating-SPA frame.
+/// Chrome-audit FIX 1: precise pseudo-class style invalidation on a
+/// no-DOM-mutation frame, instead of the blanket `mark_all_style_dirty()` that
+/// defeats the style + layout caches for the whole document every non-structural
+/// frame. A no-mutation frame re-styles ONLY the first paint (cold cache) + the
+/// invalidation set of the OLD/NEW :focus/:hover transition: the changed
+/// element's subtree PLUS — computed from the `RuleFeatureSet` (Blink
+/// pseudo-state `InvalidationSet`) — its following siblings when a
+/// sibling-combinator rule is keyed on the state (`X:hover ~/+ .y`) and its
+/// `:has()` anchor ancestors when a `:has(:state)` rule exists. Both caches hit
+/// on the common animating-SPA frame.
+///
+/// DEFAULT-ON (2026-06-15): the blocker was the missing sibling/`:has()` cases
+/// (an under-invalidation that could paint a stale frame). Now fixed +
+/// byte-identical-oracle-proven:
+/// `arena_pseudo_state_invalidation_matches_full_recompute` (precise == blanket
+/// `mark_all_style_dirty` across hover/focus/`~`/`+`/`:has()`/descendant-of-anchor
+/// transitions, non-vacuity proven), mutation-proved by
+/// `arena_pseudo_state_invalidation_oracle_catches_under_dirtying` (the OLD
+/// subtree-only path DIVERGES), and the perf win is retained
+/// (`arena_plain_hover_reuses_clean_nodes`). `CV_STYLE_INVALIDATION=0` is the
+/// escape hatch forcing the old whole-document `mark_all_style_dirty` path.
 fn precise_style_invalidation_enabled() -> bool {
     use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var("CV_STYLE_INVALIDATION").as_deref() == Ok("1"))
+    *ENABLED.get_or_init(|| std::env::var("CV_STYLE_INVALIDATION").as_deref() != Ok("0"))
 }
 
 thread_local! {
@@ -38071,6 +38108,18 @@ impl<'a> cv_css::selectors::ElementView<'a> for ArenaNodeRef<'a> {
     fn attr(&self, name: &str) -> Option<&'a str> {
         self.doc.attr_raw(self.id, name)
     }
+    fn is_hovered(&self) -> bool {
+        // The CV_DOM arena cascade applies `:hover` by consulting the
+        // per-build hovered NodeId (the cv_html `TableView` uses path
+        // comparison; the arena uses stable NodeIds). Without this the arena
+        // path silently dropped every `:hover` rule.
+        arena_hovered_node() == Some(self.id)
+    }
+    fn is_focused(&self) -> bool {
+        // Resolves `:focus` / `:focus-within` / `:focus-visible` (all routed to
+        // `is_focused` by selectors.rs) on the arena cascade path.
+        arena_focused_node() == Some(self.id)
+    }
     fn previous_element_sibling(&self) -> Option<Self> {
         let (elems, pos) = self.elem_siblings_and_pos()?;
         let prev = *elems.get(pos.checked_sub(1)?)?;
@@ -49855,6 +49904,47 @@ fn apply_style_invalidations(
     }
 }
 
+/// Dirty everything a `:hover`/`:focus` STATE transition on `node` can affect,
+/// per the stylesheet-derived [`cv_css::PseudoStateInvalidation`]. Always dirties
+/// `node`'s own subtree (a `:state` rule on it, or `node:state .desc`); then,
+/// only if the sheets actually contain such a rule:
+///   - `affects_following_siblings` → dirty `node`'s PARENT subtree, a safe
+///     superset of "following siblings + their descendants" (Blink
+///     `SiblingInvalidationSet`; same coarse tier the class-keyed sibling
+///     combinator uses via `invalidates_parent_subtree`).
+///   - `affects_ancestor_has` → dirty every ANCESTOR's subtree. A `:has(:state)`
+///     anchor can be any ancestor and may itself host descendant-combinator
+///     rules (`.z:has(:focus) .w`), so the union of all ancestor subtrees (the
+///     document root subtree, reached by dirtying each ancestor's subtree) is the
+///     safe superset. Paid only on pages whose sheets use `:has(:state)`.
+/// A superset is always correct; under-dirtying paints a stale frame.
+fn dirty_pseudo_state_invalidation(
+    doc: &mut cv_dom::Document,
+    node: cv_dom::NodeId,
+    set: &cv_css::PseudoStateInvalidation,
+) {
+    // The element's own subtree always restyles (its `:state` match flipped).
+    doc.mark_style_dirty_subtree(node);
+    if set.affects_following_siblings {
+        // Following siblings can flip via `X:state ~ .y` / `X:state + .y`.
+        // Dirty the parent's subtree (covers all following siblings + their
+        // descendants). Falls back to node's own subtree at the root.
+        match doc.parent(node) {
+            Some(p) => doc.mark_style_dirty_subtree(p),
+            None => doc.mark_style_dirty_subtree(node),
+        }
+    }
+    if set.affects_ancestor_has {
+        // A `:has(:state)` anchor (or its descendant via `.z:has(:state) .w`)
+        // can be any ancestor; dirty each ancestor's subtree.
+        let mut cur = doc.parent(node);
+        while let Some(p) = cur {
+            doc.mark_style_dirty_subtree(p);
+            cur = doc.parent(p);
+        }
+    }
+}
+
 fn apply_invalidation_set(
     doc: &mut cv_dom::Document,
     node: cv_dom::NodeId,
@@ -50698,6 +50788,38 @@ fn build_styled_tree_full_arena_inner(
 /// Arena counterpart of [`build_styled_tree`] — builds the cascade index, then
 /// walks the arena from the document's root element (`<html>`) with the same
 /// empty root path the cv_html walker uses.
+thread_local! {
+    /// The arena NodeIds currently in the `:hover` / `:focus` dynamic states,
+    /// consulted by `ArenaNodeRef::is_hovered`/`is_focused` so the arena cascade
+    /// (the CV_DOM / precise-invalidation path) actually applies `:hover` /
+    /// `:focus*` rules. The cv_html `TableView` cascade reads its own
+    /// `hovered_path`/`focused_path`; this is the arena equivalent, set per build
+    /// by `build_styled_tree_arena_focus`. `None` ⇒ no element in that state.
+    static ARENA_HOVER_FOCUS: std::cell::Cell<(Option<cv_dom::NodeId>, Option<cv_dom::NodeId>)> =
+        const { std::cell::Cell::new((None, None)) };
+}
+
+/// Install the current frame's hovered/focused arena NodeIds for the duration of
+/// `f`, restoring the previous value after (so nested/test callers don't leak
+/// state). Returns `f`'s result.
+fn with_arena_hover_focus<R>(
+    hover: Option<cv_dom::NodeId>,
+    focus: Option<cv_dom::NodeId>,
+    f: impl FnOnce() -> R,
+) -> R {
+    let prev = ARENA_HOVER_FOCUS.with(|c| c.replace((hover, focus)));
+    let r = f();
+    ARENA_HOVER_FOCUS.with(|c| c.set(prev));
+    r
+}
+
+fn arena_hovered_node() -> Option<cv_dom::NodeId> {
+    ARENA_HOVER_FOCUS.with(|c| c.get().0)
+}
+fn arena_focused_node() -> Option<cv_dom::NodeId> {
+    ARENA_HOVER_FOCUS.with(|c| c.get().1)
+}
+
 fn build_styled_tree_arena(
     doc: &cv_dom::Document,
     sheets: &[cv_css::Stylesheet],
@@ -59713,6 +59835,311 @@ mod tests {
             inc3,
             full(&arena.borrow()),
             "after .c add: inherited color change propagates to descendants"
+        );
+    }
+
+    /// THE ORACLE for CV_STYLE_INVALIDATION on `:hover`/`:focus` transitions with
+    /// SIBLING-combinator and `:has()` rules (the reason the flag was gated off).
+    ///
+    /// For each hover/focus transition, the styled tree produced by the PRECISE
+    /// path — `dirty_pseudo_state_invalidation` (subtree + following-siblings +
+    /// `:has()` anchors) over a warm style cache — must be BYTE-IDENTICAL to the
+    /// BLANKET path (`mark_all_style_dirty` + full recompute). An under-dirtying
+    /// (the sibling/`:has()` element keeps its stale cached style) fails here.
+    ///
+    /// Non-vacuity is proven inline: the blanket baseline itself MUST differ
+    /// across the toggle (so we know the state actually changes paint and the
+    /// equality is meaningful, not "nothing ever changed").
+    #[test]
+    fn arena_pseudo_state_invalidation_matches_full_recompute() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        fn fp(n: &cv_layout::StyledNode, out: &mut String) {
+            match &n.kind {
+                cv_layout::StyledKind::Element { tag } => out.push_str(&format!(
+                    "<{tag} c={:?} bg={:?}>",
+                    n.style.text_color, n.style.background
+                )),
+                cv_layout::StyledKind::Text(t) => out.push_str(&format!("#{t}#")),
+            }
+            for ch in &n.children {
+                fp(ch, out);
+            }
+            out.push('/');
+        }
+        // Tree: body > {menu(.x), item(.y), adj(.y2)} and card(.z) > {sib(.sib), inp}.
+        //   .x:hover ~ .y       → following-sibling (~) keyed on hover
+        //   .x:hover + .y2      → adjacent-sibling (+) keyed on hover
+        //   .z:has(:focus)      → ancestor :has() anchor keyed on focus
+        //   .z:has(:focus) .sib → DESCENDANT of the :has() anchor (NOT an ancestor
+        //                         of the changed node) — the case a subtree-only
+        //                         dirty genuinely misses
+        //   .x:hover            → the changed element itself (self subtree)
+        let mut doc = cv_html::parse(
+            "<html><body>\
+             <div class=x id=menu>m</div>\
+             <div class=y id=item>i</div>\
+             <div class=y2 id=adj>a</div>\
+             <div class=z id=card><span class=sib id=sib>s</span><input id=inp></div>\
+             </body></html>",
+        );
+        assign_node_ids(&mut doc.root);
+        let (arena0, _m) = build_arena_dom(&doc);
+        let arena = Rc::new(RefCell::new(arena0));
+        let sheets = vec![cv_css::parse_stylesheet(
+            ".x:hover { background:#111111 } \
+             .x:hover ~ .y { background:#222222 } \
+             .x:hover + .y2 { background:#333333 } \
+             .z:has(:focus) { background:#444444 } \
+             .z:has(:focus) .sib { background:#666666 } \
+             :focus { background:#555555 }",
+        )];
+        let cfg = cv_layout::LayoutConfig::default();
+        let fs = cv_css::build_rule_feature_set(&sheets);
+        let cache: Rc<RefCell<std::collections::HashMap<cv_dom::NodeId, CachedSubtree>>> =
+            Rc::new(RefCell::new(std::collections::HashMap::new()));
+
+        let menu = arena.borrow().get_element_by_id("menu").unwrap();
+        let inp = arena.borrow().get_element_by_id("inp").unwrap();
+
+        // BLANKET baseline: mark_all + full recompute (no cache) under the state.
+        let blanket = |hover: Option<cv_dom::NodeId>, focus: Option<cv_dom::NodeId>| {
+            CURRENT_STYLE_CACHE.with(|c| *c.borrow_mut() = None);
+            let mut s = String::new();
+            with_arena_hover_focus(hover, focus, || {
+                let t = build_styled_tree_arena(&arena.borrow(), &sheets, &cfg, None, None);
+                fp(&t, &mut s);
+            });
+            s
+        };
+        // PRECISE: warm the cache fully under the PREVIOUS state, then clear the
+        // dirty bits and dirty ONLY this transition's pseudo-state invalidation,
+        // then recompute with the cache live. Mutates only the arena's DIRTY BITS
+        // (which gate cache reuse, never the styled output) — exactly what
+        // `ensure_arena_current_focus` does on the one persistent arena, so no
+        // Document clone is needed.
+        let precise = |prev_hover: Option<cv_dom::NodeId>,
+                       prev_focus: Option<cv_dom::NodeId>,
+                       hover: Option<cv_dom::NodeId>,
+                       focus: Option<cv_dom::NodeId>| {
+            cache.borrow_mut().clear();
+            CURRENT_STYLE_CACHE.with(|c| *c.borrow_mut() = Some(cache.clone()));
+            // Warm under the PREVIOUS state (every node dirty → fills the cache).
+            arena.borrow_mut().mark_all_style_dirty();
+            with_arena_hover_focus(prev_hover, prev_focus, || {
+                let _ = build_styled_tree_arena(&arena.borrow(), &sheets, &cfg, None, None);
+            });
+            // Transition: clear, then dirty ONLY the precise invalidation set.
+            {
+                let mut a = arena.borrow_mut();
+                a.clear_all_style_dirty();
+                if hover != prev_hover {
+                    if let Some(n) = prev_hover {
+                        dirty_pseudo_state_invalidation(&mut a, n, &fs.hover);
+                    }
+                    if let Some(n) = hover {
+                        dirty_pseudo_state_invalidation(&mut a, n, &fs.hover);
+                    }
+                }
+                if focus != prev_focus {
+                    if let Some(n) = prev_focus {
+                        dirty_pseudo_state_invalidation(&mut a, n, &fs.focus);
+                    }
+                    if let Some(n) = focus {
+                        dirty_pseudo_state_invalidation(&mut a, n, &fs.focus);
+                    }
+                }
+            }
+            let mut s = String::new();
+            with_arena_hover_focus(hover, focus, || {
+                let t = build_styled_tree_arena(&arena.borrow(), &sheets, &cfg, None, None);
+                fp(&t, &mut s);
+            });
+            CURRENT_STYLE_CACHE.with(|c| *c.borrow_mut() = None);
+            s
+        };
+
+        // Transition 1: nothing → hover(menu). Must light up .x, .y (~) and .y2 (+).
+        let base = blanket(None, None);
+        let hovered = blanket(Some(menu), None);
+        assert_ne!(base, hovered, "NON-VACUITY: hovering .x must change paint");
+        assert_eq!(
+            precise(None, None, Some(menu), None),
+            hovered,
+            "hover(.x): precise (subtree + ~ + sibling) == blanket"
+        );
+
+        // Transition 2: hover(menu) → nothing. Must revert siblings to base.
+        assert_eq!(
+            precise(Some(menu), None, None, None),
+            base,
+            "unhover(.x): precise reverts following siblings to base"
+        );
+
+        // Transition 3: nothing → focus(inp). Must light up .z via :has(:focus).
+        let focused = blanket(None, Some(inp));
+        assert_ne!(base, focused, "NON-VACUITY: focusing input must change paint");
+        assert_eq!(
+            precise(None, None, None, Some(inp)),
+            focused,
+            "focus(input): precise (:has() ancestor) == blanket"
+        );
+
+        // Transition 4: focus(inp) → nothing. Must revert the :has() anchor.
+        assert_eq!(
+            precise(None, Some(inp), None, None),
+            base,
+            "blur(input): precise reverts the :has() ancestor to base"
+        );
+
+        // Transition 5: hover AND focus together → both, in one transition.
+        let both = blanket(Some(menu), Some(inp));
+        assert_ne!(both, hovered, "NON-VACUITY: adding focus changes paint");
+        assert_eq!(
+            precise(None, None, Some(menu), Some(inp)),
+            both,
+            "hover(.x)+focus(input): precise == blanket for combined transition"
+        );
+    }
+
+    /// MUTATION-PROOF that the oracle above is non-vacuous: a DELIBERATELY broken
+    /// invalidation (the OLD `mark_style_dirty_subtree`-only behaviour, i.e.
+    /// dropping the sibling + `:has()` extensions) MUST diverge from the blanket
+    /// baseline — proving the oracle actually catches the under-invalidation the
+    /// flag was gated on. (Runs the broken path inline; asserts it FAILS to match.)
+    #[test]
+    fn arena_pseudo_state_invalidation_oracle_catches_under_dirtying() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        fn fp(n: &cv_layout::StyledNode, out: &mut String) {
+            if let cv_layout::StyledKind::Element { tag } = &n.kind {
+                out.push_str(&format!("<{tag} bg={:?}>", n.style.background));
+            }
+            for ch in &n.children {
+                fp(ch, out);
+            }
+        }
+        // `.sib` is a SIBLING of the focused input under the `:has()` anchor `.z`
+        // — a descendant of the anchor that is NOT on the changed node's ancestor
+        // chain, so subtree-only dirtying (which only flags the input + its
+        // ancestor chain) genuinely misses it.
+        let mut doc = cv_html::parse(
+            "<html><body>\
+             <div class=x id=menu>m</div><div class=y id=item>i</div>\
+             <div class=z id=card><span class=sib id=sib>s</span><input id=inp></div>\
+             </body></html>",
+        );
+        assign_node_ids(&mut doc.root);
+        let (arena0, _m) = build_arena_dom(&doc);
+        let arena = Rc::new(RefCell::new(arena0));
+        let sheets = vec![cv_css::parse_stylesheet(
+            ".x:hover ~ .y { background:#222222 } .z:has(:focus) .sib { background:#444444 }",
+        )];
+        let cfg = cv_layout::LayoutConfig::default();
+        let cache: Rc<RefCell<std::collections::HashMap<cv_dom::NodeId, CachedSubtree>>> =
+            Rc::new(RefCell::new(std::collections::HashMap::new()));
+        let menu = arena.borrow().get_element_by_id("menu").unwrap();
+        let inp = arena.borrow().get_element_by_id("inp").unwrap();
+
+        let blanket = |hover: Option<cv_dom::NodeId>, focus: Option<cv_dom::NodeId>| {
+            CURRENT_STYLE_CACHE.with(|c| *c.borrow_mut() = None);
+            let mut s = String::new();
+            with_arena_hover_focus(hover, focus, || {
+                fp(&build_styled_tree_arena(&arena.borrow(), &sheets, &cfg, None, None), &mut s);
+            });
+            s
+        };
+        // BROKEN precise path: dirty ONLY the changed node's subtree (no sibling,
+        // no :has() ancestor) — the pre-fix behaviour. Warm under "no state" with
+        // a live cache, then dirty subtree-only and recompute.
+        let broken = |hover: Option<cv_dom::NodeId>, focus: Option<cv_dom::NodeId>| {
+            cache.borrow_mut().clear();
+            CURRENT_STYLE_CACHE.with(|c| *c.borrow_mut() = Some(cache.clone()));
+            arena.borrow_mut().mark_all_style_dirty();
+            with_arena_hover_focus(None, None, || {
+                let _ = build_styled_tree_arena(&arena.borrow(), &sheets, &cfg, None, None);
+            });
+            {
+                let mut a = arena.borrow_mut();
+                a.clear_all_style_dirty();
+                // Subtree-only (the OLD code) — intentionally omits siblings/:has().
+                if let Some(n) = hover {
+                    a.mark_style_dirty_subtree(n);
+                }
+                if let Some(n) = focus {
+                    a.mark_style_dirty_subtree(n);
+                }
+            }
+            let mut s = String::new();
+            with_arena_hover_focus(hover, focus, || {
+                fp(&build_styled_tree_arena(&arena.borrow(), &sheets, &cfg, None, None), &mut s);
+            });
+            CURRENT_STYLE_CACHE.with(|c| *c.borrow_mut() = None);
+            s
+        };
+        // The broken (subtree-only) path must paint a STALE frame for both the
+        // sibling rule and the :has() rule — i.e. it diverges from the truth.
+        assert_ne!(
+            broken(Some(menu), None),
+            blanket(Some(menu), None),
+            "subtree-only under-dirties the `~` sibling → stale frame (oracle works)"
+        );
+        assert_ne!(
+            broken(None, Some(inp)),
+            blanket(None, Some(inp)),
+            "subtree-only under-dirties the :has() anchor → stale frame (oracle works)"
+        );
+    }
+
+    /// PERF GUARD: the precise path must KEEP the measured win — a plain
+    /// `:hover` (no sibling/`:has()` rule) restyles ONLY the hovered element's
+    /// subtree, reusing every other node's cached style. If
+    /// `dirty_pseudo_state_invalidation` ever widened to the whole tree on the
+    /// common case, the flag would buy nothing over `mark_all_style_dirty`.
+    #[test]
+    fn arena_plain_hover_reuses_clean_nodes() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let mut doc = cv_html::parse(
+            "<html><body>\
+             <div class=x id=menu>m</div><div class=y id=a>a</div>\
+             <div class=y id=b>b</div><div class=y id=c>c</div></body></html>",
+        );
+        assign_node_ids(&mut doc.root);
+        let (arena0, _m) = build_arena_dom(&doc);
+        let arena = Rc::new(RefCell::new(arena0));
+        // No sibling / `:has()` relation keyed on hover.
+        let sheets = vec![cv_css::parse_stylesheet(".x:hover { background:#111111 }")];
+        let cfg = cv_layout::LayoutConfig::default();
+        let fs = cv_css::build_rule_feature_set(&sheets);
+        assert!(
+            !fs.hover.reaches_outside_subtree(),
+            "plain .x:hover must not reach outside the element subtree"
+        );
+        let cache: Rc<RefCell<std::collections::HashMap<cv_dom::NodeId, CachedSubtree>>> =
+            Rc::new(RefCell::new(std::collections::HashMap::new()));
+        let menu = arena.borrow().get_element_by_id("menu").unwrap();
+
+        // Warm the cache fully (no hover).
+        CURRENT_STYLE_CACHE.with(|c| *c.borrow_mut() = Some(cache.clone()));
+        arena.borrow_mut().mark_all_style_dirty();
+        let _ = build_styled_tree_arena(&arena.borrow(), &sheets, &cfg, None, None);
+
+        // Hover transition: clear + precise-dirty ONLY the hover invalidation.
+        {
+            let mut a = arena.borrow_mut();
+            a.clear_all_style_dirty();
+            dirty_pseudo_state_invalidation(&mut a, menu, &fs.hover);
+        }
+        RESTYLE_STATS.with(|s| s.set((0, 0)));
+        with_arena_hover_focus(Some(menu), None, || {
+            let _ = build_styled_tree_arena(&arena.borrow(), &sheets, &cfg, None, None);
+        });
+        let (computed, reused) = RESTYLE_STATS.with(|s| s.get());
+        CURRENT_STYLE_CACHE.with(|c| *c.borrow_mut() = None);
+        assert!(
+            reused > 0,
+            "clean .y siblings must be reused on a plain hover (got computed={computed}, reused={reused})"
         );
     }
 

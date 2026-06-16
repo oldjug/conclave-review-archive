@@ -1538,6 +1538,52 @@ impl InvalidationSet {
 pub struct RuleFeatureSet {
     pub class_invalidation: std::collections::HashMap<String, InvalidationSet>,
     pub id_invalidation: std::collections::HashMap<String, InvalidationSet>,
+    /// Invalidation features for the `:hover`/`:focus*` *dynamic pseudo states*
+    /// (Blink models these the same as class/attribute features in
+    /// `RuleFeatureSet`, but the trigger is a state change rather than a DOM
+    /// mutation). When the hovered/focused element changes, this describes which
+    /// OTHER elements — beyond the element's own subtree — can flip their match
+    /// and so must be restyled. See [`PseudoStateInvalidation`].
+    pub hover: PseudoStateInvalidation,
+    pub focus: PseudoStateInvalidation,
+}
+
+/// What a `:hover` / `:focus` STATE transition on element X requires re-styling,
+/// computed from the stylesheets (Blink `RuleFeatureSet` / `InvalidationSet` for
+/// pseudo-state features — `third_party/blink/renderer/core/css/invalidation/`).
+///
+/// The element's own subtree is always dirtied by the driver (a `:hover` rule on
+/// X, or a descendant-combinator rule `X:hover .y`, restyles X + descendants).
+/// These two flags capture the relationships that reach OUTSIDE that subtree:
+///
+/// - `affects_following_siblings`: a rule places the state pseudo in a compound
+///   that is the LEFT side of a sibling combinator (`X:hover ~ .y`,
+///   `X:hover + .y`). When X's state flips, its following siblings' match can
+///   flip — Blink's `SiblingInvalidationSet`. The driver dirties X's parent
+///   subtree (a safe superset of "following siblings + their descendants", the
+///   same coarse tier `invalidates_parent_subtree` uses for class-keyed sibling
+///   combinators).
+/// - `affects_ancestor_has`: a rule places the state pseudo inside a `:has()`
+///   argument (`.z:has(:hover)`, `.z:has(.a:focus)`, `.z:has(+ :hover)`). When
+///   X's state flips, a `:has()` ANCHOR ancestor (or preceding sibling) can flip
+///   its match — Blink invalidates the `:has()` anchor scope. Because the anchor
+///   may be any ancestor and may itself have descendant-combinator rules
+///   (`.z:has(:focus) .w`), the safe superset is to dirty X's whole ancestor
+///   chain's subtrees (= the document root subtree). We pay this only on pages
+///   whose sheets actually contain a `:has(:hover/:focus)` rule (rare); the
+///   common no-`:has` page keeps the precise per-subtree win.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PseudoStateInvalidation {
+    pub affects_following_siblings: bool,
+    pub affects_ancestor_has: bool,
+}
+
+impl PseudoStateInvalidation {
+    /// True if a state transition reaches beyond the changed element's subtree
+    /// (so the driver must do more than `mark_style_dirty_subtree`).
+    pub fn reaches_outside_subtree(&self) -> bool {
+        self.affects_following_siblings || self.affects_ancestor_has
+    }
 }
 
 impl RuleFeatureSet {
@@ -1547,6 +1593,22 @@ impl RuleFeatureSet {
     pub fn id_set(&self, id: &str) -> Option<&InvalidationSet> {
         self.id_invalidation.get(id)
     }
+    /// Pseudo-state invalidation features keyed by the state name as it appears
+    /// in `is_hovered`/`is_focused`: `:hover` → hover; `:focus` /
+    /// `:focus-within` / `:focus-visible` → focus (all driven by `is_focused`).
+    pub fn pseudo_state_set(&self, state: PseudoState) -> &PseudoStateInvalidation {
+        match state {
+            PseudoState::Hover => &self.hover,
+            PseudoState::Focus => &self.focus,
+        }
+    }
+}
+
+/// The two dynamic pseudo-states the renderer tracks for invalidation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PseudoState {
+    Hover,
+    Focus,
 }
 
 /// Build the `RuleFeatureSet` from every selector in every sheet (including
@@ -1573,8 +1635,130 @@ pub fn build_rule_feature_set(sheets: &[Stylesheet]) -> RuleFeatureSet {
     fs
 }
 
+/// Lowercased pseudo-class name → which dynamic state it queries, or `None` if
+/// it is not a state we invalidate on (`:hover`, `:focus`, `:focus-within`,
+/// `:focus-visible` are exactly the ones `selectors.rs` resolves via
+/// `is_hovered`/`is_focused`).
+fn pseudo_state_of(name: &str) -> Option<PseudoState> {
+    match name.to_ascii_lowercase().as_str() {
+        "hover" => Some(PseudoState::Hover),
+        "focus" | "focus-within" | "focus-visible" => Some(PseudoState::Focus),
+        _ => None,
+    }
+}
+
+/// Does this compound carry a dynamic state pseudo (`:hover`/`:focus*`) directly
+/// in its own `pseudo_classes`? (Not recursing into `:has()`/`:is()` here — that
+/// is handled separately so we can tell "subject of sibling combinator" from
+/// "inside :has()".)
+fn compound_state(comp: &crate::selectors::SimpleSelector) -> Option<PseudoState> {
+    comp.pseudo_classes
+        .iter()
+        .find_map(|pc| pseudo_state_of(pc))
+}
+
+/// Record, for every `:hover`/`:focus*` state that appears in `sel`, the
+/// relationships that reach OUTSIDE the changed element's own subtree:
+///   (a) a state compound on the LEFT of a sibling combinator (`X:hover ~ .y`)
+///       → that state `affects_following_siblings`;
+///   (b) a state pseudo anywhere inside a `:has()` argument → that state
+///       `affects_ancestor_has`.
+/// Functional pseudos (`:is`/`:where`/`:not`) are recursed for both checks; a
+/// `:has()` argument routes ALL its inner states to (b) (they re-anchor on the
+/// `:has()` host regardless of the inner combinator). Mirrors Blink collecting
+/// pseudo-state features in `RuleFeatureSet::CollectFeaturesFromSelector`.
+fn harvest_pseudo_state_features(fs: &mut RuleFeatureSet, sel: &Selector) {
+    let parts = &sel.parts;
+    for (i, part) in parts.iter().enumerate() {
+        let comp = &part.compound;
+        // (a) Direct state pseudo on this compound: does any part to its RIGHT
+        // join with a sibling combinator? If so, a following sibling's match
+        // depends on this compound's state.
+        if let Some(state) = compound_state(comp) {
+            let followed_by_sibling = parts[i + 1..].iter().any(|p| {
+                matches!(
+                    p.combinator,
+                    Some(crate::selectors::Combinator::NextSibling)
+                        | Some(crate::selectors::Combinator::SubsequentSibling)
+                )
+            });
+            if followed_by_sibling {
+                fs_state_mut(fs, state).affects_following_siblings = true;
+            }
+        }
+        // (b) Any state pseudo inside a `:has()` argument re-anchors on the host.
+        for has_arg in &comp.has_selectors {
+            for st in collect_states_in_selector(has_arg) {
+                fs_state_mut(fs, st).affects_ancestor_has = true;
+            }
+        }
+        // Recurse functional pseudos for BOTH relationships. A state inside
+        // `:is()`/`:where()`/`:not()` behaves like a direct state on this
+        // compound for combinator purposes, so re-run the same right-sibling
+        // test against the host's position.
+        let nested: Vec<&Selector> = comp
+            .is_selectors
+            .iter()
+            .chain(comp.where_selectors.iter())
+            .chain(comp.not_selectors.iter())
+            .collect();
+        if !nested.is_empty() {
+            let followed_by_sibling = parts[i + 1..].iter().any(|p| {
+                matches!(
+                    p.combinator,
+                    Some(crate::selectors::Combinator::NextSibling)
+                        | Some(crate::selectors::Combinator::SubsequentSibling)
+                )
+            });
+            for inner in nested {
+                for st in collect_states_in_selector(inner) {
+                    if followed_by_sibling {
+                        fs_state_mut(fs, st).affects_following_siblings = true;
+                    }
+                    // The nested selector itself may carry sibling combinators
+                    // or `:has()` — its own harvest covers those.
+                }
+                harvest_pseudo_state_features(fs, inner);
+            }
+        }
+    }
+}
+
+/// Every dynamic pseudo-state that appears anywhere in `sel` (recursing through
+/// functional pseudos and `:has()`). Used to route a `:has()` argument's inner
+/// states to the ancestor-`:has()` bucket.
+fn collect_states_in_selector(sel: &Selector) -> Vec<PseudoState> {
+    let mut out = Vec::new();
+    for part in &sel.parts {
+        let comp = &part.compound;
+        for pc in &comp.pseudo_classes {
+            if let Some(st) = pseudo_state_of(pc) {
+                out.push(st);
+            }
+        }
+        for nested in comp
+            .is_selectors
+            .iter()
+            .chain(comp.where_selectors.iter())
+            .chain(comp.not_selectors.iter())
+            .chain(comp.has_selectors.iter())
+        {
+            out.extend(collect_states_in_selector(nested));
+        }
+    }
+    out
+}
+
+fn fs_state_mut(fs: &mut RuleFeatureSet, state: PseudoState) -> &mut PseudoStateInvalidation {
+    match state {
+        PseudoState::Hover => &mut fs.hover,
+        PseudoState::Focus => &mut fs.focus,
+    }
+}
+
 fn harvest_selector(fs: &mut RuleFeatureSet, sel: &Selector) {
     use crate::selectors::Combinator;
+    harvest_pseudo_state_features(fs, sel);
     let parts = &sel.parts;
     let Some(subject_part) = parts.last() else {
         return;
@@ -9385,6 +9569,65 @@ mod tests {
         assert!(
             fs.class_set("d").unwrap().whole_subtree,
             "universal subject widens to whole subtree"
+        );
+    }
+
+    /// Pseudo-state (`:hover`/`:focus`) invalidation features: a state change on
+    /// element X must reach following siblings (for `~`/`+`) and `:has()`
+    /// anchors (for `:has(:state)`). This is the feature behind
+    /// CV_STYLE_INVALIDATION — under-detecting it would paint a stale frame.
+    #[test]
+    fn pseudo_state_invalidation_harvest() {
+        // Plain `:hover` rule with NO sibling/`:has()` relation → neither flag.
+        let fs = build_rule_feature_set(&[parse_stylesheet("a:hover { color: red }")]);
+        assert!(
+            !fs.hover.reaches_outside_subtree(),
+            "plain a:hover stays within the element's own subtree"
+        );
+        assert!(!fs.focus.reaches_outside_subtree());
+
+        // `~` sibling combinator keyed on hover → following-sibling invalidation.
+        let fs = build_rule_feature_set(&[parse_stylesheet(".x:hover ~ .y { color: red }")]);
+        assert!(
+            fs.hover.affects_following_siblings,
+            ".x:hover ~ .y → hover affects following siblings"
+        );
+        assert!(!fs.hover.affects_ancestor_has);
+        assert!(!fs.focus.reaches_outside_subtree(), "focus untouched");
+
+        // `+` (adjacent) sibling combinator keyed on focus.
+        let fs = build_rule_feature_set(&[parse_stylesheet(".x:focus + .y { color: red }")]);
+        assert!(
+            fs.focus.affects_following_siblings,
+            ".x:focus + .y → focus affects following siblings"
+        );
+        assert!(!fs.hover.reaches_outside_subtree());
+
+        // `:has(:focus)` → ancestor `:has()` invalidation.
+        let fs = build_rule_feature_set(&[parse_stylesheet(".z:has(:focus) { color: red }")]);
+        assert!(
+            fs.focus.affects_ancestor_has,
+            ".z:has(:focus) → focus affects ancestor :has()"
+        );
+        assert!(!fs.focus.affects_following_siblings);
+
+        // `:has(.a:hover)` (state nested in a compound inside :has()).
+        let fs = build_rule_feature_set(&[parse_stylesheet(".z:has(.a:hover) { color: red }")]);
+        assert!(fs.hover.affects_ancestor_has, ":has(.a:hover) → hover :has()");
+
+        // `:has(+ :hover)` — sibling combinator INSIDE :has() still routes to the
+        // ancestor-:has() bucket (it re-anchors on the host, not the host's tree).
+        let fs = build_rule_feature_set(&[parse_stylesheet(".z:has(+ :hover) { color: red }")]);
+        assert!(
+            fs.hover.affects_ancestor_has,
+            ":has(+ :hover) → hover affects ancestor :has()"
+        );
+
+        // State inside `:is(...)` on the left of a sibling combinator counts.
+        let fs = build_rule_feature_set(&[parse_stylesheet(":is(.x:hover) ~ .y { color: red }")]);
+        assert!(
+            fs.hover.affects_following_siblings,
+            ":is(.x:hover) ~ .y → hover affects following siblings"
         );
     }
 

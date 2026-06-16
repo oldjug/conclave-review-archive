@@ -27,7 +27,8 @@ pub mod selectors;
 pub mod tokenizer;
 
 pub use cascade::{
-    AncestorFilter, ContainerType, InvalidationSet, KeyframeRule, QueryContainer,
+    AncestorFilter, ContainerType, InvalidationSet, KeyframeRule, PseudoState,
+    PseudoStateInvalidation, QueryContainer,
     QueryContainerStack, RuleFeatureSet, SelectorIndex, bloom_reset, bloom_stats,
     build_rule_feature_set, collect_keyframes, compute_pseudo, compute_pseudo_with_index,
     compute_with_index, compute_with_index_cq, compute_with_index_inheriting,
