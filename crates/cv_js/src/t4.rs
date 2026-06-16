@@ -44,6 +44,7 @@
 
 use crate::bytecode::{BcFunction, Module, Op};
 
+pub mod aot;
 pub mod redundancy;
 
 // ======================================================================
@@ -514,6 +515,21 @@ pub fn try_compile_t4_status(module: &Module, fn_idx: usize) -> T4CompileStatus 
         Err(_) => return T4CompileStatus::Decline,
     };
 
+    // ── P5 AOT-PERSIST (single-function P2 path; gated CV_AOT_PERSIST, DEFAULT OFF).
+    //    The OPTIMIZED module is the program identity here: codegen consumes it AND a
+    //    deopt resumes the VM on it (the identity-map module). On a COLD REPEAT VISIT
+    //    we re-install the persisted native code with ZERO codegen + ZERO warmup —
+    //    the path PAST V8. For the single-fn path the "fused" and "original" key
+    //    inputs are BOTH the optimized module (no inlining; resume is on it), and the
+    //    reloaded blob is marked is_inlined=false so `run_t4_call` falls to the proven
+    //    `run_t3_call` resume — identical to this fresh single-fn install below.
+    let opt_key_module = Module { fns: vec![optimized.clone()] };
+    if aot::aot_persist_enabled() {
+        if let Some(jf) = aot::load_from_disk(&opt_key_module, &opt_key_module) {
+            return T4CompileStatus::Ready(jf);
+        }
+    }
+
     // Compile the optimized bytecode with the REPRESENTATION-AWARE backend. It
     // emits the same prolog / DeoptSites / epilogue as the T2-lite numeric path
     // PLUS the per-block unboxed-f64 value cache (the win). Any op outside the
@@ -529,6 +545,20 @@ pub fn try_compile_t4_status(module: &Module, fn_idx: usize) -> T4CompileStatus 
         Some(x) => x,
         None => return T4CompileStatus::Decline,
     };
+
+    // ── P5 AOT-PERSIST store (single-fn path; best-effort, gated CV_AOT_PERSIST).
+    //    We reached here on an AOT miss (or persist off) and produced fresh
+    //    relocation-free native code. Persist it keyed by the optimized module so the
+    //    NEXT cold visit re-installs it with zero codegen. is_inlined=false → the
+    //    reload uses the `run_t3_call` (non-inlined) resume, matching this install.
+    //    GUARD: only persist when the safepoint map is EMPTY (the numeric subset
+    //    carries NO heap-pointer roots, so it always is). The reload path does not
+    //    carry a safepoint map, so persisting a function WITH live roots would drop
+    //    its UAF rooting — decline AOT-store in that (currently-unreachable) case
+    //    rather than ship a blob that loses a root. Never wrong: it just won't cache.
+    if safepoints.is_empty() {
+        aot::store_to_disk(&code, &deopt_sites, &opt_key_module, &opt_key_module, false);
+    }
 
     // Pin heap mode OFF for the run (numeric store mode), matching the compile —
     // the T4 backend always uses `T2StoreMode::Numeric`, so the run-time bank must
@@ -671,6 +701,33 @@ pub fn try_compile_t4_inlined_status(module: &Module, fn_idx: usize) -> T4Compil
         return T4CompileStatus::Decline;
     }
 
+    // ── P5 AOT-PERSIST (★ the cold-repeat beat-Chrome lever; gated CV_AOT_PERSIST,
+    //    DEFAULT OFF). At this point the FUSED body (after inlining + P4 redundancy)
+    //    and the ORIGINAL caller module are FULLY DETERMINED — they are exactly what
+    //    codegen would consume and what a deopt resumes on. So they are the program
+    //    identity the persisted native code is keyed by. On a COLD REPEAT VISIT
+    //    (fresh process, warm AOT store) we re-install the already-optimized native
+    //    code with ZERO codegen + ZERO warmup — the path PAST V8, which re-JITs every
+    //    cold load. A digest miss / corruption falls through to a fresh compile
+    //    (below) — never wrong, just a recompile. The re-installed DeoptSite table
+    //    re-checks every guard on the new load, so even an (astronomically unlikely)
+    //    digest collision deopts to the VM, never produces a wrong value.
+    //
+    //    The fused module is wrapped as a single-fn `Module` exactly as the runtime
+    //    carries it (`with_t3_module`); the original caller is the whole module
+    //    (so the resume's `fns[0]` caller + every callee sibling is intact).
+    let fused_for_key = Module { fns: vec![result.fused.clone()] };
+    if aot::aot_persist_enabled() {
+        if let Some(jf) = aot::load_from_disk(&fused_for_key, module) {
+            // The persisted blob carries its own fused + original modules + the
+            // DeoptSite table; `load_from_disk` already attached them. We still
+            // bump the inline-compile honesty counter (an inlined function WAS
+            // produced — it just came from the AOT store, not a fresh codegen).
+            INLINE_COMPILE_COUNT.with(|c| c.set(c.get() + result.inlined_calls as u64));
+            return T4CompileStatus::Ready(jf);
+        }
+    }
+
     // Compile the FUSED body with the resume-pc map (inlined-region guards → caller
     // Call op; caller-region ops → their own original index).
     let consts = result.fused.consts.clone();
@@ -695,6 +752,17 @@ pub fn try_compile_t4_inlined_status(module: &Module, fn_idx: usize) -> T4Compil
     if deopt_sites.iter().any(|s| s.bc_pc >= caller_code_len) {
         return T4CompileStatus::Decline;
     }
+
+    // ── P5 AOT-PERSIST store (best-effort, gated CV_AOT_PERSIST). We reached here
+    //    on an AOT MISS (or with persist off) and just produced fresh relocation-
+    //    free native code + its DeoptSite table. Persist it keyed by the SAME
+    //    (fused, original) program identity so the NEXT cold visit re-installs it
+    //    with zero codegen. The numeric subset is relocation-free by construction,
+    //    so the bytes are safe to re-run verbatim on the next load. No-op when
+    //    persist is off / a module is non-serializable / the disk write fails.
+    //    is_inlined=true → the reload attaches `t4_deopt_module` (INLINE-DEOPT-TO-
+    //    CALLER resume), exactly as this fresh install does below.
+    aot::store_to_disk(&code, &deopt_sites, &fused_for_key, module, true);
 
     let _heap = crate::interp::T2HeapGuard::new(false);
     let native = match crate::jit::JitFunction::install(&code) {

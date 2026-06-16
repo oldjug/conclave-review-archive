@@ -540,6 +540,210 @@ fn measure_js(file: &str, result_global: &str) -> Result<JsResult, String> {
     })
 }
 
+/// The measured outcome of the T4 P5 AOT-PERSIST COLD-REPEAT-VISIT leg — the ★
+/// beat-Chrome lever. `first_cold_ms` is the FIRST cold visit (fresh process
+/// analogue: compile T4 + persist the native blob, paying the full warmup). The key
+/// number `repeat_cold_ms` is the SECOND cold visit (a fresh interp with the live
+/// T4 cache cleared, so the optimized native code is RE-INSTALLED FROM THE DISK
+/// BLOB with ZERO codegen + ZERO warmup) — the path PAST V8, which re-JITs every
+/// cold load. `aot_loaded` (>0) is the honesty guard: the reload actually fired.
+struct AotRepeatResult {
+    first_cold_ms: f64,
+    repeat_cold_ms: Vec<f64>,
+    aot_loaded: u64,
+    aot_stored: u64,
+    t4_exec_count: u64,
+    /// Byte-identity guard: the result value of the cold-repeat (reloaded) run MUST
+    /// equal the value of a plain VM run of the same script. True iff they matched —
+    /// a fast number with a mismatched result is FAKE, not a win.
+    result_matches_vm: bool,
+    /// COMPILE-COST ISOLATION: a LOW-iteration variant where the T4 codegen is a
+    /// MEASURABLE fraction of the run (vs jit.js's 1.5M iters, where the one-time
+    /// compile is a negligible fraction of the runtime). `first_compile_ms` = a cold
+    /// visit that COMPILES T4 (full codegen + warmup); `repeat_compile_ms` = a cold
+    /// REPEAT visit that RE-INSTALLS the persisted blob (zero codegen). The delta is
+    /// the warmup/codegen cost the AOT lever eliminates — the part of the
+    /// cold-repeat win that V8 cannot get (it re-JITs every cold load).
+    first_compile_ms: f64,
+    repeat_compile_ms: f64,
+}
+
+/// Measure the T4 P5 AOT-PERSIST cold-repeat lever on `file` (jit.js). Forces T4 +
+/// AOT on in an ISOLATED on-disk store, runs the script ONCE to compile+persist the
+/// optimized native code, then runs it AGAIN in a fresh interp with the live T4
+/// cache cleared — so the second run RE-INSTALLS the persisted native code from disk
+/// with zero warmup. The second run's time is the beat-Chrome cold-repeat number.
+/// All correctness gates from the round-trip oracle hold (the persisted DeoptSite
+/// table re-checks every guard); this leg ADDS the timing.
+fn measure_aot_cold_repeat(file: &str, result_global: &str) -> Result<AotRepeatResult, String> {
+    let src = read_input(file)?;
+    let blank = "<!doctype html><html><head></head><body></body></html>";
+    let doc = cv_html::parse(blank);
+    let label = "file:///benchfix/jsbench-aot";
+
+    // VM baseline result (the source of truth for the byte-identity guard).
+    let vm_result = {
+        let _g = cv_js::TierGuard::new(cv_js::ForcedTier::Vm);
+        cv_js::interp::reset_t4_cache();
+        let mut rt = LiveInterp::new(&doc, label);
+        rt.interp
+            .run(&src)
+            .map_err(|e| format!("aot vm run {file}: {e:?}"))?;
+        rt.interp.run_completion_value(result_global)
+    };
+
+    // Isolate the on-disk AOT store to a unique dir so the repeat run reloads
+    // exactly the blob the first run persisted (no stale cross-run contamination).
+    let dir = std::env::temp_dir().join(format!(
+        "tbjs_aot_bench_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    cv_js::t4::aot::set_thread_dir_override(Some(dir.clone()));
+    let _persist = cv_js::t4::aot::AotPersistGuard::new(true);
+    let _t4 = cv_js::TierGuard::new(cv_js::ForcedTier::T4);
+    // Route jit.js's `f(x)` to T4 (not the P6 f64 leaf JIT, which is tried first):
+    // P6 would otherwise win the pure-numeric callee and T4 would never engage, so
+    // the AOT lever (which persists T4 code) would have nothing to reload. This is
+    // the apples-to-apples "what does AOT-persist save when T4 IS the tier"
+    // measurement — exactly the prompt's `CV_NOJIT=1 CV_T4=1` T4-ENGAGED config.
+    let _no_p6 = cv_js::NoP6JitGuard::new();
+
+    // ── FIRST COLD VISIT: compile T4 + persist the native blob (full warmup). ──
+    cv_js::t4::aot::reset_aot_store_count();
+    cv_js::t4::aot::reset_aot_load_count();
+    cv_js::interp::reset_t4_cache();
+    cv_js::reset_t4_exec_count();
+    let mut first_result_ok = true;
+    let first_cold_ms = {
+        let mut rt = LiveInterp::new(&doc, label);
+        let t = Instant::now();
+        rt.interp
+            .run(&src)
+            .map_err(|e| format!("aot first cold run {file}: {e:?}"))?;
+        let ms = t.elapsed().as_secs_f64() * 1000.0;
+        if !matches!(rt.interp.run_completion_value(result_global), Ok(cv_js::Value::Number(_))) {
+            first_result_ok = false;
+        }
+        ms
+    };
+    let aot_stored = cv_js::t4::aot::aot_store_count();
+
+    // ── COLD REPEAT VISITS: a FRESH interp + CLEARED live T4 cache, so the
+    //    optimized native code is RE-INSTALLED FROM DISK with zero codegen. ──
+    let mut repeat_cold_ms = Vec::with_capacity(ITERS);
+    let mut last_result = vm_result.clone();
+    let mut total_loaded = 0u64;
+    for _ in 0..ITERS {
+        cv_js::interp::reset_t4_cache(); // clear the live JitFunction → MUST reload from disk
+        cv_js::t4::aot::reset_aot_load_count();
+        cv_js::reset_t4_exec_count();
+        let mut rt = LiveInterp::new(&doc, label);
+        let t = Instant::now();
+        rt.interp
+            .run(&src)
+            .map_err(|e| format!("aot repeat cold run {file}: {e:?}"))?;
+        repeat_cold_ms.push(t.elapsed().as_secs_f64() * 1000.0);
+        last_result = rt.interp.run_completion_value(result_global);
+        total_loaded += cv_js::t4::aot::aot_load_count();
+    }
+    let t4_exec_count = cv_js::t4_exec_count();
+
+    // ── COMPILE-COST ISOLATION: a LOW-iteration variant where T4 codegen is a
+    //    measurable fraction. We synthesize many DISTINCT hot functions so each pays
+    //    its own T4 compile (the codegen cost the AOT lever eliminates on reload),
+    //    each called just past the tier-up threshold. A separate isolated dir per
+    //    sub-run so the compile run truly compiles and the reload run truly reloads.
+    let compile_src = aot_compile_cost_script();
+    let dir2 = std::env::temp_dir().join(format!(
+        "tbjs_aot_compile_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    let _ = std::fs::remove_dir_all(&dir2);
+    cv_js::t4::aot::set_thread_dir_override(Some(dir2.clone()));
+    // FIRST compile visit: empty store → every hot fn COMPILES T4 (full codegen).
+    let first_compile_ms = {
+        cv_js::interp::reset_t4_cache();
+        let mut rt = LiveInterp::new(&doc, label);
+        let t = Instant::now();
+        rt.interp
+            .run(&compile_src)
+            .map_err(|e| format!("aot compile-cost first run: {e:?}"))?;
+        t.elapsed().as_secs_f64() * 1000.0
+    };
+    // COLD REPEAT compile visit: warm store + cleared live cache → every hot fn
+    // RE-INSTALLS from disk (zero codegen). The delta vs first is the codegen cost.
+    let mut repeat_compile_samples = Vec::with_capacity(ITERS);
+    for _ in 0..ITERS {
+        cv_js::interp::reset_t4_cache();
+        let mut rt = LiveInterp::new(&doc, label);
+        let t = Instant::now();
+        rt.interp
+            .run(&compile_src)
+            .map_err(|e| format!("aot compile-cost repeat run: {e:?}"))?;
+        repeat_compile_samples.push(t.elapsed().as_secs_f64() * 1000.0);
+    }
+    let repeat_compile_ms = median(&repeat_compile_samples);
+
+    cv_js::t4::aot::set_thread_dir_override(None);
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&dir2);
+
+    // Byte-identity guard: the reloaded cold-repeat result MUST equal the VM result.
+    let result_matches_vm = first_result_ok
+        && match (&last_result, &vm_result) {
+            (Ok(cv_js::Value::Number(a)), Ok(cv_js::Value::Number(b))) => {
+                a == b || (a.is_nan() && b.is_nan())
+            }
+            _ => false,
+        };
+
+    Ok(AotRepeatResult {
+        first_cold_ms,
+        repeat_cold_ms,
+        aot_loaded: total_loaded,
+        aot_stored,
+        t4_exec_count,
+        result_matches_vm,
+        first_compile_ms,
+        repeat_compile_ms,
+    })
+}
+
+/// A compile-cost-isolation script: MANY distinct small float-dense functions, each
+/// called just past the T4 tier-up threshold. Each function pays its OWN T4 codegen
+/// on a fresh compile (the cost the AOT lever skips on reload), and the total
+/// runtime is dominated by codegen rather than steady-state execution (unlike
+/// jit.js's 1.5M-iter single function, where compile is a negligible fraction). The
+/// per-fn loop count is small but past threshold so T4 engages once per fn.
+fn aot_compile_cost_script() -> String {
+    let mut s = String::new();
+    let n_fns = 200; // many distinct compiles → codegen is a measurable fraction
+    let per_fn_calls = 80; // just past the tier-up threshold
+    s.push_str("var __acc = 0;\n");
+    for k in 0..n_fns {
+        // Distinct constants per fn so each is a DISTINCT program (own AOT key).
+        let a = (k % 7) as f64 + 0.5;
+        let b = (k % 5) as f64 + 1.25;
+        s.push_str(&format!(
+            "function f{k}(x){{ return x*x*{a} + x*{b} - {a} + x*x*x*0.25 - x*0.5; }}\n"
+        ));
+        s.push_str(&format!(
+            "for (var i{k}=0; i{k}<{per_fn_calls}; i{k}=i{k}+1) {{ __acc = __acc + f{k}(i{k}); }}\n"
+        ));
+    }
+    s.push_str("var __bench_aot_compile_result = __acc; __bench_aot_compile_result;\n");
+    s
+}
+
 // ── public entry ─────────────────────────────────────────────────────────────
 
 /// Run the full bench and emit one JSON object to stdout (and optionally to the
@@ -584,6 +788,15 @@ pub fn run_bench(cli: &Cli) -> Result<(), String> {
     // ── JS-EXEC ──
     let js_loop = measure_js("loop.js", "__bench_loop_result")?;
     let js_jit = measure_js("jit.js", "__bench_jit_result")?;
+
+    // ── T4 P5 AOT-PERSIST COLD-REPEAT (★ the beat-Chrome cold-repeat lever) ──
+    // Measures jit.js on a COLD REPEAT VISIT where the optimized T4 native code is
+    // re-installed from the persisted disk blob with ZERO codegen + ZERO warmup —
+    // the path PAST V8 (which re-JITs every cold load). Off the default path (it
+    // forces T4+AOT in an isolated store), so it never perturbs the default numbers
+    // above; it is a dedicated lever measurement. `result_matches_vm` is the
+    // anti-fake guard: a fast number only counts if the result is byte-identical.
+    let aot_jit = measure_aot_cold_repeat("jit.js", "__bench_jit_result")?;
 
     // ── MEMORY (gc_live_object_count is the deterministic, in-process,
     // cross-platform heap-liveness metric — exact integer, the leak/sawtooth
@@ -708,6 +921,11 @@ pub fn run_bench(cli: &Cli) -> Result<(), String> {
                     J::Obj(vec![
                         ("loop", js_json(&js_loop)),
                         ("jit", js_json(&js_jit)),
+                        // ★ T4 P5 AOT-PERSIST cold-repeat lever (jit.js): the second
+                        // cold visit re-installs optimized native code from disk with
+                        // zero warmup — the past-V8 number. Only meaningful with
+                        // `result_matches_vm: true` (the anti-fake guard).
+                        ("jit_aot_cold_repeat", aot_json(&aot_jit)),
                     ]),
                 ),
                 (
@@ -757,6 +975,37 @@ fn js_json(r: &JsResult) -> J {
         // Kept for continuity with the prior baseline JSON.
         ("t2_exec_count", J::I(r.t2_exec_count as i64)),
         ("t2_enabled", J::Bool(r.t2_enabled)),
+    ])
+}
+
+fn aot_json(r: &AotRepeatResult) -> J {
+    J::Obj(vec![
+        // The FIRST cold visit (compile T4 + persist — full warmup paid once).
+        ("first_cold_ms", J::F(r.first_cold_ms)),
+        // ★ THE NUMBER: the COLD REPEAT visit — optimized native code re-installed
+        // from the persisted disk blob with ZERO codegen + ZERO warmup. V8 re-JITs
+        // every cold load; this is the path PAST it.
+        ("repeat_cold_ms_median", J::F(median(&r.repeat_cold_ms))),
+        ("repeat_cold_ms_min", J::F(min_of(&r.repeat_cold_ms))),
+        // Honesty guards: the reload actually fired (>0), a blob was persisted (>0),
+        // T4 ran the hot fn natively (>0). A zero here means the lever was vacuous.
+        ("aot_blobs_loaded", J::I(r.aot_loaded as i64)),
+        ("aot_blobs_stored", J::I(r.aot_stored as i64)),
+        ("t4_exec_count", J::I(r.t4_exec_count as i64)),
+        // ANTI-FAKE: the cold-repeat result MUST be byte-identical to the VM. A fast
+        // number with this false is BROKEN, not a win.
+        ("result_matches_vm", J::Bool(r.result_matches_vm)),
+        // COMPILE-COST ISOLATION: many distinct hot fns, so T4 codegen is a
+        // measurable fraction. compile_first = cold compile (full codegen);
+        // compile_repeat = cold repeat (reload from disk, zero codegen). The delta
+        // (and the speedup ratio) is the warmup/codegen cost the AOT lever
+        // eliminates — the cold-repeat win V8 cannot get (it re-JITs every load).
+        ("compile_cost_first_ms", J::F(r.first_compile_ms)),
+        ("compile_cost_repeat_ms", J::F(r.repeat_compile_ms)),
+        (
+            "compile_cost_speedup_ratio",
+            J::F(ratio(r.first_compile_ms, r.repeat_compile_ms)),
+        ),
     ])
 }
 

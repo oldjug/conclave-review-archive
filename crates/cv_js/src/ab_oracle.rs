@@ -439,6 +439,117 @@ pub fn assert_tiers_agree_t4_redundancy_engaged(src: &str) -> Result<(), Diverge
     Ok(())
 }
 
+/// T4 P5 AOT-PERSIST round-trip oracle — the ★ beat-Chrome cold-repeat gate.
+///
+/// Proves the persisted optimized NATIVE CODE is byte-identical to the VM AFTER a
+/// full persist → reload → run cycle (the cold-repeat-visit path V8 cannot take):
+///   1. Run `src` under `ForcedTier::T4` with AOT persist FORCED ON in a FRESH,
+///      isolated on-disk store (a unique temp dir per call). This compiles the hot
+///      function fresh and PERSISTS its native blob (`aot_store_count` > 0).
+///   2. SIMULATE A COLD REPEAT VISIT: clear the in-process T4 compile cache (so the
+///      next run can't reuse the live `JitFunction` — it MUST reconstruct from
+///      disk), reset the AOT load counter, and run `src` AGAIN under `ForcedTier::T4`
+///      + AOT on. This time the function's native code is RE-INSTALLED FROM THE DISK
+///      BLOB with zero codegen (`aot_load_count` > 0 — the non-vacuity guard).
+///   3. The reloaded run's outcome MUST be byte-identical to the plain VM (and thus
+///      tree-walk) — the persisted code + re-attached DeoptSite table runs exactly
+///      as fresh T4 would. This is the round-trip correctness gate.
+///
+/// Returns `Ok(true)` iff the reload path actually fired (a blob was re-installed
+/// from disk), so a caller can assert non-vacuity; `Ok(false)` means T4 declined to
+/// produce a persistable native function for this snippet (no inlinable numeric
+/// call — the round-trip is vacuous, not a failure). Any byte-identity divergence
+/// is returned as `Err` (the round-trip produced a WRONG value — a hard fail).
+#[cfg(target_os = "windows")]
+pub fn assert_aot_roundtrip_matches_vm(src: &str) -> Result<bool, Divergence> {
+    // The VM baseline (and tree-walk, transitively) — the source of truth.
+    let a = run_one_tier(src, ForcedTier::TreeWalk);
+    let b = run_one_tier(src, ForcedTier::Vm);
+    compare_outcomes(&a, &b, "tree-walk", "vm")?;
+
+    // Isolate the on-disk AOT store to a unique temp dir so this oracle never reads
+    // a stale blob from a prior run / another test and the reload it observes is
+    // exactly the one IT persisted. Cleaned up at the end (best-effort). The dir
+    // must be unique even across PARALLEL test threads, so we use a PROCESS-WIDE
+    // atomic sequence (not a thread-local — two threads would both start at 0 and
+    // collide) plus the pid + a nanosecond clock component.
+    let seq = AOT_ORACLE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let dir = std::env::temp_dir().join(format!(
+        "tbjs_aot_oracle_{}_{}_{}",
+        std::process::id(),
+        seq,
+        nanos
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    // CV_AOT_PERSIST_DIR is read fresh by `aot_dir()` on each store/load, so setting
+    // it here routes THIS oracle call's disk I/O to the unique dir. NOTE: the env var
+    // is process-global; parallel oracle calls would race on it. To avoid that, the
+    // AOT disk seam ALSO honors a thread-local dir override (set below), which takes
+    // precedence over the env — so parallel oracle threads never collide.
+    crate::t4::aot::set_thread_dir_override(Some(dir.clone()));
+    let _persist = crate::t4::aot::AotPersistGuard::new(true);
+
+    // ── Run 1 — fresh compile + PERSIST the native blob.
+    let run_t4 = |store_before: u64| -> (TierOutcome, u64, u64) {
+        let _guard = TierGuard::new(ForcedTier::T4);
+        crate::interp::reset_bc_fn_cache();
+        crate::interp::reset_t4_cache();
+        crate::interp::reset_t4_exec_count();
+        crate::t4::aot::reset_aot_load_count();
+        let mut interp = Interp::new();
+        interp.install_basic_globals();
+        let result = match interp.run_completion_value(src) {
+            Ok(v) => Ok(v),
+            Err(e) => Err(reduce_thrown(&e)),
+        };
+        let outcome = TierOutcome {
+            result,
+            output: interp.output.clone(),
+        };
+        (
+            outcome,
+            crate::t4::aot::aot_store_count().saturating_sub(store_before),
+            crate::t4::aot::aot_load_count(),
+        )
+    };
+
+    crate::t4::aot::reset_aot_store_count();
+    let (out1, stored, _l1) = run_t4(0);
+    compare_outcomes(&a, &out1, "tree-walk", "t4-aot-warm")?;
+
+    // ── Run 2 — SIMULATE A COLD REPEAT VISIT: the in-process T4 cache is cleared
+    //    (run_t4 resets it), so the function MUST reconstruct from the disk blob.
+    let (out2, _stored2, loaded) = run_t4(stored);
+    compare_outcomes(&a, &out2, "tree-walk", "t4-aot-cold-repeat")?;
+
+    // Cleanup (best-effort).
+    crate::t4::aot::set_thread_dir_override(None);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // Non-vacuity: the reload fired iff a blob was both persisted (run 1) AND
+    // re-installed from disk (run 2). If T4 never produced a persistable native
+    // function (no inlinable numeric call), `stored == 0` and the round-trip is
+    // vacuous — Ok(false), not a failure.
+    Ok(stored > 0 && loaded > 0)
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn assert_aot_roundtrip_matches_vm(src: &str) -> Result<bool, Divergence> {
+    // No RX install on non-Windows → no native AOT path; just prove VM==tree-walk.
+    let a = run_one_tier(src, ForcedTier::TreeWalk);
+    let b = run_one_tier(src, ForcedTier::Vm);
+    compare_outcomes(&a, &b, "tree-walk", "vm")?;
+    Ok(false)
+}
+
+/// Process-wide sequence so each `assert_aot_roundtrip_matches_vm` call (across ALL
+/// test threads) uses a unique on-disk store dir (no cross-call contamination).
+static AOT_ORACLE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Like `assert_tiers_agree`, but ALSO requires the T2-lite tier to have
 /// genuinely executed native code (≥1 T2-lite invocation) — guarding against a
 /// vacuously-green oracle where T2-lite silently declines/deopts everything. Use
