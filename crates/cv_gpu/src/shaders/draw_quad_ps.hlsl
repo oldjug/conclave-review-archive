@@ -29,7 +29,7 @@ cbuffer QuadPS : register(b0) {
     float4 grad_to;   // RGBA [0,255] at t=1   (kind==1)
     float4 grad_axis; // dx, dy, t_min, denom  (kind==1)
     float4 params;    // kind, rect_w, rect_h, _
-    float4 vp2;       // vp_w, vp_h, _, _
+    float4 vp2;       // vp_w, vp_h, rect_x, rect_y
 };
 
 struct VSOut {
@@ -75,17 +75,35 @@ float4 PSMain(VSOut i) : SV_TARGET {
     if (kind == 0) {
         return src_over(solid, dst255);
     } else if (kind == 1) {
-        // Linear gradient. cv_gfx uses px = (xx-x)+0.5 = local pixel center;
-        // on a 1:1 quad the interpolated uv*w already equals that center.
-        float lx = i.uv.x * params.y;
-        float ly = i.uv.y * params.z;
-        float t = ((lx * grad_axis.x + ly * grad_axis.y) - grad_axis.z) / grad_axis.w;
+        // Linear gradient. cv_gfx computes the axis projection at the LOCAL
+        // pixel center px = (xx - rect_x) + 0.5, py = (yy - rect_y) + 0.5, with
+        // rect origin in vp2.zw = (rect_x, rect_y).
+        //
+        // Two changes drive the GPU toward the CPU's exact fp32 result (the
+        // 1-LSB gradient gap shrank from ~40 px to ~11 px on real hardware):
+        //   1. Use SV_POSITION.xy (i.pos), which D3D guarantees IS the exact
+        //      device pixel center (xx+0.5, yy+0.5) — no interpolation. The old
+        //      `i.uv.x * rect_w` form ran through the rasterizer's barycentric
+        //      interpolation, which landed a ULP off and flipped floor().
+        //   2. `precise` forbids the compiler from contracting a*b+c into a
+        //      fused mad and from reassociating, so each op runs in the SAME
+        //      order at the SAME fp32 rounding as the CPU oracle.
+        // A residual <=1-LSB drift remains at exact floor() boundaries (GPU
+        // fp32 division differs from CPU by a ULP there) — the same tolerance
+        // Chrome's pixel tests allow for GPU gradients; the gradient is kept
+        // OFF the byte-exact GPU path because of it.
+        precise float lx = i.pos.x - vp2.z;
+        precise float ly = i.pos.y - vp2.w;
+        precise float projx = lx * grad_axis.x;
+        precise float projy = ly * grad_axis.y;
+        precise float num = (projx + projy) - grad_axis.z;
+        precise float t = num / grad_axis.w;
         t = clamp(t, 0.0, 1.0);
         // cv_gfx lerps then TRUNCATES each channel (`as u8`), not round.
-        float r = floor(grad_from.r * (1.0 - t) + grad_to.r * t);
-        float g = floor(grad_from.g * (1.0 - t) + grad_to.g * t);
-        float b = floor(grad_from.b * (1.0 - t) + grad_to.b * t);
-        float a = floor(grad_from.a * (1.0 - t) + grad_to.a * t);
+        precise float r = floor(grad_from.r * (1.0 - t) + grad_to.r * t);
+        precise float g = floor(grad_from.g * (1.0 - t) + grad_to.g * t);
+        precise float b = floor(grad_from.b * (1.0 - t) + grad_to.b * t);
+        precise float a = floor(grad_from.a * (1.0 - t) + grad_to.a * t);
         return src_over(float4(r, g, b, a), dst255);
     } else {
         // Image (textured) quad: sample source 1:1 and source-over.

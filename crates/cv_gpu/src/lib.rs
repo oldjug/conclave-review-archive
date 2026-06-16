@@ -27,4 +27,7 @@ pub mod quad_draw;
 
 pub use hw_present::{HwPresenter, HwPresentError};
 pub use present::{PresentConfig, PresentDescriptor, PresentLayer, SwapChain, SwapChainError};
-pub use quad_draw::{GpuQuad, QuadDrawError, QuadDrawer, QuadFill, Rgba, quad_raster_enabled};
+pub use quad_draw::{
+    GpuQuad, QuadDrawError, QuadDrawer, QuadFill, Rgba, blend_bgra, cpu_draw_quad,
+    cpu_render_quads, quad_raster_enabled,
+};

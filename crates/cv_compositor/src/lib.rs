@@ -14,6 +14,7 @@
 
 use std::collections::HashMap;
 
+pub mod display_list_gpu;
 pub mod display_list_rasterize;
 pub mod promote;
 pub mod tree_builder;

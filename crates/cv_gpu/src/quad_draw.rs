@@ -44,6 +44,36 @@ use std::ffi::c_void;
 /// Read `CV_GPU_RASTER` once. **Default OFF**: only `=1`/`on`/`true`/`yes`
 /// enables the per-quad GPU raster path. Any other value (incl. unset) → OFF,
 /// so the default present path is untouched.
+///
+/// ## Status (2026-06-15): WIRED + byte-exact-proven, but kept OFF
+///
+/// The per-quad pipeline is no longer orphaned. `cv_compositor::display_list_gpu`
+/// drives a `cv_paint::DisplayList` through `QuadDrawer` (flattening the
+/// transform/clip/opacity stack to screen-space quads exactly as the CPU
+/// rasterizer does), with `cv_gpu::cpu_render_quads` as the byte-exact oracle +
+/// device-loss fallback. On real D3D11 hardware the golden gate proves a
+/// realistic solid/border/clip/transform/image page is **byte-identical**
+/// (max-delta 0) to the CPU spec (`gpu_solid_page_is_byte_identical`,
+/// `gpu_image_in_list_is_byte_identical`), and the production
+/// `display_list_gpu::rasterize` is byte-identical-or-CPU-fallback by
+/// construction (it takes the GPU path ONLY for gradient-free GPU-exact lists).
+///
+/// It stays **default OFF** because two genuine gaps remain — flipping it would
+/// not honestly make the *live page* GPU-rasterize:
+///   1. **Gradient is 1-LSB, not delta-0.** GPU fp32 division at a `floor()`
+///      boundary drifts by at most 1 LSB vs the truncating CPU reference (the
+///      same tolerance Chrome's pixel tests allow for GPU gradients). Closed
+///      from ~40 px to ~11 px via SV_POSITION-derived coords + `precise` math,
+///      but not to zero; so gradient lists are excluded from the GPU path.
+///   2. **The live present consumes the cv_gfx text-inclusive bake**, not a
+///      `cv_paint::DisplayList`. Routing the live page through the display-list
+///      GPU path needs (a) the live bake to emit a DisplayList and (b) GPU
+///      glyph raster — "text-on-GPU still partial". Until then,
+///      `display_list_gpu::rasterize` is the proven seam but is not on the live
+///      WM_PAINT present, so a default-on flip would have no live effect.
+///
+/// When both are done, flip to the `!= Ok("0")` default-on idiom (keeping the
+/// `=0` escape hatch) — the safety is already proven by the golden gate.
 pub fn quad_raster_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
@@ -106,6 +136,125 @@ pub struct GpuQuad {
     pub w: i32,
     pub h: i32,
     pub fill: QuadFill,
+}
+
+// ── CPU reference rasterizer (the oracle + the device-loss fallback) ──
+//
+// This is the SAME straight-alpha math the GPU pixel shader (draw_quad_ps.hlsl)
+// reproduces, and the SAME math `cv_gfx` (the live rasterizer) uses for
+// fill_rect / fill_rect_gradient / blit_bgra / blend_bgra. It is the byte-exact
+// oracle the golden tests compare the GPU output against, AND the fallback the
+// present path runs when no D3D11 device is available or a draw fails. Keeping
+// it in the library (not just the test module) means the wiring degrades to a
+// correct CPU result on device failure WITHOUT diverging from the oracle — the
+// "CPU stays oracle + fallback FOREVER" guarantee, implemented for real.
+
+/// `cv_gfx::blend_bgra` — straight-alpha (non-premultiplied) Porter-Duff
+/// source-over with un-premultiply + round. `dst` is packed BGRA u32; `src` is
+/// straight-alpha RGBA. Byte-identical to the shader's `src_over`.
+#[inline]
+pub fn blend_bgra(dst: u32, src: Rgba) -> u32 {
+    let da = (dst >> 24) & 0xFF;
+    let dr = (dst >> 16) & 0xFF;
+    let dg = (dst >> 8) & 0xFF;
+    let db = dst & 0xFF;
+    let sa_f = src.a as f32 / 255.0;
+    let da_f = da as f32 / 255.0;
+    let inv = 1.0 - sa_f;
+    let out_a = sa_f + da_f * inv;
+    if out_a <= 0.0 {
+        return 0;
+    }
+    let r = ((src.r as f32 * sa_f + dr as f32 * da_f * inv) / out_a).round() as u32;
+    let g = ((src.g as f32 * sa_f + dg as f32 * da_f * inv) / out_a).round() as u32;
+    let b = ((src.b as f32 * sa_f + db as f32 * da_f * inv) / out_a).round() as u32;
+    let a = (out_a * 255.0).round() as u32;
+    (a << 24) | (r << 16) | (g << 8) | b
+}
+
+/// Composite one quad over `fb` (packed BGRA u32, `vp_w * vp_h`) in place,
+/// reproducing `cv_gfx::fill_rect` / `fill_rect_gradient` / `blit_bgra`
+/// EXACTLY. This is the per-quad body of [`cpu_render_quads`].
+pub fn cpu_draw_quad(fb: &mut [u32], vp_w: i32, vp_h: i32, q: &GpuQuad) {
+    let x0 = q.x.max(0);
+    let y0 = q.y.max(0);
+    let x1 = (q.x + q.w).min(vp_w);
+    let y1 = (q.y + q.h).min(vp_h);
+    if x1 <= x0 || y1 <= y0 {
+        return;
+    }
+    match &q.fill {
+        QuadFill::Solid(c) => {
+            for yy in y0..y1 {
+                for xx in x0..x1 {
+                    let idx = (yy * vp_w + xx) as usize;
+                    if c.a == 255 {
+                        fb[idx] = c.to_bgra_u32();
+                    } else if c.a > 0 {
+                        fb[idx] = blend_bgra(fb[idx], *c);
+                    }
+                }
+            }
+        }
+        QuadFill::LinearGradient { angle_deg, from, to } => {
+            let (dx, dy, t_min, denom) = gradient_axis(*angle_deg, q.w, q.h);
+            for yy in y0..y1 {
+                let py = (yy - q.y) as f32 + 0.5;
+                for xx in x0..x1 {
+                    let px = (xx - q.x) as f32 + 0.5;
+                    let t = (((px * dx + py * dy) - t_min) / denom).clamp(0.0, 1.0);
+                    let r = (from.r as f32 * (1.0 - t) + to.r as f32 * t) as u8;
+                    let g = (from.g as f32 * (1.0 - t) + to.g as f32 * t) as u8;
+                    let b = (from.b as f32 * (1.0 - t) + to.b as f32 * t) as u8;
+                    let a = (from.a as f32 * (1.0 - t) + to.a as f32 * t) as u8;
+                    let c = Rgba { r, g, b, a };
+                    let idx = (yy * vp_w + xx) as usize;
+                    if a == 255 {
+                        fb[idx] = c.to_bgra_u32();
+                    } else if a > 0 {
+                        fb[idx] = blend_bgra(fb[idx], c);
+                    }
+                }
+            }
+        }
+        QuadFill::Image { bgra } => {
+            for yy in y0..y1 {
+                let sy = (yy - q.y) as usize;
+                for xx in x0..x1 {
+                    let sx = (xx - q.x) as usize;
+                    let s = bgra[sy * (q.w as usize) + sx];
+                    let sa = ((s >> 24) & 0xFF) as u8;
+                    if sa == 0 {
+                        continue;
+                    }
+                    let idx = (yy * vp_w + xx) as usize;
+                    if sa == 255 {
+                        fb[idx] = s;
+                    } else {
+                        let c = Rgba {
+                            r: ((s >> 16) & 0xFF) as u8,
+                            g: ((s >> 8) & 0xFF) as u8,
+                            b: (s & 0xFF) as u8,
+                            a: sa,
+                        };
+                        fb[idx] = blend_bgra(fb[idx], c);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// CPU-rasterize `quads` IN ORDER over `backdrop`, returning the composited
+/// frame (packed BGRA u32, `vp_w * vp_h`). The oracle + device-loss fallback
+/// for [`QuadDrawer::draw_quads_offscreen`].
+pub fn cpu_render_quads(vp_w: u32, vp_h: u32, backdrop: &[u32], quads: &[GpuQuad]) -> Vec<u32> {
+    assert_eq!(backdrop.len(), (vp_w * vp_h) as usize, "backdrop must be vp_w*vp_h");
+    let mut fb = backdrop.to_vec();
+    for q in quads {
+        cpu_draw_quad(&mut fb, vp_w as i32, vp_h as i32, q);
+    }
+    fb
 }
 
 // ── Embedded precompiled DXBC (no runtime d3dcompiler dependency) ─────
@@ -274,7 +423,7 @@ struct QuadPsCb {
     grad_to: [f32; 4],
     grad_axis: [f32; 4], // dx, dy, t_min, denom
     params: [f32; 4],    // kind, rect_w, rect_h, 0
-    vp2: [f32; 4],       // vp_w, vp_h, 0, 0
+    vp2: [f32; 4],       // vp_w, vp_h, rect_x, rect_y
 }
 
 // ── Errors ────────────────────────────────────────────────────────────
@@ -596,7 +745,10 @@ impl QuadDrawer {
             grad_to: [0.0; 4],
             grad_axis: [0.0; 4],
             params: [0.0, q.w as f32, q.h as f32, 0.0],
-            vp2: [vp_w as f32, vp_h as f32, 0.0, 0.0],
+            // vp2.zw carry the quad's device-pixel ORIGIN so the gradient PS
+            // can compute the LOCAL pixel center (i.screen - origin) exactly as
+            // the CPU oracle does — the byte-exact gradient fix.
+            vp2: [vp_w as f32, vp_h as f32, q.x as f32, q.y as f32],
         };
         match &q.fill {
             QuadFill::Solid(c) => {
@@ -1126,111 +1278,21 @@ unsafe fn ctx_unmap(context: *mut c_void, res: *mut c_void) {
 mod tests {
     use super::*;
 
-    // ── CPU oracle (verbatim cv_gfx math) ────────────────────────────
+    // ── CPU oracle ───────────────────────────────────────────────────
+    //
+    // The oracle is now the PUBLIC library rasterizer (`cpu_render_quads` /
+    // `blend_bgra`) — the exact same code the present path uses as the
+    // device-loss fallback. Tests delegate to it so the oracle and the
+    // production fallback can never drift apart (a single source of truth for
+    // the cv_gfx straight-alpha math). The thin aliases below keep the existing
+    // test bodies unchanged.
 
-    /// cv_gfx::blend_bgra — straight-alpha source-over with un-premultiply +
-    /// round. `dst` is packed BGRA u32; `src` is straight-alpha RGBA.
     fn oracle_blend_bgra(dst: u32, src: Rgba) -> u32 {
-        let da = (dst >> 24) & 0xFF;
-        let dr = (dst >> 16) & 0xFF;
-        let dg = (dst >> 8) & 0xFF;
-        let db = dst & 0xFF;
-        let sa_f = src.a as f32 / 255.0;
-        let da_f = da as f32 / 255.0;
-        let inv = 1.0 - sa_f;
-        let out_a = sa_f + da_f * inv;
-        if out_a <= 0.0 {
-            return 0;
-        }
-        let r = ((src.r as f32 * sa_f + dr as f32 * da_f * inv) / out_a).round() as u32;
-        let g = ((src.g as f32 * sa_f + dg as f32 * da_f * inv) / out_a).round() as u32;
-        let b = ((src.b as f32 * sa_f + db as f32 * da_f * inv) / out_a).round() as u32;
-        let a = (out_a * 255.0).round() as u32;
-        (a << 24) | (r << 16) | (g << 8) | b
-    }
-
-    /// CPU render of one quad over `fb` (BGRA u32, vp_w*vp_h), in place —
-    /// reproduces cv_gfx::fill_rect / fill_rect_gradient / blit_bgra.
-    fn oracle_draw_quad(fb: &mut [u32], vp_w: i32, vp_h: i32, q: &GpuQuad) {
-        let x0 = q.x.max(0);
-        let y0 = q.y.max(0);
-        let x1 = (q.x + q.w).min(vp_w);
-        let y1 = (q.y + q.h).min(vp_h);
-        if x1 <= x0 || y1 <= y0 {
-            return;
-        }
-        match &q.fill {
-            QuadFill::Solid(c) => {
-                for yy in y0..y1 {
-                    for xx in x0..x1 {
-                        let idx = (yy * vp_w + xx) as usize;
-                        if c.a == 255 {
-                            fb[idx] = c.to_bgra_u32();
-                        } else if c.a > 0 {
-                            fb[idx] = oracle_blend_bgra(fb[idx], *c);
-                        }
-                    }
-                }
-            }
-            QuadFill::LinearGradient {
-                angle_deg,
-                from,
-                to,
-            } => {
-                let (dx, dy, t_min, denom) = gradient_axis(*angle_deg, q.w, q.h);
-                for yy in y0..y1 {
-                    let py = (yy - q.y) as f32 + 0.5;
-                    for xx in x0..x1 {
-                        let px = (xx - q.x) as f32 + 0.5;
-                        let t = (((px * dx + py * dy) - t_min) / denom).clamp(0.0, 1.0);
-                        let r = (from.r as f32 * (1.0 - t) + to.r as f32 * t) as u8;
-                        let g = (from.g as f32 * (1.0 - t) + to.g as f32 * t) as u8;
-                        let b = (from.b as f32 * (1.0 - t) + to.b as f32 * t) as u8;
-                        let a = (from.a as f32 * (1.0 - t) + to.a as f32 * t) as u8;
-                        let c = Rgba { r, g, b, a };
-                        let idx = (yy * vp_w + xx) as usize;
-                        if a == 255 {
-                            fb[idx] = c.to_bgra_u32();
-                        } else if a > 0 {
-                            fb[idx] = oracle_blend_bgra(fb[idx], c);
-                        }
-                    }
-                }
-            }
-            QuadFill::Image { bgra } => {
-                for yy in y0..y1 {
-                    let sy = (yy - q.y) as usize;
-                    for xx in x0..x1 {
-                        let sx = (xx - q.x) as usize;
-                        let s = bgra[sy * (q.w as usize) + sx];
-                        let sa = ((s >> 24) & 0xFF) as u8;
-                        if sa == 0 {
-                            continue;
-                        }
-                        let idx = (yy * vp_w + xx) as usize;
-                        if sa == 255 {
-                            fb[idx] = s;
-                        } else {
-                            let c = Rgba {
-                                r: ((s >> 16) & 0xFF) as u8,
-                                g: ((s >> 8) & 0xFF) as u8,
-                                b: (s & 0xFF) as u8,
-                                a: sa,
-                            };
-                            fb[idx] = oracle_blend_bgra(fb[idx], c);
-                        }
-                    }
-                }
-            }
-        }
+        blend_bgra(dst, src)
     }
 
     fn oracle_render(vp_w: u32, vp_h: u32, backdrop: &[u32], quads: &[GpuQuad]) -> Vec<u32> {
-        let mut fb = backdrop.to_vec();
-        for q in quads {
-            oracle_draw_quad(&mut fb, vp_w as i32, vp_h as i32, q);
-        }
-        fb
+        cpu_render_quads(vp_w, vp_h, backdrop, quads)
     }
 
     /// Max per-channel delta between two BGRA u32 buffers + the count of
@@ -1535,5 +1597,6 @@ mod tests {
         let (max, _) = diff(&gpu, &backdrop);
         assert_eq!(max, 0, "no quads must return the backdrop unchanged");
     }
+
 }
 

@@ -11,3 +11,4 @@ workspace = true
 
 [dependencies]
 cv_paint = { path = "../cv_paint" }
+cv_gpu = { path = "../cv_gpu" }

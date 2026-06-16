@@ -68,6 +68,7 @@ dependencies = [
 name = "cv_compositor"
 version = "0.0.1"
 dependencies = [
+ "cv_gpu",
  "cv_paint",
 ]
 
