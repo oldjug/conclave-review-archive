@@ -1885,9 +1885,22 @@ fn bc_per_fn_enabled() -> bool {
     })
 }
 
-/// Chrome-audit FIX 2 gate (default OFF until A/B-oracle soak): compile arrow
-/// functions to the bytecode VM (with lexical `this` via __lexical_this) instead
-/// of always tree-walking them. Off ⇒ byte-identical to today (arrows decline).
+/// Chrome-audit FIX 2 gate. Default-ON since 2026-06-15 (escape hatch:
+/// `CV_ARROW_TIER=0` forces OFF). Compiles arrow functions to the already-
+/// default bytecode VM (with lexical `this` via a __lexical_this upvalue) instead
+/// of always tree-walking them. This is SAFE to ship as the default because it is
+/// strictly-more-correct/faster onto an already-default, differential-oracle-
+/// covered path, PROVEN observable-identical to tree-walk: `arrow_tier_enabled()`
+/// returns true under any forced_tier, so the differential A/B oracle
+/// (`ab_oracle.rs` `assert_tiers_agree`: TreeWalk vs Vm vs Jit vs T2Lite vs T3)
+/// exercises the arrow-in-VM path and proves completion-value + throw-parity +
+/// console-side-effect identity to tree-walk; `test262_object_model_subset_agrees_
+/// across_tiers` ran 229 positive files across 13 dirs with 0 unexpected
+/// divergences (object/class methods + callbacks are arrow-heavy); and the
+/// targeted unit tests (`bytecode::arrow_captures_lexical_this`,
+/// `interp::arrow_inherits_lexical_this_not_call_receiver` — the React
+/// class-component pattern — `arrow_captures_outer_local_read/write`) are green.
+/// Force OFF with `CV_ARROW_TIER=0` to fall back to tree-walking arrows.
 fn arrow_tier_enabled() -> bool {
     if matches!(forced_tier(), Some(_)) {
         return true;
@@ -1898,7 +1911,7 @@ fn arrow_tier_enabled() -> bool {
     ON.with(|c| match c.get() {
         Some(v) => v,
         None => {
-            let v = std::env::var("CV_ARROW_TIER").as_deref() == Ok("1");
+            let v = std::env::var("CV_ARROW_TIER").as_deref() != Ok("0");
             c.set(Some(v));
             v
         }

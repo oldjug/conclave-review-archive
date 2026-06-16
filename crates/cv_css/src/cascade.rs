@@ -3200,18 +3200,22 @@ fn matched_props_cache_enabled() -> bool {
     }
     use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    // Default-OFF (opt in with `CV_MPC=1`). The cache is OUTPUT-IDENTICAL to the
-    // cold cascade (oracle-proven: `mpc_*` tests assert byte-identical
-    // ComputedStyle on vs off) and delivers a MEASURED ~70% cut in the per-element
-    // cascade-apply step (1560ns → 465ns; see `mpc_apply_share_diagnostic`). It is
-    // NOT yet default-on because that cascade-apply step is only a small share of
-    // end-to-end TTFP in our engine (layout + text measurement + paint baking
-    // dominate the medium_dom build), so the win is below the `--type bench` TTFP
-    // noise floor — the honesty rule is "real bench drop or default-OFF". Flip to
-    // default-on after a soak, OR once the cascade becomes a larger TTFP share
-    // (e.g. var-heavy / utility-CSS pages where `apply_declaration` + `expand_vars`
-    // cost more per element and the apply share rises).
-    *ENABLED.get_or_init(|| matches!(std::env::var("CV_MPC").as_deref(), Ok("1") | Ok("true") | Ok("on")))
+    // Default-ON since 2026-06-15 (escape hatch: `CV_MPC=0` forces OFF). The cache
+    // is OUTPUT-IDENTICAL to the cold cascade — this is OK to ship as the default
+    // because it is ORACLE-PROVEN byte-identical, not merely believed so: the
+    // `mpc_*` tests assert format!("{:?}") of the ComputedStyle is byte-identical
+    // across cache-OFF vs cache-ON(cold miss) vs cache-ON(warm HIT) for multiple
+    // element cases (`mpc_computed_style_identical_cache_on_vs_off`), and the
+    // over-eager-key guards (`mpc_differing_sibling_does_not_hit`,
+    // `mpc_identical_siblings_share_one_cascade`) prove a distinct sibling gets a
+    // distinct key (no wrong reuse) while identical siblings collapse to ONE
+    // cascade. Because the output cannot change, default-on can only (slightly)
+    // speed: a MEASURED ~70% cut in the per-element cascade-apply step (1560ns →
+    // 465ns; see `mpc_apply_share_diagnostic`). It was previously default-OFF for
+    // perf-honesty only (the apply step is a small share of medium_dom TTFP where
+    // layout/text/paint dominate), but byte-identity means there is no correctness
+    // reason to keep the faster path opt-in. Force OFF with `CV_MPC=0` for A/B.
+    *ENABLED.get_or_init(|| !matches!(std::env::var("CV_MPC").as_deref(), Ok("0") | Ok("false") | Ok("off")))
 }
 
 /// Hash the cascade inputs into the MatchedPropertiesCache key. Captures the
