@@ -1728,7 +1728,7 @@ pub fn try_compile_t3_status(module: &Module, fn_idx: usize) -> T3CompileStatus 
         Ok(x) => x,
         Err(_) => return T3CompileStatus::Decline,
     };
-    let opt_module = Module { fns: vec![optimized] };
+    let opt_module = Module { fns: vec![optimized], script_forinit_syncs: Vec::new() };
     // Hand the optimized module to the proven T2 numeric backend. T3's subset is
     // numeric/control-flow only (no GetProp/Call), so the NUMERIC T2 path applies
     // directly — no IC warming needed, and the deopt/resume machinery is reused

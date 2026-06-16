@@ -217,7 +217,7 @@ fn non_serializable_const_declines_serialize() {
         ic: std::cell::RefCell::new(Vec::new()),
         feedback: std::cell::RefCell::new(Vec::new()),
     };
-    let module = Module { fns: vec![f] };
+    let module = Module { fns: vec![f], script_forinit_syncs: Vec::new() };
     assert!(
         serialize_module("x", &module).is_none(),
         "a non-serializable const must make the module decline to cache"
@@ -360,7 +360,7 @@ fn module_with_baked_shape(shape_keys: &[&str], slot: u32) -> Module {
         ics.resize(f.code.len(), crate::bytecode::PropIc::INVALID);
         ics[0] = crate::bytecode::PropIc::from_serialized_own(&[(shape_id, slot)], false);
     }
-    Module { fns: vec![f] }
+    Module { fns: vec![f], script_forinit_syncs: Vec::new() }
 }
 
 #[test]

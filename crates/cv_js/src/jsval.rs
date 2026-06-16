@@ -1444,7 +1444,7 @@ mod tests {
         // `Module` is a fully-public struct (`{ fns: Vec<BcFunction> }`) and
         // `BcClosure`'s fields are all public, so we can build one directly with
         // no private-type access.
-        let module = Rc::new(crate::bytecode::Module { fns: vec![] });
+        let module = Rc::new(crate::bytecode::Module { fns: vec![], script_forinit_syncs: Vec::new() });
         Value::BcClosure(Rc::new(BcClosure {
             fn_idx: 0,
             upvalues: RefCell::new(vec![]),

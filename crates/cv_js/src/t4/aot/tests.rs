@@ -38,7 +38,7 @@ fn sample_fn(name: &str) -> BcFunction {
 }
 
 fn sample_module(name: &str) -> Module {
-    Module { fns: vec![sample_fn(name)] }
+    Module { fns: vec![sample_fn(name)], script_forinit_syncs: Vec::new() }
 }
 
 fn sample_code_and_sites() -> (Vec<u8>, Vec<DeoptSite>) {

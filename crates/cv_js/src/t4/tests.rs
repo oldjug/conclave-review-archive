@@ -162,7 +162,7 @@ mod windows_engagement {
             ic: std::cell::RefCell::new(Vec::new()),
             feedback: std::cell::RefCell::new(Vec::new()),
         };
-        let m = Module { fns: vec![f, g] };
+        let m = Module { fns: vec![f, g], script_forinit_syncs: Vec::new() };
         crate::t4::reset_inline_compile_count();
         let r = crate::t4::try_compile_t4_inlined_status(&m, 0);
         assert!(
@@ -374,7 +374,7 @@ fn t4_inliner_produces_callfree_fused_body_with_resume_map() {
         feedback: std::cell::RefCell::new(Vec::new()),
     };
     let g_code_len = g.code.len();
-    let m = Module { fns: vec![f, g] };
+    let m = Module { fns: vec![f, g], script_forinit_syncs: Vec::new() };
     let r = crate::t4::inline_first_call(&m, 0).expect("inlines the CallFn to numeric g");
     assert_eq!(r.inlined_calls, 1);
     assert_eq!(r.bc_pc_map.len(), r.fused.code.len(), "map covers every fused op");
@@ -425,7 +425,7 @@ fn t4_inliner_declines_un_inlinable_callee() {
             ic: std::cell::RefCell::new(Vec::new()),
             feedback: std::cell::RefCell::new(Vec::new()),
         };
-        Module { fns: vec![f, g] }
+        Module { fns: vec![f, g], script_forinit_syncs: Vec::new() }
     };
     // Heap op in the callee → decline.
     let heap = mk(vec![Op::GetProp { dst: 1, obj: 0, key_k: 0 }, Op::Ret { src: 1 }], 1, 1);

@@ -1266,6 +1266,88 @@ mod tests {
         let _ = (r.t2_exec_count, r.t2_enabled);
     }
 
+    /// ★ LEAF-JIT ROUTING under the top-level VM. With `CV_TOPLEVEL_VM` ON, the hot
+    /// top-level loop runs on the register VM and the leaf callee (`work`/`f`) is
+    /// invoked via the in-VM `Op::CallFn`. The fix routes that in-VM call to the
+    /// SAME P6 f64 native tier the tree-walk call path uses — so the leaf must run
+    /// as NATIVE code (`p6_exec_count > 0`), not regress to the interpreter, AND
+    /// the top level must genuinely engage the VM (`toplevel_vm_took > 0`). A green
+    /// here proves the loop.js/jit.js native win SURVIVES top-level-VM mode.
+    #[test]
+    fn leaf_jit_routes_to_p6_under_toplevel_vm() {
+        for (file, result_global) in
+            [("loop.js", "__bench_loop_result"), ("jit.js", "__bench_jit_result")]
+        {
+            let src = read_input(file).expect("read bench input");
+            let blank = "<!doctype html><html><head></head><body></body></html>";
+            let doc = cv_html::parse(blank);
+            let label = "file:///benchfix/leaftest";
+            let _g = cv_js::TopLevelVmGuard::new(true);
+            cv_js::reset_p6_exec_count();
+            cv_js::reset_toplevel_vm_took_count();
+            let mut rt = LiveInterp::new(&doc, label);
+            rt.interp.run(&src).unwrap_or_else(|e| panic!("{file}: {e:?}"));
+            let p6 = cv_js::p6_exec_count();
+            let toplevel = cv_js::toplevel_vm_took_count();
+            assert!(
+                toplevel > 0,
+                "{file}: top-level VM must engage with the flag on (took={toplevel})"
+            );
+            assert!(
+                p6 > 0,
+                "{file}: leaf callee must run as P6 native code under the top-level VM \
+                 (p6_exec_count={p6}); the in-VM CallFn must route to the f64 JIT"
+            );
+        }
+    }
+
+    /// OFFLINE before/after timing for the two JS microbenches under the
+    /// top-level-VM flag OFF (tree-walk top level = the byte-identical baseline)
+    /// vs ON (hot top level on the register VM + the leaf routed to P6). Ignored
+    /// by default (timing, not a pass/fail gate); run explicitly in RELEASE:
+    ///   cargo test -p cv_browser --bins --release toplevel_vm_before_after_timing -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn toplevel_vm_before_after_timing() {
+        use std::time::Instant;
+        fn best_ms(file: &str, on: bool) -> (f64, u64, u64) {
+            let src = read_input(file).expect("read");
+            let blank = "<!doctype html><html><head></head><body></body></html>";
+            let doc = cv_html::parse(blank);
+            let label = "file:///benchfix/timing";
+            // warmup
+            for _ in 0..3 {
+                let _g = cv_js::TopLevelVmGuard::new(on);
+                let mut rt = LiveInterp::new(&doc, label);
+                let _ = rt.interp.run(&src);
+            }
+            let mut best = f64::MAX;
+            let (mut p6, mut tv) = (0u64, 0u64);
+            for _ in 0..12 {
+                let _g = cv_js::TopLevelVmGuard::new(on);
+                cv_js::reset_p6_exec_count();
+                cv_js::reset_toplevel_vm_took_count();
+                let mut rt = LiveInterp::new(&doc, label);
+                let t = Instant::now();
+                rt.interp.run(&src).unwrap();
+                let ms = t.elapsed().as_secs_f64() * 1000.0;
+                if ms < best {
+                    best = ms;
+                    p6 = cv_js::p6_exec_count();
+                    tv = cv_js::toplevel_vm_took_count();
+                }
+            }
+            (best, p6, tv)
+        }
+        for file in ["loop.js", "jit.js"] {
+            let (off, _, _) = best_ms(file, false);
+            let (on, p6, tv) = best_ms(file, true);
+            println!(
+                "[timing] {file}: toplevel_vm OFF={off:.2}ms  ON={on:.2}ms  (ON p6_exec={p6} toplevel_took={tv})"
+            );
+        }
+    }
+
     #[test]
     fn memory_reports_bounded_live_object_counts() {
         let cfg = cfg();

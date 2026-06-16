@@ -825,6 +825,20 @@ impl BcFunction {
 #[derive(Debug, Clone)]
 pub struct Module {
     pub fns: Vec<BcFunction>,
+    /// Script-frame `for (var i = …)` init bindings that are kept in a fast
+    /// LOCAL register for the hot loop and only synced to their (function-scoped,
+    /// i.e. global) binding at loop exit. Each entry is `(global name, register)`
+    /// in `fns[0]`'s register file. On a THROW that escapes the loop (mid-loop),
+    /// the normal post-loop `StoreGlobal` is skipped, so the run loop flushes
+    /// these live registers to `globals` on the script frame's error-return path —
+    /// matching the tree-walker (and Node/Chrome), where `globalThis.i` reflects
+    /// the value `i` held at the throw point (ECMA-262: a global `var` is a
+    /// property of the global object, so every write must reach it). Empty for any
+    /// program without a script-level for-init `var` (zero overhead). NOT
+    /// persisted: a module carrying these declines disk caching (see
+    /// `code_cache::serialize_module`) so it is always recompiled with the field
+    /// present — never silently lost on a cache reload.
+    pub script_forinit_syncs: Vec<(String, Reg)>,
 }
 
 #[derive(Debug)]
@@ -879,7 +893,7 @@ pub fn compile_program(source: &str) -> Result<Module, CompileError> {
         .into_iter()
         .filter(|s| !matches!(s, Stmt::FunctionDecl { .. }))
         .collect();
-    let (script, _) = compile_function(
+    let (script, _, script_forinit_syncs) = compile_function(
         "<script>",
         &[],
         &script_body,
@@ -890,7 +904,7 @@ pub fn compile_program(source: &str) -> Result<Module, CompileError> {
     fns_pool.borrow_mut()[0] = script;
 
     for (i, (name, params, body)) in declared.iter().enumerate() {
-        let (f, _) = compile_function(
+        let (f, _, _) = compile_function(
             name,
             params,
             body,
@@ -902,7 +916,10 @@ pub fn compile_program(source: &str) -> Result<Module, CompileError> {
     }
 
     let fns = fns_pool.borrow().clone();
-    Ok(Module { fns })
+    Ok(Module {
+        fns,
+        script_forinit_syncs,
+    })
 }
 
 /// Compile a SINGLE function (one `FunctionValue`) into a runnable Module whose
@@ -950,7 +967,7 @@ pub fn compile_single_function_arrow(
     // Name "<arrow>" makes compile_function set is_arrow so Expr::This uses the
     // __lexical_this upvalue path; "<fn>" keeps the regular LoadThis behaviour.
     let root_name = if is_arrow { "<arrow>" } else { "<fn>" };
-    let (f, ups) = compile_function(
+    let (f, ups, _) = compile_function(
         root_name,
         params,
         body,
@@ -975,7 +992,15 @@ pub fn compile_single_function_arrow(
             }
         }
     }
-    Ok((Module { fns }, ups))
+    // A per-function (non-script) compile never has script-level for-init `var`s
+    // (those are function-local here), so no global syncs are needed.
+    Ok((
+        Module {
+            fns,
+            script_forinit_syncs: Vec::new(),
+        },
+        ups,
+    ))
 }
 
 /// Whether a per-function caller can safely run this module on the VM. Declines
@@ -1127,7 +1152,7 @@ fn compile_function(
     fn_index: &HashMap<String, u16>,
     parent_locals: Option<HashMap<String, Reg>>,
     fns_pool: std::rc::Rc<std::cell::RefCell<Vec<BcFunction>>>,
-) -> Result<(BcFunction, Vec<UpvalueRecord>), CompileError> {
+) -> Result<(BcFunction, Vec<UpvalueRecord>, Vec<(String, Reg)>), CompileError> {
     let is_script = name == "<script>";
     let is_arrow = name == "<arrow>";
     // A nested named function (compiled with a parent snapshot) can refer to
@@ -1155,6 +1180,7 @@ fn compile_function(
         fns_pool,
         free_regs: Vec::new(),
         local_regs: std::collections::HashSet::new(),
+        script_forinit_syncs: Vec::new(),
     };
     let mut rest_reg: Option<Reg> = None;
     for p in params {
@@ -1188,6 +1214,7 @@ fn compile_function(
         ));
     }
     let uvs = c.upvalues.clone();
+    let script_forinit_syncs = c.script_forinit_syncs.clone();
     Ok((
         BcFunction {
             name: name.to_string(),
@@ -1200,6 +1227,7 @@ fn compile_function(
         feedback: std::cell::RefCell::new(Vec::new()),
         },
         uvs,
+        script_forinit_syncs,
     ))
 }
 
@@ -1274,6 +1302,13 @@ struct FnCompiler<'a> {
     /// the interpreter (smaller frames) and letting more functions fit the JIT.
     free_regs: Vec<Reg>,
     local_regs: std::collections::HashSet<Reg>,
+    /// SCRIPT FRAME ONLY: `(global name, register)` for each `for (var i = …)`
+    /// init binding kept in a fast local for the loop (synced to the global at
+    /// loop exit). Surfaced on the `Module` so the run loop can flush the live
+    /// register to `globals` on a mid-loop throw (where the post-loop sync is
+    /// skipped) — the tree-walk/Node/Chrome-identical behavior. Empty in
+    /// non-script frames (a function's for-init `var` is purely function-local).
+    script_forinit_syncs: Vec<(String, Reg)>,
 }
 
 impl<'a> FnCompiler<'a> {
@@ -1555,20 +1590,25 @@ impl<'a> FnCompiler<'a> {
             Stmt::VarDecl { kind: _, decls } => {
                 for VarDeclarator { name, init } in decls {
                     if self.is_script {
-                        // Hoist to a real global. Subsequent reads from
-                        // module-level fns resolve via LoadGlobal.
-                        let value_reg = if let Some(init) = init {
-                            self.compile_expr(init)?
-                        } else {
-                            let r = self.alloc_reg();
-                            self.emit(Op::LoadUndef { dst: r });
-                            r
-                        };
-                        let name_k = self.add_const(Value::str(name.clone()));
-                        self.emit(Op::StoreGlobal {
-                            name_k,
-                            src: value_reg,
-                        });
+                        // The global binding was already created (undefined) at
+                        // hoist time (`hoist_vars_into` / `globals_snapshot`).
+                        // Per ECMA-262 §14.3.2.1, EXECUTING a `var` declaration
+                        // only ASSIGNS when there is an Initializer; `var x;`
+                        // alone is a NO-OP. Emitting `StoreGlobal undefined` for
+                        // the no-init case would CLOBBER any value assigned to the
+                        // global earlier in the same script (the assign-before-var
+                        // shape `x = 7; var x;`, which must leave x === 7 — matches
+                        // the tree-walker's `Stmt::VarDecl` Var arm + Node/Chrome).
+                        // So only store when there is an initializer. Subsequent
+                        // reads from module-level fns resolve via LoadGlobal.
+                        if let Some(init) = init {
+                            let value_reg = self.compile_expr(init)?;
+                            let name_k = self.add_const(Value::str(name.clone()));
+                            self.emit(Op::StoreGlobal {
+                                name_k,
+                                src: value_reg,
+                            });
+                        }
                     } else {
                         let slot = self.declare(name);
                         if let Some(init) = init {
@@ -1643,7 +1683,7 @@ impl<'a> FnCompiler<'a> {
                     });
                     idx
                 };
-                let (inner, inner_upvalues) = compile_function(
+                let (inner, inner_upvalues, _) = compile_function(
                     name,
                     params,
                     body,
@@ -1758,9 +1798,49 @@ impl<'a> FnCompiler<'a> {
                     match init {
                         ForInit::VarDecl { kind: _, decls } => {
                             for VarDeclarator { name, init } in decls {
-                                let slot = self.declare(name);
+                                // SCRIPT FRAME: reuse the SAME register for a name
+                                // that already owns a for-init sync slot (sibling
+                                // `for (var i …)` loops). `Stmt::For` pushes a fresh
+                                // scope so `declare` would otherwise hand out a NEW
+                                // register each time; pinning one register per name
+                                // keeps the throw-time flush (which maps name→ONE
+                                // register on the Module) unambiguous regardless of
+                                // which sibling loop a throw escaped from.
+                                let slot = if self.is_script {
+                                    if let Some(r) = self
+                                        .script_forinit_syncs
+                                        .iter()
+                                        .find(|(n, _)| n == name)
+                                        .map(|(_, r)| *r)
+                                    {
+                                        // Bind the existing register into this loop's
+                                        // (just-pushed) scope so reads/writes resolve.
+                                        self.scopes
+                                            .last_mut()
+                                            .unwrap()
+                                            .insert(name.clone(), r);
+                                        r
+                                    } else {
+                                        self.declare(name)
+                                    }
+                                } else {
+                                    self.declare(name)
+                                };
                                 if self.is_script {
                                     script_forinit_globals.push((name.clone(), slot));
+                                    // Surface (name, live register) on the Module so
+                                    // the run loop can flush the LIVE value to the
+                                    // global on a mid-loop throw (where the post-loop
+                                    // StoreGlobal below is skipped). One entry per
+                                    // name (registers are pinned per name above).
+                                    if !self
+                                        .script_forinit_syncs
+                                        .iter()
+                                        .any(|(n, _)| n == name)
+                                    {
+                                        self.script_forinit_syncs
+                                            .push((name.clone(), slot));
+                                    }
                                 }
                                 if let Some(init) = init {
                                     // Same self-recursion guard as Stmt::VarDecl:
@@ -2260,7 +2340,7 @@ impl<'a> FnCompiler<'a> {
                     });
                     idx
                 };
-                let (inner, inner_upvalues) = compile_function(
+                let (inner, inner_upvalues, _) = compile_function(
                     name.as_deref().unwrap_or("<anon>"),
                     params,
                     body,
@@ -2296,7 +2376,7 @@ impl<'a> FnCompiler<'a> {
                     });
                     idx
                 };
-                let (inner, inner_upvalues) = compile_function(
+                let (inner, inner_upvalues, _) = compile_function(
                     "<arrow>",
                     params,
                     &body_stmts,
@@ -2992,7 +3072,7 @@ impl<'a> FnCompiler<'a> {
                     });
                     idx
                 };
-                let (inner, inner_upvalues) = compile_function(
+                let (inner, inner_upvalues, _) = compile_function(
                     name.as_deref().unwrap_or("<anon>"),
                     params,
                     body,
@@ -3032,7 +3112,7 @@ impl<'a> FnCompiler<'a> {
                     });
                     idx
                 };
-                let (inner, inner_upvalues) = compile_function(
+                let (inner, inner_upvalues, _) = compile_function(
                     "<arrow>",
                     params,
                     &body_stmts,
@@ -3643,6 +3723,108 @@ thread_local! {
     /// `run_function` call. Grows to ~max recursion depth, then recycles.
     static REGS_POOL: std::cell::RefCell<Vec<Vec<Value>>> =
         const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// One in-VM P6 (f64 numeric) native-code cache slot for a module-local function
+/// reached via `Op::CallFn`. `Declined` means the callee isn't P6-compilable
+/// (recorded so we don't retry the compile every call). `Ready` holds the
+/// installed native function. `code_ptr` + `code_len` are a CONTENT GUARD: the
+/// cache is keyed by `(module.fns.as_ptr(), fn_idx)`, but a freed-then-realloc'd
+/// module could reuse that address with DIFFERENT bytecode at the same index — so
+/// a hit is only trusted when the callee's `code` slice identity matches, never
+/// running stale native code.
+enum CallFnP6Slot {
+    Declined,
+    Ready(std::rc::Rc<crate::jit::JitFunction>),
+}
+
+thread_local! {
+    /// In-VM `Op::CallFn` P6 JIT cache, keyed by `(module fns ptr, fn_idx)`.
+    /// Lets a hot, all-numeric, module-local callee reached THROUGH the bytecode
+    /// VM (e.g. the top-level-VM loop's `f(i)` / `work(n)`) run as the SAME P6 f64
+    /// native code the tree-walk call path already uses — so routing the hot top
+    /// level onto the VM does not regress the leaf to the interpreter. Bounded:
+    /// cleared wholesale if it grows past the cap (each entry's executable page is
+    /// freed on drop), so a long-lived process can't accumulate stale modules'
+    /// code. Identity is re-checked on every hit via the content guard below.
+    static CALLFN_P6_CACHE: std::cell::RefCell<
+        std::collections::HashMap<(usize, usize), (usize, usize, CallFnP6Slot)>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Resolve (compile + cache) the P6 f64 native code for module-local `fn_idx`,
+/// returning the installed native function iff the callee is P6-eligible. `None`
+/// means "not P6-compilable" (a recorded decline → caller runs the VM). Keyed by
+/// `(fns ptr, fn_idx)` with a `code`-slice content guard so a recycled module
+/// address can never dispatch stale native code.
+fn resolve_callfn_p6(
+    module: &Module,
+    fn_idx: usize,
+) -> Option<std::rc::Rc<crate::jit::JitFunction>> {
+    let f = module.fns.get(fn_idx)?;
+    // P6 compiles only ≤4-param numeric bodies; declines anything else.
+    if f.n_params > 4 {
+        return None;
+    }
+    let key = (module.fns.as_ptr() as usize, fn_idx);
+    let code_ptr = f.code.as_ptr() as usize;
+    let code_len = f.code.len();
+    CALLFN_P6_CACHE.with(|c| {
+        {
+            let cache = c.borrow();
+            if let Some((cp, cl, slot)) = cache.get(&key) {
+                // Content guard: only trust a hit for the SAME bytecode slice.
+                if *cp == code_ptr && *cl == code_len {
+                    return match slot {
+                        CallFnP6Slot::Declined => None,
+                        CallFnP6Slot::Ready(jf) => Some(jf.clone()),
+                    };
+                }
+            }
+        }
+        // Miss (or a recycled address) — compile fresh. Bound the cache first.
+        {
+            let mut cache = c.borrow_mut();
+            if cache.len() >= 4096 {
+                cache.clear();
+            }
+        }
+        let compiled = crate::jit::compile_bytecode_f64(&f.code, f.n_params, |k| {
+            match f.consts.get(k as usize) {
+                Some(Value::Number(n)) => Some(*n),
+                _ => None,
+            }
+        })
+        .and_then(|code| crate::jit::JitFunction::install(&code).ok());
+        let (slot, ret) = match compiled {
+            Some(jf) => {
+                let rc = std::rc::Rc::new(jf);
+                (CallFnP6Slot::Ready(rc.clone()), Some(rc))
+            }
+            None => (CallFnP6Slot::Declined, None),
+        };
+        c.borrow_mut().insert(key, (code_ptr, code_len, slot));
+        ret
+    })
+}
+
+/// Dispatch numeric `args` to an already-resolved in-VM P6 native function (the
+/// `Op::CallFn` fast path). Mirrors `interp::run_p6_native`: box the (≤4) numeric
+/// args into a stack array, run the native code, and bump the honest P6 exec
+/// counter so the engagement guard counts this dispatch route too. Callers MUST
+/// have checked the args are all-numeric and `args.len() >= n_params`.
+#[inline]
+fn run_callfn_p6(jf: &crate::jit::JitFunction, args: &[Value]) -> Value {
+    let mut fbuf = [0.0f64; 4];
+    let n = args.len().min(4);
+    for (slot, a) in fbuf.iter_mut().zip(args.iter()) {
+        if let Value::Number(v) = a {
+            *slot = *v;
+        }
+    }
+    let r = unsafe { jf.call_f64_args(&fbuf[..n]) };
+    crate::interp::bump_p6_exec_count();
+    Value::Number(r)
 }
 
 /// A register file borrowed from `REGS_POOL`. Derefs to `Vec<Value>` (so callers
@@ -6151,7 +6333,29 @@ fn run_function(
     // itself lives in `run_function_inner` so the T2 deopt path can RESUME the
     // VM mid-function at an arbitrary `bc_pc` over a reconstructed register file
     // — see T2 Phase 5. For the ip=0 entry this is a pure no-op refactor.
-    run_function_inner(module, fn_idx, this, globals, closure, dispatch, &mut regs, 0)
+    let result = run_function_inner(module, fn_idx, this, globals, closure, dispatch, &mut regs, 0);
+    // SCRIPT FRAME throw-time global flush. A top-level `for (var i = …)` init
+    // var is kept in a fast LOCAL register for the hot loop and only synced to its
+    // (function-scoped, i.e. global) binding by a post-loop `StoreGlobal`. On a
+    // THROW/deadline that escapes the loop mid-iteration, that post-loop store is
+    // skipped — so the live register value would never reach `globals`, and a
+    // throwing script's `globalThis.i` would diverge from the tree-walker (which
+    // mutates the global binding in place every iteration). Flush the live
+    // for-init registers to `globals` on the error path so the global ends
+    // byte-identical to the tree-walker + Node/Chrome (`i === 3` for a throw at
+    // i===3). Only the script frame (`fn_idx == 0`) carries these syncs; a normal
+    // (Ok) completion already ran the post-loop store, so we flush ONLY on Err and
+    // never pay a cost in the hot, non-throwing loop. `regs` still holds the final
+    // register image here (it is dropped after this).
+    if result.is_err() && fn_idx == 0 && !module.script_forinit_syncs.is_empty() {
+        let mut g = globals.borrow_mut();
+        for (name, reg) in &module.script_forinit_syncs {
+            if let Some(v) = regs.get(*reg as usize) {
+                g.insert(name.clone(), v.clone());
+            }
+        }
+    }
+    result
 }
 
 /// The shared interpreter dispatch loop. `run_function` calls this with `ip=0`
@@ -6478,6 +6682,32 @@ fn run_function_inner(
                 let mut call_args: Vec<Value> = Vec::with_capacity(n_args as usize);
                 for i in 0..n_args {
                     call_args.push(regs[first_arg as usize + i as usize].clone());
+                }
+                // ── P6 leaf-JIT fast path. A module-local callee that is a hot,
+                // all-numeric, ≤4-arg pure-arithmetic function runs as native f64
+                // code — the SAME P6 tier the tree-walk call path takes. Without
+                // this, routing the hot TOP LEVEL onto the VM regressed a leaf like
+                // jit.js's `f(i)` / loop.js's `work(n)` to the interpreter (the
+                // in-VM `CallFn` only ran `run_function`), losing the native win.
+                // Eligibility mirrors `interp::p6_args_eligible`: JIT on, ≥1 arg,
+                // ≤4 args, at least as many args as params, all-numeric. A non-
+                // numeric arg / non-compilable body falls through to the VM below —
+                // byte-identical, just slower. The result of a P6 numeric fn is a
+                // Number, identical to the VM (the f64 JIT only compiles bodies
+                // whose VM result is provably the same f64).
+                if crate::interp::jit_enabled_pub()
+                    && n_args >= 1
+                    && n_args <= 4
+                    && module
+                        .fns
+                        .get(fn_idx as usize)
+                        .is_some_and(|cf| (n_args as usize) >= cf.n_params as usize)
+                    && call_args.iter().all(|a| matches!(a, Value::Number(_)))
+                {
+                    if let Some(jf) = resolve_callfn_p6(module, fn_idx as usize) {
+                        regs[dst as usize] = run_callfn_p6(&jf, &call_args);
+                        continue;
+                    }
                 }
                 match run_function(
                     module,
@@ -12352,7 +12582,7 @@ mod tests {
         feedback: std::cell::RefCell::new(Vec::new()),
         };
         let call_pc = 2;
-        (Module { fns: vec![f, g] }, call_pc)
+        (Module { fns: vec![f, g], script_forinit_syncs: Vec::new() }, call_pc)
     }
 
     /// INLINED-FRAME-DEOPT FUZZER #1 — the reconstruction is byte-identical to the
@@ -12692,7 +12922,7 @@ mod tests {
             ic: std::cell::RefCell::new(Vec::new()),
             feedback: std::cell::RefCell::new(Vec::new()),
         };
-        let m = Module { fns: vec![f, g] };
+        let m = Module { fns: vec![f, g], script_forinit_syncs: Vec::new() };
         let inlined = crate::t4::inline_first_call(&m, 0).expect("inlines the branchy callee");
         assert!(!inlined.fused.code.iter().any(|op| matches!(op, Op::CallFn { .. })));
         let native = compile_t4_inlined_for_fuzz(&m).expect("branchy inlined body compiles");
@@ -12774,7 +13004,7 @@ mod tests {
             ic: std::cell::RefCell::new(Vec::new()),
             feedback: std::cell::RefCell::new(Vec::new()),
         };
-        let m = Module { fns: vec![f, g] };
+        let m = Module { fns: vec![f, g], script_forinit_syncs: Vec::new() };
 
         // NON-VACUITY: the inliner + P4 fold leave FEWER `Mul` ops in the fused body
         // than the raw splice (which would have all three y*y). Count Muls before/after.

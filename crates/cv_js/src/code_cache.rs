@@ -50,7 +50,7 @@ use std::path::PathBuf;
 /// semantics. A version mismatch rejects every on-disk entry (clean recompile).
 /// This is the coarse "engine version" leg of the cache key — finer-grained flag
 /// + source + shape digests live alongside it in the key.
-pub const ENGINE_VERSION: u32 = 1;
+pub const ENGINE_VERSION: u32 = 2;
 
 /// Magic header bytes (`"TBCC"` = Toasty-Blum Code Cache) + a format version.
 const MAGIC: u32 = 0x5442_4343; // 'T''B''C''C'
@@ -858,6 +858,15 @@ pub fn serialize_module(source: &str, module: &Module) -> Option<Vec<u8>> {
             return None;
         }
     }
+    // Script-frame `for (var i = …)` init→global throw-flush map. Persisted so a
+    // disk-cache RELOAD keeps the mid-loop-throw global write-back (without it a
+    // throwing cached script would diverge from the tree-walker — a silent
+    // wrong-global hazard on a cache hit). `(global name, register)` pairs.
+    w.u32(module.script_forinit_syncs.len() as u32);
+    for (name, reg) in &module.script_forinit_syncs {
+        w.str(name);
+        w.u16(*reg);
+    }
     Some(w.buf)
 }
 
@@ -892,7 +901,21 @@ pub fn deserialize_module(blob: &[u8], expected_key: CacheKey) -> Option<Module>
         let f = read_fn(&mut r, &mut clen)?;
         fns.push(f);
     }
-    Some(Module { fns })
+    // Script-frame for-init `var` throw-flush map (see `serialize_module`).
+    let n_syncs = r.u32()? as usize;
+    if n_syncs > (1 << 16) {
+        return None; // absurd count from a corrupt blob
+    }
+    let mut script_forinit_syncs = Vec::with_capacity(n_syncs.min(1 << 12));
+    for _ in 0..n_syncs {
+        let name = r.str()?;
+        let reg = r.u16()?;
+        script_forinit_syncs.push((name, reg));
+    }
+    Some(Module {
+        fns,
+        script_forinit_syncs,
+    })
 }
 
 // ----------------------------------------------------------------------

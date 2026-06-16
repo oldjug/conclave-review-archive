@@ -523,7 +523,7 @@ pub fn try_compile_t4_status(module: &Module, fn_idx: usize) -> T4CompileStatus 
     //    inputs are BOTH the optimized module (no inlining; resume is on it), and the
     //    reloaded blob is marked is_inlined=false so `run_t4_call` falls to the proven
     //    `run_t3_call` resume — identical to this fresh single-fn install below.
-    let opt_key_module = Module { fns: vec![optimized.clone()] };
+    let opt_key_module = Module { fns: vec![optimized.clone()], script_forinit_syncs: Vec::new() };
     if aot::aot_persist_enabled() {
         if let Some(jf) = aot::load_from_disk(&opt_key_module, &opt_key_module) {
             return T4CompileStatus::Ready(jf);
@@ -569,7 +569,7 @@ pub fn try_compile_t4_status(module: &Module, fn_idx: usize) -> T4CompileStatus 
         Ok(jf) => jf,
         Err(_) => return T4CompileStatus::Decline,
     };
-    let opt_module = std::rc::Rc::new(Module { fns: vec![optimized] });
+    let opt_module = std::rc::Rc::new(Module { fns: vec![optimized], script_forinit_syncs: Vec::new() });
     T4CompileStatus::Ready(
         native
             .with_deopt_sites(deopt_sites)
@@ -716,7 +716,7 @@ pub fn try_compile_t4_inlined_status(module: &Module, fn_idx: usize) -> T4Compil
     //    The fused module is wrapped as a single-fn `Module` exactly as the runtime
     //    carries it (`with_t3_module`); the original caller is the whole module
     //    (so the resume's `fns[0]` caller + every callee sibling is intact).
-    let fused_for_key = Module { fns: vec![result.fused.clone()] };
+    let fused_for_key = Module { fns: vec![result.fused.clone()], script_forinit_syncs: Vec::new() };
     if aot::aot_persist_enabled() {
         if let Some(jf) = aot::load_from_disk(&fused_for_key, module) {
             // The persisted blob carries its own fused + original modules + the
@@ -778,7 +778,7 @@ pub fn try_compile_t4_inlined_status(module: &Module, fn_idx: usize) -> T4Compil
     // sibling lives in the same module, so cloning the WHOLE module preserves both
     // the caller (still `fns[0]`) and every callee index. (The fused module's bank
     // is what codegen targets; the resume's `fns[0]` is the caller.)
-    let fused_module = std::rc::Rc::new(Module { fns: vec![result.fused] });
+    let fused_module = std::rc::Rc::new(Module { fns: vec![result.fused], script_forinit_syncs: Vec::new() });
     // fn_idx == 0 is guaranteed above, so the whole-module clone keeps the caller at
     // fns[0] AND every callee sibling index intact for the re-run-the-call resume.
     let orig_caller_module = std::rc::Rc::new(module.clone());

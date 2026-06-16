@@ -4530,6 +4530,64 @@ fn toplevel_vm_oracle_is_non_vacuous() {
         .expect("must agree AND the VM path must actually engage (non-vacuous)");
 }
 
+/// Helper: run `src` through `Interp::run` with the top-level VM gate forced to
+/// `on`, then return the post-run value of global `name` as an f64 (NaN if it is
+/// not a finite Number). The Chrome/Node parity check for the three divergence
+/// regression cases — `assert_toplevel_vm_agrees` proves the two PATHS agree;
+/// THIS proves they agree on the SPEC value (not on a shared wrong answer).
+fn toplevel_vm_global_num(src: &str, name: &str, on: bool) -> f64 {
+    let _no_tier = crate::interp::set_force_tier(None);
+    crate::interp::reset_bc_fn_cache();
+    let _g = crate::interp::TopLevelVmGuard::new(on);
+    let mut interp = Interp::new();
+    interp.install_basic_globals();
+    let _ = interp.run(src);
+    match interp.globals_snapshot().get(name) {
+        Some(crate::interp::Value::Number(n)) => *n,
+        _ => f64::NAN,
+    }
+}
+
+/// ★ THE THREE DIVERGENCE REGRESSION CASES (the verifier + Node/Chrome cross-check
+/// found these; the fix makes top-level-VM == tree-walk == Chrome on all three).
+///
+/// BUG 1 — assign-before-`var`: `x = 7; var x;`. A no-init top-level `var` must NOT
+///   re-store `undefined` over the earlier assignment (the global was already
+///   hoisted to undefined). Chrome/Node: `x === 7`.
+/// BUG 2 — for-init `var` on a MID-LOOP THROW: the live loop counter must reach the
+///   global even when the post-loop sync is skipped by the throw. Chrome/Node:
+///   `i === 3`.
+/// BUG 3 — block-scoped for-init `var`: a `for (var i …)` inside `{ … }` hoists to
+///   the function/global scope, so `i` survives the block. Chrome/Node: `i === 2`.
+///
+/// Each case asserts BOTH (a) the two paths are byte-identical
+/// (`assert_toplevel_vm_agrees`) and (b) each path's global equals the Chrome value.
+#[test]
+fn toplevel_vm_global_writeback_divergence_cases_match_chrome() {
+    // BUG 1: x === 7 (assign-before-var).
+    {
+        let src = "x = 7; var x;";
+        assert_toplevel_vm_agrees(src).unwrap_or_else(|d| panic!("BUG1 paths diverge:\n{src}\n{d}"));
+        assert_eq!(toplevel_vm_global_num(src, "x", false), 7.0, "BUG1 tree-walk x != 7");
+        assert_eq!(toplevel_vm_global_num(src, "x", true), 7.0, "BUG1 VM x != 7 (Chrome=7)");
+    }
+    // BUG 2: i === 3 (for-init var, mid-loop throw). Caught at top level (no
+    // try/catch); the throw escapes `run`, so we read the global afterward.
+    {
+        let src = "var s=0; for(var i=0;i<5;i=i+1){ s=s+i; if(i===3) throw 'mid'; }";
+        assert_toplevel_vm_agrees(src).unwrap_or_else(|d| panic!("BUG2 paths diverge:\n{src}\n{d}"));
+        assert_eq!(toplevel_vm_global_num(src, "i", false), 3.0, "BUG2 tree-walk i != 3");
+        assert_eq!(toplevel_vm_global_num(src, "i", true), 3.0, "BUG2 VM i != 3 (Chrome=3)");
+    }
+    // BUG 3: i === 2 (block-scoped for-init var hoists to function/global scope).
+    {
+        let src = "{ for(var i=0;i<2;i=i+1){} } i;";
+        assert_toplevel_vm_agrees(src).unwrap_or_else(|d| panic!("BUG3 paths diverge:\n{src}\n{d}"));
+        assert_eq!(toplevel_vm_global_num(src, "i", false), 2.0, "BUG3 tree-walk i != 2 (Chrome=2)");
+        assert_eq!(toplevel_vm_global_num(src, "i", true), 2.0, "BUG3 VM i != 2 (Chrome=2)");
+    }
+}
+
 /// A broad reuse of curated stressors through the top-level oracle.
 #[test]
 fn toplevel_vm_corpus_agrees() {

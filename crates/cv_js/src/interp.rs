@@ -1723,6 +1723,24 @@ thread_local! {
     static P6_JIT_FORCE_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// Public accessor for the P6 numeric JIT gate (default-on, opt out via
+/// `CV_NOJIT`, force-off via `NoP6JitGuard`). Lets the bytecode VM's in-VM
+/// `Op::CallFn` route a hot, all-numeric module-local callee to the SAME P6 f64
+/// native tier the tree-walk call path already uses — so a leaf `f(i)` reached
+/// THROUGH the top-level VM (instead of via `call_value_with_this`) still runs as
+/// native code (no regression vs the tree-walk-top-level path).
+pub fn jit_enabled_pub() -> bool {
+    jit_enabled()
+}
+
+/// Bump the honest P6 native-execution counter by one. Public so the bytecode
+/// VM's in-VM `Op::CallFn` P6 fast path attributes its native runs to P6 exactly
+/// like the tree-walk path's `run_p6_native` does (the engagement/honesty guard
+/// the benches read must count BOTH dispatch routes).
+pub fn bump_p6_exec_count() {
+    P6_EXEC_COUNT.with(|c| c.set(c.get() + 1));
+}
+
 fn jit_enabled() -> bool {
     if P6_JIT_FORCE_OFF.with(|c| c.get()) {
         return false;
@@ -14466,29 +14484,42 @@ impl Interp {
                 if let Some(init) = init {
                     match init {
                         ForInit::VarDecl { kind, decls } => {
-                            // `var` is function-scoped, so it must remain
-                            // visible AFTER the loop (e.g. webpack's
-                            // `for(var n=…,d=!0;…) …; if(d){…}`). Bind it in
-                            // the enclosing scope; only `let`/`const` are
-                            // block-scoped to the loop's own scope. Initializer
-                            // expressions still evaluate in `for_scope` so an
-                            // earlier declarator is visible to a later one.
-                            let var_target = if matches!(kind, VarKind::Var) {
-                                env
-                            } else {
-                                &for_scope
-                            };
+                            // `var` is FUNCTION-scoped (ECMA-262 §14.7.4): it must
+                            // hoist to the nearest function/global scope, NOT the
+                            // immediate block. `hoist_vars_into` already created the
+                            // binding there (it descends into blocks + for-inits), so
+                            // EXECUTING the init ASSIGNS that hoisted binding via
+                            // `scope_set` (which walks UP to it) — never `scope_define`
+                            // into `env`, which when the `for` sits inside a `{ … }`
+                            // block would create a stale BLOCK-LOCAL `i` that vanishes
+                            // at the block's end. That bug made `{ for(var i=0;…){} } i;`
+                            // read `undefined` in the tree-walker while the VM (and
+                            // Node/Chrome) give `2`. Mirrors the `Stmt::VarDecl` Var
+                            // arm, which already uses `scope_set` for the same reason.
+                            // `let`/`const` stay block-scoped to the loop's own scope.
+                            // Initializer expressions still evaluate in `for_scope` so
+                            // an earlier declarator is visible to a later one.
                             for d in decls {
                                 let v = match &d.init {
                                     Some(e) => self.eval(e, &for_scope)?,
                                     None => Value::Undefined,
                                 };
-                                scope_define(
-                                    var_target,
-                                    &d.name,
-                                    v,
-                                    matches!(kind, VarKind::Const),
-                                );
+                                if matches!(kind, VarKind::Var) {
+                                    // `var` for-init with no initializer is still a
+                                    // no-op assignment of the hoisted `undefined` — but
+                                    // an explicit `for(var i=0;…)` MUST assign. We only
+                                    // reach here when there IS a declarator value
+                                    // (undefined when no init), so always assign the
+                                    // hoisted binding.
+                                    scope_set(env, &d.name, v)?;
+                                } else {
+                                    scope_define(
+                                        &for_scope,
+                                        &d.name,
+                                        v,
+                                        matches!(kind, VarKind::Const),
+                                    );
+                                }
                             }
                         }
                         ForInit::Expr(e) => {
