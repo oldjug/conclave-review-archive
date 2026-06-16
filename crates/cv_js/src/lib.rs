@@ -86,6 +86,14 @@ pub mod weakref;
 /// T2-lite backend. Gated by `CV_T3` / `ForcedTier::T3`, DEFAULT OFF.
 pub mod t3;
 
+/// T4 (Maglev-class) speculative optimizing tier — PHASE P2: representation
+/// selection + unboxed Float64. Reuses T3's optimizer + the T2-lite deopt
+/// keystone, but emits through the representation-aware backend
+/// (`jit::compile_t4_unboxed_with_deopt`) so same-block numeric operands skip the
+/// per-op reload + tag-check + unbox. Gated by `CV_T4` / `ForcedTier::T4`, DEFAULT
+/// OFF (byte-identical default build until soak).
+pub mod t4;
+
 pub use ast::{ArrowBody, Expr, ForInit, Stmt, VarDeclarator, VarKind};
 pub use bytecode::{
     BcFunction, CompileError, Module, Op, RuntimeError, compile_program as bc_compile,
@@ -105,8 +113,8 @@ pub use interp::{
     parse_bigint_from_string,
     register_jit_bank, resolve_promise,
     reset_bc_fn_cache, reset_call_inline_cache, reset_p6_exec_count, reset_t1_exec_count,
-    reset_t2_exec_count, reset_t3_exec_count, set_force_tier, t1_exec_count, t2_exec_count,
-    t2_heap_enabled, t3_exec_count,
+    reset_t2_exec_count, reset_t3_exec_count, reset_t4_exec_count, set_force_tier, t1_exec_count,
+    t2_exec_count, t2_heap_enabled, t3_exec_count, t4_exec_count,
 };
 pub use lexer::{Keyword, Punct, Token, TokenKind, tokenize};
 pub use parser::{ParseError, parse_program};

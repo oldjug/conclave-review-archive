@@ -1501,6 +1501,50 @@ pub fn t3_enabled() -> bool {
     crate::t3::t3_enabled()
 }
 
+// ---- T4 Maglev-class tier (PHASE P2): per-function native-code cache + exec
+// counter, mirroring T3's machinery (its own slot type so a T4 compile decision is
+// independent of T3's). T4 reuses the T3 RUNNER (`run_t3_call`) because T4 native
+// code, like T3's, resumes the VM on the OPTIMIZED module carried on the
+// JitFunction — so only the COMPILE path differs (representation-aware backend). ----
+
+/// Per-function T4 native-code slot, keyed by `Rc::as_ptr(FunctionValue)`.
+enum T4Slot {
+    Untried,
+    Declined,
+    Ready(Rc<crate::jit::JitFunction>),
+}
+
+struct T4Entry {
+    weak: Weak<FunctionValue>,
+    count: u32,
+    slot: T4Slot,
+}
+
+thread_local! {
+    static T4_CACHE: RefCell<std::collections::HashMap<usize, T4Entry>> =
+        RefCell::new(std::collections::HashMap::new());
+    /// Count of function invocations that ran as T4 native code (whether or not
+    /// they deopted partway). The bench/oracle read this to prove the tier engaged
+    /// (a vacuously-green T4 — silently declining everything — is a FAIL).
+    static T4_EXEC_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Number of T4 native function executions on this thread since the last reset.
+pub fn t4_exec_count() -> u64 {
+    T4_EXEC_COUNT.with(|c| c.get())
+}
+
+/// Reset the T4 exec counter (call before a measured run).
+pub fn reset_t4_exec_count() {
+    T4_EXEC_COUNT.with(|c| c.set(0));
+}
+
+/// Clear the per-function T4 native-code cache (the oracle clears it between tiers
+/// so a compile decision can't leak across runs).
+pub fn reset_t4_cache() {
+    T4_CACHE.with(|c| c.borrow_mut().clear());
+}
+
 /// Whether the T4 Maglev-class optimizing tier is enabled. Re-exported wrapper
 /// over `crate::t3::t4_enabled` so the dispatcher reads it like the others.
 /// DEFAULT-OFF; P0 scaffold declines on every function (byte-identical default).
@@ -20678,7 +20722,6 @@ impl Interp {
     /// arrives, this body grows the feedback/representation/inline path; until
     /// then declining is the correct, byte-identical scaffold (NOT a stub — it is
     /// the honest "no T4 codegen yet, run the lower proven tier" outcome).
-    #[allow(unused_variables)]
     fn try_t4_call(
         &mut self,
         f: &Rc<FunctionValue>,
@@ -20686,11 +20729,67 @@ impl Interp {
         this_value: &Value,
         args: &[Value],
     ) -> Option<Result<Value, crate::bytecode::RuntimeError>> {
-        // P0: no codegen — decline so the caller runs T3/T2/VM (always correct).
-        // The keystones this tier will rely on (osr::InlinedDeoptSite reconstruction
-        // + SafepointMap::verify_against_bank) are activated + fuzz-proven in P0; the
-        // codegen that uses them lands in P2/P3.
-        None
+        // P2: REAL codegen — the representation-specialized backend. The compile
+        // path mirrors `try_t3_call` (per-function cache keyed by FunctionValue ptr,
+        // compile-on-hot, reuse-guarded by Weak upgrade); the RUN path reuses the
+        // T3 runner (`run_t3_call`) because T4 native code, like T3's, resumes the
+        // VM on the OPTIMIZED module carried on the JitFunction — a deopt is
+        // byte-identical to the VM. Any function outside the numeric/control-flow
+        // subset DECLINES (None) → the dispatcher falls to T3/T2/VM (always correct).
+        let forced = matches!(forced_tier(), Some(ForcedTier::T4));
+        let ptr = Rc::as_ptr(f) as usize;
+        let native: Option<Rc<crate::jit::JitFunction>> = T4_CACHE.with(|c| {
+            let mut cache = c.borrow_mut();
+            let entry = cache.entry(ptr).or_insert_with(|| T4Entry {
+                weak: Rc::downgrade(f),
+                count: 0,
+                slot: T4Slot::Untried,
+            });
+            if entry.weak.upgrade().map_or(true, |rc| !Rc::ptr_eq(&rc, f)) {
+                *entry = T4Entry {
+                    weak: Rc::downgrade(f),
+                    count: 0,
+                    slot: T4Slot::Untried,
+                };
+            }
+            match &entry.slot {
+                T4Slot::Ready(jf) => Some(jf.clone()),
+                T4Slot::Declined => None,
+                T4Slot::Untried => {
+                    entry.count += 1;
+                    if forced || entry.count >= T2_THRESHOLD {
+                        match crate::t4::try_compile_t4_status(module, 0) {
+                            crate::t4::T4CompileStatus::Ready(jf) => {
+                                let rc = Rc::new(jf);
+                                entry.slot = T4Slot::Ready(rc.clone());
+                                Some(rc)
+                            }
+                            crate::t4::T4CompileStatus::Decline => {
+                                entry.slot = T4Slot::Declined;
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    }
+                }
+            }
+        });
+        let native = native?;
+        let g = self.global.borrow().bindings.clone();
+        let res = {
+            let mut dispatch = |callee: Value, this: Value, a: Vec<Value>| {
+                self.call_value_with_this(callee, this, a).map_err(|e| match e {
+                    JsError::Throw(v) => crate::bytecode::RuntimeError::Thrown(v),
+                    other => crate::bytecode::RuntimeError::TypeError(format!("{other:?}")),
+                })
+            };
+            crate::bytecode::run_t3_call(&native, args, this_value, &g, &mut dispatch)
+        };
+        // The native code RAN (even if it deopted partway) — count it as a T4
+        // execution so the engagement honesty guard is not vacuously green.
+        T4_EXEC_COUNT.with(|c| c.set(c.get() + 1));
+        Some(res)
     }
 
     /// T3 OPTIMIZING fast path (B2; OFF by default, opt in via CV_T3 or

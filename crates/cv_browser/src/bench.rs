@@ -219,6 +219,7 @@ struct JsResult {
     p6_exec_count: u64,
     t1_exec_count: u64,
     t3_exec_count: u64,
+    t4_exec_count: u64,
     t2_exec_count: u64,
     t2_enabled: bool,
 }
@@ -465,6 +466,7 @@ fn measure_js(file: &str, result_global: &str) -> Result<JsResult, String> {
     let mut last_p6 = 0u64;
     let mut last_t1 = 0u64;
     let mut last_t3 = 0u64;
+    let mut last_t4 = 0u64;
     let mut last_t2 = 0u64;
 
     // Warmup iters (not timed) — primes any process-global JIT machinery so the
@@ -485,6 +487,7 @@ fn measure_js(file: &str, result_global: &str) -> Result<JsResult, String> {
         cv_js::reset_p6_exec_count();
         cv_js::reset_t1_exec_count();
         cv_js::reset_t3_exec_count();
+        cv_js::reset_t4_exec_count();
         cv_js::reset_t2_exec_count();
         let tc = Instant::now();
         rt.interp
@@ -520,16 +523,18 @@ fn measure_js(file: &str, result_global: &str) -> Result<JsResult, String> {
         last_p6 = cv_js::p6_exec_count();
         last_t1 = cv_js::t1_exec_count();
         last_t3 = cv_js::t3_exec_count();
+        last_t4 = cv_js::t4_exec_count();
         last_t2 = cv_js::t2_exec_count();
     }
 
     Ok(JsResult {
         cold_ms,
         warm_ms,
-        native_exec_count: last_p6 + last_t1 + last_t3 + last_t2,
+        native_exec_count: last_p6 + last_t1 + last_t3 + last_t4 + last_t2,
         p6_exec_count: last_p6,
         t1_exec_count: last_t1,
         t3_exec_count: last_t3,
+        t4_exec_count: last_t4,
         t2_exec_count: last_t2,
         t2_enabled: cv_js::t2_heap_enabled(),
     })
@@ -747,6 +752,8 @@ fn js_json(r: &JsResult) -> J {
         ("p6_exec_count", J::I(r.p6_exec_count as i64)),
         ("t1_exec_count", J::I(r.t1_exec_count as i64)),
         ("t3_exec_count", J::I(r.t3_exec_count as i64)),
+        // T4 Maglev-class representation-selection tier (CV_T4; default off).
+        ("t4_exec_count", J::I(r.t4_exec_count as i64)),
         // Kept for continuity with the prior baseline JSON.
         ("t2_exec_count", J::I(r.t2_exec_count as i64)),
         ("t2_enabled", J::Bool(r.t2_enabled)),

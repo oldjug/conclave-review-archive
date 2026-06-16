@@ -1701,6 +1701,544 @@ pub fn compile_t2lite_with_deopt(
     Some((em.code, deopt_sites))
 }
 
+/// T4 (Maglev-class) P2 — compile an OPTIMIZED numeric bytecode function to native
+/// code with REPRESENTATION SELECTION (unboxed Float64) + the proven per-guard
+/// resume deopt. This is `compile_t2lite_with_deopt`'s numeric subset PLUS the
+/// per-block unboxed-f64 value cache (see the big comment below): same prolog,
+/// same DeoptSites, same epilogue/stubs, same bank store-after-every-op — the
+/// ONLY difference is that an arithmetic/compare operand whose unboxed f64 is
+/// already resident in an XMM from earlier in the same basic block is read
+/// straight from that XMM instead of being reloaded + tag-checked + unboxed.
+///
+/// SUBSET: the numeric/control-flow ops T3 lowers (LoadConst/LoadUndef/bool/Move/
+/// Add/Sub/Mul/Div/compares/Jmp/JmpIfFalse/Ret). Any other op (GetProp/Call/heap/
+/// try) declines (`None`) — the caller falls to T3/T2/VM. NUMERIC store mode only
+/// (the bank holds immediates), so no helper call ever clobbers the XMM cache.
+///
+/// Returns the code bytes + the per-guard DeoptSite table, exactly like the
+/// T2-lite backend, so the EXISTING T3 runner (`run_t3_call`) executes it and the
+/// EXISTING resume machinery handles a deopt — T4 needs no new runner.
+#[cfg(target_os = "windows")]
+pub fn compile_t4_unboxed_with_deopt(
+    code: &[crate::bytecode::Op],
+    const_f64: impl Fn(u16) -> Option<f64>,
+) -> Option<(Vec<u8>, Vec<crate::osr::DeoptSite>)> {
+    use crate::bytecode::Op;
+    if code.is_empty() {
+        return None;
+    }
+    let n = code.len();
+    let store_mode = T2StoreMode::Numeric;
+
+    // Decline ops outside the numeric subset up front (the cache reasoning + the
+    // no-XMM-clobber guarantee both rely on the numeric-only subset).
+    for op in code {
+        let ok = matches!(
+            op,
+            Op::LoadConst { .. }
+                | Op::LoadUndef { .. }
+                | Op::LoadTrue { .. }
+                | Op::LoadFalse { .. }
+                | Op::LoadNull { .. }
+                | Op::Move { .. }
+                | Op::Add { .. }
+                | Op::Sub { .. }
+                | Op::Mul { .. }
+                | Op::Div { .. }
+                | Op::Lt { .. }
+                | Op::Le { .. }
+                | Op::Gt { .. }
+                | Op::Ge { .. }
+                | Op::Eq { .. }
+                | Op::Neq { .. }
+                | Op::LooseEq { .. }
+                | Op::LooseNeq { .. }
+                | Op::Jmp { .. }
+                | Op::JmpIfFalse { .. }
+                | Op::Ret { .. }
+        );
+        if !ok {
+            return None;
+        }
+    }
+
+    // Block-boundary set: every op that is a JUMP TARGET begins a basic block, so
+    // the XMM cache (which is per-block) must be invalidated at its entry — a value
+    // computed before a back-edge / branch is NOT live in an XMM after the jump.
+    // We mark each target index; the main loop invalidates the cache when it
+    // reaches a marked op (and after every branch/jump/ret, which END a block).
+    let mut is_block_start = vec![false; n];
+    is_block_start[0] = true;
+    for op in code {
+        match *op {
+            Op::Jmp { target }
+            | Op::JmpIfFalse { target, .. }
+            | Op::JmpIfTrue { target, .. } => {
+                if (target as usize) < n {
+                    is_block_start[target as usize] = true;
+                }
+            }
+            _ => {}
+        }
+        // The op AFTER a branch/jump/ret also starts a block (a fall-through join).
+        // Handled in the loop by invalidating after those ops.
+    }
+
+    let mut em = Emitter::new();
+    let mut offsets = vec![0usize; n];
+    let mut jump_patches: Vec<(usize, usize)> = Vec::new();
+    let mut deopt_patches: Vec<(usize, crate::osr::DeoptReason)> = Vec::new();
+    let mut tier_a_deopt_patches: Vec<usize> = Vec::new();
+    let mut epilogue_patches: Vec<usize> = Vec::new();
+    let mut deopt_sites: Vec<crate::osr::DeoptSite> = Vec::new();
+    let mut resume_patches: Vec<(usize, usize)> = Vec::new();
+
+    // Prolog — IDENTICAL to the T2-lite backend (4 callee-saved pushes keep RSP ≡ 8
+    // (mod 16) at every op boundary; T4 uses only volatile XMM0..=XMM5 so it needs
+    // no xmm save area). BANK/OUT/CTX loaded from RCX/RDX/R8 (CTX unused — no calls).
+    em.push_r64(T2_BANK);
+    em.push_r64(T2_OUT);
+    em.push_r64(T2_CTX);
+    em.push_r64(R64::Rbp);
+    em.mov_r64_r64(T2_BANK, R64::Rcx);
+    em.mov_r64_r64(T2_OUT, R64::Rdx);
+    em.mov_r64_r64(T2_CTX, R64::R8);
+
+    let force_deopt_pc = T2_FORCE_DEOPT_PC.with(|c| c.get());
+    let mut cache = T4ValueCache::new();
+    let mut i = 0usize;
+    while i < n {
+        offsets[i] = em.code.len();
+        // BLOCK BOUNDARY: a jump target begins a fresh block — invalidate the XMM
+        // cache so cross-block reads reload-with-guard from the bank (the value is
+        // not live in an XMM across the branch). This is what makes the per-block
+        // cache sound with NO dataflow analysis: out-of-block always reloads.
+        if is_block_start[i] {
+            cache.invalidate();
+        }
+        let deopt_before = deopt_patches.len();
+        // DEOPT-FUZZ force (same as T2-lite): force a deopt at op `i`'s boundary.
+        if force_deopt_pc == Some(i) {
+            let fj = em.jmp_rel32_placeholder();
+            deopt_patches.push((fj, crate::osr::DeoptReason::NonNumber));
+        }
+        match code[i] {
+            Op::LoadConst { dst, k } => {
+                let f = const_f64(k)?;
+                let bits = if f.is_nan() { JV_CANONICAL_NAN } else { f.to_bits() };
+                em.mov_r64_imm64(R64::Rax, bits as i64);
+                t2_emit_bank_store(&mut em, dst, store_mode);
+                // The constant's value isn't put in an XMM here (it's stored boxed);
+                // forget any stale cache entry so a later read reloads it (cheap —
+                // a constant operand is a one-time movq). Keeping it out of the
+                // cache avoids a redundant materialize for a const that's never
+                // re-read.
+                cache.forget(dst);
+            }
+            Op::LoadUndef { dst } => {
+                em.mov_r64_imm64(R64::Rax, 0xFFFE_0000_0000_0000u64 as i64);
+                t2_emit_bank_store(&mut em, dst, store_mode);
+                cache.forget(dst);
+            }
+            Op::LoadTrue { dst } => {
+                em.mov_r64_imm64(R64::Rax, JV_TRUE as i64);
+                t2_emit_bank_store(&mut em, dst, store_mode);
+                cache.forget(dst);
+            }
+            Op::LoadFalse { dst } => {
+                em.mov_r64_imm64(R64::Rax, JV_FALSE as i64);
+                t2_emit_bank_store(&mut em, dst, store_mode);
+                cache.forget(dst);
+            }
+            Op::LoadNull { dst } => {
+                em.mov_r64_imm64(R64::Rax, 0xFFFE_0000_0000_0001u64 as i64);
+                t2_emit_bank_store(&mut em, dst, store_mode);
+                cache.forget(dst);
+            }
+            Op::Move { dst, src } => {
+                // A Move just copies the JsVal (whatever lane). Do the raw copy as
+                // T2-lite does (so a non-number value moves correctly), and update
+                // the cache: if `src` is cached, `dst` now aliases the same f64 —
+                // copy it into a dst cache XMM; else forget `dst`.
+                em.mov_r64_mem(R64::Rax, T2_BANK, (src as i32) * 8);
+                t2_emit_bank_store(&mut em, dst, store_mode);
+                if let Some(sx) = cache.get(src) {
+                    let dx = cache.assign(dst);
+                    if dx != sx {
+                        em.movsd_xmm_xmm(dx, sx);
+                    }
+                } else {
+                    cache.forget(dst);
+                }
+            }
+            Op::Add { dst, lhs, rhs } => {
+                t4_emit_arith(&mut em, T2Arith::Add, dst, lhs, rhs, &mut cache, &mut deopt_patches, store_mode);
+            }
+            Op::Sub { dst, lhs, rhs } => {
+                t4_emit_arith(&mut em, T2Arith::Sub, dst, lhs, rhs, &mut cache, &mut deopt_patches, store_mode);
+            }
+            Op::Mul { dst, lhs, rhs } => {
+                t4_emit_arith(&mut em, T2Arith::Mul, dst, lhs, rhs, &mut cache, &mut deopt_patches, store_mode);
+            }
+            Op::Div { dst, lhs, rhs } => {
+                t4_emit_arith(&mut em, T2Arith::Div, dst, lhs, rhs, &mut cache, &mut deopt_patches, store_mode);
+            }
+            Op::Lt { dst, lhs, rhs } => {
+                t4_emit_cmp(&mut em, T2Cmp::Lt, dst, lhs, rhs, &cache, &mut deopt_patches, store_mode);
+                cache.forget(dst); // result is a Bool, not an unboxed f64
+            }
+            Op::Le { dst, lhs, rhs } => {
+                t4_emit_cmp(&mut em, T2Cmp::Le, dst, lhs, rhs, &cache, &mut deopt_patches, store_mode);
+                cache.forget(dst);
+            }
+            Op::Gt { dst, lhs, rhs } => {
+                t4_emit_cmp(&mut em, T2Cmp::Gt, dst, lhs, rhs, &cache, &mut deopt_patches, store_mode);
+                cache.forget(dst);
+            }
+            Op::Ge { dst, lhs, rhs } => {
+                t4_emit_cmp(&mut em, T2Cmp::Ge, dst, lhs, rhs, &cache, &mut deopt_patches, store_mode);
+                cache.forget(dst);
+            }
+            Op::Eq { dst, lhs, rhs } | Op::LooseEq { dst, lhs, rhs } => {
+                t4_emit_cmp(&mut em, T2Cmp::Eq, dst, lhs, rhs, &cache, &mut deopt_patches, store_mode);
+                cache.forget(dst);
+            }
+            Op::Neq { dst, lhs, rhs } | Op::LooseNeq { dst, lhs, rhs } => {
+                t4_emit_cmp(&mut em, T2Cmp::Neq, dst, lhs, rhs, &cache, &mut deopt_patches, store_mode);
+                cache.forget(dst);
+            }
+            Op::Jmp { target } => {
+                let o = em.jmp_rel32_placeholder();
+                jump_patches.push((o, target as usize));
+                cache.invalidate(); // end of block
+            }
+            Op::JmpIfFalse { cond, target } => {
+                // Read `cond` from the bank (it is a Bool/number — the cache holds
+                // only f64 values; a Bool result was `forget`-ed above, so a fresh
+                // bank read is correct). The branch ENDS the block.
+                t2_emit_jmp_if_false(&mut em, cond, &mut jump_patches, target as usize, &mut deopt_patches);
+                cache.invalidate();
+            }
+            Op::Ret { src } => {
+                // Store the bank's boxed value (the canonical image — NOT the cache,
+                // so the returned value is byte-identical to the VM) to *out.
+                em.mov_r64_mem(R64::Rax, T2_BANK, (src as i32) * 8);
+                em.mov_mem_r64(T2_OUT, 0, R64::Rax);
+                let e = em.jmp_rel32_placeholder();
+                epilogue_patches.push(e);
+                cache.invalidate();
+            }
+            _ => return None,
+        }
+        // Attribute every guard emitted during op `i` to a DeoptSite at bc_pc == i
+        // (the op boundary) — IDENTICAL to the T2-lite backend.
+        for (off, reason) in deopt_patches.drain(deopt_before..) {
+            let site_idx = deopt_sites.len();
+            deopt_sites.push(crate::osr::DeoptSite {
+                native_off: 0,
+                bc_pc: i,
+                reason,
+            });
+            resume_patches.push((off, site_idx));
+        }
+        i += 1;
+    }
+    debug_assert!(deopt_patches.is_empty());
+
+    // Fall-through guard → Tier-A deopt (same as T2-lite).
+    let deopt_fallthrough = em.jmp_rel32_placeholder();
+    tier_a_deopt_patches.push(deopt_fallthrough);
+
+    // Epilogue + deopt pads + per-guard resume stubs — IDENTICAL to T2-lite.
+    let emit_restore_ret = |em: &mut Emitter| {
+        em.pop_r64(R64::Rbp);
+        em.pop_r64(T2_CTX);
+        em.pop_r64(T2_OUT);
+        em.pop_r64(T2_BANK);
+        em.ret();
+    };
+    let epilogue = em.code.len();
+    em.mov_r64_imm64(R64::Rax, T2_RETURNED as i64);
+    emit_restore_ret(&mut em);
+    let deopt = em.code.len();
+    em.mov_r64_imm64(R64::Rax, T2_DEOPT as i64);
+    emit_restore_ret(&mut em);
+    let resume_tail = em.code.len();
+    em.mov_r64_imm64(R64::Rax, T2_DEOPT_RESUME as i64);
+    emit_restore_ret(&mut em);
+    let mut stub_off: Vec<usize> = Vec::with_capacity(deopt_sites.len());
+    for (idx, site) in deopt_sites.iter_mut().enumerate() {
+        let off = em.code.len();
+        site.native_off = off;
+        stub_off.push(off);
+        em.mov_r64_imm64(R64::Rcx, idx as i64);
+        em.mov_mem_r64(T2_OUT, 0, R64::Rcx);
+        let j = em.jmp_rel32_placeholder();
+        em.patch_rel32_to(j, resume_tail);
+    }
+    for (_, t) in &jump_patches {
+        if *t >= n {
+            return None;
+        }
+    }
+    for (disp_off, t) in jump_patches {
+        em.patch_rel32_to(disp_off, offsets[t]);
+    }
+    for disp_off in epilogue_patches {
+        em.patch_rel32_to(disp_off, epilogue);
+    }
+    for disp_off in tier_a_deopt_patches {
+        em.patch_rel32_to(disp_off, deopt);
+    }
+    for (disp_off, site_idx) in resume_patches {
+        em.patch_rel32_to(disp_off, stub_off[site_idx]);
+    }
+    Some((em.code, deopt_sites))
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn compile_t4_unboxed_with_deopt(
+    _code: &[crate::bytecode::Op],
+    _const_f64: impl Fn(u16) -> Option<f64>,
+) -> Option<(Vec<u8>, Vec<crate::osr::DeoptSite>)> {
+    None
+}
+
+/// T4 arith: get both operands (cache-aware — same-block operands skip the
+/// reload+tag-check), compute into T2_XA, then box+store to the bank AND cache the
+/// unboxed result for same-block consumers.
+fn t4_emit_arith(
+    em: &mut Emitter,
+    op: T2Arith,
+    dst: u16,
+    lhs: u16,
+    rhs: u16,
+    cache: &mut T4ValueCache,
+    deopt_patches: &mut Vec<(usize, crate::osr::DeoptReason)>,
+    store_mode: T2StoreMode,
+) {
+    t4_emit_get_operand(em, cache, lhs, T2_XA, deopt_patches);
+    t4_emit_get_operand(em, cache, rhs, T2_XB, deopt_patches);
+    match op {
+        T2Arith::Add => em.addsd_xmm_xmm(T2_XA, T2_XB),
+        T2Arith::Sub => em.subsd_xmm_xmm(T2_XA, T2_XB),
+        T2Arith::Mul => em.mulsd_xmm_xmm(T2_XA, T2_XB),
+        T2Arith::Div => em.divsd_xmm_xmm(T2_XA, T2_XB),
+    }
+    t4_emit_box_store_cached(em, T2_XA, dst, cache, store_mode);
+}
+
+/// T4 compare: get both operands cache-aware (T2_XA/T2_XB), then the SAME
+/// `t2_emit_cmp_store` boolean-result emission as T2-lite. The Bool result is not
+/// an unboxed f64, so the caller `forget`s `dst` after.
+fn t4_emit_cmp(
+    em: &mut Emitter,
+    cmp: T2Cmp,
+    dst: u16,
+    lhs: u16,
+    rhs: u16,
+    cache: &T4ValueCache,
+    deopt_patches: &mut Vec<(usize, crate::osr::DeoptReason)>,
+    store_mode: T2StoreMode,
+) {
+    t4_emit_get_operand(em, cache, lhs, T2_XA, deopt_patches);
+    t4_emit_get_operand(em, cache, rhs, T2_XB, deopt_patches);
+    t2_emit_cmp_store(em, cmp, dst, store_mode);
+}
+
+// ======================================================================
+// T4 (Maglev-class) P2 — REPRESENTATION SELECTION + UNBOXED FLOAT64.
+//
+// The T2-lite numeric backend above re-does the FULL box/unbox round-trip on
+// EVERY arithmetic op: it reloads both operands from the bank, runs the
+// `is-number` tag-check guard, unboxes each to an XMM, computes, re-boxes
+// (NaN-canonicalize), and stores back to the bank. For a value produced and
+// immediately consumed within the SAME basic block (the dominant shape of an
+// arithmetic-heavy function like jit.js's `f(x)` — a long chain of `t = a OP b`
+// temporaries), the reload + tag-check + unbox of that operand is PURE WASTE: we
+// just boxed it from an XMM one op ago and it is provably a number.
+//
+// T4 P2 adds REPRESENTATION SELECTION over the FLOAT64 representation: within a
+// basic block it keeps each register's UNBOXED f64 value resident in an XMM and
+// reads same-block operands straight from that XMM — eliminating the redundant
+// reload + tag-check guard + unbox on every intermediate. This is exactly V8
+// Maglev's `ValueRepresentation::kFloat64` selection + its CheckNumber/CheckSmi
+// guard placement: the guard (a DeoptSite) fires ONCE where a TAGGED value first
+// enters the unboxed domain (a fresh bank operand, e.g. the parameter `x` or a
+// cross-block value), NOT on every use. Modeled on V8
+// `src/maglev/maglev-graph-builder` representation selection + the
+// `CheckedTaggedToFloat64`/`CheckSmi` conversion nodes.
+//
+// CORRECTNESS — the deopt identity-map invariant is PRESERVED VERBATIM. Every op
+// STILL boxes its result and stores it to its bank slot (so the bank remains the
+// exact pre-op VM register image at every op boundary), and every guard is the
+// SAME DeoptSite the T2-lite path emits, with bc_pc == the op index — so a
+// non-number operand deopts to the VM frame byte-identically. The ONLY thing T4
+// changes is WHERE an operand's f64 value comes from when it is already proven
+// unboxed in-block (an XMM read instead of a reload+guard). The XMM cache is a
+// pure performance shadow of the bank; it is INVALIDATED at every basic-block
+// boundary (any jump target, and after every branch/jump/ret), so a cross-block
+// value always reloads-with-guard from the bank — cross-block correctness is
+// trivially the same as T2-lite. The A/B oracle (ForcedTier::T4) proves
+// byte-identity to the VM across the corpus, and the deopt-fuzzer force-deopts
+// every op to prove the resumed VM result is identical.
+//
+// REPRESENTATION (P2 scope): FLOAT64 only — always correct for JS Numbers (every
+// JS number is an f64; the `Value::Number(f64)` model has no separate Int32
+// value, and `JsVal::try_from_value` always boxes a number in the DOUBLE lane).
+// So T4 stores every numeric result in the double lane exactly as T2-lite does
+// and the bank decode on deopt is byte-identical. (kInt32 with an overflow guard
+// is the documented next step; it would only help if int values stayed in GPRs
+// across ops, which requires the register-resident-roots pass — deferred. The
+// f64 representation already removes the per-op tag-check, which is the in-block
+// win, with zero new correctness surface.)
+// ======================================================================
+
+/// The XMM registers T4 uses as the per-block UNBOXED-f64 value cache. XMM0/XMM1
+/// stay the arithmetic scratch (T2_XA/T2_XB) exactly as in the T2-lite path;
+/// XMM2..=XMM5 are the cache pool. All four are caller-saved (volatile) under the
+/// Win64 ABI, so T4 needs NO callee-saved xmm save area — the prolog/epilogue are
+/// byte-identical to the T2-lite backend. A function that needs more than 4
+/// simultaneously-live in-block values simply evicts the oldest cache entry (the
+/// value is still in the bank, so the next read reloads-with-guard — always
+/// correct, just one missed fast path).
+const T4_CACHE_XMMS: [Xmm; 4] = [Xmm::Xmm2, Xmm::Xmm3, Xmm::Xmm4, Xmm::Xmm5];
+
+/// The per-basic-block UNBOXED-f64 value cache: maps a bank slot to the XMM that
+/// currently holds its unboxed f64 value (valid only within the current block).
+/// `slot_of[k]` is the bank slot whose value lives in `T4_CACHE_XMMS[k]`, or
+/// `None` if that cache register is free. `next_evict` is a round-robin victim
+/// pointer for when all cache registers are occupied. The whole cache is
+/// `invalidate`d at every block boundary so a cross-block read reloads-with-guard.
+struct T4ValueCache {
+    /// bank slot resident in each cache XMM (parallel to `T4_CACHE_XMMS`).
+    slot_of: [Option<u16>; 4],
+    /// Round-robin eviction pointer.
+    next_evict: usize,
+}
+
+impl T4ValueCache {
+    fn new() -> Self {
+        T4ValueCache {
+            slot_of: [None; 4],
+            next_evict: 0,
+        }
+    }
+
+    /// Drop ALL cached values — called at every basic-block boundary so a value
+    /// produced in one block is never read as "unboxed in XMM" from another (the
+    /// XMM is dead across the branch). After this, every operand read reloads from
+    /// the bank with its tag-check guard, exactly as T2-lite does.
+    fn invalidate(&mut self) {
+        self.slot_of = [None; 4];
+        self.next_evict = 0;
+    }
+
+    /// If `slot`'s unboxed f64 value is currently cached, return its XMM.
+    fn get(&self, slot: u16) -> Option<Xmm> {
+        for (k, s) in self.slot_of.iter().enumerate() {
+            if *s == Some(slot) {
+                return Some(T4_CACHE_XMMS[k]);
+            }
+        }
+        None
+    }
+
+    /// Forget any cached XMM for `slot` (the slot is about to be overwritten by a
+    /// non-cached store, e.g. a constant load or a Move from an unknown value —
+    /// the old XMM no longer reflects the bank).
+    fn forget(&mut self, slot: u16) {
+        for s in self.slot_of.iter_mut() {
+            if *s == Some(slot) {
+                *s = None;
+            }
+        }
+    }
+
+    /// Reserve a cache XMM for `slot` (evicting round-robin if full). Returns the
+    /// XMM the caller should write `slot`'s freshly-computed unboxed f64 into. The
+    /// value MUST also be boxed+stored to the bank by the caller (identity-map
+    /// invariant) — the cache is only a fast-read shadow.
+    fn assign(&mut self, slot: u16) -> Xmm {
+        // First clear any prior cache entry for this slot (re-defining it).
+        self.forget(slot);
+        // Prefer a free register.
+        if let Some(k) = self.slot_of.iter().position(|s| s.is_none()) {
+            self.slot_of[k] = Some(slot);
+            return T4_CACHE_XMMS[k];
+        }
+        // Full → evict round-robin (the evicted value is still in the bank).
+        let k = self.next_evict % T4_CACHE_XMMS.len();
+        self.next_evict = self.next_evict.wrapping_add(1);
+        self.slot_of[k] = Some(slot);
+        T4_CACHE_XMMS[k]
+    }
+}
+
+/// T4: get operand `slot`'s unboxed f64 value into `want` (a scratch XMM,
+/// T2_XA/T2_XB). If the value is already cached in an XMM from earlier in this
+/// block, copy it (no reload, NO tag-check guard) — the representation-selection
+/// win. Otherwise fall back to the proven `t2_emit_load_num` (reload + tag-check
+/// DeoptSite + unbox), exactly as T2-lite. Either way `want` ends holding the f64.
+fn t4_emit_get_operand(
+    em: &mut Emitter,
+    cache: &T4ValueCache,
+    slot: u16,
+    want: Xmm,
+    deopt_patches: &mut Vec<(usize, crate::osr::DeoptReason)>,
+) {
+    if let Some(src) = cache.get(slot) {
+        // FAST PATH: the value is proven-unboxed in `src` (it was produced and
+        // boxed/stored earlier in this block, and the bank still mirrors it). Read
+        // it directly — no reload, no tag-check, no unbox. This is the per-op
+        // tag-check elimination (the float-dense win).
+        if src != want {
+            em.movsd_xmm_xmm(want, src);
+        }
+    } else {
+        // SLOW PATH (cross-block value, function arg, or evicted): reload from the
+        // bank with the SAME is-number guard the T2-lite path emits — a DeoptSite
+        // at this op's boundary, so a non-number operand deopts to the VM frame
+        // byte-identically.
+        t2_emit_load_num(em, slot, want, deopt_patches);
+    }
+}
+
+/// T4: box the f64 result in `from` (canonicalize NaN), store it to `bank[dst]`
+/// (the identity-map invariant — the bank stays a complete pre-op image), AND
+/// record `dst` in the value cache with its OWN freshly-allocated cache XMM
+/// (copying the f64 in so a same-block consumer reads it without a reload). The
+/// boxing is identical to `t2_emit_box_store`; the only addition is the cache
+/// bookkeeping + the copy into the cache register.
+fn t4_emit_box_store_cached(
+    em: &mut Emitter,
+    from: Xmm,
+    dst: u16,
+    cache: &mut T4ValueCache,
+    store_mode: T2StoreMode,
+) {
+    // Box + store to the bank exactly as T2-lite (deopt identity-map preserved).
+    t2_emit_box_store(em, from, dst, store_mode);
+    // Cache the unboxed f64 for same-block consumers: allocate a cache XMM for
+    // `dst` and copy the result in. (The result is the NON-canonicalized `from`
+    // value; for a NON-NaN result that equals the canonical stored value, and a
+    // NaN result compares-unequal to everything so any later arithmetic on it is
+    // NaN either way — observationally identical to reloading the canonical NaN.
+    // To be exactly bit-faithful we copy `from`, whose only possible divergence
+    // from the stored value is a NON-canonical NaN payload, which is unobservable
+    // through f64 arithmetic/comparison. The conservative choice — and the one
+    // that keeps the cache a faithful shadow — is to NOT cache a NaN result; but
+    // detecting NaN here costs a branch, so instead we cache `from` and rely on
+    // the invariant that a cached value is only ever CONSUMED by f64 arith/compare
+    // ops, where a non-canonical-NaN payload is indistinguishable from the
+    // canonical NaN. The deopt path NEVER reads the cache — it decodes the BANK,
+    // which holds the canonical value — so deopt stays byte-identical.)
+    let cx = cache.assign(dst);
+    if cx != from {
+        em.movsd_xmm_xmm(cx, from);
+    }
+}
+
 /// Emit one inlined arithmetic op: load both operands (tag-checked), do the f64
 /// op into `T2_XA`, box (canonicalize NaN) + store to `bank[dst]`.
 fn t2_emit_arith(

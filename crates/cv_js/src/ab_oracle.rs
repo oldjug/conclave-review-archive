@@ -104,6 +104,10 @@ fn run_one_tier(src: &str, tier: ForcedTier) -> TierOutcome {
     // Same for the T3 optimizing tier.
     crate::interp::reset_t3_cache();
     crate::interp::reset_t3_exec_count();
+    // Same for the T4 Maglev-class tier (its own per-function compile cache +
+    // engagement counter, so a prior tier's T4 decision / count can't leak in).
+    crate::interp::reset_t4_cache();
+    crate::interp::reset_t4_exec_count();
     // T2→T2 native-to-native registry + counter (so a prior tier's installed
     // callee code can't be resolved by a later tier's caller).
     crate::interp::reset_t2_module_registry();
@@ -334,6 +338,46 @@ pub fn assert_tiers_agree_t3_engaged(src: &str) -> Result<(), Divergence> {
             path: "<t3-engagement>".to_string(),
             tree_walk: "expected T3 to execute ≥1 function natively".to_string(),
             vm: "T3 executed 0 functions (vacuously green — FAIL)".to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Like `assert_tiers_agree`, but ALSO requires the T4 Maglev-class tier to have
+/// genuinely executed native code (≥1 T4 invocation) — guarding against a
+/// vacuously-green oracle where T4 silently declines/deopts everything. Use for
+/// the numeric/loop/arith kernel corpus where T4's representation-selection
+/// backend MUST engage. Byte-identity to tree-walk (transitively VM) is checked
+/// exactly as `assert_tiers_agree`; engagement via `t4_exec_count`.
+pub fn assert_tiers_agree_t4_engaged(src: &str) -> Result<(), Divergence> {
+    let a = run_one_tier(src, ForcedTier::TreeWalk);
+    let b = run_one_tier(src, ForcedTier::Vm);
+    compare_outcomes(&a, &b, "tree-walk", "vm")?;
+    let c = {
+        let _guard = TierGuard::new(ForcedTier::T4);
+        crate::interp::reset_bc_fn_cache();
+        crate::interp::reset_t4_cache();
+        crate::interp::reset_t4_exec_count();
+        let mut interp = Interp::new();
+        interp.install_basic_globals();
+        let result = match interp.run_completion_value(src) {
+            Ok(v) => Ok(v),
+            Err(e) => Err(reduce_thrown(&e)),
+        };
+        let outcome = TierOutcome {
+            result,
+            output: interp.output.clone(),
+        };
+        let execed = crate::interp::t4_exec_count();
+        (outcome, execed)
+    };
+    compare_outcomes(&a, &c.0, "tree-walk", "t4")?;
+    if c.1 == 0 {
+        return Err(Divergence {
+            kind: DivergenceKind::SideEffect,
+            path: "<t4-engagement>".to_string(),
+            tree_walk: "expected T4 to execute ≥1 function natively".to_string(),
+            vm: "T4 executed 0 functions (vacuously green — FAIL)".to_string(),
         });
     }
     Ok(())

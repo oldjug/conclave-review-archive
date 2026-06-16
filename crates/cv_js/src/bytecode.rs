@@ -11699,6 +11699,118 @@ mod tests {
         assert!(forced_any, "deopt-fuzz forced no ops (function declined T2 entirely)");
     }
 
+    /// THE T4 deopt-fuzz sweep — the P2 analogue of `deopt_fuzz_sweep`, exercising
+    /// the representation-aware backend (`compile_t4_unboxed_with_deopt`). For
+    /// `src`'s first function called with `args`:
+    ///   1. compute the VM oracle (`run_function` from ip=0);
+    ///   2. for EACH op index, force a deopt at that op's boundary, compile + run
+    ///      via T4 (which resumes the VM on the OPTIMIZED module at that bc_pc), and
+    ///      assert the result == the oracle.
+    /// A forced deopt at op P with type-correct args proves the T4 native bank at P
+    /// is the exact pre-op VM register image (the unboxed XMM cache is invalidated
+    /// per-block and NEVER read on deopt — the bank is), so resuming the VM at P
+    /// finishes identically. This is the existential gate: a T4 representation
+    /// specialization whose deopt is wrong is BROKEN, not done.
+    #[cfg(target_os = "windows")]
+    fn t4_deopt_fuzz_sweep(src: &str, args: &[Value]) {
+        // T4 runs numeric mode (the representation backend stores in the double
+        // lane); pin heap off so the run-time bank matches the compile, exactly as
+        // `run_t3_call` does.
+        let _heap = crate::interp::T2HeapGuard::new(false);
+        let m = module_for_first_fn(src);
+        let empty: std::cell::RefCell<HashMap<String, Value>> =
+            std::cell::RefCell::new(HashMap::new());
+        let mut refuse = refuse_with_interp;
+        let oracle = run_function(&m, 0, args, &Value::Undefined, &empty, None, &mut refuse);
+        let n = m.fns[0].code.len();
+        // Control: no forced deopt — T4 must compile, run, and AGREE.
+        {
+            if let Some(native) = crate::t4::try_compile_t4(&m, 0) {
+                let mut d = refuse_with_interp;
+                let r = run_t3_call(&native, args, &Value::Undefined, &empty, &mut d);
+                assert!(
+                    fuzz_results_eq(&r, &oracle),
+                    "T4 deopt-fuzz control (no force): T4 != VM oracle\n  t4={r:?}\n  vm={oracle:?}\n  src={src}"
+                );
+            } else {
+                // T4 declined the whole function (outside its subset) — nothing to
+                // fuzz; the dispatcher would run T3/T2/VM (always correct).
+                return;
+            }
+        }
+        // Forced sweep: every op boundary, one at a time. `set_force_deopt_pc` is
+        // read by `compile_t4_unboxed_with_deopt` (same thread-local as T2), so the
+        // forced deopt is emitted at op P's boundary in the T4 code.
+        let mut forced_any = false;
+        for pc in 0..n {
+            let _g = ForceDeoptGuard::new(Some(pc));
+            let native = match crate::t4::try_compile_t4(&m, 0) {
+                Some(j) => j,
+                None => continue, // declined under force (e.g. a back-edge target) — skip
+            };
+            forced_any = true;
+            let mut d = refuse_with_interp;
+            let r = run_t3_call(&native, args, &Value::Undefined, &empty, &mut d);
+            assert!(
+                fuzz_results_eq(&r, &oracle),
+                "T4 DEOPT-FUZZ: forced deopt at op {pc} resumed to a DIFFERENT result \
+                 (silent miscompute)\n  resumed={r:?}\n  vm-oracle={oracle:?}\n  src={src}"
+            );
+        }
+        assert!(forced_any, "T4 deopt-fuzz forced no ops (function declined T4 entirely)");
+    }
+
+    /// T4 DEOPT-FUZZ #1 — float-dense function (the jit.js `f(x)` shape, maximal
+    /// same-block XMM-cache reuse): every op's resume is bit-exact. This is the
+    /// phase's keystone — it proves the unboxed-f64 representation's deopt is
+    /// byte-identical to the VM at EVERY op boundary, over special inputs too.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn t4_deopt_fuzz_float_dense_every_op_resumes_identically() {
+        let src = "function f(x){ return ((x*x*0.5 + x*3.0 - 1.0) * (x - 2.0) + x*x*x*0.25) \
+                   / (x + 1.0) - x*0.5 + x*x*0.125 - x*7.0; }";
+        for x in [5.0, 0.0, -0.0, 1.5, -2.5, f64::NAN, 1e160, 100.0, -7.0] {
+            t4_deopt_fuzz_sweep(src, &[Value::Number(x)]);
+        }
+    }
+
+    /// T4 DEOPT-FUZZ #2 — a LOOP (cross-block cache invalidation): forcing a deopt
+    /// MID-loop must resume with the EXACT loop state. Proves the per-block XMM
+    /// cache invalidation at the back-edge is sound (a value computed before the
+    /// back-edge is reloaded-with-guard after it, never read from a dead XMM).
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn t4_deopt_fuzz_loop_mid_iteration_resumes_with_exact_state() {
+        let src =
+            "function sumTo(n){ var s = 0; for (var i = 0; i < n; i = i + 1) { s = s + i * 2.0; } return s; }";
+        for n in [0.0, 1.0, 5.0, 20.0, 100.0] {
+            t4_deopt_fuzz_sweep(src, &[Value::Number(n)]);
+        }
+    }
+
+    /// T4 DEOPT-FUZZ #3 — branchy control flow with early returns + comparisons.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn t4_deopt_fuzz_branchy_function_resumes_identically() {
+        let src =
+            "function pick(x){ if (x < 10.0) { return x * 2.0; } if (x >= 100.0) { return x - 1.0; } return x + 5.0; }";
+        for x in [5.0, 9.0, 10.0, 50.0, 99.0, 100.0, 250.0] {
+            t4_deopt_fuzz_sweep(src, &[Value::Number(x)]);
+        }
+    }
+
+    /// T4 DEOPT-FUZZ #4 — NaN in a bank slot at deopt: a forced deopt while a
+    /// computed NaN sits in a register must resume with the CANONICAL NaN from the
+    /// bank (the XMM cache may hold a non-canonical NaN payload, but deopt decodes
+    /// the BANK, which is canonical — so resume is byte-identical).
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn t4_deopt_fuzz_nan_in_bank_slot_resumes_canonical() {
+        let src = "function f(a, b){ var x = a / b; var y = x + 1.0; return y * 2.0; }";
+        t4_deopt_fuzz_sweep(src, &[Value::Number(0.0), Value::Number(0.0)]);
+        t4_deopt_fuzz_sweep(src, &[Value::Number(f64::NAN), Value::Number(2.0)]);
+    }
+
     /// DEOPT-FUZZ #1 — pure numeric function: every op's resume is bit-exact.
     #[cfg(target_os = "windows")]
     #[test]
