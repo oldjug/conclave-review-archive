@@ -4128,3 +4128,70 @@ fn realmix_t2_vs_vm_benchmark() {
     );
     println!("====================================================================\n");
 }
+
+// ─────────────────────── T4 (Maglev-class) ORACLE LEG ───────────────────────
+// P0 scaffold gates: prove the `ForcedTier::T4` leg is wired + byte-identical.
+// In P0 T4 has no codegen and DECLINES on every function, so a T4 run falls
+// through to T3 → T2 → VM and is byte-identical to tree-walk. These tests prove
+// (a) the gate flips under the override, (b) the leg runs the corpus shapes
+// identically, and (c) `assert_tiers_agree` now includes the T4 leg.
+
+/// THE T4 GATE TEETH: `ForcedTier::T4` must make `t4_enabled()` true (the gate
+/// flips), while the default (no override) keeps it OFF — so the default build is
+/// byte-identical until P2 lands codegen + a soak. This is the analogue of the
+/// tier-switch teeth test for the new tier flag.
+#[test]
+fn teeth_t4_flag_flips_under_override_and_defaults_off() {
+    // Default: T4 OFF (byte-identical default build).
+    assert!(
+        !crate::interp::t4_enabled() || crate::interp::forced_tier().is_some(),
+        "T4 must default OFF (env CV_T4 unset) so the default build is byte-identical"
+    );
+    // Under the override the gate flips ON (so the oracle/dispatch route through T4).
+    {
+        let _g = TierGuard::new(ForcedTier::T4);
+        assert!(
+            crate::interp::t4_enabled(),
+            "ForcedTier::T4 must enable t4_enabled() so the T4 dispatch hook engages"
+        );
+        assert_eq!(crate::interp::forced_tier(), Some(ForcedTier::T4));
+    }
+    // Restored on drop.
+    assert!(
+        !crate::interp::t4_enabled() || crate::interp::forced_tier().is_some(),
+        "T4 gate must restore to OFF after the guard drops"
+    );
+}
+
+/// The T4 leg runs a numeric/loop/branchy/object corpus byte-identical to tree-
+/// walk (transitively VM). In P0 T4 declines to T3/T2/VM, so this proves the leg
+/// is observationally identical AND that `assert_tiers_agree` (which now includes
+/// the T4 leg) is green on these shapes — the gate every later T4 phase rides on.
+#[test]
+fn t4_oracle_leg_is_byte_identical_on_corpus() {
+    let corpus = [
+        // pure numeric f(x) called in a loop (the jit.js shape the inliner targets)
+        "function f(x){ return x*0.5 + 3.0; } var s = 0; for (var i = 0; i < 200; i = i+1) { s = s + f(i); } s;",
+        // integer loop (loop.js shape)
+        "var s = 0; for (var i = 0; i < 1000; i = i+1) { s = s + i; } s;",
+        // branchy control flow
+        "function pick(x){ if (x < 10) return x*2; if (x >= 100) return x-1; return x+5; } pick(5) + pick(50) + pick(250);",
+        // property reads + a hot loop
+        "var o = {a:1, b:2, c:3}; var s = 0; for (var i = 0; i < 100; i = i+1) { s = s + o.a + o.b; } s;",
+        // cross-function calls (the inline-deopt-to-caller shape, un-inlined here)
+        "function g(y){ return y + 1; } function f(x){ return g(x*2) * 3; } f(5) + f(0) + f(-2);",
+        // NaN / special numbers through a function
+        "function h(a,b){ return a/b + 1; } h(0,0); ",
+    ];
+    for src in corpus {
+        if let Err(d) = assert_tiers_agree(src) {
+            panic!("T4 oracle leg diverged on a corpus snippet:\n{d}\n  src={src}");
+        }
+        // Also a direct T4-vs-VM check so a T4-specific divergence is unambiguous.
+        let vm = run_one_tier(src, ForcedTier::Vm);
+        let t4 = run_one_tier(src, ForcedTier::T4);
+        if let Err(d) = compare_outcomes(&vm, &t4, "vm", "t4") {
+            panic!("T4 != VM on a corpus snippet:\n{d}\n  src={src}");
+        }
+    }
+}

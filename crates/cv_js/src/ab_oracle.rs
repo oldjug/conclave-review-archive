@@ -242,6 +242,15 @@ pub fn assert_tiers_agree(src: &str) -> Result<(), Divergence> {
     // here, so any optimizer miscompile reddens the oracle.
     let e = run_one_tier(src, ForcedTier::T3);
     compare_outcomes(&a, &e, "tree-walk", "t3")?;
+    // T4 (the Maglev-class speculative tier) must agree too. In P0 T4 has no
+    // codegen and DECLINES on every function, so a T4 run falls through to T3 → T2
+    // → VM and is transitively byte-identical to tree-walk; this leg is wired NOW
+    // so the moment P2 emits real T4 code (representation selection / inlining)
+    // every snippet in the corpus is already gated T4 == VM == tree-walk, and any
+    // T4 miscompile reddens the oracle. The deopt-fuzz + the inlined-frame
+    // reconstruction fuzzer gate the per-guard bailout separately.
+    let g = run_one_tier(src, ForcedTier::T4);
+    compare_outcomes(&a, &g, "tree-walk", "t4")?;
     Ok(())
 }
 

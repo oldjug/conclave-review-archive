@@ -72,6 +72,36 @@ pub fn t3_enabled() -> bool {
     })
 }
 
+/// Whether the T4 MAGLEV-CLASS optimizing tier is enabled. DEFAULT-OFF (opt IN
+/// with `CV_T4=1`), mirroring `t3_enabled`. A `ForcedTier::T4` override takes
+/// precedence so the in-process A/B oracle can drive T4 without the process-global
+/// env.
+///
+/// P0 SCAFFOLD CONTRACT: T4 has NO codegen yet, so `try_t4_call` DECLINES (returns
+/// `None`) on every function — a forced/enabled T4 run falls through to T3 → T2 →
+/// VM and is therefore observationally identical to today. This is deliberate: P0
+/// lands the deopt + safepoint activation scaffold (the inlined-frame DeoptSite,
+/// the verify_against_bank gate, both keystone fuzzers, this flag, and the oracle
+/// leg) with ZERO behavior change, so the default build stays byte-identical and
+/// every later phase (P2 representation selection, P3 inlining) lands against a
+/// proven safety net rather than building the net under load.
+pub fn t4_enabled() -> bool {
+    if matches!(crate::interp::forced_tier(), Some(crate::interp::ForcedTier::T4)) {
+        return true;
+    }
+    thread_local! {
+        static ON: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    }
+    ON.with(|c| match c.get() {
+        Some(v) => v,
+        None => {
+            let v = std::env::var("CV_T4").as_deref() == Ok("1");
+            c.set(Some(v));
+            v
+        }
+    })
+}
+
 // ----------------------------------------------------------------------
 // MUTATION HOOK (test-only). The A/B oracle's job is to catch an optimizer that
 // is NOT semantics-preserving. To PROVE the oracle is non-vacuous, this hook lets

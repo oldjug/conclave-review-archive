@@ -223,6 +223,157 @@ impl DeoptFrame {
     }
 }
 
+// ======================================================================
+// T4 EXTENSION 1 — INLINED-FRAME DEOPT (INLINE-DEOPT-TO-CALLER).
+//
+// This is the ONLY genuinely new deopt DATA the T4 (Maglev-class) tier requires,
+// and it is scaffolded HERE (P0) — as a pure data + reconstruction-math addition
+// — BEFORE any inliner exists, so the inlined-frame-deopt fuzzer can prove the
+// reconstruction is byte-identical to the un-inlined VM on the existing corpus.
+//
+// THE PROBLEM (when P3 inlining lands): T4 inlines a small pure callee `g` into
+// caller `f`'s hot loop, so the body of `g` runs with NO separate VM frame. A
+// type/shape guard INSIDE the inlined `g` body fails. The naive thing — synthesize
+// a mid-`g` VM frame AND resume `f` at the Call — needs two reconstructed frames
+// and breaks the per-frame identity-map invariant (the bank is `f`'s register file,
+// not `g`'s).
+//
+// THE CHOSEN DESIGN (mirrors V8/Maglev's deopt-to-the-call-site for an
+// eager-deopt without a full multi-frame translation): INLINE-DEOPT-TO-CALLER.
+// A guard inside the inlined region deopts to the CALLER's `Call` bytecode op,
+// reconstructing the call's ARGUMENT registers from the bank, and lets the VM
+// perform the ORDINARY (non-inlined) call — which re-enters `g` on the VM/T2.
+// This keeps the proven per-frame identity-map invariant (the reconstructed frame
+// is `f`'s, exactly as the single-frame deopt does) and costs, on the rare deopt,
+// ONE extra (re-)execution of the call — never a wrong value. Because `bc_pc`
+// points at the `Call` op (BEFORE its `dst` store, like every other DeoptSite),
+// the VM re-executes the whole call and stores its result, identical to a plain
+// VM run.
+//
+// V8 SOURCE MODELED: V8's deoptimizer reconstructs interpreter frames from a
+// `TranslationArray` describing each (possibly inlined) frame's registers +
+// bytecode offset; Maglev emits a `LazyDeoptInfo`/`EagerDeoptInfo` whose
+// `DeoptFrame` carries the bytecode position + a value list. Our INLINE-DEOPT-TO-
+// CALLER is the eager-deopt-to-the-call special case: instead of translating a
+// mid-callee frame we resume the caller AT the call, which the deoptimizer is
+// always free to do for an eager type/shape guard (the call has no committed
+// effect yet — its `dst` is unwritten). This is strictly simpler and provably
+// correct (the fuzzer below proves it == the non-inlined VM result).
+//
+// EAGER, not LAZY: like the existing single-frame DeoptSite, this fires
+// synchronously at the guard, over a complete pre-call bank image. (Lazy
+// invalidate-on-event deopt is deferred to T5.)
+// ======================================================================
+
+/// The extra data an INLINED-FRAME `DeoptSite` carries: enough to reconstruct the
+/// CALLER frame at the inlined `Call` op (the INLINE-DEOPT-TO-CALLER design).
+///
+/// When a guard inside an inlined callee fails, the runner does NOT resume in the
+/// (non-existent) callee VM frame. Instead it:
+///   1. reconstructs the caller's register file from the bank (the IDENTITY map,
+///      exactly as `DeoptFrame::from_bank`), then
+///   2. resumes the caller VM at `caller_bc_pc_of_call` — the `Call` op — so the
+///      VM performs the ordinary call with the live argument registers and stores
+///      the result to the call's `dst`, exactly as an un-inlined run would.
+///
+/// `arg_slot_map` records WHICH caller bank slots hold the call's arguments at the
+/// moment of the (inlined) call, in argument order. It is the seam the inliner
+/// fills; the reconstruction MUST find those slots already populated in the bank
+/// (the inliner spills/keeps the args in their caller slots across the inlined
+/// region, just as the bytecode `CallFn`/`CallValue` op expects `first_arg..` to
+/// be live). `callee_entry_bc_pc` is recorded for diagnostics + the deferred
+/// precise multi-frame translation (T5); the chosen INLINE-DEOPT-TO-CALLER form
+/// does not consult it at run time (it resumes the caller, not the callee).
+#[derive(Debug, Clone)]
+pub struct InlinedFrame {
+    /// Bytecode index of the CALLER's `Call`/`CallFn`/`CallValue`/`New` op that
+    /// was inlined away. The runner resumes the CALLER VM here (BEFORE the op's
+    /// `dst` store — the bank is the exact pre-call register image), so the VM
+    /// re-runs the real call. This is the load-bearing resume target.
+    pub caller_bc_pc_of_call: usize,
+    /// Bytecode index of the inlined callee's entry (offset 0 of the callee body).
+    /// DIAGNOSTIC + reserved for the T5 precise multi-frame translation; the
+    /// INLINE-DEOPT-TO-CALLER form does not use it at run time.
+    pub callee_entry_bc_pc: usize,
+    /// Caller bank-slot indices holding the call's arguments, in argument order
+    /// (`args[0]` = bank slot `arg_slot_map[0]`, …). These slots are decoded from
+    /// the bank into the resumed caller register file by the ordinary identity-map
+    /// reconstruction; the resumed `Call` op then reads them as its `first_arg..`
+    /// operands. Recorded for the precise translation + the verifier; the
+    /// identity-map resume reconstructs the WHOLE bank, so these are guaranteed
+    /// present iff they are in-range bank slots (the verifier below checks that).
+    pub arg_slot_map: Vec<usize>,
+}
+
+/// An INLINED-FRAME deopt site: a base `DeoptSite` (whose `bc_pc` is the CALLER's
+/// `Call` op per the INLINE-DEOPT-TO-CALLER design) PLUS the `InlinedFrame`
+/// reconstruction data. Kept as a SEPARATE type so the existing single-frame
+/// `DeoptSite` path (jit.rs emission, `run_t2lite_call` resume) is byte-for-byte
+/// UNTOUCHED — the inliner (P3) records these in a parallel table consulted only
+/// when a guard's site is an inlined one. P0 ships the type + the reconstruction
+/// math + the fuzzer; nothing emits one yet (no inliner), so the production build
+/// is unchanged.
+#[derive(Debug, Clone)]
+pub struct InlinedDeoptSite {
+    /// The base site. `bc_pc` is the CALLER's `Call` op index (the resume target);
+    /// `reason` is the inner guard's reason; `native_off` is the inner guard's stub.
+    pub base: DeoptSite,
+    /// The caller-frame reconstruction data (INLINE-DEOPT-TO-CALLER).
+    pub frame: InlinedFrame,
+}
+
+impl InlinedDeoptSite {
+    /// VERIFY this inlined-frame site against the CALLER function's bank size
+    /// (`n_regs`). The reconstruction resumes the caller at `caller_bc_pc_of_call`
+    /// over the full identity-map register image, so it is correct iff:
+    ///   * the resume `bc_pc` (the Call op index) is in range of the caller code,
+    ///     and
+    ///   * every recorded argument slot is an in-range bank slot (so the
+    ///     identity-map decode populates it — exactly the same in-range discipline
+    ///     the SafepointMap verifier applies to roots).
+    /// This is the inlined-frame analogue of `SafepointMap::verify_against_bank`:
+    /// it catches an inliner that records an out-of-range arg slot (which would
+    /// resume the call with a garbage / missing argument) at COMPILE time. P0
+    /// runs it in the fuzzer; P3 runs it as a debug-assert on every inlined compile.
+    pub fn verify_against_caller(&self, caller_code_len: usize, caller_n_regs: usize) -> bool {
+        if self.frame.caller_bc_pc_of_call >= caller_code_len {
+            return false;
+        }
+        self.frame
+            .arg_slot_map
+            .iter()
+            .all(|&slot| slot < caller_n_regs)
+    }
+}
+
+/// Reconstruct the CALLER's VM register file for an INLINE-DEOPT-TO-CALLER bailout.
+///
+/// This is the Extension-1 reconstruction MATH, proven by the inlined-frame-deopt
+/// fuzzer before any inliner exists. Given the live JIT bank (the caller's
+/// identity-map register image at the inlined call boundary) and the
+/// `InlinedFrame`, it produces the `(regs, resume_bc_pc)` the VM resumes the
+/// CALLER over. The decode is IDENTICAL to `DeoptFrame::from_bank` (every bank
+/// slot → its `Value` via `JsVal::to_value`, the identity map) — the inlined-frame
+/// design's whole point is that NO new reconstruction primitive is needed: the
+/// caller frame is reconstructed exactly as a single-frame deopt would, and the
+/// resume `bc_pc` is the recorded Call op. The arg slots are already part of the
+/// full register image, so the re-run `Call` op reads them as its operands.
+///
+/// # Safety
+/// Same contract as [`DeoptFrame::from_bank`]: the bank's pointer-lane slots must
+/// be alive for the decode (the owning bank keeps a +1 per slot; `to_value` takes
+/// its own +1 so the returned `Value`s outlive the bank teardown).
+pub unsafe fn reconstruct_caller_frame(
+    fn_idx: usize,
+    site: &InlinedDeoptSite,
+    bank: &[crate::jsval::JsVal],
+) -> DeoptFrame {
+    // The identity-map decode is the proven single-frame reconstruction; the only
+    // inlined-frame-specific choice is the resume bc_pc (the Call op, not the inner
+    // guard's op). The full register image already contains the argument slots.
+    unsafe { DeoptFrame::from_bank(fn_idx, site.frame.caller_bc_pc_of_call, bank) }
+}
+
 // ----------------------------------------------------------------------
 // B1 / B3 — safepoint stack maps (the GC-rooting groundwork for T3).
 //
@@ -724,5 +875,63 @@ mod tests {
             err,
             SafepointDisciplineError::RootOutOfBankRange { native_off: 20, slot: 9, bank_len: 4 }
         );
+    }
+
+    // ------------------------------------------------------------------
+    // T4 EXTENSION 1 — INLINED-FRAME DEOPT site data + verifier (the
+    // reconstruction-math structural gate, before any inliner exists).
+    // ------------------------------------------------------------------
+
+    /// An inlined-frame site whose resume target + every arg slot are in range of
+    /// the caller verifies — it can be reconstructed by the identity-map decode.
+    #[test]
+    fn inlined_frame_site_verifies_when_in_caller_range() {
+        let site = InlinedDeoptSite {
+            base: DeoptSite { native_off: 0, bc_pc: 5, reason: DeoptReason::NonNumber },
+            frame: InlinedFrame {
+                caller_bc_pc_of_call: 5, // the caller's Call op (resume target)
+                callee_entry_bc_pc: 0,
+                arg_slot_map: vec![2, 3], // caller bank slots holding the args
+            },
+        };
+        // Caller has 12 bytecode ops and an 8-slot bank: bc_pc 5 < 12 and slots
+        // 2,3 < 8, so the reconstruction can run.
+        assert!(site.verify_against_caller(12, 8));
+    }
+
+    /// An inlined-frame site whose Call resume bc_pc is OUT of the caller code is
+    /// rejected — resuming there would read past the bytecode (a wrong/garbage op).
+    #[test]
+    fn inlined_frame_site_rejects_out_of_range_resume_pc() {
+        let site = InlinedDeoptSite {
+            base: DeoptSite { native_off: 0, bc_pc: 99, reason: DeoptReason::ShapeMiss },
+            frame: InlinedFrame {
+                caller_bc_pc_of_call: 99, // past the end of a 12-op caller
+                callee_entry_bc_pc: 0,
+                arg_slot_map: vec![0],
+            },
+        };
+        assert!(!site.verify_against_caller(12, 8));
+    }
+
+    /// An inlined-frame site recording an arg slot OUTSIDE the caller bank is
+    /// rejected — the identity-map decode would not populate it, so the re-run Call
+    /// would read a missing argument (the inlined-frame analogue of the
+    /// out-of-bank-root UAF the SafepointMap verifier catches). This is the teeth:
+    /// a SAME site that is in range against a bigger bank passes, proving the check
+    /// is the range relation, not a constant rejection.
+    #[test]
+    fn inlined_frame_site_rejects_arg_slot_outside_caller_bank() {
+        let site = InlinedDeoptSite {
+            base: DeoptSite { native_off: 0, bc_pc: 5, reason: DeoptReason::NonNumber },
+            frame: InlinedFrame {
+                caller_bc_pc_of_call: 5,
+                callee_entry_bc_pc: 0,
+                arg_slot_map: vec![3, 9], // slot 9 is out of an 8-slot bank
+            },
+        };
+        assert!(!site.verify_against_caller(12, 8));
+        // The SAME site verifies against a bank large enough to hold slot 9.
+        assert!(site.verify_against_caller(12, 10));
     }
 }

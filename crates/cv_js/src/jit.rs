@@ -961,6 +961,38 @@ pub fn set_force_deopt_pc(pc: Option<usize>) -> Option<usize> {
     })
 }
 
+thread_local! {
+    /// T4 EXTENSION-1 FUZZER HOOK (test-only). When set to `Some(call_pc)`, the
+    /// T2 RESUME runner treats a forced deopt landing at bytecode op `call_pc`
+    /// (which must be a `CallFn`/`CallValue`) as an INLINED-FRAME deopt: instead
+    /// of the ordinary single-frame `bank.decode_to_values()` + resume, it builds
+    /// an `osr::InlinedDeoptSite` for that call op and reconstructs the CALLER
+    /// frame via `osr::reconstruct_caller_frame` (the INLINE-DEOPT-TO-CALLER
+    /// math), then resumes the caller at the Call op. This drives the Extension-1
+    /// reconstruction over the REAL JIT bank so the inlined-frame-deopt fuzzer can
+    /// prove it is byte-identical to the un-inlined VM — BEFORE any inliner exists.
+    /// Never set in production (no env path; only the in-process setter below).
+    static T2_FORCE_INLINED_RECONSTRUCT_PC: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Set (or clear with `None`) the T4 Extension-1 inlined-frame-reconstruction
+/// fuzzer hook for the resume runner. Returns the previous value. Test-only.
+pub fn set_force_inlined_reconstruct_pc(pc: Option<usize>) -> Option<usize> {
+    T2_FORCE_INLINED_RECONSTRUCT_PC.with(|c| {
+        let prev = c.get();
+        c.set(pc);
+        prev
+    })
+}
+
+/// Read the T4 Extension-1 inlined-frame-reconstruction fuzzer hook. The resume
+/// runner consults this on a deopt to decide whether to route through the
+/// inlined-frame caller-reconstruction path (test-only; `None` in production).
+pub fn force_inlined_reconstruct_pc() -> Option<usize> {
+    T2_FORCE_INLINED_RECONSTRUCT_PC.with(|c| c.get())
+}
+
 /// Emit: load `bank[slot]` (a `JsVal`) into `xmm`, jumping to a (later-patched)
 /// DEOPT site — its rel32 byte offset is pushed to `deopt_patches` — if the slot
 /// is NOT a number. Uses RAX/RCX/R10/R11 (all volatile) as scratch.

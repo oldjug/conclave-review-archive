@@ -1501,6 +1501,13 @@ pub fn t3_enabled() -> bool {
     crate::t3::t3_enabled()
 }
 
+/// Whether the T4 Maglev-class optimizing tier is enabled. Re-exported wrapper
+/// over `crate::t3::t4_enabled` so the dispatcher reads it like the others.
+/// DEFAULT-OFF; P0 scaffold declines on every function (byte-identical default).
+pub fn t4_enabled() -> bool {
+    crate::t3::t4_enabled()
+}
+
 /// Number of T2-lite calls before a hot function is compiled. The oracle forces
 /// compilation immediately (threshold bypassed).
 const T2_THRESHOLD: u32 = 12;
@@ -1780,6 +1787,15 @@ pub enum ForcedTier {
     /// identical to the original). Engagement is asserted via `t3_exec_count`.
     /// Implies the VM + T2 are enabled for the fall-back path.
     T3,
+    /// T4 MAGLEV-CLASS optimizing tier — the speculative tier layered above T3
+    /// (feedback consumption + representation selection + cross-function inlining,
+    /// all behind the proven DeoptSite/SafepointMap keystones). DEFAULT-OFF
+    /// (`CV_T4`); P0 ships ONLY the scaffold — `t4_enabled()` declines so the
+    /// build stays byte-identical until real codegen lands (P2). Until then a T4
+    /// run is observationally identical to T3/T2/VM (it falls through to them), so
+    /// adding the oracle leg now is byte-safe and gates every later phase.
+    /// Implies the VM + T2 + T3 are enabled for the fall-back path.
+    T4,
 }
 
 thread_local! {
@@ -1865,11 +1881,15 @@ pub fn tb_js_verify_enabled() -> bool {
 /// default path is byte-identical to before.
 fn bc_per_fn_enabled() -> bool {
     if let Some(t) = forced_tier() {
-        // Jit/T2Lite imply the bytecode tier (they compile the bytecode module
-        // and fall back to the VM on decline/deopt).
+        // Jit/T2Lite/T3/T4 imply the bytecode tier (they compile the bytecode
+        // module and fall back to the VM on decline/deopt).
         return matches!(
             t,
-            ForcedTier::Vm | ForcedTier::Jit | ForcedTier::T2Lite | ForcedTier::T3
+            ForcedTier::Vm
+                | ForcedTier::Jit
+                | ForcedTier::T2Lite
+                | ForcedTier::T3
+                | ForcedTier::T4
         );
     }
     thread_local! {
@@ -20643,6 +20663,36 @@ impl Interp {
         Some(res)
     }
 
+    /// T4 MAGLEV-CLASS fast path (OFF by default, opt in via CV_T4 or
+    /// ForcedTier::T4). The speculative optimizing tier — feedback consumption +
+    /// representation selection + cross-function inlining over the proven
+    /// DeoptSite/SafepointMap keystones.
+    ///
+    /// P0 SCAFFOLD: there is NO T4 codegen yet, so this DECLINES (returns `None`)
+    /// on every function. The dispatcher then falls through to T3 → T2 → VM, so a
+    /// forced/enabled T4 run is observationally IDENTICAL to today's tiers. The
+    /// method exists now (with the dispatch hook + the oracle leg) so the moment
+    /// P2 lands real codegen the seam is already wired and proven — and the
+    /// inlined-frame DeoptSite + the verify_against_bank gate + both keystone
+    /// fuzzers (built in P0) bound any later speculation to a safe bailout. When P2
+    /// arrives, this body grows the feedback/representation/inline path; until
+    /// then declining is the correct, byte-identical scaffold (NOT a stub — it is
+    /// the honest "no T4 codegen yet, run the lower proven tier" outcome).
+    #[allow(unused_variables)]
+    fn try_t4_call(
+        &mut self,
+        f: &Rc<FunctionValue>,
+        module: &Rc<crate::bytecode::Module>,
+        this_value: &Value,
+        args: &[Value],
+    ) -> Option<Result<Value, crate::bytecode::RuntimeError>> {
+        // P0: no codegen — decline so the caller runs T3/T2/VM (always correct).
+        // The keystones this tier will rely on (osr::InlinedDeoptSite reconstruction
+        // + SafepointMap::verify_against_bank) are activated + fuzz-proven in P0; the
+        // codegen that uses them lands in P2/P3.
+        None
+    }
+
     /// T3 OPTIMIZING fast path (B2; OFF by default, opt in via CV_T3 or
     /// ForcedTier::T3). A hot function in T3's numeric/control-flow subset is run
     /// through the T3 optimizer (IR + passes + linear-scan regalloc) and the
@@ -20826,6 +20876,22 @@ impl Interp {
                 return Some(res.map_err(|e| match e {
                     crate::bytecode::RuntimeError::Thrown(v) => JsError::Throw(v),
                     other => JsError::Throw(err_str(format!("t1: {other:?}"))),
+                }));
+            }
+        }
+        // T4 MAGLEV-CLASS fast path (OFF by default, opt in via CV_T4 or
+        // ForcedTier::T4). Tried BEFORE T3 so, when enabled, a function gets the
+        // speculative optimized native code first. P0 SCAFFOLD: `try_t4_call`
+        // declines on every function (no codegen yet), so this falls through to
+        // T3 → T2 → VM and is byte-identical to today. The hook is wired now so
+        // the moment P2 emits T4 code the dispatch + oracle leg are already in
+        // place (and the inlined-frame DeoptSite / SafepointMap keystones are
+        // proven). On any T4 decline/deopt, lower tiers below run — always correct.
+        if t4_enabled() {
+            if let Some(res) = self.try_t4_call(f, &compiled.0, this_value, args) {
+                return Some(res.map_err(|e| match e {
+                    crate::bytecode::RuntimeError::Thrown(v) => JsError::Throw(v),
+                    other => JsError::Throw(err_str(format!("t4: {other:?}"))),
                 }));
             }
         }
