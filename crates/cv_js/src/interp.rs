@@ -2090,6 +2090,19 @@ fn toplevel_vm_eligible(stmts: &[Stmt]) -> bool {
     let mut forbidden_in_fn = toplevel_fn_names.clone();
     forbidden_in_fn.extend(forinit_var_names.iter().cloned());
 
+    // ── DIVERGING-CONSTRUCT DECLINE (full-corpus byte-identity gate) ──────────
+    // A second, marker-based pass declines whole CONSTRUCT FAMILIES whose
+    // top-level-VM lowering is NOT byte-identical to the tree-walker and whose
+    // correct VM impl is large/risky to build now (the spec-faithful contract is
+    // that a decline falls back to the tree-walker and is therefore correct, just
+    // not VM-fast). NONE of these are the jit.js/loop.js numeric counted-loop
+    // shape, so declining them keeps the measured speedup intact. Each was
+    // confirmed divergent by the production-faithful top-level oracle
+    // (`assert_toplevel_vm_agrees`): see `interp::tests` and `ab_oracle::tests`.
+    if stmts.iter().any(stmt_has_toplevel_vm_divergence) {
+        return false;
+    }
+
     let mut ctx = DeclineCtx {
         fn_names: &toplevel_fn_names,
         forbidden_in_fn: &forbidden_in_fn,
@@ -2102,6 +2115,291 @@ fn toplevel_vm_eligible(stmts: &[Stmt]) -> bool {
         }
     }
     ctx.ok
+}
+
+/// Synthetic desugar-marker identifiers that signal a construct the top-level VM
+/// module path does not run byte-identically (generators / async coroutines):
+///   - `__tb_make_generator__` — a `function*` body wrapped into a lazy iterator;
+///     the VM module path runs it EAGERLY (the tree-walk drives it as a resumable
+///     state machine), diverging on yield order + two-way `.next(v)` delivery.
+///   - `__tb_run_async__` / `__tb_make_async_iterable_wrapper__` — async fn/gen
+///     desugar thunks (suspension semantics not modeled in the module path).
+const TOPLEVEL_VM_DIVERGING_MARKERS: &[&str] = &[
+    "__tb_make_generator__",
+    "__tb_run_async__",
+    "__tb_make_async_iterable_wrapper__",
+];
+
+/// Constructors whose top-level-VM construction + later method/accessor reads
+/// diverge from the tree-walker (live-getter / internal-slot / trap semantics the
+/// VM property model does not reproduce):
+///   - `Set`/`Map`/`WeakSet`/`WeakMap` — the live `.size` getter reads a stale
+///     construction-time snapshot in the VM module path.
+///   - `WeakRef` — `new WeakRef(globalThis.X)` reads the target as a non-object.
+///   - `Proxy` — the `construct` trap (`new (new Proxy(C,{construct}))()`) is not
+///     honored in the VM module path.
+const TOPLEVEL_VM_DIVERGING_CTORS: &[&str] =
+    &["Set", "Map", "WeakSet", "WeakMap", "WeakRef", "Proxy"];
+
+/// True iff `name` is the callee/object of a member access that re-borrows a
+/// method off a primitive receiver. Reading `"".toLowerCase` / `[].includes` as a
+/// VALUE binds the VM's inline method closure to the EMPTY-string / empty-array
+/// receiver it was read off of; a later `.call(other)`/`.apply`/`.bind` then runs
+/// against the WRONG `this` (the VM binding ignores the dynamic receiver), so the
+/// result diverges from the tree-walker. Decline any `.call`/`.apply`/`.bind`
+/// member access.
+fn is_method_rebind_key(key: &str) -> bool {
+    matches!(key, "call" | "apply" | "bind")
+}
+
+/// True iff this statement subtree contains a construct whose top-level-VM
+/// lowering diverges from the tree-walker (see the const tables + the class-IIFE
+/// + `arguments` + accessor-defineProperty checks below). Recurses into function
+/// bodies (a top-level IIFE / nested closure runs on the same module path).
+fn stmt_has_toplevel_vm_divergence(s: &Stmt) -> bool {
+    match s {
+        Stmt::Expression(e) | Stmt::Throw(e) | Stmt::Return(Some(e)) => {
+            expr_has_toplevel_vm_divergence(e)
+        }
+        Stmt::Return(None) | Stmt::Break(_) | Stmt::Continue(_) | Stmt::Empty
+        | Stmt::Import { .. } => false,
+        Stmt::Export { decl, .. } => decl
+            .as_ref()
+            .map_or(false, |d| stmt_has_toplevel_vm_divergence(d)),
+        Stmt::VarDecl { decls, .. } => decls.iter().any(|d| {
+            // A class desugars to `var X = (function(){ … return X; })()`. The
+            // VM module path constructs instances WITHOUT linking the prototype
+            // chain (methods read as `undefined`, `instanceof` is false), so
+            // decline any var whose initializer is the class-IIFE shape.
+            if let Some(init) = &d.init {
+                if expr_is_class_iife(init) {
+                    return true;
+                }
+                expr_has_toplevel_vm_divergence(init)
+            } else {
+                false
+            }
+        }),
+        Stmt::FunctionDecl { body, .. } => body.iter().any(stmt_has_toplevel_vm_divergence),
+        Stmt::If { test, cons, alt } => {
+            expr_has_toplevel_vm_divergence(test)
+                || stmt_has_toplevel_vm_divergence(cons)
+                || alt.as_ref().map_or(false, |a| stmt_has_toplevel_vm_divergence(a))
+        }
+        Stmt::While { test, body } | Stmt::DoWhile { body, test } => {
+            expr_has_toplevel_vm_divergence(test) || stmt_has_toplevel_vm_divergence(body)
+        }
+        Stmt::For { init, test, update, body } => {
+            let init_div = match init {
+                Some(crate::ast::ForInit::VarDecl { decls, .. }) => decls.iter().any(|d| {
+                    d.init.as_ref().map_or(false, |e| {
+                        expr_is_class_iife(e) || expr_has_toplevel_vm_divergence(e)
+                    })
+                }),
+                Some(crate::ast::ForInit::Expr(e)) => expr_has_toplevel_vm_divergence(e),
+                None => false,
+            };
+            init_div
+                || test.as_ref().map_or(false, |t| expr_has_toplevel_vm_divergence(t))
+                || update.as_ref().map_or(false, |u| expr_has_toplevel_vm_divergence(u))
+                || stmt_has_toplevel_vm_divergence(body)
+        }
+        Stmt::ForIn { source, body, .. } | Stmt::ForOf { source, body, .. } => {
+            expr_has_toplevel_vm_divergence(source) || stmt_has_toplevel_vm_divergence(body)
+        }
+        Stmt::Labeled { body, .. } => stmt_has_toplevel_vm_divergence(body),
+        Stmt::Block(body) => body.iter().any(stmt_has_toplevel_vm_divergence),
+        Stmt::Try { block, catch_block, finally_block, .. } => {
+            block.iter().any(stmt_has_toplevel_vm_divergence)
+                || catch_block
+                    .as_ref()
+                    .map_or(false, |cb| cb.iter().any(stmt_has_toplevel_vm_divergence))
+                || finally_block
+                    .as_ref()
+                    .map_or(false, |fb| fb.iter().any(stmt_has_toplevel_vm_divergence))
+        }
+        Stmt::Switch { discriminant, cases, .. } => {
+            expr_has_toplevel_vm_divergence(discriminant)
+                || cases.iter().any(|c| {
+                    c.test.as_ref().map_or(false, |t| expr_has_toplevel_vm_divergence(t))
+                        || c.body.iter().any(stmt_has_toplevel_vm_divergence)
+                })
+        }
+    }
+}
+
+/// Expression-level counterpart of [`stmt_has_toplevel_vm_divergence`].
+fn expr_has_toplevel_vm_divergence(e: &Expr) -> bool {
+    match e {
+        // A bare `arguments` reference inside any function/arrow body run on the
+        // VM module path throws "arguments is not defined" (the module call frame
+        // does not materialize the `arguments` object); the tree-walker binds it.
+        Expr::Identifier(n) => {
+            n == "arguments" || TOPLEVEL_VM_DIVERGING_MARKERS.contains(&n.as_str())
+        }
+        Expr::Number(_)
+        | Expr::BigInt(_)
+        | Expr::String(_)
+        | Expr::TemplateLiteral(_)
+        | Expr::Boolean(_)
+        | Expr::Null
+        | Expr::Undefined
+        | Expr::This
+        | Expr::NewTarget
+        | Expr::Regex(_, _)
+        | Expr::ImportMeta => false,
+        Expr::Array(items) | Expr::Sequence(items) => {
+            items.iter().any(expr_has_toplevel_vm_divergence)
+        }
+        Expr::Object(props) => props.iter().any(|(_k, v)| expr_has_toplevel_vm_divergence(v)),
+        Expr::Unary { target, .. } | Expr::Update { target, .. } | Expr::Spread(target) => {
+            expr_has_toplevel_vm_divergence(target)
+        }
+        Expr::Binary { left, right, .. } | Expr::Logical { left, right, .. } => {
+            expr_has_toplevel_vm_divergence(left) || expr_has_toplevel_vm_divergence(right)
+        }
+        Expr::Conditional { test, cons, alt } => {
+            expr_has_toplevel_vm_divergence(test)
+                || expr_has_toplevel_vm_divergence(cons)
+                || expr_has_toplevel_vm_divergence(alt)
+        }
+        Expr::Assignment { target, value, .. } => {
+            expr_has_toplevel_vm_divergence(target) || expr_has_toplevel_vm_divergence(value)
+        }
+        Expr::Member { object, property, computed } => {
+            // A `.call`/`.apply`/`.bind` read re-borrows a method off its
+            // receiver — the VM inline binding ignores the dynamic `this`.
+            if !*computed {
+                if let Expr::Identifier(k) = property.as_ref() {
+                    if is_method_rebind_key(k) {
+                        return true;
+                    }
+                }
+            }
+            expr_has_toplevel_vm_divergence(object)
+                || (*computed && expr_has_toplevel_vm_divergence(property))
+        }
+        Expr::Call { callee, args } => {
+            // `Object.defineProperty(...)` / `Object.defineProperties(...)` with
+            // an ACCESSOR descriptor escapes a getter/setter closure whose captured
+            // environment the VM module path drops (the getter throws on a
+            // captured `let`). Also `o.__defineGetter__/__defineSetter__`. Decline.
+            if call_is_accessor_define(callee, args) {
+                return true;
+            }
+            // A function/arrow expression nested ANYWHERE in an argument (e.g.
+            // `WebAssembly.instantiate(b, { env: { f: function(){…} } })`) escapes
+            // to a host native that invokes it later; the VM dispatches that
+            // escaping closure on a throwaway snapshot, dropping captured globals
+            // and thrown-error message identity. The direct-arg case is already
+            // declined in `scan_expr_for_decline`; this catches functions buried
+            // inside object/array-literal arguments too.
+            if args.iter().any(arg_contains_escaping_function) {
+                return true;
+            }
+            expr_has_toplevel_vm_divergence(callee)
+                || args.iter().any(expr_has_toplevel_vm_divergence)
+        }
+        Expr::New { callee, args } => {
+            if let Expr::Identifier(n) = callee.as_ref() {
+                if TOPLEVEL_VM_DIVERGING_CTORS.contains(&n.as_str()) {
+                    return true;
+                }
+            }
+            if args.iter().any(arg_contains_escaping_function) {
+                return true;
+            }
+            expr_has_toplevel_vm_divergence(callee)
+                || args.iter().any(expr_has_toplevel_vm_divergence)
+        }
+        Expr::Function { body, .. } => body.iter().any(stmt_has_toplevel_vm_divergence),
+        Expr::Arrow { body, .. } => match body {
+            crate::ast::ArrowBody::Expr(e) => expr_has_toplevel_vm_divergence(e),
+            crate::ast::ArrowBody::Block(body) => {
+                body.iter().any(stmt_has_toplevel_vm_divergence)
+            }
+        },
+        Expr::DynamicImport(inner) => expr_has_toplevel_vm_divergence(inner),
+    }
+}
+
+/// True iff a call is `Object.defineProperty`/`Object.defineProperties` with a
+/// descriptor object that has a `get`/`set` accessor, or `x.__defineGetter__` /
+/// `x.__defineSetter__`. The accessor closure escapes onto the property and is
+/// later invoked with an environment the VM module path does not preserve.
+fn call_is_accessor_define(callee: &Expr, args: &[Expr]) -> bool {
+    if let Expr::Member { object, property, computed: false } = callee {
+        if let Expr::Identifier(method) = property.as_ref() {
+            if method == "__defineGetter__" || method == "__defineSetter__" {
+                return true;
+            }
+            if (method == "defineProperty" || method == "defineProperties")
+                && matches!(object.as_ref(), Expr::Identifier(o) if o == "Object")
+            {
+                // Decline only when a descriptor argument actually carries a
+                // get/set accessor (a plain `{ value: … }` data descriptor runs
+                // byte-identically and stays VM-eligible).
+                return args.iter().any(descriptor_has_accessor);
+            }
+        }
+    }
+    false
+}
+
+/// True iff an expression is (or contains, for `defineProperties`' map) an object
+/// literal with a `get`/`set` key — an accessor descriptor.
+fn descriptor_has_accessor(e: &Expr) -> bool {
+    match e {
+        Expr::Object(props) => props.iter().any(|(k, v)| {
+            k == "get" || k == "set" || descriptor_has_accessor(v)
+        }),
+        _ => false,
+    }
+}
+
+/// True iff a call/new argument is (or transitively contains, through object /
+/// array / conditional / sequence literals) a function or arrow EXPRESSION — an
+/// escaping callback the host may invoke later. Does NOT descend into a found
+/// function's body (that closure is the escapee; its internals don't matter for
+/// the decline). Mirrors the direct-arg decline in `scan_expr_for_decline`,
+/// extended to functions nested inside literal arguments
+/// (`f({ cb: function(){…} })`, `f([fn])`).
+fn arg_contains_escaping_function(e: &Expr) -> bool {
+    match e {
+        Expr::Function { .. } | Expr::Arrow { .. } => true,
+        Expr::Object(props) => props.iter().any(|(_k, v)| arg_contains_escaping_function(v)),
+        Expr::Array(items) | Expr::Sequence(items) => {
+            items.iter().any(arg_contains_escaping_function)
+        }
+        Expr::Conditional { cons, alt, .. } => {
+            arg_contains_escaping_function(cons) || arg_contains_escaping_function(alt)
+        }
+        Expr::Spread(inner) => arg_contains_escaping_function(inner),
+        _ => false,
+    }
+}
+
+/// True iff an expression is the class desugar IIFE: `(function(){ …
+/// function NAME(...) {...} … return NAME; })()` — a zero-arg call of an
+/// anonymous function expression whose body declares a function and RETURNS that
+/// same name. This is exactly what `parser::parse_class_tail` emits and is not a
+/// shape ordinary IIFEs take (they return values/objects, not a self-declared
+/// function identifier), so it precisely targets classes without false positives.
+fn expr_is_class_iife(e: &Expr) -> bool {
+    let Expr::Call { callee, args } = e else { return false };
+    if !args.is_empty() {
+        return false;
+    }
+    let Expr::Function { params, body, .. } = callee.as_ref() else { return false };
+    if !params.is_empty() {
+        return false;
+    }
+    // The IIFE must declare a function and end by returning that exact name.
+    let returned = match body.last() {
+        Some(Stmt::Return(Some(Expr::Identifier(n)))) => n.clone(),
+        _ => return false,
+    };
+    body.iter().any(|s| matches!(s, Stmt::FunctionDecl { name, .. } if *name == returned))
 }
 
 /// Walk top-level statements (and nested blocks/loops/branches that share the
@@ -3233,7 +3531,7 @@ impl Value {
 /// ECMA-262 §7.2.10 SameValueZero. Differs from strict_eq (`===`) on
 /// exactly one case: NaN equals NaN. Used by Array.prototype.includes,
 /// Set/Map key equivalence, and TypedArray.prototype.includes.
-fn same_value_zero(a: &Value, b: &Value) -> bool {
+pub(crate) fn same_value_zero(a: &Value, b: &Value) -> bool {
     if let (Value::Number(x), Value::Number(y)) = (a, b) {
         if x.is_nan() && y.is_nan() {
             return true;
@@ -6516,6 +6814,34 @@ pub fn current_native_this() -> Value {
     NATIVE_THIS_TL.with(|s| s.borrow().last().cloned().unwrap_or(Value::Undefined))
 }
 
+/// RAII guard that pushes a `this` value onto the native-receiver thread-local
+/// for the lifetime of a `Pure` native-builtin call dispatched FROM THE VM, then
+/// pops it on drop (even on panic / early return). The tree-walk dispatcher
+/// (`dispatch_call`) always pushes `this` for both `Pure` and `WithInterp`
+/// natives so a builtin can resolve its dynamic receiver via
+/// `current_native_this()` (the `this_string_or` / `this_array_or` / WeakRef
+/// `deref` etc. pattern). The VM's `dispatch_call_value` ran `Pure` bodies
+/// DIRECTLY without this push, so a VM-dispatched `obj.method()` saw the WRONG
+/// receiver — `globalThis.__w.deref()` threw "called on non-object". This guard
+/// makes the VM's `Pure` path set the receiver byte-identically to the
+/// tree-walker.
+pub(crate) struct VmNativeThisGuard;
+
+impl VmNativeThisGuard {
+    pub(crate) fn new(this: Value) -> Self {
+        NATIVE_THIS_TL.with(|s| s.borrow_mut().push(this));
+        VmNativeThisGuard
+    }
+}
+
+impl Drop for VmNativeThisGuard {
+    fn drop(&mut self) {
+        NATIVE_THIS_TL.with(|s| {
+            s.borrow_mut().pop();
+        });
+    }
+}
+
 /// For a built-in array method: the array it should operate on. Prefers the
 /// dynamically-bound `this` (so `method.call(otherArray, …)` works), falling
 /// back to the array the method was originally read off of (so a detached
@@ -8044,9 +8370,14 @@ impl Interp {
                 };
                 let a = args.get(1).cloned().unwrap_or(Value::Undefined);
                 let b = args.get(2).cloned().unwrap_or(Value::Undefined);
-                // ECMA-262 §7.2.13: ToPrimitive(Number hint) Object operands
-                // for relational operators before comparing.
-                if matches!(&*op, "<" | ">" | "<=" | ">=") {
+                // ECMA-262 §7.2.13 / §13.15.3: ToPrimitive(default hint) Object
+                // operands for relational operators AND `+` before applying the
+                // operator. For `+` this is what makes `'' + {toString(){...}}`
+                // and `obj + 1` (valueOf) byte-identical to the tree-walk
+                // `Expr::Binary` Add arm (which ToPrimitive's both operands
+                // before `binary_op`); the VM's `op_add` routes Object operands
+                // here exactly for this reason.
+                if matches!(&*op, "<" | ">" | "<=" | ">=" | "+") {
                     let ap = if matches!(a, Value::Object(_)) {
                         interp.ordinary_to_primitive(&a, false).unwrap_or_else(|| a.clone())
                     } else {
@@ -23655,7 +23986,7 @@ fn arg_num(args: &[Value], i: usize) -> f64 {
 ///   • pow(-1, ±Infinity) = NaN  (Rust returns 1.0)
 /// Everything else delegates to `powf`.
 #[inline]
-fn js_pow(base: f64, exp: f64) -> f64 {
+pub(crate) fn js_pow(base: f64, exp: f64) -> f64 {
     // §21.3.2.26 step 4: If |base| is 1 and exp is ±∞ or NaN → NaN.
     if exp.is_nan() && base.abs() == 1.0 {
         return f64::NAN;
@@ -25191,6 +25522,86 @@ mod tests {
         i.install_basic_globals();
         let v = i.run(src).expect("run");
         (v, i.output)
+    }
+
+    /// REGRESSION GATE for the `CV_TOPLEVEL_VM` full-corpus divergences. Each of
+    /// these top-level constructs ONCE diverged between the tree-walker and the
+    /// bytecode-VM top-level path; this test proves both that (1) every one now
+    /// agrees through the production-faithful oracle (throw + console + every
+    /// touched global, observed THROUGH the global object), and (2) the intended
+    /// disposition holds — a VM BUG was FIXED (stays VM-eligible, fast) or a
+    /// risky construct is DECLINED (falls back to the byte-identical tree-walker).
+    /// Categorized exactly as the task's enumerate→fix/decline pass.
+    #[test]
+    fn toplevel_vm_all_corpus_constructs_agree_fixed_or_declined() {
+        // (construct, src, expect_vm_eligible)
+        //   expect_vm_eligible = true  → FIXED in the VM (stays fast).
+        //   expect_vm_eligible = false → DECLINED to the tree-walker (correct fallback).
+        let cases: &[(&str, &str, bool)] = &[
+            // ── FIXED VM BUGS (stay eligible) ───────────────────────────────
+            ("array_includes_nan(SameValueZero)",
+             "console.log([NaN].includes(NaN)); console.log([1,NaN,3].includes(NaN)); console.log([1,2,3].includes(NaN));", true),
+            ("delete_array_idx(hole reads undefined)",
+             "var arr = [10, 20, 30]; delete arr[1]; console.log(arr[1] === undefined, arr.length);", true),
+            ("math_pow(1 ** NaN special case)",
+             "var p4 = 1 ** (0/0); console.log(p4 !== p4 ? 'NaN' : String(p4));", true),
+            ("object_plus_toprimitive",
+             "var o = { toString: function(){ return 'TS'; } }; console.log(String(o)); console.log('' + o);", true),
+            // ── DECLINED CONSTRUCTS (fall back to tree-walk) ────────────────
+            ("arguments_in_iife",
+             "var count = 0;(function(n){ count++; if (n > 0) arguments.callee(n - 1); })(3);console.log(count);", false),
+            ("generator_lazy_order",
+             "var log = []; function* g() { log.push('start'); yield 1; log.push('mid'); yield 2; log.push('end'); } var it = g(); log.push('created'); var a = it.next(); var b = it.next(); var c = it.next(); console.log(a.value, a.done, b.value, b.done, c.value, c.done, log.join(','));", false),
+            ("generator_twoway_next",
+             "function* g() { var a = yield 1; var b = yield a + 10; yield b + 100; } var it = g(); var r1 = it.next(); var r2 = it.next(5); var r3 = it.next(20); console.log(r1.value, r2.value, r3.value);", false),
+            ("class_extends_instanceof",
+             "class Animal { constructor(n){ this.name = n; } } class Dog extends Animal { constructor(n){ super(n); } } var d = new Dog('Rex'); console.log(d instanceof Dog); console.log(d instanceof Animal);", false),
+            ("plain_class_method_and_instanceof",
+             "class A { constructor(n){ this.n = n; } get2(){ return this.n + 2; } } var a = new A(5); console.log(a.n); console.log(a.get2()); console.log(a instanceof A);", false),
+            ("iterator_helpers_lazy",
+             "var pulled = []; function* gen() { for (var i = 1; i <= 5; i++) { pulled.push(i); yield i; } } var r = gen().take(2).toArray(); console.log(r.join(',')); console.log('pulled:' + pulled.join(','));", false),
+            ("map_set_live_size",
+             "var s = new Set(); console.log('i: ' + s.size); s.add(1); s.add(2); console.log('a: ' + s.size);", false),
+            ("define_property_accessor_escape",
+             "function make() { var exports = {}; Object.defineProperty(exports, 'Foo', { enumerable: true, get: function(){ return hg; } }); var hg = 7; return exports; } var exports = make(); console.log(typeof exports.Foo); console.log(exports.Foo);", false),
+            ("string_method_rebind_via_call",
+             "console.log(\"\".toLowerCase.call(\"HELLO\")); console.log(\"\".toUpperCase.call(\"hello\"));", false),
+            ("escaping_callback_in_object_literal_arg",
+             "var hits = []; [1,2].forEach(function(v){ hits.push(v); }); console.log(hits.join(','));", false),
+            ("new_proxy_construct_trap",
+             "function C(n){ this.n = n; } var p = new Proxy(C, { construct(t, args){ return { n: args[0] * 2 }; } }); var o = new p(5); console.log(o.n);", false),
+        ];
+        for (name, src, expect_eligible) in cases {
+            let eligible = super::toplevel_vm_eligible(
+                &crate::parser::parse_program(src).expect("parse"),
+            );
+            assert_eq!(
+                eligible, *expect_eligible,
+                "{name}: VM-eligibility disposition changed (expected eligible={expect_eligible}, got {eligible})"
+            );
+            crate::ab_oracle::assert_toplevel_vm_agrees(src)
+                .unwrap_or_else(|d| panic!("{name}: top-level VM diverges from tree-walk\n{src}\n{d}"));
+        }
+    }
+
+    /// The fixed VM bugs must ALSO be correct as plain values vs Node/Chrome
+    /// ground truth (not merely agree between the two tiers, which could be
+    /// both-wrong). Run on the actual `run()` path with the top-level VM forced ON.
+    #[test]
+    fn toplevel_vm_fixed_bugs_match_node_ground_truth() {
+        let _g = super::TopLevelVmGuard::new(true);
+        // [NaN].includes(NaN) === true (SameValueZero); [1,2,3].includes(NaN) === false.
+        let (_, o) = run("console.log([NaN].includes(NaN), [1,2,3].includes(NaN));");
+        assert_eq!(o, vec!["true false"]);
+        // delete arr[1] → hole reads undefined, length stays 3.
+        let (_, o) = run("var a=[10,20,30]; delete a[1]; console.log(a[1] === undefined, a.length);");
+        assert_eq!(o, vec!["true 3"]);
+        // 1 ** NaN === NaN (ECMA-262 §21.3.2.26), unlike IEEE pow(1,NaN)=1.
+        let (_, o) = run("var p = 1 ** (0/0); console.log(p !== p);");
+        assert_eq!(o, vec!["true"]);
+        // '' + {toString(){return 'TS'}} === 'TS' (ToPrimitive), and valueOf for +.
+        let (_, o) = run("var o={toString:function(){return 'TS';}}; var v={valueOf:function(){return 7;}}; console.log('' + o, v + 1);");
+        assert_eq!(o, vec!["TS 8"]);
     }
 
     #[test]
@@ -32273,6 +32684,16 @@ mod gengc_oracle {
     /// as an f64, plus the total P6 native exec count over the run. Uses a fresh
     /// interp + the standard globals. The P6 JIT is the default-on tier here.
     fn run_p6(src: &str, result_global: &str) -> (f64, u64) {
+        // These tests measure the TREE-WALK P6 JIT's per-call native exec count
+        // (`p6_exec_count`) for a hot top-level loop. That counter only advances
+        // when the loop's `f(i)` calls go through the tree-walk call op — so the
+        // measurement requires the top-level body to TREE-WALK. With the
+        // `CV_TOPLEVEL_VM` lever forced ON (the corpus flag-on gate) the whole
+        // loop would instead run on the bytecode VM (its `Op::CallFn` dispatch,
+        // not the tree-walk JIT), driving `p6_exec_count` to 0. Pin the lever OFF
+        // here so the tier under measurement is the one this oracle is about; the
+        // VALUE result is independently identical on either path.
+        let _no_toplevel_vm = crate::interp::TopLevelVmGuard::new(false);
         reset_call_inline_cache();
         reset_p6_exec_count();
         let mut i = Interp::new();
@@ -32291,6 +32712,10 @@ mod gengc_oracle {
     /// Same workload but with the P6 JIT (and therefore the inline cache) FORCED
     /// OFF — the pure-VM oracle reference (the CV_T2=0 / no-JIT equivalent).
     fn run_p6_off(src: &str, result_global: &str) -> f64 {
+        // Pin the top-level VM lever OFF for the same reason as `run_p6`: this is
+        // the pure-VM (JIT-off) reference for the TREE-WALK path's value, so both
+        // sides of the byte-identity assert must run the loop on the tree-walker.
+        let _no_toplevel_vm = crate::interp::TopLevelVmGuard::new(false);
         let _guard = NoP6JitGuard::new();
         reset_call_inline_cache();
         let mut i = Interp::new();

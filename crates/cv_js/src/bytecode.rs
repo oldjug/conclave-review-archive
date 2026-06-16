@@ -1099,10 +1099,19 @@ pub(crate) fn dispatch_call_value(
     };
     match callee_eff {
         Value::NativeFunction(nf) => match &nf.func {
-            crate::interp::NativeFnBody::Pure(body) => body(call_args).map_err(|e| match e {
-                crate::interp::JsError::Throw(v) => RuntimeError::Thrown(v),
-                other => RuntimeError::TypeError(format!("native fn `{}`: {other:?}", nf.name)),
-            }),
+            crate::interp::NativeFnBody::Pure(body) => {
+                // Push the receiver onto the native-`this` thread-local for the
+                // duration of the body, exactly as the tree-walk dispatcher does,
+                // so a `Pure` builtin that resolves its dynamic receiver via
+                // `current_native_this()` (string/array methods rebound through
+                // `.call`, WeakRef `deref`, …) sees the right `this` from VM
+                // dispatch. The guard pops on every exit (incl. the error path).
+                let _this_guard = crate::interp::VmNativeThisGuard::new(this_val);
+                body(call_args).map_err(|e| match e {
+                    crate::interp::JsError::Throw(v) => RuntimeError::Thrown(v),
+                    other => RuntimeError::TypeError(format!("native fn `{}`: {other:?}", nf.name)),
+                })
+            }
             crate::interp::NativeFnBody::WithInterp(_) => {
                 dispatch(Value::NativeFunction(nf.clone()), this_val, call_args)
             }
@@ -5727,14 +5736,55 @@ fn op_add(st: &mut VmState, dst: Reg, lhs: Reg, rhs: Reg) -> StepStatus {
         match bigint_binop("+", &regs[lhs as usize], &regs[rhs as usize], st.globals, disp) {
             Some(Ok(r)) => r,
             Some(Err(e)) => return StepStatus::from_err(e),
-            None => match add_values(&regs[lhs as usize], &regs[rhs as usize]) {
-                Ok(r) => r,
-                Err(e) => return StepStatus::from_err(e),
+            // An Object operand needs ToPrimitive (`Symbol.toPrimitive` /
+            // `valueOf` / `toString` via the interp) before `+` decides
+            // string-concat vs numeric — `add_values` only stringifies with the
+            // opaque `[object Object]`, which diverges from the tree-walker on
+            // `'' + {toString(){...}}` and `obj + 1` (valueOf). Route Object
+            // operands through `__tb_host_binop("+")` (the full tree-walk
+            // `binary_op`, ToPrimitive-aware) so VM `+` is byte-identical.
+            None => match additive_host_binop(
+                &regs[lhs as usize],
+                &regs[rhs as usize],
+                st.globals,
+                disp,
+            ) {
+                Some(Ok(r)) => r,
+                Some(Err(e)) => return StepStatus::from_err(e),
+                None => match add_values(&regs[lhs as usize], &regs[rhs as usize]) {
+                    Ok(r) => r,
+                    Err(e) => return StepStatus::from_err(e),
+                },
             },
         }
     };
     regs[dst as usize] = v;
     StepStatus::Continue
+}
+
+/// When either operand of `+` is an Object, dispatch to `__tb_host_binop("+")`
+/// so the full ToPrimitive (`Symbol.toPrimitive`/`valueOf`/`toString`) runs
+/// before deciding string-concat vs numeric — byte-identical to the tree-walk
+/// `+`. Returns `None` when neither operand is an Object (the fast `add_values`
+/// path handles it) or when no host is wired (bare-globals entry points).
+fn additive_host_binop(
+    a: &Value,
+    b: &Value,
+    globals: &std::cell::RefCell<HashMap<String, Value>>,
+    dispatch: WithInterpDispatch<'_>,
+) -> Option<Result<Value, RuntimeError>> {
+    if !matches!(a, Value::Object(_)) && !matches!(b, Value::Object(_)) {
+        return None;
+    }
+    let getter = globals.borrow().get("__tb_host_binop").cloned();
+    match getter {
+        Some(g @ Value::NativeFunction(_)) => Some(dispatch(
+            g,
+            Value::Undefined,
+            vec![Value::str("+".to_string()), a.clone(), b.clone()],
+        )),
+        _ => None,
+    }
 }
 
 #[inline]
@@ -5940,17 +5990,20 @@ fn op_mod(st: &mut VmState, dst: Reg, lhs: Reg, rhs: Reg) -> StepStatus {
 #[inline]
 fn op_pow(st: &mut VmState, dst: Reg, lhs: Reg, rhs: Reg) -> StepStatus {
     let regs = unsafe { &mut *st.regs };
+    // Use the spec-faithful `js_pow` (ECMA-262 §21.3.2.26 special cases:
+    // `1 ** NaN` / `(-1) ** ±Infinity` → NaN, unlike IEEE `powf` which returns
+    // 1.0) so VM exponentiation is byte-identical to the tree-walker's `**`.
     let v = if let (Value::Number(a), Value::Number(b)) =
         (&regs[lhs as usize], &regs[rhs as usize])
     {
-        Value::Number(a.powf(*b))
+        Value::Number(crate::interp::js_pow(*a, *b))
     } else {
         let disp = unsafe { &mut *st.dispatch };
         match bigint_binop("**", &regs[lhs as usize], &regs[rhs as usize], st.globals, disp) {
             Some(Ok(r)) => r,
             Some(Err(e)) => return StepStatus::from_err(e),
             None => match (to_num(&regs[lhs as usize]), to_num(&regs[rhs as usize])) {
-                (Ok(a), Ok(b)) => Value::Number(a.powf(b)),
+                (Ok(a), Ok(b)) => Value::Number(crate::interp::js_pow(a, b)),
                 (Err(e), _) | (_, Err(e)) => return StepStatus::from_err(e),
             },
         }
@@ -9632,7 +9685,14 @@ fn property_lookup(obj: &Value, key: &str) -> Value {
                 return Value::Number(a.borrow().len() as f64);
             }
             if let Ok(idx) = key.parse::<usize>() {
-                return a.borrow().get(idx).cloned().unwrap_or(Value::Undefined);
+                // A deleted slot is a `Value::Hole` in storage; per ECMA-262
+                // §10.4.2 it READS as `undefined` (so `delete arr[1]; arr[1] ===
+                // undefined` is true) — normalize it here so the VM index read is
+                // byte-identical to the tree-walker, which never surfaces a hole.
+                return match a.borrow().get(idx) {
+                    Some(Value::Hole) | None => Value::Undefined,
+                    Some(v) => v.clone(),
+                };
             }
             // Named own-property hung on the array (e.g. webpack's overridden
             // `push`) shadows the built-in method binding.
@@ -9858,9 +9918,14 @@ fn array_method_binding(arr: std::rc::Rc<std::cell::RefCell<Vec<Value>>>, key: &
                 "includes",
                 Box::new(move |args| {
                     let needle = args.first().cloned().unwrap_or(Value::Undefined);
-                    Ok(Value::Bool(
-                        a.borrow().iter().any(|x| Value::strict_eq(x, &needle)),
-                    ))
+                    // ECMA-262 §23.1.3.13 Array.prototype.includes uses
+                    // SameValueZero (NaN equals NaN), NOT strict_eq — so
+                    // `[NaN].includes(NaN)` is true, byte-identical to the
+                    // tree-walker. A Hole reads as `undefined` for the compare.
+                    Ok(Value::Bool(a.borrow().iter().any(|x| {
+                        let xv = if matches!(x, Value::Hole) { &Value::Undefined } else { x };
+                        crate::interp::same_value_zero(xv, &needle)
+                    })))
                 }),
             )
         }
