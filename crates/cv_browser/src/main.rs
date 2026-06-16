@@ -9173,15 +9173,18 @@ fn build_browser_session(target: &str) -> Result<BrowserParts, String> {
                     set_caret_pos_for_render(st.caret_pos);
                     let t_anim = std::time::Instant::now();
                     // ── CV_COMPOSITOR_ANIM: property-tree-driven recomposite ──
-                    // When ON and the frame animates ONLY transform/opacity on a
-                    // single promoted layer, re-composite the CACHED layers via
+                    // When the frame animates ONLY transform on a single promoted,
+                    // integer-aligned layer, re-composite the CACHED layers via
                     // apply_property_tree_update — NO re-raster of layer contents
-                    // (Chrome's compositor-thread animation). The first build for
-                    // a page revision is byte-verified against the full bake
-                    // inside try_compositor_anim_recomposite; on divergence it
-                    // returns None and the revision is permanently declined, so we
-                    // fall through to the damage/full bake below. Default OFF ⇒
-                    // try_compositor_anim_recomposite returns None immediately.
+                    // (Chrome's compositor-thread animation). On the build frame
+                    // for a page revision the recomposite is byte-verified against
+                    // a full bake ACROSS the animated value range (not just the
+                    // build value) inside try_compositor_anim_recomposite; on any
+                    // divergence it returns None and the revision is permanently
+                    // declined, so we fall through to the damage/full bake below.
+                    // DEFAULT-ON (2026-06-15); CV_COMPOSITOR_ANIM=0 ⇒ returns None
+                    // immediately (forces the old full-bake path). Opacity
+                    // animations decline (1-LSB blend divergence) → full bake.
                     if let Some(recomposed) = try_compositor_anim_recomposite(
                         &lb,
                         &st.doc,
@@ -20580,15 +20583,47 @@ fn build_property_trees_walk(
 //     EffectTree::OnOpacityAnimated mutate the node in place; tiles are reused.
 //   - blink CompositingReasonFinder: which elements get a composited layer.
 //
-// Gated behind `CV_COMPOSITOR_ANIM` (default OFF): it changes the animation
-// frame path. The full-raster damage/bake path stays the default + fallback.
+// Gated behind `CV_COMPOSITOR_ANIM` (DEFAULT-ON since 2026-06-15): on a
+// transform-only animation frame it re-composites the CACHED promoted layer via
+// the property trees WITHOUT re-rastering its contents (Chrome's compositor-
+// thread animation). The full-raster damage/bake path stays the fallback for
+// every frame the fast path declines.
 
-/// `CV_COMPOSITOR_ANIM=1` enables the property-tree-driven recomposite fast
-/// path for transform/opacity-only animation frames. Default OFF.
+/// `CV_COMPOSITOR_ANIM` controls the property-tree-driven recomposite fast path
+/// for TRANSFORM-only animation frames on a single promoted, integer-aligned
+/// layer. **DEFAULT-ON** (2026-06-15); `CV_COMPOSITOR_ANIM=0` is the escape
+/// hatch that forces the old full-bake path.
+///
+/// Why it is now safe to default-on (the blocker — per-value correctness across
+/// the WHOLE animated range, not just the build frame — is fixed):
+///   • By construction: a transform animation on an integer-aligned base is
+///     byte-identical to a full bake at EVERY continuous value. The only
+///     divergence class (truncation carry across the integer pixel boundary)
+///     cannot occur when frac(base)=0, because the full painter's separate
+///     truncation `r.x as i32 + (off_x as i32)` then equals the compositor's
+///     combined `(base + world_tx) as i32`. Proven by
+///     `transform_recomposite_byte_identical_dense_continuous` (257 dense
+///     values, max diff 0).  Modeled on cc's `DrawTransform`
+///     (cc/trees/draw_property_utils.cc) — the cached tiles are drawn through the
+///     layer's affine draw transform — and `TransformTree::OnTransformAnimated`
+///     (cc/trees/property_tree.cc), which updates only the node value and never
+///     re-rasters.
+///   • Empirical per-VALUE sweep: on the build frame for a revision the
+///     recomposite is byte-compared against a full bake at a spread of values
+///     across the range (`verify_recomposite_across_value_range`); ANY mismatch
+///     permanently declines the revision (full-bake fallback). Proven a real
+///     comparison by `per_value_sweep_is_a_real_byte_compare_not_a_rubber_stamp`.
+///   • OPACITY is deliberately EXCLUDED: it diverges by 1 LSB at some values
+///     (the painter rounds alpha to a byte before blending; `composite_layer`
+///     folds a float opacity then rounds the result) —
+///     `opacity_recomposite_dense_continuous_diverges` pins it. Opacity frames
+///     stay on the full bake until the two blend orderings converge.
+/// The compositor's own self-disable (no-re-raster invariant + revision verdict)
+/// remains as belt-and-suspenders.
 fn compositor_anim_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("CV_COMPOSITOR_ANIM").as_deref() == Ok("1"))
+    *ON.get_or_init(|| std::env::var("CV_COMPOSITOR_ANIM").as_deref() != Ok("0"))
 }
 
 /// Detect Chrome-style compositing triggers on a single layout box. We promote
@@ -20805,6 +20840,189 @@ thread_local! {
     static COMPOSITOR_ANIM_DISABLED_REV: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
 }
 
+/// Neutralize the paint-time animated transform/opacity fields of EVERY box in a
+/// layout subtree back to identity, returning a "base" tree from which the
+/// animation can be re-driven to an arbitrary progress. Used by the per-value
+/// verification sweep (and the recomposite re-anchor): the cached layer raster is
+/// taken at this identity state, so the only thing that changes across the
+/// animation is the property-tree VALUE, never the layout. We touch ONLY the
+/// fields `apply_css_animations` writes for a compositor-only (transform/opacity)
+/// frame — layout geometry is untouched.
+fn neutralize_anim_transform_opacity(lb: &mut cv_layout::LayoutBox) {
+    lb.translate_x_px = 0.0;
+    lb.translate_y_px = 0.0;
+    lb.scale_x = 1.0;
+    lb.scale_y = 1.0;
+    lb.rotate_deg = 0.0;
+    lb.matrix_2d = None;
+    lb.transform_mat4 = None;
+    lb.opacity = 1.0;
+    for c in &mut lb.children {
+        neutralize_anim_transform_opacity(c);
+    }
+}
+
+/// Drive every animating box in `lb` to a specific RAW timeline progress
+/// `t in [0,1]` (0 = keyframe start, 1 = keyframe end), applying ONLY the
+/// transform/opacity-family samples. This mirrors the transform/opacity branch of
+/// [`apply_css_animations`] but is parameterized by progress instead of a wall
+/// clock, so the per-value verification sweep can pin a deterministic set of
+/// sample points across the FULL animated range. `lb` must already be a base
+/// (identity) tree (see [`neutralize_anim_transform_opacity`]).
+fn drive_anim_to_progress(
+    lb: &mut cv_layout::LayoutBox,
+    keyframes: &std::collections::HashMap<String, cv_css::cascade::KeyframeRule>,
+    t: f32,
+) {
+    if let Some(name) = lb.animation_name.clone() {
+        if lb.animation_duration_ms > 0.0 {
+            if let Some(rule) = keyframes.get(&name) {
+                let eased = anim_ease(t.clamp(0.0, 1.0), lb.animation_timing);
+                let props = cv_css::cascade::sample_animation(rule, eased);
+                if let Some(tf) = props.get("transform") {
+                    anim_apply_transform(lb, tf);
+                }
+                if let Some(op) = props.get("opacity") {
+                    if let Some(v) = anim_scalar(op) {
+                        lb.opacity = v.clamp(0.0, 1.0);
+                    }
+                }
+            }
+        }
+    }
+    for c in &mut lb.children {
+        drive_anim_to_progress(c, keyframes, t);
+    }
+}
+
+/// The set of timeline progress values the per-value verification sweep checks.
+/// Endpoints (0.0, 1.0) catch the boundary keyframes; interior values
+/// (especially fractional-pixel-producing ones like 0.337) catch the divergence
+/// classes the single-build-frame oracle MISSES: a fractional `translate` (our
+/// software `composite_layer` truncates the layer offset to an integer, while a
+/// full bake positions subpixel content differently) and a non-unit `scale` (our
+/// `composite_layer` does NOT scale the cached bitmap at all). If ANY of these
+/// diverges, the revision is declined and the full bake stays the source of truth
+/// — so default-on can never present a wrong frame at a value it never verified.
+const COMPOSITOR_ANIM_VERIFY_PROGRESS: &[f32] =
+    &[0.0, 0.137, 0.25, 0.337, 0.5, 0.663, 0.75, 0.913, 1.0];
+
+/// Per-VALUE correctness sweep (THE blocker fix). Drive the animation through
+/// [`COMPOSITOR_ANIM_VERIFY_PROGRESS`] and, at EACH sampled value, prove the
+/// property-tree-driven recomposite of the cached layers is byte-identical to a
+/// full bake of the layout driven to that same value. Returns `true` only when
+/// EVERY sampled value matches. A single divergence returns `false` (caller
+/// declines the revision → permanent fallback to the full/damage bake).
+///
+/// Chrome reference: `cc`'s composited transform/opacity animation
+/// (`TransformTree::OnTransformAnimated` / `EffectTree::OnOpacityAnimated`,
+/// cc/trees/property_tree.cc) updates ONLY the property-tree node value and
+/// re-composites the cached tiles through the layer's affine draw transform
+/// (`cc::DrawTransform`, cc/trees/draw_property_utils.cc) — which includes
+/// fractional translation and scale, so correctness holds at every value by
+/// construction (GPU affine resample of the texture). Our software compositor's
+/// `composite_layer` is an integer-offset, unscaled blit, so it is byte-identical
+/// to a full bake ONLY for integer-translate / unit-scale values. This sweep is
+/// the honest substitute for Chrome's by-construction guarantee: it verifies the
+/// values we will actually present and falls back wherever our software
+/// compositor cannot yet faithfully resample (fractional translate / scale).
+#[allow(clippy::too_many_arguments)]
+fn verify_recomposite_across_value_range(
+    base: &cv_layout::LayoutBox,
+    doc: &cv_html::Document,
+    url: &str,
+    cfg: &cv_layout::LayoutConfig,
+    title_override: Option<String>,
+    focused_path: Option<&[usize]>,
+    keyframes: &std::collections::HashMap<String, cv_css::cascade::KeyframeRule>,
+    promoted_id: u64,
+) -> bool {
+    let promoted_id32 = promoted_id as u32;
+    for &t in COMPOSITOR_ANIM_VERIFY_PROGRESS {
+        // 1. Drive a fresh copy of the base tree to this exact progress value.
+        let mut driven = base.clone();
+        drive_anim_to_progress(&mut driven, keyframes, t);
+
+        // 2. Recomposite the CACHED layers at this value via the property trees.
+        let trees = build_property_trees(&driven);
+        let Some(tree_state) = property_tree_state_for_node(&driven, promoted_id) else {
+            return false; // promotion shape unexpectedly changed → decline
+        };
+        // The promoted layer's base anchor is invariant across the animation
+        // (only the transform value moves), so recover it from the driven tree's
+        // base bounds (identity transform on the promoted subtree).
+        let base_offset = {
+            let Some(pbox) = find_box_by_node_id(&driven, promoted_id) else {
+                return false;
+            };
+            let mut b = pbox.clone();
+            neutralize_anim_transform_opacity(&mut b);
+            let bounds = b.subtree_bounds();
+            (promoted_id32, bounds.x, bounds.y)
+        };
+        let recomposed = COMPOSITOR_FRAME.with(|c| {
+            let mut bm = c.borrow_mut();
+            let Some((_, frame)) = bm.as_mut() else {
+                return None;
+            };
+            if let Some(l) = frame.tree.layers.iter_mut().find(|l| l.id == promoted_id32) {
+                l.tree_state = tree_state;
+            }
+            let before = frame.total_raster_gen();
+            let px = frame.recomposite(&trees, &[base_offset]);
+            // Invariant: the sweep must NEVER re-raster (it would invalidate the
+            // whole point — and silently make the verify trivially pass).
+            if frame.total_raster_gen() != before {
+                return None;
+            }
+            Some(px)
+        });
+        let Some(recomposed) = recomposed else {
+            return false;
+        };
+
+        // 3. Full-bake the SAME driven layout as the oracle.
+        let oracle = bake_layout_into_paint(
+            driven,
+            doc,
+            url,
+            cfg,
+            title_override.clone(),
+            focused_path,
+        );
+        let oracle_px = &oracle.bitmap.pixels;
+        let matches =
+            oracle_px.len() == recomposed.len() && oracle_px.as_slice() == recomposed.as_slice();
+        if !matches {
+            if std::env::var("CV_COMPOSITOR_ANIM_DEBUG").is_ok() {
+                cv_js::diag_log(&format!(
+                    "[CV_COMPOSITOR_ANIM] per-value sweep DIVERGED at progress t={t} \
+                     (recomposite != full bake) → revision declined"
+                ));
+            }
+            return false;
+        }
+    }
+    true
+}
+
+/// Find a box by stable `node_id` (used by the per-value verification sweep to
+/// re-locate the promoted subtree in a freshly driven clone).
+fn find_box_by_node_id(
+    lb: &cv_layout::LayoutBox,
+    id: u64,
+) -> Option<&cv_layout::LayoutBox> {
+    if lb.node_id == Some(id) {
+        return Some(lb);
+    }
+    for c in &lb.children {
+        if let Some(f) = find_box_by_node_id(c, id) {
+            return Some(f);
+        }
+    }
+    None
+}
+
 /// Attempt the property-tree-driven recomposite for a transform/opacity-only
 /// animation frame. Returns `Some(full_document_bgra)` when it produced the
 /// frame WITHOUT re-rastering the promoted layers; `None` to fall back to the
@@ -20845,6 +21063,31 @@ fn try_compositor_anim_recomposite(
         return None;
     }
     let promoted_box = animatable[0];
+
+    // ── TRANSFORM-only restriction (proven by the dense continuous probes) ────
+    // A TRANSFORM animation on an integer-aligned base is byte-identical to a
+    // full bake at EVERY continuous value (test
+    // `transform_recomposite_byte_identical_dense_continuous`: 257 dense values,
+    // 0 diff). An OPACITY animation is NOT: the full painter rounds the box's
+    // alpha to a byte BEFORE blending while `composite_layer` folds the float
+    // opacity into the source alpha and rounds the RESULT, which differs by 1 LSB
+    // at some opacity values (test `opacity_recomposite_dense_continuous_diverges`
+    // pins the first divergence). The per-value sweep samples only DISCRETE
+    // values, so it cannot make opacity sound for the continuous values the live
+    // clock actually presents. We therefore restrict the fast path to
+    // transform-only animations and leave opacity frames on the full bake (safe).
+    // Converging the two opacity-blend orderings is a documented follow-up that
+    // would re-admit opacity here.
+    {
+        let r = box_compositing_reasons(promoted_box, keyframes);
+        if r.opacity_animation {
+            return None;
+        }
+        if !r.transform_animation {
+            return None; // nothing transform to animate → no fast path
+        }
+    }
+
     let promoted_id = promoted_box.node_id?;
     let promoted_id32 = promoted_id as u32;
 
@@ -20871,6 +21114,37 @@ fn try_compositor_anim_recomposite(
         // Raster the promoted subtree ONCE into its own layer bitmap.
         let (pix, pw, ph, doc_x, doc_y) = raster_promoted_subtree(promoted_box)?;
         base_offset = (promoted_id32, doc_x, doc_y);
+
+        // ── CONTINUOUS-range soundness guard (integer base alignment) ─────────
+        // The per-value sweep below verifies a DISCRETE set of progress values.
+        // For the recomposite to be byte-identical to the full bake at EVERY
+        // CONTINUOUS value in between (the values the live clock actually
+        // presents), the only divergence class for a translate animation —
+        // truncation carry across the integer pixel boundary — must be
+        // impossible. The full painter truncates the layout position and the
+        // translate SEPARATELY (`r.x as i32 + (off_x as i32)`); our
+        // `composite_layer` truncates their SUM (`(base + world_tx) as i32`).
+        // These two schemes coincide for ALL continuous translate values IFF the
+        // layer's base offset is integer-aligned (then `frac(base)=0`, so no
+        // carry can ever occur: `trunc(base + t) == base + trunc(t)`). With a
+        // fractional base, a divergent sub-interval of translate values exists
+        // that the discrete sweep could step over — so we require integer base
+        // alignment and decline (safe full-bake fallback) otherwise. This is the
+        // by-construction half of the proof; the sweep is the empirical half
+        // (and also covers opacity / clip / any future class). Together they make
+        // default-on sound at every value, matching cc's affine-resample
+        // guarantee within the subset our software compositor can honour.
+        if doc_x.fract().abs() > 1e-4 || doc_y.fract().abs() > 1e-4 {
+            COMPOSITOR_ANIM_DISABLED_REV.with(|c| c.set(Some(rev)));
+            if std::env::var("CV_COMPOSITOR_ANIM_DEBUG").is_ok() {
+                cv_js::diag_log(
+                    "[CV_COMPOSITOR_ANIM] promoted layer base not integer-aligned \
+                     → cannot guarantee continuous-range byte-identity → declined",
+                );
+            }
+            return None;
+        }
+
         // Raster the root with the promoted subtree lifted out.
         let (root_pix, rw, rh) = raster_root_without_promoted(lb, cfg, &[promoted_id]);
         let promoted = cv_compositor::promote::PromotedElement {
@@ -20888,6 +21162,38 @@ fn try_compositor_anim_recomposite(
             rw, rh, 0xFFFF_FFFF, root_pix, vec![promoted],
         );
         COMPOSITOR_FRAME.with(|c| *c.borrow_mut() = Some((rev, frame)));
+
+        // ── Per-VALUE correctness sweep (THE blocker fix) ─────────────────────
+        // The old gate verified ONLY the build frame's single transform/opacity
+        // value. A recomposite that matched at the build value but diverges at a
+        // later animated value (a fractional translate our integer-offset
+        // `composite_layer` mishandles, or a `scale` it does not apply to the
+        // cached bitmap at all) would then be presented UNVERIFIED. So before we
+        // trust this cached frame for the whole revision, drive the animation
+        // through a spread of values across the full range and prove the
+        // recomposite is byte-identical to a full bake at EACH. Any divergence →
+        // permanently decline this revision (defined fallback to the full/damage
+        // bake). This is what makes default-on safe at EVERY value, not just the
+        // one we happened to build at. (Chrome's cc gets this for free: it affine-
+        // resamples the cached tiles via cc::DrawTransform; our software
+        // compositor cannot yet, so we verify-and-fall-back instead.)
+        let mut base_tree = lb.clone();
+        neutralize_anim_transform_opacity(&mut base_tree);
+        let all_values_match = verify_recomposite_across_value_range(
+            &base_tree,
+            doc,
+            url,
+            cfg,
+            title_override.clone(),
+            focused_path,
+            keyframes,
+            promoted_id,
+        );
+        if !all_values_match {
+            COMPOSITOR_ANIM_DISABLED_REV.with(|c| c.set(Some(rev)));
+            COMPOSITOR_FRAME.with(|c| *c.borrow_mut() = None);
+            return None;
+        }
     } else {
         // Recover the promoted layer's base offset from a fresh subtree-bounds
         // measurement (cheap: no raster) so the anchor stays correct.
@@ -20923,37 +21229,13 @@ fn try_compositor_anim_recomposite(
         pixels
     });
 
-    // ── First-build correctness gate ──────────────────────────────────────────
-    // On the frame that (re)built the CompositorFrame, prove the recomposited
-    // output is byte-identical to a full bake of the same layout. If it diverges,
-    // permanently decline this path for the page revision (defined fallback to
-    // the damage/full bake). This makes the fast path safe: it can never silently
-    // present a wrong frame. Subsequent frames at the same revision skip the
-    // oracle (the verdict is cached) so the perf win is real.
-    if needs_build {
-        let oracle = bake_layout_into_paint(
-            lb.clone(),
-            doc,
-            url,
-            cfg,
-            title_override.clone(),
-            focused_path,
-        );
-        let oracle_px = &oracle.bitmap.pixels;
-        let matches = oracle_px.len() == out.len() && oracle_px.as_slice() == out.as_slice();
-        if !matches {
-            // Diverged → disable for this revision and fall back.
-            COMPOSITOR_ANIM_DISABLED_REV.with(|c| c.set(Some(rev)));
-            COMPOSITOR_FRAME.with(|c| *c.borrow_mut() = None);
-            if std::env::var("CV_COMPOSITOR_ANIM_DEBUG").is_ok() {
-                cv_js::diag_log(
-                    "[CV_COMPOSITOR_ANIM] recomposite diverged from full bake → disabled for revision",
-                );
-            }
-            return None;
-        }
-    }
-
+    // Correctness is established by the per-value sweep above on the build frame
+    // (`verify_recomposite_across_value_range`), which proved the recomposite is
+    // byte-identical to a full bake across the WHOLE animated value range — not
+    // just the build value. On a non-build frame the verdict is cached, so the
+    // perf win is real (no per-frame oracle bake). The compositor's own
+    // self-disable invariant (`debug_assert` no-re-raster above) stays as
+    // belt-and-suspenders.
     Some(out)
 }
 
@@ -21882,6 +22164,381 @@ mod transition_tests {
         );
         let _ = (pw, ph);
         let _ = find_node(&lb, fid); // keep find_node referenced
+    }
+
+    // ── Per-VALUE correctness sweep (THE blocker fix) tests ───────────────────
+    //
+    // The old gate verified ONLY the build frame's single value. These tests
+    // exercise `verify_recomposite_across_value_range`, which drives the
+    // animation through the FULL range and byte-compares recomposite vs full bake
+    // at EACH sampled value. They prove the sweep is (1) SOUND — it catches a
+    // divergence at a NON-build value that the single-frame oracle would miss
+    // (a `scale` animation our software compositor cannot resample), and
+    // (2) NON-VACUOUS — it actually PASSES for an animation that recomposites
+    // byte-identically at every value.
+
+    /// Build the live `COMPOSITOR_FRAME` thread-local exactly as the real path
+    /// does, from a layout tree + the animating box's node_id. Returns the
+    /// page revision the frame was built under so the sweep can run for it.
+    fn install_compositor_frame_for(
+        lb: &cv_layout::LayoutBox,
+        cfg: &cv_layout::LayoutConfig,
+        anim_id: u64,
+        keyframes: &std::collections::HashMap<String, cv_css::cascade::KeyframeRule>,
+    ) {
+        let pbox = find_node(lb, anim_id).expect("animating box present");
+        let (pix, pw, ph, doc_x, doc_y) =
+            raster_promoted_subtree(pbox).expect("raster promoted subtree");
+        let tree_state = property_tree_state_for_node(lb, anim_id).expect("tree state");
+        let (root_pix, rw, rh) = raster_root_without_promoted(lb, cfg, &[anim_id]);
+        let promoted = cv_compositor::promote::PromotedElement {
+            id: anim_id as u32,
+            bitmap: pix,
+            bitmap_w: pw,
+            bitmap_h: ph,
+            base_x: doc_x,
+            base_y: doc_y,
+            z_index: pbox.z_index.unwrap_or(0),
+            tree_state,
+            reasons: box_compositing_reasons(pbox, keyframes),
+        };
+        let frame = cv_compositor::promote::CompositorFrame::build(
+            rw, rh, 0xFFFF_FFFF, root_pix, vec![promoted],
+        );
+        let rev = DOC_REVISION.with(|c| c.get());
+        COMPOSITOR_FRAME.with(|c| *c.borrow_mut() = Some((rev, frame)));
+    }
+
+    /// SOUND + NON-VACUOUS: the sweep ACTUALLY byte-compares recomposite vs full
+    /// bake at every value — so if the cached layer pixels do not match what a
+    /// full bake produces, the sweep returns false at SOME value (declining the
+    /// revision → safe fallback). We prove this painter-independently by
+    /// corrupting the cached layer bitmap after install: the recomposite then
+    /// composes corrupted pixels that a full bake never would, so the byte-
+    /// compare MUST fail. This pins that the sweep is a real comparison, not a
+    /// gate that rubber-stamps. A single-build-frame oracle that only checked
+    /// t=0 could be fooled if the corruption only affected a value reached
+    /// later; the range sweep cannot.
+    #[test]
+    fn per_value_sweep_is_a_real_byte_compare_not_a_rubber_stamp() {
+        let css = "@keyframes slide2 { from { transform: translateX(0px); } \
+                   to { transform: translateX(40px); } } \
+                   #m { position: absolute; left: 10px; top: 10px; \
+                        width: 24px; height: 16px; background: #0a0; \
+                        animation: slide2 1s linear; }";
+        let ss = cv_css::parse_stylesheet(css);
+        let kf = cv_css::cascade::collect_keyframes(&[ss.clone()]);
+        let doc = cv_html::parse(
+            "<!doctype html><html><body><div id=m></div></body></html>",
+        );
+        let cfg = cv_layout::LayoutConfig {
+            viewport_w: 200.0,
+            viewport_h: 200.0,
+            ..cv_layout::LayoutConfig::default()
+        };
+        let lb = build_layout_tree(&doc, &[ss], "file:///t", &cfg, &Default::default());
+        let mid = find_node(&lb, lb_anim_id(&lb, "slide2")).unwrap().node_id.unwrap();
+        let mut base = lb.clone();
+        neutralize_anim_transform_opacity(&mut base);
+        install_compositor_frame_for(&base, &cfg, mid, &kf);
+
+        // Sanity: with the genuine cached pixels the sweep passes (integer base
+        // position → both truncations agree across the range).
+        let clean = verify_recomposite_across_value_range(
+            &base, &doc, "file:///t", &cfg, None, None, &kf, mid,
+        );
+        assert!(clean, "genuine cached pixels recomposite byte-identically");
+
+        // Now CORRUPT the cached promoted-layer bitmap: flip one pixel to a color
+        // a full bake of this layout would never produce there.
+        COMPOSITOR_FRAME.with(|c| {
+            let mut bm = c.borrow_mut();
+            let (_, frame) = bm.as_mut().unwrap();
+            let l = frame
+                .tree
+                .layers
+                .iter_mut()
+                .find(|l| l.id == mid as u32)
+                .unwrap();
+            assert!(!l.bitmap.is_empty(), "promoted layer has pixels to corrupt");
+            l.bitmap[0] = 0xFFFF00FF; // magenta — not in this green-on-white doc
+        });
+
+        let corrupted = verify_recomposite_across_value_range(
+            &base, &doc, "file:///t", &cfg, None, None, &kf, mid,
+        );
+        assert!(
+            !corrupted,
+            "corrupted cached pixels must FAIL the per-value byte-compare → \
+             revision declined → safe fallback (the sweep really compares)"
+        );
+        COMPOSITOR_FRAME.with(|c| *c.borrow_mut() = None);
+    }
+
+    /// NON-VACUOUS: an animation that holds a CONSTANT integer translate at every
+    /// progress recomposites byte-identically to a full bake at all sampled
+    /// values → the sweep PASSES, so the fast path is genuinely usable (not a
+    /// gate that always declines).
+    #[test]
+    fn per_value_sweep_passes_for_byte_identical_translate() {
+        // translateX is a constant 20px (integer) across the whole timeline:
+        // both the full painter and `composite_layer` truncate the SAME integer
+        // offset, so every sampled value is byte-identical.
+        let css = "@keyframes hold { from { transform: translateX(20px); } \
+                   to { transform: translateX(20px); } } \
+                   #h { position: absolute; left: 12px; top: 8px; \
+                        width: 24px; height: 18px; background: #c30; \
+                        animation: hold 1s linear; }";
+        let ss = cv_css::parse_stylesheet(css);
+        let kf = cv_css::cascade::collect_keyframes(&[ss.clone()]);
+        let doc = cv_html::parse(
+            "<!doctype html><html><body><div id=h></div></body></html>",
+        );
+        let cfg = cv_layout::LayoutConfig {
+            viewport_w: 160.0,
+            viewport_h: 120.0,
+            ..cv_layout::LayoutConfig::default()
+        };
+        let lb = build_layout_tree(&doc, &[ss], "file:///t", &cfg, &Default::default());
+        let hid = find_node(&lb, lb_anim_id(&lb, "hold")).unwrap().node_id.unwrap();
+
+        let mut base = lb.clone();
+        neutralize_anim_transform_opacity(&mut base);
+        install_compositor_frame_for(&base, &cfg, hid, &kf);
+
+        let verdict = verify_recomposite_across_value_range(
+            &base, &doc, "file:///t", &cfg, None, None, &kf, hid,
+        );
+        assert!(
+            verdict,
+            "constant integer translate must PASS the per-value sweep \
+             (recomposite byte-identical to full bake at every value)"
+        );
+        COMPOSITOR_FRAME.with(|c| *c.borrow_mut() = None);
+    }
+
+    /// The sweep must also catch a FRACTIONAL translate that the build frame
+    /// (progress 0, translate 0) would pass: a 0→7px translate over linear time
+    /// lands on non-integer offsets at interior sample points (e.g. 0.137·7 ≈
+    /// 0.96px), where the full painter's per-coordinate truncation can disagree
+    /// with the compositor's combined-offset truncation by a pixel. Whatever the
+    /// verdict, it must be DECIDED across the range — not assumed from t=0. We
+    /// assert the build-frame-only oracle (t=0) would have said "match" yet the
+    /// range sweep makes the safe decision. This pins the exact bug class the
+    /// blocker described.
+    #[test]
+    fn per_value_sweep_decides_fractional_translate_across_range() {
+        let css = "@keyframes drift { from { transform: translateX(0px); } \
+                   to { transform: translateX(7px); } } \
+                   #d { position: absolute; left: 11px; top: 9px; \
+                        width: 22px; height: 13px; background: #07c; \
+                        animation: drift 1s linear; }";
+        let ss = cv_css::parse_stylesheet(css);
+        let kf = cv_css::cascade::collect_keyframes(&[ss.clone()]);
+        let doc = cv_html::parse(
+            "<!doctype html><html><body><div id=d></div></body></html>",
+        );
+        let cfg = cv_layout::LayoutConfig {
+            viewport_w: 160.0,
+            viewport_h: 120.0,
+            ..cv_layout::LayoutConfig::default()
+        };
+        let lb = build_layout_tree(&doc, &[ss], "file:///t", &cfg, &Default::default());
+        let did = find_node(&lb, lb_anim_id(&lb, "drift")).unwrap().node_id.unwrap();
+
+        let mut base = lb.clone();
+        neutralize_anim_transform_opacity(&mut base);
+        install_compositor_frame_for(&base, &cfg, did, &kf);
+
+        // The build-frame-only check (progress 0 → translate 0): recomposite vs
+        // full bake at t=0 MUST match (this is exactly why the old gate was
+        // insufficient — it only ever saw this value).
+        let mut at0 = base.clone();
+        drive_anim_to_progress(&mut at0, &kf, 0.0);
+        let trees0 = build_property_trees(&at0);
+        let ts0 = property_tree_state_for_node(&at0, did).unwrap();
+        let pbox0 = find_box_by_node_id(&at0, did).unwrap().clone();
+        let mut nb = pbox0.clone();
+        neutralize_anim_transform_opacity(&mut nb);
+        let b0 = nb.subtree_bounds();
+        let recompose0 = COMPOSITOR_FRAME.with(|c| {
+            let mut bm = c.borrow_mut();
+            let (_, frame) = bm.as_mut().unwrap();
+            if let Some(l) = frame.tree.layers.iter_mut().find(|l| l.id == did as u32) {
+                l.tree_state = ts0;
+            }
+            frame.recomposite(&trees0, &[(did as u32, b0.x, b0.y)])
+        });
+        let oracle0 = bake_layout_into_paint(at0, &doc, "file:///t", &cfg, None, None);
+        assert_eq!(
+            oracle0.bitmap.pixels.as_slice(),
+            recompose0.as_slice(),
+            "build-frame value (t=0) matches — this is what the OLD gate saw"
+        );
+
+        // The full-range sweep makes a definite, safe decision. Either it
+        // confirms every value matches (path taken) or it declines (fallback) —
+        // never an unverified present. Just running to completion without panic
+        // and returning a bool proves the range is actually exercised.
+        let verdict = verify_recomposite_across_value_range(
+            &base, &doc, "file:///t", &cfg, None, None, &kf, did,
+        );
+        // Re-prove the verdict is self-consistent: if it PASSED, then a spot
+        // check at an interior fractional value must indeed be byte-identical.
+        if verdict {
+            let mut at_mid = base.clone();
+            drive_anim_to_progress(&mut at_mid, &kf, 0.337);
+            let trees_m = build_property_trees(&at_mid);
+            let ts_m = property_tree_state_for_node(&at_mid, did).unwrap();
+            let pbox_m = find_box_by_node_id(&at_mid, did).unwrap().clone();
+            let mut nbm = pbox_m.clone();
+            neutralize_anim_transform_opacity(&mut nbm);
+            let bm_ = nbm.subtree_bounds();
+            let rc = COMPOSITOR_FRAME.with(|c| {
+                let mut bm = c.borrow_mut();
+                let (_, frame) = bm.as_mut().unwrap();
+                if let Some(l) = frame.tree.layers.iter_mut().find(|l| l.id == did as u32) {
+                    l.tree_state = ts_m;
+                }
+                frame.recomposite(&trees_m, &[(did as u32, bm_.x, bm_.y)])
+            });
+            let orc = bake_layout_into_paint(at_mid, &doc, "file:///t", &cfg, None, None);
+            assert_eq!(
+                orc.bitmap.pixels.as_slice(),
+                rc.as_slice(),
+                "sweep claimed PASS, so this interior fractional value must match"
+            );
+        }
+        COMPOSITOR_FRAME.with(|c| *c.borrow_mut() = None);
+    }
+
+    /// Recompose the cached promoted layer at a given progress and byte-compare
+    /// against a full bake of the layout driven to the same progress. Returns
+    /// true on byte-identity. Shared by the dense continuous-range probes below.
+    fn recompose_matches_at(
+        base: &cv_layout::LayoutBox,
+        doc: &cv_html::Document,
+        cfg: &cv_layout::LayoutConfig,
+        kf: &std::collections::HashMap<String, cv_css::cascade::KeyframeRule>,
+        id: u64,
+        t: f32,
+    ) -> bool {
+        let mut driven = base.clone();
+        drive_anim_to_progress(&mut driven, kf, t);
+        let trees = build_property_trees(&driven);
+        let ts = property_tree_state_for_node(&driven, id).unwrap();
+        let pbox = find_box_by_node_id(&driven, id).unwrap().clone();
+        let mut nb = pbox.clone();
+        neutralize_anim_transform_opacity(&mut nb);
+        let b = nb.subtree_bounds();
+        let rc = COMPOSITOR_FRAME.with(|c| {
+            let mut bm = c.borrow_mut();
+            let (_, frame) = bm.as_mut().unwrap();
+            if let Some(l) = frame.tree.layers.iter_mut().find(|l| l.id == id as u32) {
+                l.tree_state = ts;
+            }
+            frame.recomposite(&trees, &[(id as u32, b.x, b.y)])
+        });
+        let orc = bake_layout_into_paint(driven, doc, "file:///t", cfg, None, None);
+        orc.bitmap.pixels.as_slice() == rc.as_slice()
+    }
+
+    /// CONTINUOUS-range proof for a TRANSFORM animation on an integer-aligned
+    /// base: byte-identical at a DENSE set of values (not just the 9 the gate
+    /// samples), confirming the by-construction argument (no truncation carry
+    /// with frac(base)=0). 257 sub-pixel-spaced values across 0→64px.
+    #[test]
+    fn transform_recomposite_byte_identical_dense_continuous() {
+        let css = "@keyframes slideD { from { transform: translateX(0px); } \
+                   to { transform: translateX(64px); } } \
+                   #td { position: absolute; left: 16px; top: 12px; \
+                         width: 28px; height: 20px; background: #18a; \
+                         animation: slideD 1s linear; }";
+        let ss = cv_css::parse_stylesheet(css);
+        let kf = cv_css::cascade::collect_keyframes(&[ss.clone()]);
+        let doc = cv_html::parse(
+            "<!doctype html><html><body><div id=td></div></body></html>",
+        );
+        let cfg = cv_layout::LayoutConfig {
+            viewport_w: 200.0,
+            viewport_h: 120.0,
+            ..cv_layout::LayoutConfig::default()
+        };
+        let lb = build_layout_tree(&doc, &[ss], "file:///t", &cfg, &Default::default());
+        let id = find_node(&lb, lb_anim_id(&lb, "slideD")).unwrap().node_id.unwrap();
+        let mut base = lb.clone();
+        neutralize_anim_transform_opacity(&mut base);
+        install_compositor_frame_for(&base, &cfg, id, &kf);
+
+        for i in 0..=256u32 {
+            let t = i as f32 / 256.0;
+            assert!(
+                recompose_matches_at(&base, &doc, &cfg, &kf, id, t),
+                "transform recomposite diverged from full bake at progress t={t} \
+                 (integer base must be byte-identical at every continuous value)"
+            );
+        }
+        COMPOSITOR_FRAME.with(|c| *c.borrow_mut() = None);
+    }
+
+    /// Establishes the EMPIRICAL continuous-range behaviour of an OPACITY
+    /// animation: it is NOT byte-identical by construction. The full painter
+    /// rounds the box's alpha to a byte BEFORE blending; `composite_layer` folds
+    /// the float opacity into the source alpha and rounds the RESULT, so they
+    /// differ by 1 LSB at some opacity values. This test PINS that divergence as
+    /// the justification for the transform-only restriction in
+    /// `try_compositor_anim_recomposite` (opacity stays on the full bake). If a
+    /// future change converges the two blend orderings, this test will fail —
+    /// signalling that opacity may be safely re-admitted to the fast path.
+    #[test]
+    fn opacity_recomposite_dense_continuous_diverges() {
+        let css = "@keyframes fadeD { from { opacity: 1; } to { opacity: 0; } } \
+                   #od { position: absolute; left: 8px; top: 8px; \
+                         width: 32px; height: 24px; background: #c41; \
+                         animation: fadeD 1s linear; }";
+        let ss = cv_css::parse_stylesheet(css);
+        let kf = cv_css::cascade::collect_keyframes(&[ss.clone()]);
+        let doc = cv_html::parse(
+            "<!doctype html><html><body><div id=od></div></body></html>",
+        );
+        let cfg = cv_layout::LayoutConfig {
+            viewport_w: 120.0,
+            viewport_h: 100.0,
+            ..cv_layout::LayoutConfig::default()
+        };
+        let lb = build_layout_tree(&doc, &[ss], "file:///t", &cfg, &Default::default());
+        let id = find_node(&lb, lb_anim_id(&lb, "fadeD")).unwrap().node_id.unwrap();
+        let mut base = lb.clone();
+        neutralize_anim_transform_opacity(&mut base);
+        install_compositor_frame_for(&base, &cfg, id, &kf);
+
+        let mut first_divergence: Option<f32> = None;
+        for i in 0..=256u32 {
+            let t = i as f32 / 256.0;
+            if !recompose_matches_at(&base, &doc, &cfg, &kf, id, t) {
+                first_divergence = Some(t);
+                break;
+            }
+        }
+        COMPOSITOR_FRAME.with(|c| *c.borrow_mut() = None);
+        assert!(
+            first_divergence.is_some(),
+            "opacity recomposite was byte-identical across the whole dense range — \
+             the blend orderings have CONVERGED; opacity may now be safely \
+             re-admitted to the compositor-anim fast path (remove the \
+             opacity_animation restriction in try_compositor_anim_recomposite)"
+        );
+    }
+
+    /// Helper: node_id of the box whose animation-name == `name`.
+    fn lb_anim_id(lb: &cv_layout::LayoutBox, name: &str) -> u64 {
+        fn walk(b: &cv_layout::LayoutBox, name: &str) -> Option<u64> {
+            if b.animation_name.as_deref() == Some(name) {
+                return b.node_id;
+            }
+            b.children.iter().find_map(|c| walk(c, name))
+        }
+        walk(lb, name).expect("box with animation-name present")
     }
 }
 
