@@ -20784,7 +20784,7 @@ impl Interp {
                     other => crate::bytecode::RuntimeError::TypeError(format!("{other:?}")),
                 })
             };
-            crate::bytecode::run_t3_call(&native, args, this_value, &g, &mut dispatch)
+            crate::bytecode::run_t4_call(&native, args, this_value, &g, &mut dispatch)
         };
         // The native code RAN (even if it deopted partway) — count it as a T4
         // execution so the engagement honesty guard is not vacuously green.

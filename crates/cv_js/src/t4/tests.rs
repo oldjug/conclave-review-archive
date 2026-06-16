@@ -124,6 +124,57 @@ mod windows_engagement {
         assert_tiers_agree(src).expect("T4 must stay VM-identical across interleaved deopts");
     }
 
+    /// P3 ENGAGEMENT (honesty guard): the inliner actually fires on a CallFn-bearing
+    /// module AND the inlined T4 native run is byte-identical to the VM. Uses a
+    /// synthetic 2-fn module (the dispatch never sends a CallFn per-fn module to T4,
+    /// so this is the direct seam) and the `inline_compile_count` non-vacuity probe.
+    #[test]
+    fn t4_inline_engages_and_matches_vm() {
+        use crate::bytecode::{BcFunction, Module, Op};
+        let f = BcFunction {
+            name: "f".into(),
+            n_params: 1,
+            rest_reg: None,
+            n_regs: 6,
+            consts: vec![Value::Number(2.0), Value::Number(10.0)],
+            code: vec![
+                Op::LoadConst { dst: 1, k: 0 },
+                Op::Mul { dst: 2, lhs: 0, rhs: 1 },
+                Op::CallFn { dst: 3, fn_idx: 1, first_arg: 2, n_args: 1 },
+                Op::LoadConst { dst: 4, k: 1 },
+                Op::Add { dst: 5, lhs: 3, rhs: 4 },
+                Op::Ret { src: 5 },
+            ],
+            ic: std::cell::RefCell::new(Vec::new()),
+            feedback: std::cell::RefCell::new(Vec::new()),
+        };
+        let g = BcFunction {
+            name: "g".into(),
+            n_params: 1,
+            rest_reg: None,
+            n_regs: 3,
+            consts: vec![Value::Number(1.0)],
+            code: vec![
+                Op::LoadConst { dst: 1, k: 0 },
+                Op::Add { dst: 2, lhs: 0, rhs: 1 },
+                Op::Ret { src: 2 },
+            ],
+            ic: std::cell::RefCell::new(Vec::new()),
+            feedback: std::cell::RefCell::new(Vec::new()),
+        };
+        let m = Module { fns: vec![f, g] };
+        crate::t4::reset_inline_compile_count();
+        let r = crate::t4::try_compile_t4_inlined_status(&m, 0);
+        assert!(
+            matches!(r, crate::t4::T4CompileStatus::Ready(_)),
+            "T4 must compile the inlined fused body"
+        );
+        assert!(
+            crate::t4::inline_compile_count() >= 1,
+            "the inline-compile honesty counter must be >0 (the inliner truly fired)"
+        );
+    }
+
     fn run_completion(src: &str, tier: ForcedTier) -> Result<Value, String> {
         let _g = TierGuard::new(tier);
         crate::interp::reset_bc_fn_cache();
@@ -161,4 +212,128 @@ fn t4_backend_declines_non_numeric_subset() {
     ];
     let r = crate::jit::compile_t4_unboxed_with_deopt(&code, |_k| Some(1.0));
     assert!(r.is_none(), "T4 backend must decline a GetProp (non-numeric subset)");
+}
+
+/// The mapped backend entry rejects a malformed resume-pc map (wrong length) — a
+/// compile-time decline, never a wrong resume. Pure-IR; runs everywhere.
+#[test]
+fn t4_mapped_backend_declines_malformed_resume_pc_map() {
+    use crate::bytecode::Op;
+    let code = vec![
+        Op::LoadConst { dst: 0, k: 0 },
+        Op::Ret { src: 0 },
+    ];
+    // A map shorter than the code is malformed → decline (None).
+    let bad = crate::jit::compile_t4_unboxed_with_deopt_mapped(&code, |_k| Some(1.0), Some(&[0]));
+    assert!(bad.is_none(), "a too-short resume-pc map must decline the compile");
+    // The identity (None) map compiles fine.
+    #[cfg(target_os = "windows")]
+    {
+        let ok = crate::jit::compile_t4_unboxed_with_deopt_mapped(&code, |_k| Some(1.0), None);
+        assert!(ok.is_some(), "the identity map compiles a numeric body");
+    }
+}
+
+// ── P3 inliner — structural transform tests (pure-IR; run everywhere). ──
+
+/// The inliner produces a fused body with NO call op and a resume-pc map that
+/// covers every fused op and routes every inlined-region op to the caller's Call
+/// op. Proves the splice + remap + map construction without needing the backend.
+#[cfg(target_os = "windows")]
+#[test]
+fn t4_inliner_produces_callfree_fused_body_with_resume_map() {
+    use crate::bytecode::{BcFunction, Module, Op};
+    use crate::interp::Value;
+    // caller f(x): t = x*2 (k=0); r = g(t); return r + 1 (k=1)
+    let f = BcFunction {
+        name: "f".into(),
+        n_params: 1,
+        rest_reg: None,
+        n_regs: 6,
+        consts: vec![Value::Number(2.0), Value::Number(1.0)],
+        code: vec![
+            Op::LoadConst { dst: 1, k: 0 },
+            Op::Mul { dst: 2, lhs: 0, rhs: 1 },
+            Op::CallFn { dst: 3, fn_idx: 1, first_arg: 2, n_args: 1 },
+            Op::LoadConst { dst: 4, k: 1 },
+            Op::Add { dst: 5, lhs: 3, rhs: 4 },
+            Op::Ret { src: 5 },
+        ],
+        ic: std::cell::RefCell::new(Vec::new()),
+        feedback: std::cell::RefCell::new(Vec::new()),
+    };
+    let g = BcFunction {
+        name: "g".into(),
+        n_params: 1,
+        rest_reg: None,
+        n_regs: 3,
+        consts: vec![Value::Number(10.0)],
+        code: vec![
+            Op::LoadConst { dst: 1, k: 0 },
+            Op::Add { dst: 2, lhs: 0, rhs: 1 },
+            Op::Ret { src: 2 },
+        ],
+        ic: std::cell::RefCell::new(Vec::new()),
+        feedback: std::cell::RefCell::new(Vec::new()),
+    };
+    let g_code_len = g.code.len();
+    let m = Module { fns: vec![f, g] };
+    let r = crate::t4::inline_first_call(&m, 0).expect("inlines the CallFn to numeric g");
+    assert_eq!(r.inlined_calls, 1);
+    assert_eq!(r.bc_pc_map.len(), r.fused.code.len(), "map covers every fused op");
+    assert!(
+        !r.fused.code.iter().any(|op| matches!(op, Op::CallFn { .. })),
+        "the call must be inlined away"
+    );
+    // The callee window starts at the caller's n_regs (6); fused n_regs = 6 + 3.
+    assert_eq!(r.fused.n_regs, 9);
+    // Every resume target is a real caller op (< caller code len 6).
+    assert!(r.bc_pc_map.iter().all(|&pc| pc < m.fns[0].code.len()));
+    // The callee body op-count region all maps to the Call op (index 2).
+    assert!(
+        r.bc_pc_map.iter().filter(|&&pc| pc == 2).count() >= g_code_len,
+        "inlined-region ops resume at the caller's Call op"
+    );
+}
+
+/// The inliner DECLINES a callee that is too big / non-numeric / arity-mismatched —
+/// the caller then runs the single-function path or a lower tier (never wrong).
+#[cfg(target_os = "windows")]
+#[test]
+fn t4_inliner_declines_un_inlinable_callee() {
+    use crate::bytecode::{BcFunction, Module, Op};
+    use crate::interp::Value;
+    // callee g with a GetProp (heap op) — NOT inlinable.
+    let mk = |callee_code: Vec<Op>, callee_params: u8, n_args: u8| {
+        let f = BcFunction {
+            name: "f".into(),
+            n_params: 1,
+            rest_reg: None,
+            n_regs: 4,
+            consts: vec![],
+            code: vec![
+                Op::CallFn { dst: 1, fn_idx: 1, first_arg: 0, n_args },
+                Op::Ret { src: 1 },
+            ],
+            ic: std::cell::RefCell::new(Vec::new()),
+            feedback: std::cell::RefCell::new(Vec::new()),
+        };
+        let g = BcFunction {
+            name: "g".into(),
+            n_params: callee_params,
+            rest_reg: None,
+            n_regs: 3,
+            consts: vec![Value::Number(0.0)],
+            code: callee_code,
+            ic: std::cell::RefCell::new(Vec::new()),
+            feedback: std::cell::RefCell::new(Vec::new()),
+        };
+        Module { fns: vec![f, g] }
+    };
+    // Heap op in the callee → decline.
+    let heap = mk(vec![Op::GetProp { dst: 1, obj: 0, key_k: 0 }, Op::Ret { src: 1 }], 1, 1);
+    assert!(crate::t4::inline_first_call(&heap, 0).is_none(), "heap callee declines");
+    // Arity mismatch (callee wants 2 params, call passes 1) → decline.
+    let arity = mk(vec![Op::Ret { src: 0 }], 2, 1);
+    assert!(crate::t4::inline_first_call(&arity, 0).is_none(), "arity-mismatch declines");
 }

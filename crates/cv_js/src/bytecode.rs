@@ -5618,6 +5618,107 @@ pub fn run_t3_call(
     Err(RuntimeError::TypeError("T3 unsupported on this target".into()))
 }
 
+/// Run a T4 (Maglev-class) compiled function. For a NON-inlined T4 function this is
+/// identical to `run_t3_call` (resume on the fused/optimized module). For a P3
+/// INLINED T4 function the native code was compiled over the FUSED module (callee
+/// spliced in), but a deopt must resume the VM on the ORIGINAL caller module (whose
+/// `Call` op is intact) at the MAPPED `DeoptSite.bc_pc` — the INLINE-DEOPT-TO-CALLER
+/// design. The bank is sized from the fused module (so the native stores fit); the
+/// resume decodes the bank and runs the original caller VM, which only reads its own
+/// `n_regs` (the fused bank's extra callee-window slots are ignored). The caller's
+/// register slots `0..caller_n_regs` are a valid caller image at the resume op (the
+/// inliner never overwrites a caller slot before its post-call op), so the resumed
+/// result is byte-identical to a non-inlined VM run (oracle + deopt-fuzz proven).
+#[cfg(target_os = "windows")]
+pub fn run_t4_call(
+    native: &crate::jit::JitFunction,
+    args: &[Value],
+    this: &Value,
+    globals: &std::cell::RefCell<HashMap<String, Value>>,
+    dispatch: WithInterpDispatch<'_>,
+) -> Result<Value, RuntimeError> {
+    use crate::jsval::JsVal;
+    // NON-inlined T4: no separate caller module → the proven T3 runner path.
+    let resume_module = match native.t4_deopt_module() {
+        Some(m) => m.clone(),
+        None => return run_t3_call(native, args, this, globals, dispatch),
+    };
+    // INLINED T4: bank sized from the FUSED module (carried on t3_module), resume on
+    // the ORIGINAL caller module.
+    let fused_module = match native.t3_module() {
+        Some(m) => m.clone(),
+        None => {
+            return Err(RuntimeError::TypeError(
+                "T4 inlined run: missing fused module".into(),
+            ))
+        }
+    };
+    let _heap = crate::interp::T2HeapGuard::new(false);
+    let fused = match fused_module.fns.first() {
+        Some(f) => f,
+        None => return Err(RuntimeError::TypeError("T4 inlined run: empty fused module".into())),
+    };
+    // NUMERIC bank, sized to the FUSED function's reg count (>= caller_n_regs).
+    let n_slots = (fused.n_regs as usize).max(args.len()).max(1);
+    let mut bank: Vec<u64> = vec![JsVal::undefined().bits(); n_slots];
+    for (i, a) in args.iter().enumerate() {
+        bank[i] = JsVal::try_from_value(a)
+            .map(|v| v.bits())
+            .unwrap_or_else(|| JsVal::undefined().bits());
+    }
+    let mut out: u64 = 0;
+    // SAFETY: `bank`/`out` are live stack locals; the native code reads/writes only
+    // within `bank[0..n_slots]` (the fused n_regs) and writes `out` once on RETURNED.
+    // The bank holds only immediate JsVals (numeric store mode), so no Rc lifetime is
+    // live across the call.
+    let tag = unsafe { native.call_t2lite(bank.as_mut_ptr(), &mut out as *mut u64) };
+    match tag {
+        crate::jit::T2_RETURNED => {
+            let jv = JsVal(out);
+            Ok(unsafe { jv.to_value() })
+        }
+        crate::jit::T2_DEOPT_RESUME => {
+            let deopt_id = out as usize;
+            match native.deopt_site(deopt_id) {
+                Some(site) => {
+                    // Decode the fused bank → VM regs (numeric bank → trivially safe;
+                    // every slot is an immediate). The slots 0..caller_n_regs are the
+                    // caller's register image; the extra callee-window slots are
+                    // ignored by the original caller VM (it uses its own n_regs).
+                    let regs: Vec<Value> =
+                        bank.iter().map(|&b| unsafe { JsVal(b).to_value() }).collect();
+                    crate::interp::note_t2_deopt();
+                    // RESUME ON THE ORIGINAL CALLER MODULE at the MAPPED bc_pc (an
+                    // inlined-region guard's bc_pc is the caller's Call op → the VM
+                    // re-runs the ordinary non-inlined call).
+                    t2_resume_on_vm(&resume_module, regs, site.bc_pc, this, globals, dispatch)
+                }
+                // Unreachable: every guard stub bakes a valid in-range DeoptSite
+                // index. Surface a loud error rather than silently miscompute.
+                None => Err(RuntimeError::TypeError(format!(
+                    "T4 inlined resume: out-of-range deopt id {deopt_id}"
+                ))),
+            }
+        }
+        // Tier-A deopt / fall-through (a pre-effect decline): re-run the ORIGINAL
+        // caller on the VM from the top — identical, since no side effect committed
+        // (the numeric subset has no committed call before a guard; the inlined call
+        // is pure by the inliner's heuristics).
+        _ => run_module_call(&resume_module, args, this, globals, None, dispatch),
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn run_t4_call(
+    _native: &crate::jit::JitFunction,
+    args: &[Value],
+    _this: &Value,
+    _globals: &std::cell::RefCell<HashMap<String, Value>>,
+    _dispatch: WithInterpDispatch<'_>,
+) -> Result<Value, RuntimeError> {
+    Err(RuntimeError::TypeError("T4 unsupported on this target".into()))
+}
+
 // ======================================================================
 // T2→T2 — NATIVE-TO-NATIVE CALL: the JsVal-args entry.
 //
@@ -12319,6 +12420,248 @@ mod tests {
             },
         };
         assert!(!bad.verify_against_caller(caller.code.len(), caller.n_regs as usize));
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // T4 PHASE P3 — CROSS-FUNCTION INLINING: REAL inlined-frame deopt fuzzer.
+    //
+    // Unlike the P0 fuzzer (which drove the inline-deopt-to-caller reconstruction
+    // over a real bank via the hook, BEFORE any inliner existed), these tests run
+    // the GENUINE P3 inliner end-to-end: inline the callee, compile the FUSED body
+    // through the T4 backend with the resume-pc map, run via `run_t4_call`, and:
+    //   (1) BYTE-IDENTITY — the inlined T4 result == the un-inlined VM result for a
+    //       range of inputs/constants (the call frame is gone but the answer is the
+    //       same);
+    //   (2) DEOPT-FUZZ — force a deopt at EVERY op of the FUSED body (including every
+    //       inlined-region op) and assert the resumed result == the VM. An inlined-
+    //       region guard's mapped bc_pc is the caller's Call op, so the resume runs
+    //       the ORIGINAL caller VM which performs the ordinary non-inlined call —
+    //       byte-identical. This is the inlined-frame deopt fuzzer "exercised for
+    //       real" (the milestone GATE);
+    //   (3) MUTATION ARM — a wrong resume-pc map reddens the deopt-fuzz (non-vacuity).
+    // ════════════════════════════════════════════════════════════════════════
+
+    /// Compile the T4 INLINED native code for a 2-fn `{caller, callee}` module
+    /// honoring any active `ForceDeoptGuard` (the backend reads the force-deopt pc).
+    /// None if there is nothing to inline / the compile declines.
+    #[cfg(target_os = "windows")]
+    fn compile_t4_inlined_for_fuzz(m: &Module) -> Option<crate::jit::JitFunction> {
+        match crate::t4::try_compile_t4_inlined_status(m, 0) {
+            crate::t4::T4CompileStatus::Ready(jf) => Some(jf),
+            _ => None,
+        }
+    }
+
+    /// P3 BYTE-IDENTITY: the inlined T4 result equals the un-inlined VM result for a
+    /// matrix of constants × inputs. Proves the inliner's splice + remap + result
+    /// store computes EXACTLY the caller's observable value with the call eliminated.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn t4_inline_result_is_byte_identical_to_vm() {
+        let empty: std::cell::RefCell<HashMap<String, Value>> =
+            std::cell::RefCell::new(HashMap::new());
+        for (k1, k2) in [(2.0, 10.0), (0.5, -3.0), (3.0, 0.0), (-1.5, 7.0), (1e6, 1.0)] {
+            let (m, _call_pc) = two_fn_caller_callee_module(k1, k2);
+            // Confirm the inliner actually fired (engagement, not vacuous green).
+            let inlined = crate::t4::inline_first_call(&m, 0)
+                .expect("the CallFn to numeric g must inline");
+            assert_eq!(inlined.inlined_calls, 1, "exactly one call inlined");
+            assert!(
+                !inlined.fused.code.iter().any(|op| matches!(op, Op::CallFn { .. })),
+                "the fused body must contain NO CallFn (the call was inlined away)"
+            );
+            let native = compile_t4_inlined_for_fuzz(&m)
+                .expect("the inlined fused body compiles under T4");
+            assert!(native.t4_deopt_module().is_some(), "inlined T4 carries the caller resume module");
+            for x in [5.0, 0.0, -2.5, 100.0, f64::NAN, -0.0] {
+                let args = [Value::Number(x)];
+                let mut r0 = refuse_with_interp;
+                let oracle = run_function(&m, 0, &args, &Value::Undefined, &empty, None, &mut r0);
+                let mut r1 = refuse_with_interp;
+                let t4 = run_t4_call(&native, &args, &Value::Undefined, &empty, &mut r1);
+                assert!(
+                    fuzz_results_eq(&t4, &oracle),
+                    "T4 INLINE result diverged from the VM (k1={k1}, k2={k2}, x={x})\n  \
+                     t4={t4:?}\n  vm={oracle:?}"
+                );
+            }
+        }
+    }
+
+    /// P3 DEOPT-FUZZ (the GATE): force a deopt at EVERY op of the FUSED body and
+    /// assert the resumed result == the un-inlined VM. This exercises the inlined-
+    /// frame deopt for REAL — an inlined-region guard resumes the ORIGINAL caller at
+    /// the Call op (the VM then performs the ordinary call), every caller-region op
+    /// resumes at its own original index. Both must be byte-identical to the VM.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn t4_inline_deopt_at_every_fused_op_is_byte_identical() {
+        let empty: std::cell::RefCell<HashMap<String, Value>> =
+            std::cell::RefCell::new(HashMap::new());
+        for (k1, k2) in [(2.0, 10.0), (0.5, -3.0), (-1.5, 7.0)] {
+            let (m, _call_pc) = two_fn_caller_callee_module(k1, k2);
+            let inlined = crate::t4::inline_first_call(&m, 0).expect("inlines");
+            let n_fused_ops = inlined.fused.code.len();
+            for x in [5.0, 0.0, -2.5, 100.0] {
+                let args = [Value::Number(x)];
+                let mut r0 = refuse_with_interp;
+                let oracle = run_function(&m, 0, &args, &Value::Undefined, &empty, None, &mut r0);
+                // Force a deopt at each fused op boundary in turn.
+                for force_pc in 0..n_fused_ops {
+                    let _gd = ForceDeoptGuard::new(Some(force_pc));
+                    let native = match compile_t4_inlined_for_fuzz(&m) {
+                        Some(n) => n,
+                        None => continue, // the forced op may make this op-index decline; skip.
+                    };
+                    let mut r1 = refuse_with_interp;
+                    let t4 = run_t4_call(&native, &args, &Value::Undefined, &empty, &mut r1);
+                    assert!(
+                        fuzz_results_eq(&t4, &oracle),
+                        "T4 INLINE deopt at fused op {force_pc} diverged from the VM \
+                         (k1={k1}, k2={k2}, x={x})\n  t4={t4:?}\n  vm={oracle:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// P3 MUTATION ARM — the resume-pc map is LOAD-BEARING. If an inlined-region
+    /// guard's resume pc were the inlined op itself (the fused index) instead of the
+    /// caller's Call op, resuming the ORIGINAL caller at that (out-of-range or wrong)
+    /// index would diverge. We compile the inlined body, then DIRECTLY resume the
+    /// original caller at a WRONG bc_pc (an inlined op's fused index, which is past
+    /// the small caller's code), and assert it does NOT match the oracle — proving
+    /// the correct mapping (to the Call op) is what makes the deopt-fuzz pass.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn t4_inline_wrong_resume_pc_mutation_arm_reddens() {
+        let empty: std::cell::RefCell<HashMap<String, Value>> =
+            std::cell::RefCell::new(HashMap::new());
+        let (m, call_pc) = two_fn_caller_callee_module(2.0, 10.0);
+        let args = [Value::Number(5.0)];
+        let mut r0 = refuse_with_interp;
+        let oracle = run_function(&m, 0, &args, &Value::Undefined, &empty, None, &mut r0).unwrap();
+        // f(5) = g(5*2) + 10 = 11 + 10 = 21.
+        assert!(matches!(oracle, Value::Number(n) if n == 21.0));
+
+        // The caller's pre-call register image (the bank at the Call op).
+        let nregs = m.fns[0].n_regs as usize;
+        let mut regs: Vec<Value> = vec![Value::Undefined; nregs];
+        regs[0] = Value::Number(5.0); // x
+        regs[1] = Value::Number(2.0); // k1
+        regs[2] = Value::Number(10.0); // t = x * k1
+
+        // CORRECT resume (the mapping the inliner produces): at the Call op.
+        let mut rc = refuse_with_interp;
+        let correct = t2_resume_on_vm(&m, regs.clone(), call_pc, &Value::Undefined, &empty, &mut rc);
+        assert!(
+            fuzz_results_eq(&correct, &Ok(oracle.clone())),
+            "correct inline resume (Call op) must equal the oracle"
+        );
+
+        // WRONG resume: skip the call, resume at the post-call Add op. r3 (the call
+        // result) was never written → divergence. (This is what a buggy map that
+        // pointed an inlined-region guard at a post-call op would do.)
+        let add_idx = m.fns[0]
+            .code
+            .iter()
+            .position(|op| matches!(op, Op::Add { .. }))
+            .expect("f has an Add after the call");
+        let mut rw = refuse_with_interp;
+        let wrong = t2_resume_on_vm(&m, regs, add_idx, &Value::Undefined, &empty, &mut rw);
+        assert!(
+            !fuzz_results_eq(&wrong, &Ok(oracle)),
+            "MUTATION ARM FAILED TO REDDEN: a wrong inline resume pc matched the oracle"
+        );
+    }
+
+    /// P3 — a callee with MULTIPLE returns (early-return branch) inlines correctly:
+    /// each `Ret` becomes a store + jump-to-continuation, so both control-flow paths
+    /// produce the VM-identical result, including a forced deopt on each.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn t4_inline_callee_with_early_return_matches_vm() {
+        let empty: std::cell::RefCell<HashMap<String, Value>> =
+            std::cell::RefCell::new(HashMap::new());
+        // caller f(x): r1 = call g(x); return r1 + 100.
+        //   0: CallFn   r1 = g(r0)        first_arg=0, n_args=1, fn_idx=1
+        //   1: LoadConst r2 = 100
+        //   2: Add      r3 = r1 + r2
+        //   3: Ret      r3
+        let f = BcFunction {
+            name: "f".into(),
+            n_params: 1,
+            rest_reg: None,
+            n_regs: 4,
+            consts: vec![Value::Number(100.0)],
+            code: vec![
+                Op::CallFn { dst: 1, fn_idx: 1, first_arg: 0, n_args: 1 },
+                Op::LoadConst { dst: 2, k: 0 },
+                Op::Add { dst: 3, lhs: 1, rhs: 2 },
+                Op::Ret { src: 3 },
+            ],
+            ic: std::cell::RefCell::new(Vec::new()),
+            feedback: std::cell::RefCell::new(Vec::new()),
+        };
+        // callee g(y): if (y < 0) return 0; return y * 2.
+        //   0: LoadConst r1 = 0
+        //   1: Lt        r2 = y < r1        (y < 0)
+        //   2: JmpIfFalse r2 -> 5
+        //   3: LoadConst r3 = 0
+        //   4: Ret       r3                 (early return 0)
+        //   5: LoadConst r4 = 2
+        //   6: Mul       r5 = y * r4
+        //   7: Ret       r5
+        let g = BcFunction {
+            name: "g".into(),
+            n_params: 1,
+            rest_reg: None,
+            n_regs: 6,
+            consts: vec![Value::Number(0.0), Value::Number(2.0)],
+            code: vec![
+                Op::LoadConst { dst: 1, k: 0 },
+                Op::Lt { dst: 2, lhs: 0, rhs: 1 },
+                Op::JmpIfFalse { cond: 2, target: 5 },
+                Op::LoadConst { dst: 3, k: 0 },
+                Op::Ret { src: 3 },
+                Op::LoadConst { dst: 4, k: 1 },
+                Op::Mul { dst: 5, lhs: 0, rhs: 4 },
+                Op::Ret { src: 5 },
+            ],
+            ic: std::cell::RefCell::new(Vec::new()),
+            feedback: std::cell::RefCell::new(Vec::new()),
+        };
+        let m = Module { fns: vec![f, g] };
+        let inlined = crate::t4::inline_first_call(&m, 0).expect("inlines the branchy callee");
+        assert!(!inlined.fused.code.iter().any(|op| matches!(op, Op::CallFn { .. })));
+        let native = compile_t4_inlined_for_fuzz(&m).expect("branchy inlined body compiles");
+        let n_fused = inlined.fused.code.len();
+        // BOTH branches: x = -3 (early-return 0 path) and x = 4 (the y*2 path).
+        for x in [-3.0, 4.0, 0.0, -0.0, 7.5] {
+            let args = [Value::Number(x)];
+            let mut r0 = refuse_with_interp;
+            let oracle = run_function(&m, 0, &args, &Value::Undefined, &empty, None, &mut r0);
+            let mut r1 = refuse_with_interp;
+            let t4 = run_t4_call(&native, &args, &Value::Undefined, &empty, &mut r1);
+            assert!(
+                fuzz_results_eq(&t4, &oracle),
+                "branchy inline result diverged (x={x})\n  t4={t4:?}\n  vm={oracle:?}"
+            );
+            // Deopt-fuzz every fused op on both branches too.
+            for force_pc in 0..n_fused {
+                let _gd = ForceDeoptGuard::new(Some(force_pc));
+                let nat = match compile_t4_inlined_for_fuzz(&m) {
+                    Some(n) => n,
+                    None => continue,
+                };
+                let mut r2 = refuse_with_interp;
+                let t4d = run_t4_call(&nat, &args, &Value::Undefined, &empty, &mut r2);
+                assert!(
+                    fuzz_results_eq(&t4d, &oracle),
+                    "branchy inline deopt@{force_pc} diverged (x={x})\n  t4={t4d:?}\n  vm={oracle:?}"
+                );
+            }
+        }
     }
 
     // ════════════════════════════════════════════════════════════════════════

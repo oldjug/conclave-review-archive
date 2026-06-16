@@ -1723,9 +1723,41 @@ pub fn compile_t4_unboxed_with_deopt(
     code: &[crate::bytecode::Op],
     const_f64: impl Fn(u16) -> Option<f64>,
 ) -> Option<(Vec<u8>, Vec<crate::osr::DeoptSite>)> {
+    // The single-function entry: the resume `bc_pc` of every guard is the op's own
+    // index (the identity map, exactly as before). P3 inlining uses the `_mapped`
+    // entry below with a custom resume-pc table.
+    compile_t4_unboxed_with_deopt_mapped(code, const_f64, None)
+}
+
+/// T4 (Maglev-class) P3 backend entry — same representation-aware codegen as
+/// [`compile_t4_unboxed_with_deopt`], but with a custom per-op RESUME-PC MAP so an
+/// INLINED region's guards can deopt to the CALLER's `Call` op (the INLINE-DEOPT-
+/// TO-CALLER design) instead of resuming on the fused module (which no longer has
+/// the call). `bc_pc_map[i]` is the bytecode index the VM resumes at for a guard
+/// emitted during fused op `i`; `None` means the identity map (`bc_pc == i`), used
+/// by the single-function path. The resume MODULE is the caller's responsibility
+/// (the fused-vs-original choice rides on the `JitFunction`, see `t4::inline`).
+///
+/// CORRECTNESS: the bank store-after-every-op invariant is unchanged, so at every
+/// guard the fused bank is a complete pre-op register image. For an inlined-region
+/// op the resume target is the caller's `Call` op (before its `dst` store), so the
+/// VM re-runs the ordinary call over the caller register image carried in the bank
+/// slots `0..caller_n_regs` — byte-identical to a non-inlined run (the inlined-
+/// frame-deopt fuzzer proves this).
+#[cfg(target_os = "windows")]
+pub fn compile_t4_unboxed_with_deopt_mapped(
+    code: &[crate::bytecode::Op],
+    const_f64: impl Fn(u16) -> Option<f64>,
+    bc_pc_map: Option<&[usize]>,
+) -> Option<(Vec<u8>, Vec<crate::osr::DeoptSite>)> {
     use crate::bytecode::Op;
     if code.is_empty() {
         return None;
+    }
+    if let Some(m) = bc_pc_map {
+        if m.len() != code.len() {
+            return None; // a malformed map is a compile-time decline (never wrong)
+        }
     }
     let n = code.len();
     let store_mode = T2StoreMode::Numeric;
@@ -1934,9 +1966,12 @@ pub fn compile_t4_unboxed_with_deopt(
         // (the op boundary) — IDENTICAL to the T2-lite backend.
         for (off, reason) in deopt_patches.drain(deopt_before..) {
             let site_idx = deopt_sites.len();
+            // The resume bc_pc is the op's own index (identity map) UNLESS a custom
+            // map routes it elsewhere — the P3 inlined-region → caller-Call-op case.
+            let resume_pc = bc_pc_map.map(|m| m[i]).unwrap_or(i);
             deopt_sites.push(crate::osr::DeoptSite {
                 native_off: 0,
-                bc_pc: i,
+                bc_pc: resume_pc,
                 reason,
             });
             resume_patches.push((off, site_idx));
@@ -2000,6 +2035,15 @@ pub fn compile_t4_unboxed_with_deopt(
 pub fn compile_t4_unboxed_with_deopt(
     _code: &[crate::bytecode::Op],
     _const_f64: impl Fn(u16) -> Option<f64>,
+) -> Option<(Vec<u8>, Vec<crate::osr::DeoptSite>)> {
+    None
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn compile_t4_unboxed_with_deopt_mapped(
+    _code: &[crate::bytecode::Op],
+    _const_f64: impl Fn(u16) -> Option<f64>,
+    _bc_pc_map: Option<&[usize]>,
 ) -> Option<(Vec<u8>, Vec<crate::osr::DeoptSite>)> {
     None
 }
@@ -3164,6 +3208,21 @@ pub struct JitFunction {
     /// bit-identical to the original on the VM. `None` for T1/T2/f64 (they resume
     /// on the caller-supplied module directly).
     t3_module: Option<std::rc::Rc<crate::bytecode::Module>>,
+    /// T4 P3 INLINING: the ORIGINAL (un-inlined) CALLER module that EVERY deopt
+    /// from this inlined T4 function resumes the VM on. When T4 inlines a callee
+    /// into the caller's body, codegen runs over a FUSED module (callee body spliced
+    /// in) but each guard's `DeoptSite.bc_pc` is mapped (via the backend's
+    /// `bc_pc_map`) back to the corresponding ORIGINAL caller op index — an inlined-
+    /// region guard maps to the caller's `Call` op (so the VM re-runs the ordinary
+    /// non-inlined call), and a caller-region op maps to its own original index.
+    /// Because the inliner keeps every caller register in its original bank slot
+    /// (the callee window lives ABOVE the caller's regs) and only writes the call's
+    /// `dst` once, after all inlined guards, the bank slots `0..caller_n_regs` are
+    /// always a valid caller register image at the mapped resume op — the INLINE-
+    /// DEOPT-TO-CALLER invariant (osr.rs Extension 1). `Some` only for an inlined T4
+    /// function; `None` for every other tier (resume uses `t3_module` / the
+    /// caller-supplied module as before).
+    t4_deopt_module: Option<std::rc::Rc<crate::bytecode::Module>>,
 }
 
 impl std::fmt::Debug for JitFunction {
@@ -3241,6 +3300,7 @@ impl JitFunction {
                 deopt_sites: Vec::new(),
                 safepoints: crate::osr::SafepointMap::new(),
                 t3_module: None,
+                t4_deopt_module: None,
             });
         }
         unsafe {
@@ -3268,6 +3328,7 @@ impl JitFunction {
                 deopt_sites: Vec::new(),
                 safepoints: crate::osr::SafepointMap::new(),
                 t3_module: None,
+                t4_deopt_module: None,
             })
         }
     }
@@ -3330,6 +3391,22 @@ impl JitFunction {
     /// runner resumes the VM on THIS module on a deopt.
     pub fn t3_module(&self) -> Option<&std::rc::Rc<crate::bytecode::Module>> {
         self.t3_module.as_ref()
+    }
+
+    /// T4 P3 — attach the ORIGINAL (un-inlined) caller module that an INLINED T4
+    /// function's deopts resume on (see the field doc). When set, the T4 runner
+    /// resumes the VM on THIS module (whose `Call` op is intact) instead of the
+    /// fused `t3_module`, using the mapped `DeoptSite.bc_pc`.
+    pub fn with_t4_deopt_module(mut self, module: std::rc::Rc<crate::bytecode::Module>) -> Self {
+        self.t4_deopt_module = Some(module);
+        self
+    }
+
+    /// The original caller module an inlined T4 function resumes the VM on, if this
+    /// is an inlined T4 function (`None` otherwise — the runner falls back to
+    /// `t3_module`).
+    pub fn t4_deopt_module(&self) -> Option<&std::rc::Rc<crate::bytecode::Module>> {
+        self.t4_deopt_module.as_ref()
     }
 
     /// Call the installed function. V1 signature is `() -> u64` — the
