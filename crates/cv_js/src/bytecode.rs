@@ -198,6 +198,18 @@ pub enum Op {
         dst: Reg,
         src: Reg,
     },
+    /// `R[dst] = ToString(R[src])` using the ECMA-262 §7.1.17 ToString algorithm
+    /// — i.e. ToPrimitive with the STRING hint (`toString`-first) for an Object
+    /// operand. Emitted for each `${expr}` substitution in a template literal so
+    /// `` `${o}` `` matches ECMA `String(o)`/the tree-walker (and Node), instead
+    /// of the NUMBER/default hint that a `"" + expr` lowering used (which calls
+    /// `valueOf` first and so diverged on an object with both `valueOf` and
+    /// `toString`). Distinct from `Add`: `'' + o` legitimately uses the DEFAULT
+    /// hint, so this op must NOT be conflated with string-concat `+`.
+    ToStr {
+        dst: Reg,
+        src: Reg,
+    },
     /// `R[dst] = (R[lhs] in R[rhs])` — property-existence test. `lhs` is the
     /// key, `rhs` the object. Throws if `rhs` isn't an object/array.
     In {
@@ -2520,18 +2532,17 @@ impl<'a> FnCompiler<'a> {
                     let parsed = crate::parser::parse_expression_str(&expr_src)
                         .map_err(|e| CompileError(format!("template expr: {e}")))?;
                     let expr_r = self.compile_expr(&parsed)?;
-                    // Coerce non-string via `"" + expr` for compat.
-                    let empty_k = self.add_const(Value::str(String::new()));
-                    let empty_r = self.alloc_reg();
-                    self.emit(Op::LoadConst {
-                        dst: empty_r,
-                        k: empty_k,
-                    });
+                    // ECMA-262 §13.2.8.5 (template substitution) → §13.15 / §7.1.17
+                    // ToString: an Object operand uses the STRING ToPrimitive hint
+                    // (`toString`-first). A `"" + expr` lowering instead used the
+                    // DEFAULT/Number hint (`valueOf`-first), which diverged from
+                    // Node/the tree-walker on `\`${o}\`` where `o` has both
+                    // `valueOf` (42) and `toString` ('X'). `Op::ToStr` applies the
+                    // correct string-hint ToString.
                     let str_expr = self.alloc_reg();
-                    self.emit(Op::Add {
+                    self.emit(Op::ToStr {
                         dst: str_expr,
-                        lhs: empty_r,
-                        rhs: expr_r,
+                        src: expr_r,
                     });
                     emit_chunk(self, str_expr, &mut acc_r);
                     i = k_idx + 1;
@@ -6182,6 +6193,58 @@ fn op_to_number(st: &mut VmState, dst: Reg, src: Reg) -> StepStatus {
     StepStatus::Continue
 }
 
+#[inline]
+fn op_to_str(st: &mut VmState, dst: Reg, src: Reg) -> StepStatus {
+    let regs = unsafe { &mut *st.regs };
+    // ECMA-262 §7.1.17 ToString. Primitives (and Array/Function values, whose
+    // default ToString is positional, no user-overridable hint) stringify
+    // directly via `to_display_string` — byte-identical to the tree-walk
+    // `to_string_value` (which only routes `Value::Object` through ToPrimitive).
+    // An OBJECT operand needs the full string-hint ToPrimitive
+    // (`@@toPrimitive('string')` → `toString` → `valueOf`, throw-propagating),
+    // which lives in the interp; dispatch to the `__tb_host_to_string` host hook
+    // (mirrors how `op_add` routes object operands to `__tb_host_binop`). On a
+    // bare-globals entry point (no host wired) we fall back to the positional
+    // display string — the same graceful degradation the other host hooks use.
+    let v = match &regs[src as usize] {
+        Value::Object(_) => {
+            let disp = unsafe { &mut *st.dispatch };
+            match host_to_string(&regs[src as usize], st.globals, disp) {
+                Some(Ok(s)) => Value::str(s),
+                Some(Err(e)) => return StepStatus::from_err(e),
+                None => Value::str(regs[src as usize].to_display_string()),
+            }
+        }
+        other => Value::str(other.to_display_string()),
+    };
+    regs[dst as usize] = v;
+    StepStatus::Continue
+}
+
+/// Route an Object operand's ToString (STRING hint) through the interp's full
+/// `to_string_throwing` (`@@toPrimitive('string')`/`toString`/`valueOf`,
+/// throw-propagating) via the `__tb_host_to_string` global — byte-identical to
+/// the tree-walk `${expr}` path (`to_string_value`). Returns `None` when no host
+/// is wired (bare-globals entry points), letting the caller fall back to the
+/// positional display string.
+fn host_to_string(
+    v: &Value,
+    globals: &std::cell::RefCell<HashMap<String, Value>>,
+    dispatch: WithInterpDispatch<'_>,
+) -> Option<Result<String, RuntimeError>> {
+    let getter = globals.borrow().get("__tb_host_to_string").cloned();
+    match getter {
+        Some(g @ Value::NativeFunction(_)) => {
+            match dispatch(g, Value::Undefined, vec![v.clone()]) {
+                Ok(Value::String(s)) => Some(Ok(s.to_string())),
+                Ok(other) => Some(Ok(other.to_display_string())),
+                Err(e) => Some(Err(e)),
+            }
+        }
+        _ => None,
+    }
+}
+
 impl StepStatus {
     /// Map a `RuntimeError` to the right step status. A watchdog `Deadline` is
     /// reported distinctly so callers keep it UNCATCHABLE (cannot be routed to a
@@ -6233,6 +6296,7 @@ pub(crate) fn t1_supported_op(o: &Op) -> bool {
             | Op::Not { .. }
             | Op::Typeof { .. }
             | Op::ToNumber { .. }
+            | Op::ToStr { .. }
             | Op::JmpIfFalse { .. }
             | Op::Jmp { .. }
             | Op::Ret { .. }
@@ -6285,6 +6349,7 @@ fn t1_step_one(state: &mut VmState) -> StepStatus {
         Op::Not { dst, src } => op_not(state, dst, src),
         Op::Typeof { dst, src } => op_typeof(state, dst, src),
         Op::ToNumber { dst, src } => op_to_number(state, dst, src),
+        Op::ToStr { dst, src } => op_to_str(state, dst, src),
         Op::JmpIfFalse { cond, target } => op_jmp_if_false(state, cond, target),
         Op::Jmp { target } => op_jmp(state, target),
         Op::Ret { src } => op_ret(state, src),
@@ -8436,6 +8501,7 @@ fn run_function_inner(
                 run_shared!(op_to_number(dst, src))
             }
             Op::Typeof { dst, src } => run_shared!(op_typeof(dst, src)),
+            Op::ToStr { dst, src } => run_shared!(op_to_str(dst, src)),
             Op::Jmp { target } => run_shared!(op_jmp(target)),
             Op::JmpIfFalse { cond, target } => run_shared!(op_jmp_if_false(cond, target)),
             Op::JmpIfTrue { cond, target } => {
@@ -13029,6 +13095,52 @@ mod tests {
         assert!(
             matches!(&r, Value::String(s) if &**s == "[object Object]"),
             "`${{}}` should be \"[object Object]\", got {r:?}"
+        );
+    }
+
+    #[test]
+    fn template_substitution_lowers_to_tostr_not_empty_add() {
+        // A `${expr}` substitution must lower to `Op::ToStr` (ECMA §7.1.17
+        // ToString, STRING ToPrimitive hint) — NOT `"" + expr` (Add, default/
+        // Number hint), which diverged on an object with both valueOf & toString.
+        let m = compile_program("function t(x) { return `v=${x}`; }").unwrap();
+        // fns[0] is the `<script>`; fns[1..] are the top-level decls (here `t`).
+        let has_tostr = m
+            .fns
+            .iter()
+            .flat_map(|f| f.code.iter())
+            .any(|op| matches!(op, Op::ToStr { .. }));
+        assert!(has_tostr, "template substitution should emit Op::ToStr");
+        // And it must NOT lower to the old `"" + expr` shape: an Add whose lhs is
+        // an empty-string const. (We just confirm ToStr is present, which the new
+        // lowering uses exclusively for the substitution.)
+    }
+
+    #[test]
+    fn vm_template_literal_primitives_via_tostr() {
+        // Op::ToStr on primitives is byte-identical to ToString: numbers, null,
+        // undefined, bool, and a string pass through to `to_display_string`.
+        let m = compile_program(
+            "function t() { return `${1+2}|${null}|${undefined}|${true}|${'s'}`; }",
+        )
+        .unwrap();
+        let r = run_fn(&m, 1, &[]).unwrap();
+        assert!(
+            matches!(&r, Value::String(s) if &**s == "3|null|undefined|true|s"),
+            "primitive template substitutions should ToString correctly, got {r:?}"
+        );
+    }
+
+    #[test]
+    fn vm_template_literal_array_via_tostr() {
+        // An Array's ToString is positional `join(",")`, with null/undefined/holes
+        // → empty — byte-identical to the tree-walk `to_display_string`. No host
+        // hook needed (only Value::Object routes through the host).
+        let m = compile_program("function t() { return `[${[1,null,3]}]`; }").unwrap();
+        let r = run_fn(&m, 1, &[]).unwrap();
+        assert!(
+            matches!(&r, Value::String(s) if &**s == "[1,,3]"),
+            "array template substitution should join with empty for null, got {r:?}"
         );
     }
 

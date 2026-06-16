@@ -407,7 +407,7 @@ op_tags! {
     T_NEW_ARRAY = 50, T_ARRAY_PUSH = 51, T_ARRAY_PUSH_SPREAD = 52,
     T_NEW_OBJECT = 53, T_THROW = 54, T_TRY_ENTER = 55, T_TRY_EXIT = 56,
     T_ENUM_KEYS = 57, T_MAKE_CLOSURE = 58, T_LOAD_UP = 59, T_STORE_UP = 60,
-    T_RET = 61, T_INSTANCEOF = 62,
+    T_RET = 61, T_INSTANCEOF = 62, T_TO_STR = 63,
 }
 
 fn write_op(w: &mut Writer, op: &Op) {
@@ -473,6 +473,7 @@ fn write_op(w: &mut Writer, op: &Op) {
         Op::Not { dst, src } => un!(T_NOT, dst, src),
         Op::BitNot { dst, src } => un!(T_BIT_NOT, dst, src),
         Op::ToNumber { dst, src } => un!(T_TO_NUMBER, dst, src),
+        Op::ToStr { dst, src } => un!(T_TO_STR, dst, src),
         Op::Typeof { dst, src } => un!(T_TYPEOF, dst, src),
         Op::In { dst, lhs, rhs } => bin!(T_IN, dst, lhs, rhs),
         Op::Instanceof { dst, lhs, rhs } => bin!(T_INSTANCEOF, dst, lhs, rhs),
@@ -667,6 +668,7 @@ fn read_op(r: &mut Reader) -> Option<Op> {
         T_NOT => Op::Not { dst: r.u16()?, src: r.u16()? },
         T_BIT_NOT => Op::BitNot { dst: r.u16()?, src: r.u16()? },
         T_TO_NUMBER => Op::ToNumber { dst: r.u16()?, src: r.u16()? },
+        T_TO_STR => Op::ToStr { dst: r.u16()?, src: r.u16()? },
         T_TYPEOF => Op::Typeof { dst: r.u16()?, src: r.u16()? },
         T_IN => Op::In { dst: r.u16()?, lhs: r.u16()?, rhs: r.u16()? },
         T_INSTANCEOF => Op::Instanceof { dst: r.u16()?, lhs: r.u16()?, rhs: r.u16()? },

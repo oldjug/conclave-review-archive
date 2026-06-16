@@ -2152,6 +2152,89 @@ fn is_method_rebind_key(key: &str) -> bool {
     matches!(key, "call" | "apply" | "bind")
 }
 
+/// True iff a `try`/`catch` body can complete ABRUPTLY in a way that crosses the
+/// enclosing `try` boundary — a `return`/`throw` anywhere, OR a `break`/`continue`
+/// (labeled or not) that is NOT contained within a loop/switch nested inside the
+/// body itself. Such a completion is where the top-level-VM `try` lowering drops
+/// the `finally` block / swallows a throw meant for an outer `catch`, so the
+/// caller declines to the byte-identical tree-walker. Conservative: a `break`/
+/// `continue` whose nearest enclosing loop/switch lies inside the body is local
+/// and does NOT cross (so a plain `for`/`switch` with internal breaks inside a
+/// try stays eligible). Nested function/arrow bodies are NOT descended into (a
+/// `return`/`break` there belongs to that function, not this try).
+fn block_can_abruptly_complete(body: &[Stmt]) -> bool {
+    body.iter().any(stmt_can_abruptly_complete)
+}
+
+fn stmt_can_abruptly_complete(s: &Stmt) -> bool {
+    match s {
+        // A throw or any return crosses the boundary (return always exits the
+        // construct; throw seeks an enclosing catch).
+        Stmt::Throw(_) | Stmt::Return(_) => true,
+        // A bare/labeled break or continue at this level targets something OUTSIDE
+        // this body (there is no enclosing loop/switch here), so it crosses.
+        Stmt::Break(_) | Stmt::Continue(_) => true,
+        // Loops & switch are break/continue SINKS: a break/continue directly in
+        // their body is captured locally. But a `return`/`throw`, or a LABELED
+        // break/continue targeting an outer label, still escapes — detect those
+        // while ignoring the locally-absorbed unlabeled break/continue.
+        Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => {
+            stmt_escapes_loop_or_switch(body)
+        }
+        Stmt::For { body, .. } | Stmt::ForIn { body, .. } | Stmt::ForOf { body, .. } => {
+            stmt_escapes_loop_or_switch(body)
+        }
+        Stmt::Switch { cases, .. } => cases
+            .iter()
+            .any(|c| c.body.iter().any(stmt_escapes_loop_or_switch)),
+        Stmt::If { cons, alt, .. } => {
+            stmt_can_abruptly_complete(cons)
+                || alt.as_ref().map_or(false, |a| stmt_can_abruptly_complete(a))
+        }
+        Stmt::Block(b) => block_can_abruptly_complete(b),
+        Stmt::Labeled { body, .. } => stmt_can_abruptly_complete(body),
+        // A nested try absorbs its own throw via its catch, but a re-throw / its
+        // own abrupt body can still cross — be conservative and treat any nested
+        // try as potentially escaping.
+        Stmt::Try { .. } => true,
+        // Declarations / expressions / function decls do not abruptly complete to
+        // an enclosing try (a throw inside an expression is caught above via the
+        // Expression-less paths; an Expression that throws at runtime is a normal
+        // completion of the statement node, the throw being a value-level concern
+        // the try lowering does handle). Nested fns are NOT descended.
+        _ => false,
+    }
+}
+
+/// Inside a loop/switch body: an unlabeled `break`/`continue` is absorbed
+/// locally, but a `return`/`throw` or a LABELED break/continue still escapes to
+/// the enclosing `try`. (We can't easily prove a label binds inside vs outside
+/// the try here, so a labeled jump is treated conservatively as escaping.)
+fn stmt_escapes_loop_or_switch(s: &Stmt) -> bool {
+    match s {
+        Stmt::Throw(_) | Stmt::Return(_) => true,
+        Stmt::Break(Some(_)) | Stmt::Continue(Some(_)) => true,
+        Stmt::Break(None) | Stmt::Continue(None) => false,
+        Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => {
+            stmt_escapes_loop_or_switch(body)
+        }
+        Stmt::For { body, .. } | Stmt::ForIn { body, .. } | Stmt::ForOf { body, .. } => {
+            stmt_escapes_loop_or_switch(body)
+        }
+        Stmt::Switch { cases, .. } => cases
+            .iter()
+            .any(|c| c.body.iter().any(stmt_escapes_loop_or_switch)),
+        Stmt::If { cons, alt, .. } => {
+            stmt_escapes_loop_or_switch(cons)
+                || alt.as_ref().map_or(false, |a| stmt_escapes_loop_or_switch(a))
+        }
+        Stmt::Block(b) => b.iter().any(stmt_escapes_loop_or_switch),
+        Stmt::Labeled { body, .. } => stmt_escapes_loop_or_switch(body),
+        Stmt::Try { .. } => true,
+        _ => false,
+    }
+}
+
 /// True iff this statement subtree contains a construct whose top-level-VM
 /// lowering diverges from the tree-walker (see the const tables + the class-IIFE
 /// + `arguments` + accessor-defineProperty checks below). Recurses into function
@@ -2210,6 +2293,32 @@ fn stmt_has_toplevel_vm_divergence(s: &Stmt) -> bool {
         Stmt::Labeled { body, .. } => stmt_has_toplevel_vm_divergence(body),
         Stmt::Block(body) => body.iter().any(stmt_has_toplevel_vm_divergence),
         Stmt::Try { block, catch_block, finally_block, .. } => {
+            // ── ABRUPT-COMPLETION DECLINE (Node-verified divergence) ──────────
+            // The top-level-VM `try` lowering does NOT run the `finally` block
+            // when the `try`/`catch` body completes abruptly (a `break`/
+            // `continue`/`return` that exits the construct), and a `throw` raised
+            // inside an inner `try`-with-`finally` that is meant for an OUTER
+            // `catch` is silently swallowed (the outer catch never fires). Both
+            // are byte-IDENTICAL in the tree-walker, so DECLINE to it:
+            //   (1) ANY `try` that has a `finally` block — `finally` must run on
+            //       every completion path (normal, abrupt, thrown); the VM path
+            //       does not guarantee that, so any finally is unsafe.
+            //   (2) ANY `try` (even finally-less) whose `try`/`catch` body can
+            //       complete abruptly across the boundary (`break`/`continue`/
+            //       `return`/`throw`) — a thrown completion targeting an enclosing
+            //       catch, or a break/continue/return exiting through the try, can
+            //       diverge. A decline is the tree-walk result, never a wrong one.
+            if finally_block.is_some() {
+                return true;
+            }
+            if block_can_abruptly_complete(block) {
+                return true;
+            }
+            if let Some(cb) = catch_block {
+                if block_can_abruptly_complete(cb) {
+                    return true;
+                }
+            }
             block.iter().any(stmt_has_toplevel_vm_divergence)
                 || catch_block
                     .as_ref()
@@ -8391,6 +8500,28 @@ impl Interp {
                     return Ok(interp.binary_op(&op, &ap, &bp));
                 }
                 Ok(interp.binary_op(&op, &a, &b))
+            }),
+        );
+        // The VM's `Op::ToStr` (template-literal `${expr}` substitution) routes
+        // OBJECT operands here so ECMA-262 §7.1.17 ToString runs with the STRING
+        // ToPrimitive hint (`@@toPrimitive('string')` → `toString` → `valueOf`,
+        // throw-propagating) — byte-identical to the tree-walk `${expr}` path
+        // (`to_string_value`/`to_string_throwing`). This is what makes
+        // `` `${o}` `` use `toString` ('X') not `valueOf` (42) on an object with
+        // both, matching Node. Primitives never reach here (the VM op handles
+        // them inline via `to_display_string`).
+        interp.define_global(
+            "__tb_host_to_string",
+            native_fn_with_interp("__tb_host_to_string", |interp, args| {
+                let v = args.into_iter().next().unwrap_or(Value::Undefined);
+                // `to_string_value` is the EXACT tree-walk `${expr}` coercion
+                // (`eval_template_string` → `to_string_value`): ToPrimitive with
+                // the STRING hint then a `to_display_string` fallback for a plain
+                // object (→ "[object Object]"). Using it keeps the VM `${expr}`
+                // BYTE-IDENTICAL to the tree-walker (the decline contract) while
+                // honouring `toString`/`@@toPrimitive('string')` first — which is
+                // exactly the Node-correct STRING-hint behaviour the bug was about.
+                Ok(Value::str(interp.to_string_value(&v)))
             }),
         );
         // The VM's `Op::Instanceof` dispatches `__tb_host_instanceof(inst, ctor)`
@@ -25547,7 +25678,27 @@ mod tests {
              "var p4 = 1 ** (0/0); console.log(p4 !== p4 ? 'NaN' : String(p4));", true),
             ("object_plus_toprimitive",
              "var o = { toString: function(){ return 'TS'; } }; console.log(String(o)); console.log('' + o);", true),
+            // FIXED VM BUG: template `${o}` uses the STRING ToPrimitive hint
+            // (toString-first), NOT the Number/default hint that `'' + o` uses.
+            // Node: `${o}` → 'X' (toString), `'' + o` → 42 (valueOf). Stays
+            // eligible — this is a real VM bug fixed, not a decline.
+            ("template_literal_object_string_hint",
+             "var o = { valueOf: function(){ return 42; }, toString: function(){ return 'X'; } }; console.log(`v=${o}`); console.log('' + o);", true),
             // ── DECLINED CONSTRUCTS (fall back to tree-walk) ────────────────
+            // try/finally + abrupt completion: `finally` dropped on a
+            // break/continue/return out of try; a throw meant for an OUTER catch
+            // swallowed. DECLINE any try with a finally, or whose body can
+            // abruptly complete across the boundary → byte-identical tree-walk.
+            ("try_finally_continue_drops_finally",
+             "var log = []; for (var i = 0; i < 3; i++) { try { if (i === 1) continue; log.push('b' + i); } finally { log.push('f' + i); } } console.log(log.join(','));", false),
+            ("try_finally_break_runs_finally",
+             "var log = []; for (var i = 0; i < 3; i++) { try { if (i === 1) break; log.push('b' + i); } finally { log.push('f' + i); } } console.log(log.join(','));", false),
+            ("try_finally_inner_throw_to_outer_catch",
+             "var log = []; try { try { throw new Error('boom'); } finally { log.push('inner-finally'); } } catch (e) { log.push('outer:' + e.message); } console.log(log.join(','));", false),
+            ("try_finally_return_runs_finally",
+             "function g() { try { return 'from-try'; } finally { /* runs */ } } console.log(g());", false),
+            ("try_no_finally_throw_to_outer_catch",
+             "var log = []; try { try { throw new Error('x'); log.push('unreached'); } catch (e) { throw e; } } catch (e2) { log.push('outer:' + e2.message); } console.log(log.join(','));", false),
             ("arguments_in_iife",
              "var count = 0;(function(n){ count++; if (n > 0) arguments.callee(n - 1); })(3);console.log(count);", false),
             ("generator_lazy_order",
@@ -25602,6 +25753,78 @@ mod tests {
         // '' + {toString(){return 'TS'}} === 'TS' (ToPrimitive), and valueOf for +.
         let (_, o) = run("var o={toString:function(){return 'TS';}}; var v={valueOf:function(){return 7;}}; console.log('' + o, v + 1);");
         assert_eq!(o, vec!["TS 8"]);
+        // Template `${o}` uses the STRING ToPrimitive hint (toString-first) so an
+        // object with BOTH valueOf and toString stringifies via toString ('X'),
+        // while `'' + o` (default hint) uses valueOf (42). Node-verified:
+        //   `${o}` → 'X'   ;   '' + o → '42'
+        let (_, o) = run(
+            "var o = { valueOf: function(){ return 42; }, toString: function(){ return 'X'; } }; console.log(`v=${o}`); console.log('' + o);",
+        );
+        assert_eq!(o, vec!["v=X", "42"]);
+        // @@toPrimitive('string') wins over both, and primitives in a template are
+        // unaffected. Node: `${sym}` → 'PRIM', `${1+2}` → '3', `${null}` → 'null'.
+        let (_, o) = run(
+            "var s = {}; s[Symbol.toPrimitive] = function(h){ return h === 'string' ? 'PRIM' : 0; }; console.log(`${s}|${1+2}|${null}|${undefined}`);",
+        );
+        assert_eq!(o, vec!["PRIM|3|null|undefined"]);
+    }
+
+    /// try/finally + abrupt completion is DECLINED to the tree-walker; the value
+    /// produced must match Node ground truth exactly. (The decline guarantees the
+    /// tree-walk result, so this also proves the chosen tree-walk path is itself
+    /// Node-correct on these shapes.)
+    #[test]
+    fn toplevel_vm_try_finally_abrupt_completion_matches_node() {
+        let _g = super::TopLevelVmGuard::new(true);
+        // continue out of try → finally STILL runs each iteration. Node:
+        //   body0,fin0,fin1,body2,fin2
+        let (_, o) = run(
+            "var log = []; for (var i = 0; i < 3; i++) { try { if (i === 1) continue; log.push('body' + i); } finally { log.push('fin' + i); } } console.log(log.join(','));",
+        );
+        assert_eq!(o, vec!["body0,fin0,fin1,body2,fin2"]);
+        // break out of try → finally runs for the breaking iteration. Node:
+        //   b0,f0,f1
+        let (_, o) = run(
+            "var log = []; for (var i = 0; i < 3; i++) { try { if (i === 1) break; log.push('b' + i); } finally { log.push('f' + i); } } console.log(log.join(','));",
+        );
+        assert_eq!(o, vec!["b0,f0,f1"]);
+        // throw from an inner try-with-finally → inner finally runs, THEN the
+        // OUTER catch fires. Node: inner-finally,outer:boom
+        let (_, o) = run(
+            "var log = []; try { try { throw new Error('boom'); } finally { log.push('inner-finally'); } } catch (e) { log.push('outer:' + e.message); } console.log(log.join(','));",
+        );
+        assert_eq!(o, vec!["inner-finally,outer:boom"]);
+        // return from try with finally → returns the try value (finally runs).
+        let (_, o) = run(
+            "function g() { try { return 'from-try'; } finally { /* runs */ } } console.log(g());",
+        );
+        assert_eq!(o, vec!["from-try"]);
+        // re-throw to an outer catch (no finally) — the throw must reach the outer
+        // catch, not be swallowed. Node: outer:x
+        let (_, o) = run(
+            "var log = []; try { try { throw new Error('x'); log.push('unreached'); } catch (e) { throw e; } } catch (e2) { log.push('outer:' + e2.message); } console.log(log.join(','));",
+        );
+        assert_eq!(o, vec!["outer:x"]);
+    }
+
+    /// The numeric counted-loop bench shape (jit.js / loop.js) must STAY
+    /// VM-eligible after the try/finally decline — the decline only descends into
+    /// `try` bodies and never into the leaf `FunctionDecl`, so a plain
+    /// `for`-loop + arithmetic leaf (no try) is unaffected. Guards the perf lever.
+    #[test]
+    fn toplevel_vm_numeric_loop_shape_stays_eligible() {
+        let bench = "function f(x){ return x*x*0.5 + x*3.0 - 1.0; } var acc = 0; for (var i = 0; i < 1000; i++) { acc = acc + f(i); } console.log(acc > 0);";
+        assert!(
+            super::toplevel_vm_eligible(&crate::parser::parse_program(bench).expect("parse")),
+            "numeric counted-loop bench shape must remain VM-eligible"
+        );
+        // A plain for-loop containing a try WITHOUT finally and with only LOCAL
+        // (loop-absorbed) break/continue must also stay eligible (common shape).
+        let local_break = "var n = 0; for (var i = 0; i < 10; i++) { try { for (var j = 0; j < 3; j++) { if (j === 1) break; n++; } } catch (e) { n = -1; } } console.log(n);";
+        assert!(
+            super::toplevel_vm_eligible(&crate::parser::parse_program(local_break).expect("parse")),
+            "try with only loop-local break/continue (no finally) must stay eligible"
+        );
     }
 
     #[test]
