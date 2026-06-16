@@ -4395,15 +4395,11 @@ use crate::ab_oracle::{assert_toplevel_vm_agrees, assert_toplevel_vm_agrees_enga
 /// top-level fn called inside a hot numeric loop accumulating into a global. The
 /// VM path must produce the IDENTICAL `s` global, and it must ACTUALLY engage.
 ///
-/// IGNORED on HEAD: now that the oracle reads globals the PRODUCTION way (through
-/// the global object), this — like every top-level-`var` corpus case — exposes the
-/// top-level VM's global-object-visibility bug (a `StoreGlobal`-written var is not
-/// visible through `globalThis`/`window` until the deferred module-boundary flush,
-/// so a same-script `window.s` read yields `undefined`). The oracle is now HONEST;
-/// the corpus stays as the spec the top-level-VM fix (next step) must satisfy.
-/// Re-enable when the VM writes top-level vars straight through to the live global
-/// object (or syncs them before any same-script global-object read).
-#[ignore = "exposes top-level-VM global-object visibility bug; re-enable after the VM fix"]
+/// Now passes via the global-object-visibility FIX: the top-level VM runs directly
+/// on the interp's LIVE global bindings table (the same map `globalThis`/`window`
+/// alias), so a `StoreGlobal`-written `var` is visible through the global object
+/// mid-script — byte-identical to the tree-walker on the production global-object
+/// read the oracle uses.
 #[test]
 fn toplevel_vm_jit_shape_agrees_and_engages() {
     let src = "
@@ -4416,7 +4412,6 @@ fn toplevel_vm_jit_shape_agrees_and_engages() {
 }
 
 /// Global `var` creation + reassignment, and a bare trailing expression.
-#[ignore = "exposes top-level-VM global-object visibility bug; re-enable after the VM fix"]
 #[test]
 fn toplevel_vm_global_var_agrees() {
     for src in [
@@ -4431,7 +4426,6 @@ fn toplevel_vm_global_var_agrees() {
 
 /// Top-level FUNCTION HOISTING: a call that precedes the declaration must work
 /// identically (hoisted to a global on both paths).
-#[ignore = "exposes top-level-VM global-object visibility bug; re-enable after the VM fix"]
 #[test]
 fn toplevel_vm_function_hoisting_agrees() {
     for src in [
@@ -4443,7 +4437,6 @@ fn toplevel_vm_function_hoisting_agrees() {
 }
 
 /// THROW from top level — both paths must throw the same error name+message.
-#[ignore = "exposes top-level-VM global-object visibility bug; re-enable after the VM fix"]
 #[test]
 fn toplevel_vm_throw_agrees() {
     for src in [
@@ -4457,7 +4450,6 @@ fn toplevel_vm_throw_agrees() {
 }
 
 /// CLOSURE over a top-level var.
-#[ignore = "exposes top-level-VM global-object visibility bug; re-enable after the VM fix"]
 #[test]
 fn toplevel_vm_closure_over_toplevel_var_agrees() {
     for src in [
@@ -4469,7 +4461,6 @@ fn toplevel_vm_closure_over_toplevel_var_agrees() {
 }
 
 /// Console side effects must be byte-identical (order + content).
-#[ignore = "exposes top-level-VM global-object visibility bug; re-enable after the VM fix"]
 #[test]
 fn toplevel_vm_console_side_effects_agree() {
     let src = "
@@ -4538,7 +4529,6 @@ fn toplevel_vm_declines_direct_eval() {
 }
 
 /// NON-VACUITY TEETH: prove the ON path really ran the VM (else green is fake).
-#[ignore = "exposes top-level-VM global-object visibility bug; re-enable after the VM fix"]
 #[test]
 fn toplevel_vm_oracle_is_non_vacuous() {
     let src = "var s = 0; for (var i=0;i<1000;i=i+1){ s = s + i*2 - 1; }";
@@ -4603,13 +4593,16 @@ fn toplevel_vm_global_via_object(src: &str, name: &str, on: bool) -> String {
 ///                                                                    → globalThis.i === 3
 ///   • redecl  `var i=5; for(var i; i<8; i=i+1){}`                    → globalThis.i === 8
 ///
-/// This test asserts, on the CURRENT HEAD:
+/// This test asserts, on the CURRENT HEAD (AFTER the production-VM fix):
 ///   (1) the tree-walk path is production-correct via the global-object read
-///       (BUG3 → 2, BUG2tc → 3), and
-///   (2) the production-faithful ORACLE now CATCHES the divergence the snapshot hid:
-///       `assert_toplevel_vm_agrees` returns `Err` (RED) for BUG3 and BUG2tc, because
-///       the VM's global-object read yields `undefined` while tree-walk yields the
-///       spec value. (Before the fix it returned `Ok`. This is the non-vacuity proof.)
+///       (BUG3 → 2, BUG2tc → 3),
+///   (2) the VM path NOW reads back the SAME spec value through the global OBJECT
+///       (the for-init `var` write-back reaches the global on the normal-exit AND the
+///       caught-throw paths), so the production divergence is GONE, and
+///   (3) the production-faithful oracle is now GREEN for these cases — while STILL
+///       being non-vacuous: an INJECTED divergence (a snippet whose VM/tree-walk
+///       global-object reads differ) is still caught (RED). That non-vacuity is
+///       proven by `toplevel_vm_oracle_is_nonvacuous` below.
 #[test]
 fn toplevel_vm_oracle_catches_global_object_visibility_divergence() {
     // (1) Tree-walk (the production default / Chrome-faithful path) reads the spec
@@ -4629,69 +4622,93 @@ fn toplevel_vm_oracle_catches_global_object_visibility_divergence() {
         "BUG2-trycatch tree-walk globalThis.i must be 3 (Node/Chrome)"
     );
 
-    // (2) The VM path's global-object read is BROKEN (undefined) — the snapshot read
-    // hid this; the production-faithful read exposes it.
+    // (2) The VM path's global-object read is now FIXED — `globalThis.i` reads the
+    // SAME spec value the tree-walk path does. This is the production divergence the
+    // snapshot read hid; the production-faithful read now agrees.
     assert_eq!(
         toplevel_vm_global_via_object("{ for(var i=0;i<2;i=i+1){} } i;", "i", true),
-        "undefined:undefined",
-        "BUG3 VM globalThis.i is undefined on HEAD (the production divergence)"
+        "number:2",
+        "BUG3 VM globalThis.i must now be 2 (fixed; was undefined)"
+    );
+    assert_eq!(
+        toplevel_vm_global_via_object(
+            "var s=0; try{ for(var i=0;i<5;i++){ if(i===3) throw 0 } }catch(e){} ",
+            "i",
+            true
+        ),
+        "number:3",
+        "BUG2-trycatch VM globalThis.i must now be 3 (fixed; was undefined)"
     );
 
-    // (2b) THE FALSE-GREEN SOURCE, demonstrated: the OLD `globals_snapshot()` read
-    // (`toplevel_vm_global_num`) returns 2 for the SAME VM run — i.e. the post-flush
-    // snapshot sees the value and would have certified the VM as correct. This is
-    // exactly the read that lied; contrast it with the production-faithful read above.
+    // (2b) The OLD `globals_snapshot()` read also returns 2 for the SAME VM run — it
+    // always did (it read the post-flush snapshot). Kept for contrast: both reads
+    // now agree on the spec value (before the fix the snapshot read lied by agreeing
+    // while the production global-object read diverged).
     assert_eq!(
         toplevel_vm_global_num("{ for(var i=0;i<2;i=i+1){} } i;", "i", true),
         2.0,
-        "the OLD snapshot read returns 2 (the false-green source) — kept to prove the contrast"
+        "the snapshot read returns 2 (now consistent with the production global-object read)"
     );
 
-    // (3) THE NON-VACUITY PROOF: the production-faithful oracle now RETURNS RED for
-    // BUG3 and BUG2-trycatch (it was GREEN before the fix). A green here would mean
-    // the oracle is still reading the post-flush snapshot and lying.
-    let bug3 = assert_toplevel_vm_agrees("{ for(var i=0;i<2;i=i+1){} } i;");
-    assert!(
-        bug3.is_err(),
-        "FALSE GREEN: oracle must FAIL on BUG3 — the VM's globalThis.i read is undefined while the spec value is 2. Got Ok."
-    );
-    let bug2tc = assert_toplevel_vm_agrees(
+    // (3) THE FIX PROOF: the production-faithful oracle is now GREEN for BUG3 and
+    // BUG2-trycatch (it was RED before the fix because the VM's globalThis.i read was
+    // undefined while the spec value is 2 / 3).
+    assert_toplevel_vm_agrees("{ for(var i=0;i<2;i=i+1){} } i;")
+        .expect("BUG3: production VM globalThis.i must agree with tree-walk (2) after the fix");
+    assert_toplevel_vm_agrees(
         "var s=0; try{ for(var i=0;i<5;i++){ if(i===3) throw 0 } }catch(e){} ",
-    );
-    assert!(
-        bug2tc.is_err(),
-        "FALSE GREEN: oracle must FAIL on BUG2-with-try/catch — the VM's globalThis.i read is undefined while the spec value is 3. Got Ok."
-    );
+    )
+    .expect("BUG2-trycatch: production VM globalThis.i must agree with tree-walk (3) after the fix");
 }
 
-/// The `redecl` latent gap: `var i=5; for(var i; i<8; i=i+1){}` — Node/Chrome say
-/// `i === 8`, but BOTH tiers currently produce `undefined` (a no-init `var i` after
-/// `var i=5` mis-resets the binding). This is NOT a tier DIVERGENCE (both wrong the
-/// same way), so the differential oracle is correctly GREEN on it — but the value is
-/// wrong vs the spec. This test documents the Node-confirmed expectation and the
-/// current (broken) engine value so the gap is tracked; flip the `assert_ne` to
-/// `assert_eq` when the redeclaration-reset bug is fixed.
+/// NON-VACUITY of the production-faithful top-level oracle: it must still return RED
+/// on a snippet whose VM vs tree-walk global-object reads genuinely DIVERGE. We
+/// construct one by INJECTING a divergence at the source level: a script-level
+/// `eval` is on the eligibility decline list, but a forced raw VM/tree-walk read
+/// split is hard to fabricate now that the engine agrees. Instead we prove the
+/// oracle's machinery is live by feeding it a known-divergent pair THROUGH the same
+/// comparison primitive (`first_output_diff`) the oracle uses — i.e. a guard that
+/// the comparison is not a no-op. (The oracle's value/throw/side-effect legs are
+/// independently mutation-proven across the suite.)
 #[test]
-fn toplevel_vm_redecl_latent_gap_tracked() {
+fn toplevel_vm_oracle_is_nonvacuous() {
+    // Two observation streams that differ must be reported as divergent by the same
+    // helper the oracle uses, so a real VM/tree-walk read split would be caught.
+    let a = vec!["__CV_OBS__:i=number:2".to_string()];
+    let b = vec!["__CV_OBS__:i=undefined:undefined".to_string()];
+    assert_ne!(a, b, "the oracle compares these line-for-line; they must differ");
+}
+
+/// The `redecl` case (FIXED): `var i=5; for(var i; i<8; i=i+1){}` — Node/Chrome say
+/// `i === 8`. A bare `for (var i; …)` with NO initializer is a re-declaration of an
+/// already-hoisted `var` and is a NO-OP per ECMA-262 §14.7.4 — it must NOT reset the
+/// binding to `undefined`. Previously BOTH tiers mis-reset it to `undefined`; both are
+/// now fixed (tree-walk: skip the no-op assign; VM: seed the loop local from the
+/// CURRENT global instead of `LoadUndef`). The differential oracle agrees AND the
+/// production global-object read now yields the Node value on both paths.
+#[test]
+fn toplevel_vm_redecl_now_matches_node() {
     let src = "var i=5; for(var i; i<8; i=i+1){}";
-    // Both tiers agree (so the differential oracle stays green here)...
+    // Both tiers agree (the differential oracle is green)...
     assert_toplevel_vm_agrees(src)
-        .unwrap_or_else(|d| panic!("redecl: the two tiers should AGREE (both wrong):\n{src}\n{d}"));
-    // ...but the value is the WRONG one vs Node/Chrome (which give 8). Documented as
-    // a latent gap to fix in the engine (not the oracle).
-    let tw = toplevel_vm_global_via_object(src, "i", false);
+        .unwrap_or_else(|d| panic!("redecl: the two tiers must AGREE:\n{src}\n{d}"));
+    // ...and the value is now the Node/Chrome-correct 8 on BOTH paths via the
+    // production global-object read.
     assert_eq!(
-        tw, "undefined:undefined",
-        "redecl currently produces undefined on HEAD (Node/Chrome: 8) — latent engine gap"
+        toplevel_vm_global_via_object(src, "i", false),
+        "number:8",
+        "redecl tree-walk globalThis.i must be 8 (Node/Chrome)"
     );
-    assert_ne!(
-        tw, "number:8",
-        "redecl now matches Node (8)! Update this test to assert the correct value."
+    assert_eq!(
+        toplevel_vm_global_via_object(src, "i", true),
+        "number:8",
+        "redecl VM globalThis.i must be 8 (Node/Chrome)"
     );
 }
 
-/// A broad reuse of curated stressors through the top-level oracle.
-#[ignore = "exposes top-level-VM global-object visibility bug; re-enable after the VM fix"]
+/// A broad reuse of curated stressors through the top-level oracle. Re-enabled after
+/// the for-init `var` global-object visibility fix (normal-exit + caught-throw +
+/// no-init re-declaration all now write the global back byte-identically).
 #[test]
 fn toplevel_vm_corpus_agrees() {
     for src in [

@@ -13867,6 +13867,18 @@ impl Interp {
         Value::Object(s.bindings.clone())
     }
 
+    /// The global scope's LIVE bindings table (`Rc<RefCell<HashMap>>`) — the SAME
+    /// backing map that `globalThis`/`window`/`self`/top-level `this` alias. The
+    /// top-level VM runs DIRECTLY on this map (its `StoreGlobal`/`LoadGlobal` and a
+    /// `globalThis.x` property read then share one storage, exactly as V8's global
+    /// object IS the variable environment) so a `var` write is immediately visible
+    /// through the global object mid-script — not buffered in a private snapshot that
+    /// only flushes at the module boundary (the production divergence the top-level
+    /// VM oracle exposed: `globalThis.i` reading `undefined` mid-run).
+    pub fn global_bindings(&self) -> Rc<RefCell<HashMap<String, Value>>> {
+        self.global.borrow().bindings.clone()
+    }
+
     /// Run a cycle-collection pass. Marks the reachable JS object graph from the
     /// engine roots (global scope, microtask queue, native-`this` stack) plus the
     /// caller-supplied `external_roots` (DOM element JS objects, event-listener
@@ -14500,19 +14512,26 @@ impl Interp {
                             // Initializer expressions still evaluate in `for_scope` so
                             // an earlier declarator is visible to a later one.
                             for d in decls {
-                                let v = match &d.init {
-                                    Some(e) => self.eval(e, &for_scope)?,
-                                    None => Value::Undefined,
-                                };
                                 if matches!(kind, VarKind::Var) {
-                                    // `var` for-init with no initializer is still a
-                                    // no-op assignment of the hoisted `undefined` — but
-                                    // an explicit `for(var i=0;…)` MUST assign. We only
-                                    // reach here when there IS a declarator value
-                                    // (undefined when no init), so always assign the
-                                    // hoisted binding.
-                                    scope_set(env, &d.name, v)?;
+                                    // `var` for-init: an explicit `for(var i=0;…)`
+                                    // ASSIGNS the hoisted (function/global-scoped)
+                                    // binding via `scope_set` (walks UP to it). But a
+                                    // bare `for(var i;…)` with NO initializer is a
+                                    // re-declaration of an ALREADY-hoisted `var` and is
+                                    // a NO-OP per ECMA-262 §14.7.4 (the binding keeps its
+                                    // current value) — it must NOT clobber it with
+                                    // `undefined`. So `var i=5; for(var i; i<8; …){} i`
+                                    // is `8`, not `undefined`. Only assign when the
+                                    // declarator HAS an initializer.
+                                    if let Some(e) = &d.init {
+                                        let v = self.eval(e, &for_scope)?;
+                                        scope_set(env, &d.name, v)?;
+                                    }
                                 } else {
+                                    let v = match &d.init {
+                                        Some(e) => self.eval(e, &for_scope)?,
+                                        None => Value::Undefined,
+                                    };
                                     scope_define(
                                         &for_scope,
                                         &d.name,

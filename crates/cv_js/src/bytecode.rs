@@ -1863,7 +1863,23 @@ impl<'a> FnCompiler<'a> {
                                             self.emit(Op::Move { dst: slot, src });
                                         }
                                     }
+                                } else if self.is_script {
+                                    // SCRIPT FRAME, bare `for (var i; …)` with NO
+                                    // initializer: `i` is a function/global-scoped
+                                    // `var` already hoisted (and possibly assigned a
+                                    // value earlier — `var i=5; for(var i; i<8; …){}`).
+                                    // Per ECMA-262 §14.7.4 a no-init `var` re-declaration
+                                    // is a NO-OP — it must NOT reset the binding to
+                                    // `undefined`. Seed the fast loop LOCAL from the
+                                    // CURRENT global value (so the test/update operate on
+                                    // the live `5`, and the loop runs to `8`) instead of
+                                    // clobbering it with `LoadUndef`. Mirrors the
+                                    // tree-walker's no-op-on-no-init for-init `var` arm.
+                                    let nk = self.add_const(Value::str(name.clone()));
+                                    self.emit(Op::LoadGlobal { dst: slot, name_k: nk });
                                 } else {
+                                    // Non-script (real function) frame: a fresh
+                                    // function-local `var` defaults to `undefined`.
                                     self.emit(Op::LoadUndef { dst: slot });
                                 }
                             }
@@ -2199,6 +2215,28 @@ impl<'a> FnCompiler<'a> {
                 } = &mut self.code[try_enter_pos]
                 {
                     *t = catch_target;
+                }
+                // SCRIPT FRAME for-init `var` sync on the CAUGHT-THROW path. A
+                // top-level `for (var i = …)` keeps `i` in a fast LOCAL and only
+                // syncs it to its (global) binding by a post-loop `StoreGlobal`. If
+                // the loop throws mid-iteration and the throw is CAUGHT by a handler
+                // in THIS same VM module (`try{ for(var i…){ …throw… } }catch{} i`),
+                // that post-loop store is skipped and control resumes here — so
+                // without this flush `globalThis.i` would read the stale hoisted
+                // `undefined` while the tree-walker (which mutates the global in place
+                // every iteration) and Node give the live value (e.g. `3`). The
+                // throw-time flush in `run_function` only fires when the error escapes
+                // the WHOLE function; a caught throw never reaches it. So at every
+                // catch-handler entry in the script frame, flush each known for-init
+                // `var`'s live local register to its global. This is idempotent
+                // (writes the current live value) and only costs a few stores on the
+                // cold catch path — the hot non-throwing loop is untouched.
+                if self.is_script && !self.script_forinit_syncs.is_empty() {
+                    let syncs = self.script_forinit_syncs.clone();
+                    for (sname, sreg) in syncs {
+                        let nk = self.add_const(Value::str(sname));
+                        self.emit(Op::StoreGlobal { name_k: nk, src: sreg });
+                    }
                 }
                 if let Some(name) = catch_param {
                     self.scopes
@@ -3684,38 +3722,41 @@ pub fn run_module_with_interp(
     // tree-walk `enter_js_task` hooks don't cover it). Aborts a runaway VM run
     // instead of freezing the UI thread.
     let _task = crate::interp::enter_js_task();
-    let globals = std::cell::RefCell::new(interp.globals_snapshot());
-    let result = {
-        let mut dispatch = |callee: Value, this: Value, args: Vec<Value>| {
-            interp
-                .call_value_with_this(callee, this, args)
-                .map_err(|e| match e {
-                    crate::interp::JsError::Throw(v) => RuntimeError::Thrown(v),
-                    other => RuntimeError::TypeError(format!("host call: {other:?}")),
-                })
-        };
-        // NOTE: do NOT `?` here — globals must be written back even when the script
-        // THROWS. In the tree-walker the global scope is mutated in place, so a
-        // top-level `throw` leaves every prior `var`/assignment visible; the VM
-        // accumulates them in `globals` and we must mirror that on BOTH paths or a
-        // throwing script's global state would diverge from the tree-walker.
-        run_function(
-            module,
-            0,
-            &[],
-            &Value::Undefined,
-            &globals,
-            None,
-            &mut dispatch,
-        )
+    // ★ Run DIRECTLY on the interp's LIVE global bindings table — the SAME
+    // `Rc<RefCell<HashMap>>` that `globalThis`/`window`/`self`/top-level `this`
+    // alias — instead of a private snapshot that only flushes back at the module
+    // boundary. In V8 the global object IS the variable environment: a `var`
+    // write and a `globalThis.x` read share one storage. The old snapshot design
+    // buffered `StoreGlobal` writes in a separate map, so a `globalThis.i` read
+    // mid-script (exactly what a page does) saw the stale hoisted `undefined`
+    // while the bare-identifier read saw the buffered value — a real production
+    // divergence the top-level VM oracle exposed. Sharing the live map makes the
+    // global-object read and the bare read agree, byte-identical to the tree-walk
+    // path (which mutates this same map in place). No write-back step is needed
+    // (and the throw path is automatically correct: every prior `var`/assignment
+    // already landed in the live map).
+    let bindings = interp.global_bindings();
+    let globals: &std::cell::RefCell<HashMap<String, Value>> = &bindings;
+    let mut dispatch = |callee: Value, this: Value, args: Vec<Value>| {
+        interp
+            .call_value_with_this(callee, this, args)
+            .map_err(|e| match e {
+                crate::interp::JsError::Throw(v) => RuntimeError::Thrown(v),
+                other => RuntimeError::TypeError(format!("host call: {other:?}")),
+            })
     };
-    // Push any new / changed globals back into the interp so the next tree-walk
-    // eval sees them — on success AND on throw (the live-scope mutation parity).
-    let final_globals = globals.into_inner();
-    for (k, v) in final_globals {
-        interp.define_global(&k, v);
-    }
-    result
+    // NOTE: do NOT `?` — but globals are already written in place (live map), so a
+    // top-level `throw` leaves every prior `var`/assignment visible exactly as the
+    // tree-walker does (the global scope is mutated in place on both paths).
+    run_function(
+        module,
+        0,
+        &[],
+        &Value::Undefined,
+        globals,
+        None,
+        &mut dispatch,
+    )
 }
 
 thread_local! {

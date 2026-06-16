@@ -475,11 +475,21 @@ fn observe_globals_through_object(src: &str, on: bool, keys: &[String]) -> Vec<S
     // member access on `globalThis` (the real [[Get]] path) and serialized as
     // `typeof:String(value)`. A throw in one key's read still emits the remaining
     // keys. JSON-escape the key so an unusual global name can't break the syntax.
+    //
+    // CALLABLE-STABLE serialization: for a FUNCTION-typed global, serialize ONLY
+    // `typeof` (always `"function"`) and the sentinel `<callable>`, NOT the
+    // source-text `String(fn)`. A function's `.toString()` representation is
+    // legitimately tier-dependent (a tree-walk closure renders its source while a
+    // VM `BcClosure` renders `function … bc#N`) and is NOT a correctness-observable
+    // value — exactly the "callable = opaque-but-present" rule `deep_diff` already
+    // applies to completion values. Without this, observing a top-level `var f =
+    // function(){…}` global would report a false divergence purely on the function
+    // body's textual rendering. Non-function values keep the full `String(value)`.
     let mut probe = String::from("\n;(function(){\n");
     for k in keys {
         let key_lit = json_string_literal(k);
         probe.push_str(&format!(
-            "  try {{ var __cv_v = globalThis[{key}]; console.log('__CV_OBS__:' + {key} + '=' + (typeof __cv_v) + ':' + String(__cv_v)); }} catch (__cv_e) {{ console.log('__CV_OBS__:' + {key} + '=THROW:' + String(__cv_e)); }}\n",
+            "  try {{ var __cv_v = globalThis[{key}]; var __cv_s = (typeof __cv_v === 'function') ? '<callable>' : String(__cv_v); console.log('__CV_OBS__:' + {key} + '=' + (typeof __cv_v) + ':' + __cv_s); }} catch (__cv_e) {{ console.log('__CV_OBS__:' + {key} + '=THROW:' + String(__cv_e)); }}\n",
             key = key_lit
         ));
     }
