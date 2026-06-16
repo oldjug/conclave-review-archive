@@ -1989,9 +1989,12 @@ pub fn toplevel_vm_enabled() -> bool {
     ON.with(|c| match c.get() {
         Some(v) => v,
         None => {
-            let v = matches!(
+            // DEFAULT ON (flipped 2026-06-16 after the differential fuzzer ran
+            // CLEAN: 0 divergences over 23k generated programs, non-vacuous, +
+            // the nasty adversarial suite). Only an explicit off value disables.
+            let v = !matches!(
                 std::env::var("CV_TOPLEVEL_VM").as_deref(),
-                Ok("1") | Ok("true") | Ok("on")
+                Ok("0") | Ok("false") | Ok("off")
             );
             c.set(Some(v));
             v

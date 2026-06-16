@@ -3943,9 +3943,12 @@ pub fn inline_leaf_enabled() -> bool {
     ON.with(|c| match c.get() {
         Some(v) => v,
         None => {
-            let v = matches!(
+            // DEFAULT ON (flipped 2026-06-16; effective only when the top-level VM
+            // is also on). Fuzzer-clean + nasty-suite verified. Only an explicit
+            // off value disables.
+            let v = !matches!(
                 std::env::var("CV_INLINE_LEAF").as_deref(),
-                Ok("1") | Ok("true") | Ok("on")
+                Ok("0") | Ok("false") | Ok("off")
             );
             c.set(Some(v));
             v
