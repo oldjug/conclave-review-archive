@@ -215,6 +215,7 @@ fn non_serializable_const_declines_serialize() {
         consts: vec![obj],
         code: vec![Op::Ret { src: 0 }],
         ic: std::cell::RefCell::new(Vec::new()),
+        feedback: std::cell::RefCell::new(Vec::new()),
     };
     let module = Module { fns: vec![f] };
     assert!(
@@ -344,6 +345,7 @@ fn module_with_baked_shape(shape_keys: &[&str], slot: u32) -> Module {
             Op::Ret { src: 1 },
         ],
         ic: std::cell::RefCell::new(Vec::new()),
+        feedback: std::cell::RefCell::new(Vec::new()),
     };
     // Intern the given shape descriptor and bake it into the GetProp IC at ip 0.
     let shape_id = crate::shapes::with_shape_table(|t| {

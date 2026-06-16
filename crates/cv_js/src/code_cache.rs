@@ -831,6 +831,12 @@ fn read_fn(r: &mut Reader, code_len_for_ic: &mut usize) -> Option<BcFunction> {
         consts,
         code,
         ic: std::cell::RefCell::new(ic_vec),
+        // T4 P1: a freshly deserialized module starts with an EMPTY feedback
+        // vector — it lazily re-fills at runtime (clean, monotone-correct). P5
+        // will serialize/restore the binary/compare/call hints alongside `ic`;
+        // P1 deliberately does not persist them (recording only), so a reload
+        // simply re-warms the lattice from scratch.
+        feedback: std::cell::RefCell::new(Vec::new()),
     })
 }
 

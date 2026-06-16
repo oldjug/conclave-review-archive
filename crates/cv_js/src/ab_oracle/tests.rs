@@ -4195,3 +4195,188 @@ fn t4_oracle_leg_is_byte_identical_on_corpus() {
         }
     }
 }
+
+// ───────────────────── T4 P1 — TYPE-FEEDBACK VECTOR ──────────────────────
+//
+// P1 records a per-bytecode binary/compare/call type-hint lattice (recording
+// only, no specialization). The gates:
+//   1. RECORDING IS INVISIBLE — every corpus snippet is byte-identical whether
+//      the recorder is off or force-on (`assert_tiers_agree` now runs both legs
+//      internally; these tests double-check the claim directly + on hot loops).
+//   2. THE VECTOR FILLS (non-vacuity) — a recorded run of a recordable snippet
+//      leaves the honesty counter > 0 and the per-function vector populated with
+//      the EXPECTED monotone hint (a float loop → Number, an int loop →
+//      SignedSmall, a string concat → String).
+//   3. THE ORACLE HAS TEETH — the recording-clobber mutation hook (a recorder
+//      that wrongly touches a JS value) MUST redden the feedback-on oracle leg.
+
+/// Recording is OBSERVATIONALLY INVISIBLE: each corpus snippet returns the exact
+/// same outcome with the feedback recorder force-ON as with it off. This is P1's
+/// central safety claim, checked directly (independent of the internal oracle
+/// leg) on numeric / oddball / string / call shapes.
+#[test]
+fn feedback_recording_is_observationally_invisible() {
+    let corpus = [
+        "var s=0; for(var i=0;i<300;i=i+1){ s = s + i*2 - 1; } s;",
+        "function f(x){ return x*0.5 + 3.0; } var s=0; for(var i=0;i<200;i=i+1){ s = s + f(i); } s;",
+        "var s=''; for(var i=0;i<10;i=i+1){ s = s + 'x' + i; } s;",
+        "var a = true + 1; var b = null + 2; var c = undefined + 3; [a,b,c];",
+        "var s=0; for(var i=0;i<50;i=i+1){ if (i < 25) s = s + i; else s = s - i; } s;",
+        "function g(y){return y+1;} function f(x){return g(x*2)*3;} f(5)+f(0)+f(-2);",
+        "1n + 2n;", // BigInt site — recorded as BigInt, results unchanged
+    ];
+    for src in corpus {
+        let off = run_one_tier(src, ForcedTier::Vm);
+        let on = {
+            let _fb = crate::feedback::FeedbackGuard::new(true);
+            run_one_tier(src, ForcedTier::Vm)
+        };
+        if let Err(d) = compare_outcomes(&off, &on, "vm", "vm+feedback") {
+            panic!("feedback recording changed the result:\n{d}\n  src={src}");
+        }
+        // And the full oracle (with its internal feedback-on legs) is green.
+        assert_tiers_agree(src)
+            .unwrap_or_else(|d| panic!("oracle diverged with feedback legs:\n{d}\n  src={src}"));
+    }
+}
+
+/// NON-VACUITY: a recorded run actually FILLS the vector. The honesty counter is
+/// > 0 and the engagement helper returns true on a recordable snippet.
+#[test]
+fn feedback_vector_is_non_vacuous() {
+    // Recordable ops must run in the bytecode VM (where the recorder lives, like
+    // V8's Ignition collecting per-FUNCTION feedback) — so the work is in a
+    // declared function `w`, which `ForcedTier::Vm` routes through the VM.
+    let engaged = super::assert_tiers_agree_feedback_engaged(
+        "function w(){ var s=0; for(var i=0;i<300;i=i+1){ s = s + i*2 - 1; } return s; } w();",
+    )
+    .expect("oracle must be green");
+    assert!(
+        engaged,
+        "the feedback vector must FILL on a recordable snippet (non-vacuity)"
+    );
+    // A function with NO recordable arith/compare/call ops in its body records no
+    // feedback — proving the counter isn't spuriously bumped. (`w` just returns a
+    // literal; the `w()` call site itself is a top-level CallValue via global
+    // lookup, NOT a recorded module-local CallFn, so nothing records.)
+    let bare = super::assert_tiers_agree_feedback_engaged(
+        "function w(){ return 42; } w();",
+    )
+    .expect("green");
+    assert!(!bare, "a body with no recordable ops records no feedback");
+}
+
+/// THE RECORDED HINT IS CORRECT + MONOTONE: run a hot loop through the VM with
+/// recording on and inspect the per-function feedback vector — an int loop yields
+/// SignedSmall, a float loop yields Number, a string concat yields String. This
+/// proves the lattice reflects the OBSERVED operand types (not a constant), end to
+/// end through the VM handlers (not just the unit-level `record_binop`).
+#[test]
+fn feedback_hint_reflects_observed_operand_types() {
+    use crate::bytecode::{compile_program, run_module_with_interp};
+    use crate::feedback::{FeedbackGuard, TypeHint};
+
+    // Helper: compile `src`, run it through the VM with recording on, and return
+    // the JOIN of every recorded binop hint across all functions (the dominant
+    // operand class the program exercised).
+    fn dominant_hint(src: &str) -> TypeHint {
+        let _fb = FeedbackGuard::new(true);
+        let module = compile_program(src).expect("compile");
+        let mut interp = crate::interp::Interp::new();
+        interp.install_basic_globals();
+        let _ = run_module_with_interp(&module, &mut interp);
+        // Join all recorded binop hints across the module's functions.
+        let mut acc = TypeHint::None;
+        for f in &module.fns {
+            for slot in f.feedback.borrow().iter() {
+                acc = acc.join(slot.binop_hint());
+            }
+        }
+        acc
+    }
+
+    // Pure small-int arithmetic in a loop → SignedSmall.
+    assert_eq!(
+        dominant_hint("function w(){var s=0; for(var i=0;i<100;i=i+1){ s=s+i; } return s;} w();"),
+        TypeHint::SignedSmall,
+        "an integer loop must record SignedSmall"
+    );
+    // Float arithmetic → Number (widened past SignedSmall).
+    assert_eq!(
+        dominant_hint("function w(){var s=0.0; for(var i=0;i<100;i=i+1){ s=s+i*0.5; } return s;} w();"),
+        TypeHint::Number,
+        "a float loop must record Number"
+    );
+    // String concat → String.
+    assert_eq!(
+        dominant_hint("function w(){var s=''; for(var i=0;i<10;i=i+1){ s=s+'x'; } return s;} w();"),
+        TypeHint::String,
+        "a string-concat loop must record String"
+    );
+}
+
+/// CALL FEEDBACK: a direct `CallFn` site records its monomorphic target. Verify
+/// the `mono_call_target_at` seam the P3 inliner will read returns the callee's
+/// module fn-index after a recorded run.
+#[test]
+fn feedback_records_monomorphic_call_target() {
+    use crate::bytecode::{compile_program, run_module_with_interp};
+    use crate::feedback::FeedbackGuard;
+
+    let _fb = FeedbackGuard::new(true);
+    let src = "function g(y){ return y+1; } function f(x){ return g(x)*2; } var s=0; for(var i=0;i<50;i=i+1){ s = s + f(i); } s;";
+    let module = compile_program(src).expect("compile");
+    let mut interp = crate::interp::Interp::new();
+    interp.install_basic_globals();
+    let _ = run_module_with_interp(&module, &mut interp);
+
+    // SOME function in the module recorded a monomorphic call target (f calls g;
+    // the top-level loop calls f). Confirm at least one call site is monomorphic.
+    let mut found_mono = false;
+    for f in &module.fns {
+        let tbl = f.feedback.borrow();
+        for (ip, slot) in tbl.iter().enumerate() {
+            if let Some(tgt) = slot.mono_call_target() {
+                found_mono = true;
+                assert!(
+                    (tgt as usize) < module.fns.len(),
+                    "recorded call target {tgt} must be a valid module fn-index (ip={ip})"
+                );
+            }
+        }
+    }
+    assert!(
+        found_mono,
+        "a direct CallFn loop must record a monomorphic call target"
+    );
+}
+
+/// ORACLE TEETH (non-vacuity of the feedback-on leg): the recording-clobber
+/// mutation hook makes the recorder wrongly touch a JS value; the feedback-ON
+/// oracle leg MUST then redden (diverge from the recording-off tree-walk). With
+/// the hook unset the same snippet is green. This proves the P1 oracle leg is not
+/// a no-op — exactly the `set_force_wrong_fold` discipline for this phase.
+#[test]
+fn feedback_oracle_leg_has_teeth() {
+    // A FUNCTION (so the body runs in the VM where the recorder + its clobber hook
+    // live) whose result depends on the rhs operand the clobber overwrites.
+    let src = "function w(){ var s=0; for(var i=0;i<5;i=i+1){ s = s + i*1; } return s; } w();";
+
+    // Sanity: clean (hook off) — green.
+    assert_tiers_agree(src).expect("clean run must be green");
+
+    // Hook ON: the recorder clobbers the rhs of every binop while recording (only
+    // active when recording is on, which the oracle's feedback legs force). The
+    // feedback-on legs must now diverge from tree-walk → the oracle reddens.
+    let _clobber = crate::feedback::RecordClobberGuard::new(true);
+    let diverged = assert_tiers_agree(src).is_err();
+    drop(_clobber);
+    assert!(
+        diverged,
+        "the recording-clobber mutation hook MUST redden the feedback-on oracle \
+         leg — otherwise the P1 oracle leg proves nothing (vacuous)"
+    );
+
+    // And after dropping the hook, the oracle is green again (no leakage).
+    assert_tiers_agree(src).expect("oracle must be green again after the hook drops");
+}

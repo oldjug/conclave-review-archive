@@ -31,6 +31,13 @@ pub mod bytecode;
 /// recompiles on load. Gated by `CV_CODE_CACHE`, DEFAULT OFF. Native-code
 /// persistence is the documented follow-on (the B1 code cage is its groundwork).
 pub mod code_cache;
+/// T4 (Maglev-class) PHASE P1 — binary/compare TYPE-FEEDBACK VECTOR. A
+/// per-bytecode-slot monotone (widen-only) type-hint lattice (V8
+/// `BinaryOperationHint`/`CompareOperationHint` shape) recorded by the bytecode
+/// VM and exposed to the T4 lowering. RECORDING ONLY (no specialization); gated by
+/// `CV_FEEDBACK`, DEFAULT OFF, observationally invisible. P2 consumes it; P5
+/// persists it.
+pub mod feedback;
 pub mod gc;
 pub mod interp;
 pub mod jit;

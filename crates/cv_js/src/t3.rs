@@ -1486,6 +1486,11 @@ impl T3Func {
             consts,
             code,
             ic: std::cell::RefCell::new(Vec::new()),
+            // T4 P1: the OPTIMIZED module starts with an empty feedback vector.
+            // T3/T4 codegen reads feedback off the ORIGINAL `BcFunction` (the one
+            // the VM recorded into); the optimized clone never records, so an empty
+            // vector here is correct and never consulted by the recorder.
+            feedback: std::cell::RefCell::new(Vec::new()),
         })
     }
 }

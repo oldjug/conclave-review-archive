@@ -752,6 +752,62 @@ pub struct BcFunction {
     /// so caches warm across calls. `RefCell` for interior mutability behind the
     /// `&BcFunction` the run loop holds.
     pub ic: std::cell::RefCell<Vec<PropIc>>,
+    /// T4 P1 — per-`arith`/`compare`/`call`-site TYPE-FEEDBACK vector, indexed by
+    /// instruction pointer exactly like `ic`. Lazily sized to `code.len()` on
+    /// first recording; only binary/unary/compare/call op indices are ever
+    /// written. Records the monotone (widen-only) V8-`BinaryOperationHint`-shaped
+    /// operand hint + monomorphic call target so the T4 lowering can speculate on
+    /// OBSERVED types. RECORDING ONLY (P1); observationally invisible; the VM only
+    /// writes it when `CV_FEEDBACK` is on (`feedback::feedback_enabled()`), so the
+    /// default build pays zero cost. Persists on the reused `Module` so feedback
+    /// warms across calls; `RefCell` for the same interior-mutability reason as
+    /// `ic`. (P5 will serialize it alongside the persisted `PropIc`.)
+    pub feedback: std::cell::RefCell<Vec<crate::feedback::TypeFeedback>>,
+}
+
+impl BcFunction {
+    /// T4 P1 — read the recorded TYPE-FEEDBACK for the op at bytecode index `ip`,
+    /// for the T4 lowering (P2 representation selection / P3 inlining). Returns
+    /// the bottom (`INVALID`, all-`None`) slot if the site never recorded
+    /// (feedback off, or the op never ran, or it's not a recorded op kind) — so a
+    /// consumer always gets a safe "no information → do not speculate" answer with
+    /// no `Option` ceremony. This is the read seam the speculative tier consults;
+    /// it never mutates (the VM is the only writer, behind `CV_FEEDBACK`).
+    #[inline]
+    pub fn feedback_at(&self, ip: usize) -> crate::feedback::TypeFeedback {
+        let tbl = self.feedback.borrow();
+        tbl.get(ip)
+            .copied()
+            .unwrap_or(crate::feedback::TypeFeedback::INVALID)
+    }
+
+    /// The recorded binary/compare TYPE-HINT for the op at `ip` — convenience over
+    /// [`feedback_at`] for the common representation-selection query. `None`
+    /// (never observed) if the site never ran / isn't a binary site / feedback is
+    /// off. The T4 lowering checks `hint.is_numeric_speculatable()` to decide
+    /// whether to pick an unboxed Int32/Float64 representation.
+    #[inline]
+    pub fn type_hint_at(&self, ip: usize) -> crate::feedback::TypeHint {
+        self.feedback_at(ip).binop_hint()
+    }
+
+    /// The MONOMORPHIC call target (module fn-index) recorded for the call op at
+    /// `ip`, if this site only ever called a single, known callee — the seam the
+    /// P3 inliner reads. `None` if never called, polymorphic, or feedback off (in
+    /// every case the inliner correctly declines).
+    #[inline]
+    pub fn mono_call_target_at(&self, ip: usize) -> Option<u32> {
+        self.feedback_at(ip).mono_call_target()
+    }
+
+    /// Whether the feedback vector carries ANY observation worth exposing — true
+    /// iff at least one op-site recorded a non-bottom hint or a call target. Lets
+    /// the T4 lowering cheaply skip a function whose feedback never warmed (decline
+    /// to T3/T2). Also the non-vacuity probe the oracle/tests assert against (the
+    /// vector must actually FILL on a recorded run).
+    pub fn has_any_feedback(&self) -> bool {
+        self.feedback.borrow().iter().any(|f| f.has_feedback())
+    }
 }
 
 /// A compiled program. The top-level script lives in `fns[0]`; user
@@ -803,6 +859,7 @@ pub fn compile_program(source: &str) -> Result<Module, CompileError> {
         consts: Vec::new(),
         code: Vec::new(),
         ic: std::cell::RefCell::new(Vec::new()),
+        feedback: std::cell::RefCell::new(Vec::new()),
     };
     for _ in 0..=declared.len() {
         fns_pool.borrow_mut().push(placeholder.clone());
@@ -876,6 +933,7 @@ pub fn compile_single_function_arrow(
         consts: Vec::new(),
         code: Vec::new(),
         ic: std::cell::RefCell::new(Vec::new()),
+        feedback: std::cell::RefCell::new(Vec::new()),
     });
     let parent_locals: HashMap<String, Reg> =
         captured_names.iter().map(|n| (n.clone(), 0u16)).collect();
@@ -1129,6 +1187,7 @@ fn compile_function(
             consts: c.consts,
             code: c.code,
             ic: std::cell::RefCell::new(Vec::new()),
+        feedback: std::cell::RefCell::new(Vec::new()),
         },
         uvs,
     ))
@@ -1570,6 +1629,7 @@ impl<'a> FnCompiler<'a> {
                         consts: Vec::new(),
                         code: Vec::new(),
                         ic: std::cell::RefCell::new(Vec::new()),
+        feedback: std::cell::RefCell::new(Vec::new()),
                     });
                     idx
                 };
@@ -2166,6 +2226,7 @@ impl<'a> FnCompiler<'a> {
                         consts: Vec::new(),
                         code: Vec::new(),
                         ic: std::cell::RefCell::new(Vec::new()),
+        feedback: std::cell::RefCell::new(Vec::new()),
                     });
                     idx
                 };
@@ -2201,6 +2262,7 @@ impl<'a> FnCompiler<'a> {
                         consts: Vec::new(),
                         code: Vec::new(),
                         ic: std::cell::RefCell::new(Vec::new()),
+        feedback: std::cell::RefCell::new(Vec::new()),
                     });
                     idx
                 };
@@ -2893,6 +2955,7 @@ impl<'a> FnCompiler<'a> {
                         consts: Vec::new(),
                         code: Vec::new(),
                         ic: std::cell::RefCell::new(Vec::new()),
+        feedback: std::cell::RefCell::new(Vec::new()),
                     });
                     idx
                 };
@@ -2932,6 +2995,7 @@ impl<'a> FnCompiler<'a> {
                         consts: Vec::new(),
                         code: Vec::new(),
                         ic: std::cell::RefCell::new(Vec::new()),
+        feedback: std::cell::RefCell::new(Vec::new()),
                     });
                     idx
                 };
@@ -5993,6 +6057,15 @@ fn run_function_inner(
     let mut last_callee_hint: String = String::new();
     let mut ip: usize = start_ip;
     let mut wd_ticks: u32 = 0;
+    // T4 P1 — TYPE-FEEDBACK RECORDING gate, hoisted ONCE per function activation
+    // (env read is memoized in `feedback_enabled`, but the branch is hoisted to a
+    // local `bool` so the hot dispatch only does a register test, not a TLS read,
+    // per op). DEFAULT-OFF (`CV_FEEDBACK`): when false the `record_fb!` macro
+    // expands to nothing observable and the recorder is never touched, so the
+    // default build is byte-identical and pays zero cost. RECORDING ONLY — a
+    // write mutates only the side table on `f`, never a JS value, so it is
+    // observationally invisible whether on or off (the oracle proves this).
+    let fb_on: bool = crate::feedback::feedback_enabled();
     loop {
         if ip >= f.code.len() {
             return Err(RuntimeError::Overrun);
@@ -6052,6 +6125,63 @@ fn run_function_inner(
                 }
             }};
         }
+        // T4 P1 — record BINARY/UNARY/CALL type feedback for the op at `ip-1`
+        // (the just-fetched op; `ip` was already advanced). Gated on `fb_on`
+        // (DEFAULT-OFF) so it is zero-cost off. The recorder lazily sizes the
+        // side table to `code.len()` on first use (mirroring `ic`), then SKIPS a
+        // SETTLED (`Any`) slot before any operand read — the V8 monotone-settle
+        // that bounds overhead: a megamorphic site costs only the settled check.
+        // The macro reads operands from the LIVE `regs` BEFORE the op executes
+        // (Ignition collects feedback at the op), so the hint reflects the exact
+        // inputs the op will consume. Writing the side table is observationally
+        // invisible (never touches a JS value), so results are unchanged.
+        macro_rules! record_fb {
+            // Binary arith/compare site: join the two operand hints.
+            (binop $idx:expr, $lhs:expr, $rhs:expr) => {{
+                if fb_on {
+                    let mut tbl = f.feedback.borrow_mut();
+                    if tbl.len() != f.code.len() {
+                        tbl.resize(f.code.len(), crate::feedback::TypeFeedback::INVALID);
+                    }
+                    let slot = &mut tbl[$idx];
+                    if !slot.binop_hint().is_settled() {
+                        let (l, r) = (&regs[$lhs as usize], &regs[$rhs as usize]);
+                        slot.record_binop(l, r);
+                    }
+                    drop(tbl);
+                    // MUTATION HOOK (test-only): a recorder that wrongly touched a
+                    // JS value would diverge — clobber the rhs register to PROVE
+                    // the feedback-on oracle leg catches such a side effect.
+                    if crate::feedback::force_record_clobber() {
+                        regs[$rhs as usize] = Value::Number(123456.0);
+                    }
+                }
+            }};
+            // Unary arith site: single operand hint.
+            (unop $idx:expr, $src:expr) => {{
+                if fb_on {
+                    let mut tbl = f.feedback.borrow_mut();
+                    if tbl.len() != f.code.len() {
+                        tbl.resize(f.code.len(), crate::feedback::TypeFeedback::INVALID);
+                    }
+                    let slot = &mut tbl[$idx];
+                    if !slot.binop_hint().is_settled() {
+                        let s = &regs[$src as usize];
+                        slot.record_unop(s);
+                    }
+                }
+            }};
+            // Direct module-local call: record the (already-known) target index.
+            (call $idx:expr, $target:expr) => {{
+                if fb_on {
+                    let mut tbl = f.feedback.borrow_mut();
+                    if tbl.len() != f.code.len() {
+                        tbl.resize(f.code.len(), crate::feedback::TypeFeedback::INVALID);
+                    }
+                    tbl[$idx].record_call($target as u32);
+                }
+            }};
+        }
         // Per-task wall-clock watchdog: abort a runaway VM loop instead of
         // freezing the UI thread. Amortized so the `Instant::now` is ~free.
         wd_ticks = wd_ticks.wrapping_add(1);
@@ -6065,10 +6195,20 @@ fn run_function_inner(
             Op::LoadNull { dst } => run_shared!(op_load_null(dst)),
             Op::LoadUndef { dst } => run_shared!(op_load_undef(dst)),
             Op::Move { dst, src } => run_shared!(op_move(dst, src)),
-            Op::Add { dst, lhs, rhs } => run_shared!(op_add(dst, lhs, rhs)),
-            Op::Sub { dst, lhs, rhs } => run_shared!(op_sub(dst, lhs, rhs)),
-            Op::Mul { dst, lhs, rhs } => run_shared!(op_mul(dst, lhs, rhs)),
+            Op::Add { dst, lhs, rhs } => {
+                record_fb!(binop ip - 1, lhs, rhs);
+                run_shared!(op_add(dst, lhs, rhs))
+            }
+            Op::Sub { dst, lhs, rhs } => {
+                record_fb!(binop ip - 1, lhs, rhs);
+                run_shared!(op_sub(dst, lhs, rhs))
+            }
+            Op::Mul { dst, lhs, rhs } => {
+                record_fb!(binop ip - 1, lhs, rhs);
+                run_shared!(op_mul(dst, lhs, rhs))
+            }
             Op::Div { dst, lhs, rhs } => {
+                record_fb!(binop ip - 1, lhs, rhs);
                 let v = if let (Value::Number(a), Value::Number(b)) =
                     (&regs[lhs as usize], &regs[rhs as usize])
                 {
@@ -6089,15 +6229,29 @@ fn run_function_inner(
                 };
                 regs[dst as usize] = v;
             }
-            Op::Mod { dst, lhs, rhs } => run_shared!(op_mod(dst, lhs, rhs)),
-            Op::Pow { dst, lhs, rhs } => run_shared!(op_pow(dst, lhs, rhs)),
-            Op::Eq { dst, lhs, rhs } => run_shared!(op_eq(dst, lhs, rhs)),
-            Op::Neq { dst, lhs, rhs } => run_shared!(op_neq(dst, lhs, rhs)),
+            Op::Mod { dst, lhs, rhs } => {
+                record_fb!(binop ip - 1, lhs, rhs);
+                run_shared!(op_mod(dst, lhs, rhs))
+            }
+            Op::Pow { dst, lhs, rhs } => {
+                record_fb!(binop ip - 1, lhs, rhs);
+                run_shared!(op_pow(dst, lhs, rhs))
+            }
+            Op::Eq { dst, lhs, rhs } => {
+                record_fb!(binop ip - 1, lhs, rhs);
+                run_shared!(op_eq(dst, lhs, rhs))
+            }
+            Op::Neq { dst, lhs, rhs } => {
+                record_fb!(binop ip - 1, lhs, rhs);
+                run_shared!(op_neq(dst, lhs, rhs))
+            }
             Op::LooseEq { dst, lhs, rhs } => {
+                record_fb!(binop ip - 1, lhs, rhs);
                 regs[dst as usize] =
                     Value::Bool(Value::loose_eq(&regs[lhs as usize], &regs[rhs as usize]));
             }
             Op::LooseNeq { dst, lhs, rhs } => {
+                record_fb!(binop ip - 1, lhs, rhs);
                 regs[dst as usize] =
                     Value::Bool(!Value::loose_eq(&regs[lhs as usize], &regs[rhs as usize]));
             }
@@ -6107,20 +6261,59 @@ fn run_function_inner(
             // and BigInt-mixed comparisons work; Object operands dispatch to
             // __tb_host_binop so valueOf() runs via the interpreter. Shared with
             // T1 via `op_lt` (single source of truth).
-            Op::Lt { dst, lhs, rhs } => run_shared!(op_lt(dst, lhs, rhs)),
-            Op::Le { dst, lhs, rhs } => run_shared!(op_le(dst, lhs, rhs)),
-            Op::Gt { dst, lhs, rhs } => run_shared!(op_gt(dst, lhs, rhs)),
-            Op::BitAnd { dst, lhs, rhs } => run_shared!(op_bitand(dst, lhs, rhs)),
-            Op::BitOr { dst, lhs, rhs } => run_shared!(op_bitor(dst, lhs, rhs)),
-            Op::BitXor { dst, lhs, rhs } => run_shared!(op_bitxor(dst, lhs, rhs)),
-            Op::Shl { dst, lhs, rhs } => run_shared!(op_shl(dst, lhs, rhs)),
-            Op::Shr { dst, lhs, rhs } => run_shared!(op_shr(dst, lhs, rhs)),
-            Op::Ushr { dst, lhs, rhs } => run_shared!(op_ushr(dst, lhs, rhs)),
-            Op::Ge { dst, lhs, rhs } => run_shared!(op_ge(dst, lhs, rhs)),
-            Op::Neg { dst, src } => run_shared!(op_neg(dst, src)),
+            Op::Lt { dst, lhs, rhs } => {
+                record_fb!(binop ip - 1, lhs, rhs);
+                run_shared!(op_lt(dst, lhs, rhs))
+            }
+            Op::Le { dst, lhs, rhs } => {
+                record_fb!(binop ip - 1, lhs, rhs);
+                run_shared!(op_le(dst, lhs, rhs))
+            }
+            Op::Gt { dst, lhs, rhs } => {
+                record_fb!(binop ip - 1, lhs, rhs);
+                run_shared!(op_gt(dst, lhs, rhs))
+            }
+            Op::BitAnd { dst, lhs, rhs } => {
+                record_fb!(binop ip - 1, lhs, rhs);
+                run_shared!(op_bitand(dst, lhs, rhs))
+            }
+            Op::BitOr { dst, lhs, rhs } => {
+                record_fb!(binop ip - 1, lhs, rhs);
+                run_shared!(op_bitor(dst, lhs, rhs))
+            }
+            Op::BitXor { dst, lhs, rhs } => {
+                record_fb!(binop ip - 1, lhs, rhs);
+                run_shared!(op_bitxor(dst, lhs, rhs))
+            }
+            Op::Shl { dst, lhs, rhs } => {
+                record_fb!(binop ip - 1, lhs, rhs);
+                run_shared!(op_shl(dst, lhs, rhs))
+            }
+            Op::Shr { dst, lhs, rhs } => {
+                record_fb!(binop ip - 1, lhs, rhs);
+                run_shared!(op_shr(dst, lhs, rhs))
+            }
+            Op::Ushr { dst, lhs, rhs } => {
+                record_fb!(binop ip - 1, lhs, rhs);
+                run_shared!(op_ushr(dst, lhs, rhs))
+            }
+            Op::Ge { dst, lhs, rhs } => {
+                record_fb!(binop ip - 1, lhs, rhs);
+                run_shared!(op_ge(dst, lhs, rhs))
+            }
+            Op::Neg { dst, src } => {
+                record_fb!(unop ip - 1, src);
+                run_shared!(op_neg(dst, src))
+            }
             Op::Not { dst, src } => run_shared!(op_not(dst, src)),
-            Op::BitNot { dst, src } => run_shared!(op_bitnot(dst, src)),
-            Op::ToNumber { dst, src } => run_shared!(op_to_number(dst, src)),
+            Op::BitNot { dst, src } => {
+                record_fb!(unop ip - 1, src);
+                run_shared!(op_bitnot(dst, src))
+            }
+            Op::ToNumber { dst, src } => {
+                record_fb!(unop ip - 1, src);
+                run_shared!(op_to_number(dst, src))
+            }
             Op::Typeof { dst, src } => run_shared!(op_typeof(dst, src)),
             Op::Jmp { target } => run_shared!(op_jmp(target)),
             Op::JmpIfFalse { cond, target } => run_shared!(op_jmp_if_false(cond, target)),
@@ -6135,6 +6328,14 @@ fn run_function_inner(
                 first_arg,
                 n_args,
             } => {
+                // T4 P1 — record the call target (module function index). A
+                // direct `CallFn` is monomorphic by construction (the target is
+                // baked in the op), so this records the same `fn_idx` every time;
+                // it is the seam the P3 inliner reads to confirm a single, known
+                // callee. (Indirect `CallValue` targets are NOT recorded in P1 —
+                // resolving a value to a module fn-index at the call site needs
+                // the closure→fn_idx mapping, which the inliner phase will add.)
+                record_fb!(call ip - 1, fn_idx);
                 let mut call_args: Vec<Value> = Vec::with_capacity(n_args as usize);
                 for i in 0..n_args {
                     call_args.push(regs[first_arg as usize + i as usize].clone());
@@ -11859,6 +12060,7 @@ mod tests {
                 Op::Ret { src: 5 },
             ],
             ic: std::cell::RefCell::new(Vec::new()),
+        feedback: std::cell::RefCell::new(Vec::new()),
         };
         // Callee g(y): regs — 0=y (param), 1=oneconst, 2=ret.
         let g = BcFunction {
@@ -11873,6 +12075,7 @@ mod tests {
                 Op::Ret { src: 2 },
             ],
             ic: std::cell::RefCell::new(Vec::new()),
+        feedback: std::cell::RefCell::new(Vec::new()),
         };
         let call_pc = 2;
         (Module { fns: vec![f, g] }, call_pc)

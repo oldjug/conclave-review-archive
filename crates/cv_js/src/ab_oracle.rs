@@ -120,6 +120,17 @@ fn run_one_tier(src: &str, tier: ForcedTier) -> TierOutcome {
     }
 }
 
+/// T4 P1 — run `src` under `tier` with the binary/compare TYPE-FEEDBACK RECORDER
+/// force-enabled (`feedback::FeedbackGuard`). The recorder mutates only a side
+/// table on the `BcFunction` (never a JS value), so the outcome MUST be
+/// byte-identical to [`run_one_tier`] with recording off — that observational
+/// invisibility is exactly what the P1 oracle leg proves. The guard is scoped to
+/// this run (restored on drop) so it cannot leak into other legs.
+fn run_one_tier_feedback(src: &str, tier: ForcedTier) -> TierOutcome {
+    let _fb = crate::feedback::FeedbackGuard::new(true);
+    run_one_tier(src, tier)
+}
+
 /// Reduce a `JsError` to a tier-stable `ThrownError` (constructor name +
 /// message). Mirrors what `catch (e) { e.name; e.message }` observes.
 fn reduce_thrown(e: &JsError) -> ThrownError {
@@ -251,7 +262,43 @@ pub fn assert_tiers_agree(src: &str) -> Result<(), Divergence> {
     // reconstruction fuzzer gate the per-guard bailout separately.
     let g = run_one_tier(src, ForcedTier::T4);
     compare_outcomes(&a, &g, "tree-walk", "t4")?;
+    // T4 P1 — TYPE-FEEDBACK RECORDING is observationally INVISIBLE. Re-run the
+    // VM and T4 with the binary/compare/call feedback recorder force-ON; the
+    // recorder only mutates a side table on the `BcFunction`, never a JS value, so
+    // the outcome MUST still be byte-identical to tree-walk. This leg PROVES P1's
+    // central claim (recording changes nothing observable) on the whole corpus and
+    // is wired NOW so the moment P2 consumes the vector for specialization, every
+    // snippet is already gated "recording-on == recording-off == VM == tree-walk".
+    let h = run_one_tier_feedback(src, ForcedTier::Vm);
+    compare_outcomes(&a, &h, "tree-walk", "vm+feedback")?;
+    let k = run_one_tier_feedback(src, ForcedTier::T4);
+    compare_outcomes(&a, &k, "tree-walk", "t4+feedback")?;
     Ok(())
+}
+
+/// T4 P1 oracle — like [`assert_tiers_agree`], but ALSO asserts the feedback
+/// vector is NON-VACUOUS on a snippet that contains recordable (arith/compare/
+/// call) ops: with recording forced on through the VM, at least one feedback slot
+/// MUST have filled (`has_any_feedback`). This guards against a vacuously-green
+/// P1 oracle where the recorder silently never runs (e.g. a mis-wired gate). It
+/// returns the engaged flag so a test can assert it; the byte-identity is checked
+/// exactly as `assert_tiers_agree` does.
+pub fn assert_tiers_agree_feedback_engaged(src: &str) -> Result<bool, Divergence> {
+    assert_tiers_agree(src)?;
+    // Run the VM once with recording on and check the honesty counter — the
+    // recorder bumps it once per classified observation, so >0 proves the vector
+    // truly filled (a mis-wired no-op gate would leave it at 0).
+    let engaged = {
+        let _fb = crate::feedback::FeedbackGuard::new(true);
+        let _guard = TierGuard::new(ForcedTier::Vm);
+        crate::interp::reset_bc_fn_cache();
+        crate::feedback::reset_feedback_record_count();
+        let mut interp = Interp::new();
+        interp.install_basic_globals();
+        let _ = interp.run_completion_value(src);
+        crate::feedback::feedback_record_count() > 0
+    };
+    Ok(engaged)
 }
 
 /// Like `assert_tiers_agree`, but ALSO requires the T3 optimizing tier to have
