@@ -283,6 +283,144 @@ pub fn assert_tiers_agree(src: &str) -> Result<(), Divergence> {
     Ok(())
 }
 
+/// TOP-LEVEL VM oracle — the differential gate for the `CV_TOPLEVEL_VM` lever.
+///
+/// `assert_tiers_agree` drives FORCED tiers, which `Interp::run`'s top-level VM
+/// seam deliberately skips (it only fires when `forced_tier().is_none()`). So this
+/// oracle compares the PRODUCTION top-level path two ways through `Interp::run`
+/// itself: once with the top-level VM gate OFF (the script's top level is
+/// tree-walked — the byte-identical baseline) and once with it ON (the eligible
+/// top-level body is compiled to a bytecode Module and run on the register VM).
+///
+/// "Observable" for the top-level path is exactly what a script can affect:
+///   (a) throw parity (same error name+message, or both no-throw) — `run` itself,
+///   (b) the ordered `console.*` side effects, and
+///   (c) the FINAL VALUE OF EVERY GLOBAL THE SCRIPT TOUCHED — `run` discards the
+///       completion value (it returns `undefined` for a normal completion, like
+///       the spec ScriptEvaluation a host ignores), so the meaningful output is
+///       the global state the body produced (e.g. jit.js's `__bench_jit_result`).
+///
+/// Returns the first `Divergence`, or `Ok(())` if the two paths agree. Used by the
+/// top-level test corpus; also wired into the runtime `CV_JS_VERIFY` gate is NOT
+/// done here (the forced-tier oracle already covers per-function VM identity).
+pub fn assert_toplevel_vm_agrees(src: &str) -> Result<(), Divergence> {
+    // Run `src` through `Interp::run` with the top-level VM gate set to `on`,
+    // capturing throw/value parity, console output, and the post-run global state.
+    fn run_toplevel(src: &str, on: bool) -> (TierOutcome, Vec<(String, Value)>) {
+        // No FORCED tier (so the top-level seam is allowed to fire); reset the
+        // per-function caches so a prior run's compile decisions can't leak in.
+        let _no_tier = crate::interp::set_force_tier(None);
+        crate::interp::reset_bc_fn_cache();
+        crate::interp::reset_t1_cache();
+        crate::interp::reset_t2_cache();
+        crate::interp::reset_t3_cache();
+        crate::interp::reset_t4_cache();
+        let _g = crate::interp::TopLevelVmGuard::new(on);
+        let mut interp = Interp::new();
+        interp.install_basic_globals();
+        // Snapshot the pristine globals so we can diff only what the SCRIPT added
+        // or changed (the standard library is identical on both paths). The global
+        // bindings are an insertion-ordered `OrderedMap`; `get`/`&iter` work the
+        // same as a HashMap here.
+        let base = interp.globals_snapshot();
+        let result = match interp.run(src) {
+            Ok(v) => Ok(v),
+            Err(e) => Err(reduce_thrown(&e)),
+        };
+        let after = interp.globals_snapshot();
+        // Keys whose value the script CREATED or CHANGED vs the pristine library.
+        // IMPORTANT: use a CHEAP shallow identity/primitive check to decide "did the
+        // script touch this key" — a full `deep_diff` over every global would walk
+        // the ENTIRE standard-library object graph (Object/Array/Function prototypes,
+        // cyclic `.constructor` back-refs, …) on every call, which is pathologically
+        // slow. Unchanged stdlib globals share the SAME Rc, so `shallow_same` returns
+        // true in O(1); only a genuinely new/mutated binding is collected, and THOSE
+        // (the script's own output) are then deep-compared between the two paths.
+        let mut touched: Vec<(String, Value)> = Vec::new();
+        for (k, v) in &after {
+            let changed = match base.get(k) {
+                None => true,
+                Some(old) => !shallow_same(old, v),
+            };
+            if changed {
+                touched.push((k.clone(), v.clone()));
+            }
+        }
+        touched.sort_by(|a, b| a.0.cmp(&b.0));
+        (
+            TierOutcome {
+                result,
+                output: interp.output.clone(),
+            },
+            touched,
+        )
+    }
+
+    let (a, ga) = run_toplevel(src, false);
+    let (b, gb) = run_toplevel(src, true);
+    // (a)+(b) throw parity, completion (always `undefined` for `run`), side effects.
+    compare_outcomes(&a, &b, "toplevel-treewalk", "toplevel-vm")?;
+    // (c) the touched-global SET must match key-for-key, value-for-value.
+    if ga.len() != gb.len() {
+        return Err(Divergence {
+            kind: DivergenceKind::Value,
+            path: "<globals>.len".to_string(),
+            tree_walk: format!(
+                "{} touched: [{}]",
+                ga.len(),
+                ga.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>().join(", ")
+            ),
+            vm: format!(
+                "{} touched: [{}]",
+                gb.len(),
+                gb.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>().join(", ")
+            ),
+        });
+    }
+    for ((ka, va), (kb, vb)) in ga.iter().zip(gb.iter()) {
+        if ka != kb {
+            return Err(Divergence {
+                kind: DivergenceKind::Value,
+                path: "<globals>.<keys>".to_string(),
+                tree_walk: ka.clone(),
+                vm: kb.clone(),
+            });
+        }
+        if let Some(d) = deep_diff(va, vb, &format!("<global>.{ka}"), 0) {
+            return Err(d);
+        }
+    }
+    Ok(())
+}
+
+/// Like `assert_toplevel_vm_agrees`, but ALSO requires the top-level VM path to
+/// have GENUINELY executed (`toplevel_vm_took_count` > 0 on the `on` run) — the
+/// anti-vacuity guard so a green oracle can't be a script that silently declined
+/// to the tree-walker on BOTH passes. Use for the corpus where the VM path MUST
+/// engage (the `var`+loop+call shape the bottleneck is).
+pub fn assert_toplevel_vm_agrees_engaged(src: &str) -> Result<(), Divergence> {
+    assert_toplevel_vm_agrees(src)?;
+    let engaged = {
+        let _no_tier = crate::interp::set_force_tier(None);
+        crate::interp::reset_bc_fn_cache();
+        let _g = crate::interp::TopLevelVmGuard::new(true);
+        crate::interp::reset_toplevel_vm_took_count();
+        let mut interp = Interp::new();
+        interp.install_basic_globals();
+        let _ = interp.run(src);
+        crate::interp::toplevel_vm_took_count() > 0
+    };
+    if !engaged {
+        return Err(Divergence {
+            kind: DivergenceKind::SideEffect,
+            path: "<toplevel-vm-engagement>".to_string(),
+            tree_walk: "expected the top-level VM path to run the script".to_string(),
+            vm: "top-level VM declined to the tree-walker (vacuously green — FAIL)".to_string(),
+        });
+    }
+    Ok(())
+}
+
 /// T4 P1 oracle — like [`assert_tiers_agree`], but ALSO asserts the feedback
 /// vector is NON-VACUOUS on a snippet that contains recordable (arith/compare/
 /// call) ops: with recording forced on through the VM, at least one feedback slot
@@ -778,6 +916,31 @@ const MAX_DEPTH: usize = 64;
 ///     recursively-equal values,
 ///   - function/native/closure: treated as opaque-but-present (callables aren't
 ///     deep-comparable; we only assert both sides are callable).
+/// CHEAP, NON-RECURSIVE "is this the same binding" test used by the top-level
+/// oracle to decide whether the SCRIPT touched a given global. Compares two values
+/// taken from the SAME interpreter (a pristine snapshot vs the post-run snapshot):
+/// heap values are compared by Rc POINTER IDENTITY (an unchanged stdlib global is
+/// the same Rc → O(1) true, so we never walk the huge cyclic stdlib object graph),
+/// and primitives by value. A reassigned-or-new binding fails this and is then
+/// deep-compared across the two paths by `deep_diff`.
+fn shallow_same(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Undefined, Value::Undefined) => true,
+        (Value::Null, Value::Null) => true,
+        (Value::Hole, Value::Hole) => true,
+        (Value::Bool(x), Value::Bool(y)) => x == y,
+        (Value::Number(x), Value::Number(y)) => numbers_same(*x, *y),
+        (Value::BigInt(x), Value::BigInt(y)) => std::rc::Rc::ptr_eq(x, y) || x == y,
+        (Value::String(x), Value::String(y)) => x == y,
+        (Value::Object(x), Value::Object(y)) => std::rc::Rc::ptr_eq(x, y),
+        (Value::Array(x), Value::Array(y)) => std::rc::Rc::ptr_eq(x, y),
+        (Value::Function(x), Value::Function(y)) => std::rc::Rc::ptr_eq(x, y),
+        (Value::NativeFunction(x), Value::NativeFunction(y)) => std::rc::Rc::ptr_eq(x, y),
+        (Value::BcClosure(x), Value::BcClosure(y)) => std::rc::Rc::ptr_eq(x, y),
+        _ => false,
+    }
+}
+
 fn deep_diff(a: &Value, b: &Value, path: &str, depth: usize) -> Option<Divergence> {
     if depth > MAX_DEPTH {
         return None; // give up rather than loop on a cycle; equal-enough.

@@ -205,6 +205,16 @@ pub enum Op {
         lhs: Reg,
         rhs: Reg,
     },
+    /// `R[dst] = (R[lhs] instanceof R[rhs])`. Routes through the host's full
+    /// `__tb_host_instanceof(instance, ctor)` (which runs the tree-walk
+    /// `ordinary_has_instance` PROTO_KEY walk + the tag-based `is_instance_of`
+    /// fallback), so the VM result is byte-identical to the tree-walk tier
+    /// without re-implementing the prototype-chain/`Symbol.hasInstance` logic.
+    Instanceof {
+        dst: Reg,
+        lhs: Reg,
+        rhs: Reg,
+    },
     /// `R[dst] = delete R[obj][consts[key_k]]` — removes the own property and
     /// yields `true`.
     DeleteProp {
@@ -1734,11 +1744,24 @@ impl<'a> FnCompiler<'a> {
                 body,
             } => {
                 self.scopes.push(HashMap::new());
+                // In the SCRIPT frame, a `for (var i = …)` init `var` is function-
+                // scoped to the global object (ECMA GlobalDeclarationInstantiation):
+                // `i` is a real global, and after the loop `globalThis.i` reads its
+                // final value. The register VM keeps `i` in a fast LOCAL for the hot
+                // loop (the whole point of the top-level-VM tier), so we record the
+                // for-init `var` names here and emit a single `StoreGlobal` for each
+                // AFTER the loop — the loop stays fast (local reads/writes) and the
+                // global ends byte-identical to the tree-walker. Non-script frames
+                // (real functions) keep `i` purely local (function scope) — no sync.
+                let mut script_forinit_globals: Vec<(String, Reg)> = Vec::new();
                 if let Some(init) = init {
                     match init {
                         ForInit::VarDecl { kind: _, decls } => {
                             for VarDeclarator { name, init } in decls {
                                 let slot = self.declare(name);
+                                if self.is_script {
+                                    script_forinit_globals.push((name.clone(), slot));
+                                }
                                 if let Some(init) = init {
                                     // Same self-recursion guard as Stmt::VarDecl:
                                     // `for (var f = function(){…f…};;)` would
@@ -1807,6 +1830,13 @@ impl<'a> FnCompiler<'a> {
                     if let Op::Jmp { target } = &mut self.code[pos] {
                         *target = end;
                     }
+                }
+                // Script frame: sync each for-init `var`'s final local value to its
+                // global binding so `globalThis.i` is byte-identical to the
+                // tree-walker after the loop (see the note at the loop init above).
+                for (name, slot) in script_forinit_globals {
+                    let name_k = self.add_const(Value::str(name));
+                    self.emit(Op::StoreGlobal { name_k, src: slot });
                 }
                 self.scopes.pop();
                 Ok(())
@@ -2695,12 +2725,15 @@ impl<'a> FnCompiler<'a> {
                         lhs: l,
                         rhs: r,
                     },
-                    // `instanceof` is not VM-compiled (needs runtime tagging /
-                    // prototype-chain walks the VM doesn't model); declined here
-                    // so the caller tree-walks it, exactly as before.
-                    BinOp::Instanceof => {
-                        return Err(CompileError("binary `instanceof` unsupported".to_string()));
-                    }
+                    // `instanceof` routes to the host's full tree-walk check
+                    // (prototype-chain + tag fallback) at run time via
+                    // `Op::Instanceof`, so the VM result is byte-identical without
+                    // re-implementing the chain walk here.
+                    BinOp::Instanceof => Op::Instanceof {
+                        dst: d,
+                        lhs: l,
+                        rhs: r,
+                    },
                 };
                 self.emit(bc);
                 // Both operands are fully consumed by this op (no short-circuit);
@@ -3581,6 +3614,11 @@ pub fn run_module_with_interp(
                     other => RuntimeError::TypeError(format!("host call: {other:?}")),
                 })
         };
+        // NOTE: do NOT `?` here — globals must be written back even when the script
+        // THROWS. In the tree-walker the global scope is mutated in place, so a
+        // top-level `throw` leaves every prior `var`/assignment visible; the VM
+        // accumulates them in `globals` and we must mirror that on BOTH paths or a
+        // throwing script's global state would diverge from the tree-walker.
         run_function(
             module,
             0,
@@ -3589,15 +3627,15 @@ pub fn run_module_with_interp(
             &globals,
             None,
             &mut dispatch,
-        )?
+        )
     };
-    // Push any new / changed globals back into the interp so the next
-    // tree-walk eval sees them.
+    // Push any new / changed globals back into the interp so the next tree-walk
+    // eval sees them — on success AND on throw (the live-scope mutation parity).
     let final_globals = globals.into_inner();
     for (k, v) in final_globals {
         interp.define_global(&k, v);
     }
-    Ok(result)
+    result
 }
 
 thread_local! {
@@ -7017,6 +7055,29 @@ fn run_function_inner(
                     }
                 } else {
                     regs[dst as usize] = Value::Bool(has_property(&recv, &key));
+                }
+            }
+            Op::Instanceof { dst, lhs, rhs } => {
+                // Route through the host so the FULL tree-walk instanceof
+                // (ordinary_has_instance PROTO_KEY walk + is_instance_of tag
+                // fallback + Symbol.hasInstance) applies — byte-identical to the
+                // tree-walk tier. The hook is installed by `install_basic_globals`.
+                let inst = regs[lhs as usize].clone();
+                let ctor = regs[rhs as usize].clone();
+                let hook = globals.borrow().get("__tb_host_instanceof").cloned();
+                match hook {
+                    Some(g @ Value::NativeFunction(_)) => {
+                        match dispatch(g, Value::Undefined, vec![inst, ctor]) {
+                            Ok(v) => regs[dst as usize] = Value::Bool(v.to_bool()),
+                            Err(e) => propagate!(e),
+                        }
+                    }
+                    // No host hook (e.g. `run_module` with an empty globals map):
+                    // fall back to the tag-based pure check, which covers built-ins.
+                    _ => {
+                        regs[dst as usize] =
+                            Value::Bool(crate::interp::is_instance_of(&inst, &ctor));
+                    }
                 }
             }
             Op::DeleteProp { dst, obj, key_k } => {

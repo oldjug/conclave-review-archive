@@ -113,8 +113,9 @@ pub use interp::{
     parse_bigint_from_string,
     register_jit_bank, resolve_promise,
     reset_bc_fn_cache, reset_call_inline_cache, reset_p6_exec_count, reset_t1_exec_count,
-    reset_t2_exec_count, reset_t3_exec_count, reset_t4_exec_count, set_force_tier, t1_exec_count,
-    t2_exec_count, t2_heap_enabled, t3_exec_count, t4_exec_count,
+    reset_t2_exec_count, reset_t3_exec_count, reset_t4_exec_count, reset_toplevel_vm_took_count,
+    set_force_tier, t1_exec_count, t2_exec_count, t2_heap_enabled, t3_exec_count, t4_exec_count,
+    TopLevelVmGuard, toplevel_vm_enabled, toplevel_vm_took_count,
 };
 pub use lexer::{Keyword, Punct, Token, TokenKind, tokenize};
 pub use parser::{ParseError, parse_program};

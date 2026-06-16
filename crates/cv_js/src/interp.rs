@@ -1949,6 +1949,562 @@ fn bc_per_fn_enabled() -> bool {
     })
 }
 
+/// TOP-LEVEL VM gate (`CV_TOPLEVEL_VM`, DEFAULT OFF). When enabled, eligible hot
+/// top-level script bodies are compiled to a bytecode Module and run on the
+/// register VM instead of the tree-walker (V8/Ignition runs ALL code — including
+/// top-level — on bytecode; the tree-walker re-walks the loop AST + string-keyed
+/// scope lookups + re-boxes every iteration, which the diagnosis measured as the
+/// dominant cost of a numeric top-level loop). Default OFF until soak: the default
+/// build is byte-identical to before. Cached (env read once per thread). A forced
+/// tier is NOT consulted here (the caller in `run` already guards on
+/// `forced_tier().is_none()` so the A/B oracle's tier split is preserved).
+pub fn toplevel_vm_enabled() -> bool {
+    // A programmatic override (set via `TopLevelVmGuard`) takes precedence over the
+    // env so tests + the bench can drive both states in one process without the
+    // per-thread env cache pinning the first-read value.
+    if let Some(v) = TOPLEVEL_VM_OVERRIDE.with(|c| c.get()) {
+        return v;
+    }
+    thread_local! {
+        static ON: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    }
+    ON.with(|c| match c.get() {
+        Some(v) => v,
+        None => {
+            let v = matches!(
+                std::env::var("CV_TOPLEVEL_VM").as_deref(),
+                Ok("1") | Ok("true") | Ok("on")
+            );
+            c.set(Some(v));
+            v
+        }
+    })
+}
+
+thread_local! {
+    /// Programmatic override for `toplevel_vm_enabled` (None = env-driven). Set via
+    /// `TopLevelVmGuard` (restored on drop).
+    static TOPLEVEL_VM_OVERRIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// RAII scope guard forcing the top-level-VM gate on/off for the current thread
+/// (the env-independent A/B knob the oracle uses). Restores the prior state on
+/// drop, even on panic / early return.
+#[must_use = "the override is restored when the guard is dropped; bind it to a name"]
+pub struct TopLevelVmGuard {
+    prev: Option<bool>,
+}
+
+impl TopLevelVmGuard {
+    pub fn new(on: bool) -> Self {
+        let prev = TOPLEVEL_VM_OVERRIDE.with(|c| {
+            let p = c.get();
+            c.set(Some(on));
+            p
+        });
+        TopLevelVmGuard { prev }
+    }
+}
+
+impl Drop for TopLevelVmGuard {
+    fn drop(&mut self) {
+        TOPLEVEL_VM_OVERRIDE.with(|c| c.set(self.prev));
+    }
+}
+
+thread_local! {
+    /// Honesty counter: how many times a top-level script actually ran on the VM
+    /// (`try_run_toplevel_vm` succeeded), NOT a fall-through to the tree-walker.
+    /// Read via `toplevel_vm_took_count()`; reset via `reset_toplevel_vm_took_count()`.
+    /// This is the anti-fake guard for the measured win — a faster jit.js only
+    /// counts if this proves the VM path was taken.
+    static TOPLEVEL_VM_TOOK_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Number of times the top-level VM path executed a script (the honesty guard).
+pub fn toplevel_vm_took_count() -> u64 {
+    TOPLEVEL_VM_TOOK_COUNT.with(|c| c.get())
+}
+
+/// Reset the top-level-VM honesty counter (so a measurement attributes the path
+/// to THIS run).
+pub fn reset_toplevel_vm_took_count() {
+    TOPLEVEL_VM_TOOK_COUNT.with(|c| c.set(0));
+}
+
+/// True iff the whole top-level script body is a shape the register VM runs
+/// OBSERVABLY-IDENTICALLY to the tree-walker. Conservative whitelist: it returns
+/// `false` (→ tree-walk fall-through) for ANYTHING whose top-level VM lowering
+/// could diverge. The guarded divergences:
+///   - `let`/`const` at top level (incl. for-init / for-in / for-of bindings):
+///     the VM's script frame lowers them to un-TDZ'd `StoreGlobal` (no
+///     temporal-dead-zone throw, and `const` reassignment is not rejected).
+///   - `import`/`export` / dynamic `import()`: module-graph semantics.
+///   - direct `eval(...)`: creates bindings in the *calling* scope.
+///   - a top-level function declaration referenced anywhere other than as the
+///     direct callee of a call (`g = f`, `f.x`, `new f`, `cb(f)`): the VM reaches a
+///     top-level fn through its own module fn-slot copy (CallFn) while the global
+///     binding is a separate tree-walk closure — identical when only *called*, but
+///     a value-position reference could observe the identity/own-property diff.
+///   - a function/arrow BODY (top-level decl OR a nested closure) that references
+///     a top-level function name OR a top-level `for`-init `var` name: a top-level
+///     for-init `var` lives in a fast VM LOCAL whose final value is synced to the
+///     global only AFTER the loop (so a fn reading it MID-loop would see a stale
+///     global), and a top-level fn name read inside a closure could observe the
+///     module-vs-global identity difference. Decline both.
+/// Everything else (the `var` + arithmetic + loop + direct-call shape the
+/// bottleneck is) is allowed; the bytecode compiler itself still declines (→
+/// `compile_program` error → tree-walk) on any construct it cannot lower.
+fn toplevel_vm_eligible(stmts: &[Stmt]) -> bool {
+    let mut toplevel_fn_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for s in stmts {
+        if let Stmt::FunctionDecl { name, .. } = s {
+            toplevel_fn_names.insert(name.clone());
+        }
+    }
+    // Names that the VM keeps in a fast LOCAL across the loop and only syncs to the
+    // global at loop exit (top-level `for (var i = …)` init vars). A function body
+    // that reads one mid-loop would observe a stale global → decline.
+    let mut forinit_var_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    collect_toplevel_forinit_var_names(stmts, &mut forinit_var_names);
+
+    // The union forbidden inside any function/arrow body (decline if referenced).
+    let mut forbidden_in_fn = toplevel_fn_names.clone();
+    forbidden_in_fn.extend(forinit_var_names.iter().cloned());
+
+    let mut ctx = DeclineCtx {
+        fn_names: &toplevel_fn_names,
+        forbidden_in_fn: &forbidden_in_fn,
+        ok: true,
+    };
+    for s in stmts {
+        scan_stmt_for_decline(s, &mut ctx);
+        if !ctx.ok {
+            return false;
+        }
+    }
+    ctx.ok
+}
+
+/// Walk top-level statements (and nested blocks/loops/branches that share the
+/// top-level `var` scope — NOT into function bodies, which have their own scope)
+/// collecting every `for (var NAME = …)` init binding name.
+fn collect_toplevel_forinit_var_names(
+    stmts: &[Stmt],
+    out: &mut std::collections::HashSet<String>,
+) {
+    for s in stmts {
+        collect_forinit_in_stmt(s, out);
+    }
+}
+
+fn collect_forinit_in_stmt(s: &Stmt, out: &mut std::collections::HashSet<String>) {
+    match s {
+        Stmt::For { init, body, .. } => {
+            if let Some(crate::ast::ForInit::VarDecl { kind: VarKind::Var, decls }) = init {
+                for d in decls {
+                    out.insert(d.name.clone());
+                }
+            }
+            collect_forinit_in_stmt(body, out);
+        }
+        Stmt::Block(body) => collect_toplevel_forinit_var_names(body, out),
+        Stmt::If { cons, alt, .. } => {
+            collect_forinit_in_stmt(cons, out);
+            if let Some(a) = alt {
+                collect_forinit_in_stmt(a, out);
+            }
+        }
+        Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => collect_forinit_in_stmt(body, out),
+        Stmt::ForIn { body, .. } | Stmt::ForOf { body, .. } => collect_forinit_in_stmt(body, out),
+        Stmt::Labeled { body, .. } => collect_forinit_in_stmt(body, out),
+        Stmt::Try { block, catch_block, finally_block, .. } => {
+            collect_toplevel_forinit_var_names(block, out);
+            if let Some(cb) = catch_block {
+                collect_toplevel_forinit_var_names(cb, out);
+            }
+            if let Some(fb) = finally_block {
+                collect_toplevel_forinit_var_names(fb, out);
+            }
+        }
+        Stmt::Switch { cases, .. } => {
+            for c in cases {
+                collect_toplevel_forinit_var_names(&c.body, out);
+            }
+        }
+        // Function declarations have their OWN scope — their for-init vars are
+        // function-local, never top-level globals; do not collect them.
+        _ => {}
+    }
+}
+
+/// Shared scan context: `fn_names` are top-level function-declaration names
+/// (value-position uses decline); `forbidden_in_fn` is the set no function/arrow
+/// body may reference; `ok` flips false on the first disqualifier.
+struct DeclineCtx<'a> {
+    fn_names: &'a std::collections::HashSet<String>,
+    forbidden_in_fn: &'a std::collections::HashSet<String>,
+    ok: bool,
+}
+
+/// Reject a statement subtree containing a disqualifying construct.
+fn scan_stmt_for_decline(s: &Stmt, ctx: &mut DeclineCtx) {
+    if !ctx.ok {
+        return;
+    }
+    match s {
+        Stmt::Expression(e) | Stmt::Throw(e) => scan_expr_for_decline(e, ctx),
+        Stmt::Return(Some(e)) => scan_expr_for_decline(e, ctx),
+        Stmt::Return(None) | Stmt::Break(_) | Stmt::Continue(_) | Stmt::Empty => {}
+        Stmt::VarDecl { kind, decls } => {
+            // Top-level `let`/`const` carry TDZ/const-reassign semantics the VM
+            // script frame does not reproduce.
+            if !matches!(kind, VarKind::Var) {
+                ctx.ok = false;
+                return;
+            }
+            for d in decls {
+                if let Some(init) = &d.init {
+                    scan_expr_for_decline(init, ctx);
+                }
+            }
+        }
+        Stmt::FunctionDecl { body, .. } => {
+            // A top-level function body must not reference a forbidden name (another
+            // top-level fn by identity, or a top-level for-init var mid-loop).
+            if body_references_forbidden(body, ctx.forbidden_in_fn) {
+                ctx.ok = false;
+            }
+        }
+        Stmt::Block(body) => {
+            for st in body {
+                scan_stmt_for_decline(st, ctx);
+            }
+        }
+        Stmt::If { test, cons, alt } => {
+            scan_expr_for_decline(test, ctx);
+            scan_stmt_for_decline(cons, ctx);
+            if let Some(a) = alt {
+                scan_stmt_for_decline(a, ctx);
+            }
+        }
+        Stmt::While { test, body } | Stmt::DoWhile { body, test } => {
+            scan_expr_for_decline(test, ctx);
+            scan_stmt_for_decline(body, ctx);
+        }
+        Stmt::For { init, test, update, body } => {
+            if let Some(init) = init {
+                match init {
+                    crate::ast::ForInit::VarDecl { kind, decls } => {
+                        if !matches!(kind, VarKind::Var) {
+                            ctx.ok = false;
+                            return;
+                        }
+                        for d in decls {
+                            if let Some(i) = &d.init {
+                                scan_expr_for_decline(i, ctx);
+                            }
+                        }
+                    }
+                    crate::ast::ForInit::Expr(e) => scan_expr_for_decline(e, ctx),
+                }
+            }
+            if let Some(t) = test {
+                scan_expr_for_decline(t, ctx);
+            }
+            if let Some(u) = update {
+                scan_expr_for_decline(u, ctx);
+            }
+            scan_stmt_for_decline(body, ctx);
+        }
+        Stmt::ForIn { kind, source, body, .. } | Stmt::ForOf { kind, source, body, .. } => {
+            if let Some(k) = kind {
+                if !matches!(k, VarKind::Var) {
+                    ctx.ok = false;
+                    return;
+                }
+            }
+            scan_expr_for_decline(source, ctx);
+            scan_stmt_for_decline(body, ctx);
+        }
+        Stmt::Labeled { body, .. } => scan_stmt_for_decline(body, ctx),
+        Stmt::Try { block, catch_block, finally_block, .. } => {
+            for st in block {
+                scan_stmt_for_decline(st, ctx);
+            }
+            if let Some(cb) = catch_block {
+                for st in cb {
+                    scan_stmt_for_decline(st, ctx);
+                }
+            }
+            if let Some(fb) = finally_block {
+                for st in fb {
+                    scan_stmt_for_decline(st, ctx);
+                }
+            }
+        }
+        Stmt::Switch { discriminant, cases, .. } => {
+            scan_expr_for_decline(discriminant, ctx);
+            for c in cases {
+                if let Some(t) = &c.test {
+                    scan_expr_for_decline(t, ctx);
+                }
+                for st in &c.body {
+                    scan_stmt_for_decline(st, ctx);
+                }
+            }
+        }
+        // Module decls: not a plain script.
+        Stmt::Import { .. } | Stmt::Export { .. } => ctx.ok = false,
+    }
+}
+
+/// Reject an expression subtree containing a direct `eval(...)`, a value-position
+/// use of a top-level function name, or a function/arrow body that references a
+/// forbidden name.
+fn scan_expr_for_decline(e: &Expr, ctx: &mut DeclineCtx) {
+    if !ctx.ok {
+        return;
+    }
+    match e {
+        Expr::Identifier(name) => {
+            if ctx.fn_names.contains(name) {
+                ctx.ok = false;
+            }
+        }
+        Expr::Number(_)
+        | Expr::BigInt(_)
+        | Expr::String(_)
+        | Expr::TemplateLiteral(_)
+        | Expr::Boolean(_)
+        | Expr::Null
+        | Expr::Undefined
+        | Expr::This
+        | Expr::NewTarget
+        | Expr::Regex(_, _)
+        | Expr::ImportMeta => {}
+        Expr::Array(items) => {
+            for it in items {
+                scan_expr_for_decline(it, ctx);
+            }
+        }
+        Expr::Object(props) => {
+            for (_k, v) in props {
+                scan_expr_for_decline(v, ctx);
+            }
+        }
+        Expr::Unary { target, .. } => scan_expr_for_decline(target, ctx),
+        Expr::Update { target, .. } => scan_expr_for_decline(target, ctx),
+        Expr::Binary { left, right, .. } | Expr::Logical { left, right, .. } => {
+            scan_expr_for_decline(left, ctx);
+            scan_expr_for_decline(right, ctx);
+        }
+        Expr::Conditional { test, cons, alt } => {
+            scan_expr_for_decline(test, ctx);
+            scan_expr_for_decline(cons, ctx);
+            scan_expr_for_decline(alt, ctx);
+        }
+        Expr::Assignment { target, value, .. } => {
+            scan_expr_for_decline(target, ctx);
+            scan_expr_for_decline(value, ctx);
+        }
+        Expr::Member { object, property, computed } => {
+            scan_expr_for_decline(object, ctx);
+            if *computed {
+                scan_expr_for_decline(property, ctx);
+            }
+        }
+        Expr::Call { callee, args } => {
+            // A DIRECT call `f(...)` where `f` is a top-level fn name is the ONLY
+            // allowed use of that name — do not treat the callee identifier as a
+            // value use. Also reject direct `eval(...)`.
+            match callee.as_ref() {
+                Expr::Identifier(name) => {
+                    if name == "eval" {
+                        ctx.ok = false;
+                        return;
+                    }
+                    // fn-name callee is fine (direct call); skip scanning it.
+                }
+                other => scan_expr_for_decline(other, ctx),
+            }
+            for a in args {
+                // A closure handed to a callee (`forEach(function(){…})`,
+                // `setTimeout(cb)`, …) can be invoked by a HOST native; when that
+                // closure WRITES a global it currently mutates a throwaway snapshot
+                // (the BcClosure host-dispatch path), so its effect would be lost vs
+                // the tree-walker. Decline a function/arrow EXPRESSION passed as an
+                // argument (the escaping-callback hazard); a directly-called local
+                // closure stays on the VM (no escape).
+                if matches!(a, Expr::Function { .. } | Expr::Arrow { .. }) {
+                    ctx.ok = false;
+                    return;
+                }
+                scan_expr_for_decline(a, ctx);
+            }
+        }
+        Expr::New { callee, args } => {
+            scan_expr_for_decline(callee, ctx);
+            for a in args {
+                if matches!(a, Expr::Function { .. } | Expr::Arrow { .. }) {
+                    ctx.ok = false;
+                    return;
+                }
+                scan_expr_for_decline(a, ctx);
+            }
+        }
+        Expr::Function { body, .. } => {
+            // A nested function expression (e.g. an IIFE, or `var inc = function(){…}`)
+            // is FINE as long as its body does not reference a forbidden name
+            // (top-level fn by identity, or a top-level for-init var mid-loop).
+            if body_references_forbidden(body, ctx.forbidden_in_fn) {
+                ctx.ok = false;
+            }
+        }
+        Expr::Arrow { body, .. } => {
+            if arrow_body_references_forbidden(body, ctx.forbidden_in_fn) {
+                ctx.ok = false;
+            }
+        }
+        Expr::Sequence(items) => {
+            for it in items {
+                scan_expr_for_decline(it, ctx);
+            }
+        }
+        Expr::Spread(inner) => scan_expr_for_decline(inner, ctx),
+        Expr::DynamicImport(_) => ctx.ok = false,
+    }
+}
+
+/// True iff any identifier anywhere in a function body (in ANY position — value,
+/// callee, member object, …) names something in `forbidden`. Conservative: it does
+/// not model the body's own inner shadowing, so a body that re-declares a forbidden
+/// name still declines (a safe over-approximation — never a wrong-result risk).
+fn body_references_forbidden(
+    body: &[Stmt],
+    forbidden: &std::collections::HashSet<String>,
+) -> bool {
+    if forbidden.is_empty() {
+        return false;
+    }
+    body.iter().any(|s| stmt_references(s, forbidden))
+}
+
+fn arrow_body_references_forbidden(
+    body: &crate::ast::ArrowBody,
+    forbidden: &std::collections::HashSet<String>,
+) -> bool {
+    if forbidden.is_empty() {
+        return false;
+    }
+    match body {
+        crate::ast::ArrowBody::Expr(e) => expr_references(e, forbidden),
+        crate::ast::ArrowBody::Block(body) => body.iter().any(|s| stmt_references(s, forbidden)),
+    }
+}
+
+fn stmt_references(s: &Stmt, names: &std::collections::HashSet<String>) -> bool {
+    match s {
+        Stmt::Expression(e) | Stmt::Throw(e) => expr_references(e, names),
+        Stmt::Return(Some(e)) => expr_references(e, names),
+        Stmt::Return(None) | Stmt::Break(_) | Stmt::Continue(_) | Stmt::Empty
+        | Stmt::Import { .. } | Stmt::Export { .. } => false,
+        Stmt::VarDecl { decls, .. } => decls
+            .iter()
+            .any(|d| d.init.as_ref().map_or(false, |e| expr_references(e, names))),
+        Stmt::FunctionDecl { body, .. } => body.iter().any(|st| stmt_references(st, names)),
+        Stmt::Block(body) => body.iter().any(|st| stmt_references(st, names)),
+        Stmt::If { test, cons, alt } => {
+            expr_references(test, names)
+                || stmt_references(cons, names)
+                || alt.as_ref().map_or(false, |a| stmt_references(a, names))
+        }
+        Stmt::While { test, body } | Stmt::DoWhile { body, test } => {
+            expr_references(test, names) || stmt_references(body, names)
+        }
+        Stmt::For { init, test, update, body } => {
+            let init_ref = match init {
+                Some(crate::ast::ForInit::VarDecl { decls, .. }) => decls
+                    .iter()
+                    .any(|d| d.init.as_ref().map_or(false, |e| expr_references(e, names))),
+                Some(crate::ast::ForInit::Expr(e)) => expr_references(e, names),
+                None => false,
+            };
+            init_ref
+                || test.as_ref().map_or(false, |t| expr_references(t, names))
+                || update.as_ref().map_or(false, |u| expr_references(u, names))
+                || stmt_references(body, names)
+        }
+        Stmt::ForIn { source, body, .. } | Stmt::ForOf { source, body, .. } => {
+            expr_references(source, names) || stmt_references(body, names)
+        }
+        Stmt::Labeled { body, .. } => stmt_references(body, names),
+        Stmt::Try { block, catch_block, finally_block, .. } => {
+            block.iter().any(|st| stmt_references(st, names))
+                || catch_block
+                    .as_ref()
+                    .map_or(false, |cb| cb.iter().any(|st| stmt_references(st, names)))
+                || finally_block
+                    .as_ref()
+                    .map_or(false, |fb| fb.iter().any(|st| stmt_references(st, names)))
+        }
+        Stmt::Switch { discriminant, cases, .. } => {
+            expr_references(discriminant, names)
+                || cases.iter().any(|c| {
+                    c.test.as_ref().map_or(false, |t| expr_references(t, names))
+                        || c.body.iter().any(|st| stmt_references(st, names))
+                })
+        }
+    }
+}
+
+fn expr_references(e: &Expr, names: &std::collections::HashSet<String>) -> bool {
+    match e {
+        Expr::Identifier(n) => names.contains(n),
+        Expr::Number(_)
+        | Expr::BigInt(_)
+        | Expr::String(_)
+        | Expr::TemplateLiteral(_)
+        | Expr::Boolean(_)
+        | Expr::Null
+        | Expr::Undefined
+        | Expr::This
+        | Expr::NewTarget
+        | Expr::Regex(_, _)
+        | Expr::ImportMeta => false,
+        Expr::Array(items) | Expr::Sequence(items) => {
+            items.iter().any(|it| expr_references(it, names))
+        }
+        Expr::Object(props) => props.iter().any(|(_k, v)| expr_references(v, names)),
+        Expr::Unary { target, .. } | Expr::Update { target, .. } | Expr::Spread(target) => {
+            expr_references(target, names)
+        }
+        Expr::Binary { left, right, .. } | Expr::Logical { left, right, .. } => {
+            expr_references(left, names) || expr_references(right, names)
+        }
+        Expr::Conditional { test, cons, alt } => {
+            expr_references(test, names)
+                || expr_references(cons, names)
+                || expr_references(alt, names)
+        }
+        Expr::Assignment { target, value, .. } => {
+            expr_references(target, names) || expr_references(value, names)
+        }
+        Expr::Member { object, property, computed } => {
+            expr_references(object, names) || (*computed && expr_references(property, names))
+        }
+        Expr::Call { callee, args } | Expr::New { callee, args } => {
+            expr_references(callee, names) || args.iter().any(|a| expr_references(a, names))
+        }
+        Expr::Function { body, .. } => body.iter().any(|s| stmt_references(s, names)),
+        Expr::Arrow { body, .. } => match body {
+            crate::ast::ArrowBody::Expr(e) => expr_references(e, names),
+            crate::ast::ArrowBody::Block(body) => body.iter().any(|s| stmt_references(s, names)),
+        },
+        Expr::DynamicImport(inner) => expr_references(inner, names),
+    }
+}
+
 /// Chrome-audit FIX 2 gate. Default-ON since 2026-06-15 (escape hatch:
 /// `CV_ARROW_TIER=0` forces OFF). Compiles arrow functions to the already-
 /// default bytecode VM (with lexical `this` via a __lexical_this upvalue) instead
@@ -7486,6 +8042,21 @@ impl Interp {
                     return Ok(interp.binary_op(&op, &ap, &bp));
                 }
                 Ok(interp.binary_op(&op, &a, &b))
+            }),
+        );
+        // The VM's `Op::Instanceof` dispatches `__tb_host_instanceof(inst, ctor)`
+        // so the FULL tree-walk `instanceof` (ordinary_has_instance PROTO_KEY walk
+        // + is_instance_of tag fallback) applies — byte-identical to tree-walk.
+        // Mirrors the tree-walk `Expr::Binary` instanceof arm exactly.
+        interp.define_global(
+            "__tb_host_instanceof",
+            native_fn_with_interp("__tb_host_instanceof", |interp, args| {
+                let inst = args.first().cloned().unwrap_or(Value::Undefined);
+                let ctor = args.get(1).cloned().unwrap_or(Value::Undefined);
+                if interp.ordinary_has_instance(&inst, &ctor) {
+                    return Ok(Value::Bool(true));
+                }
+                Ok(Value::Bool(is_instance_of(&inst, &ctor)))
             }),
         );
         interp.define_global(
@@ -13491,6 +14062,27 @@ impl Interp {
         if runlog {
             diag_log("[RUN] hoisted; executing");
         }
+        // ── TOP-LEVEL VM (V8/Ignition-shaped): when CV_TOPLEVEL_VM is enabled and
+        // the script's top-level shape is provably byte-identical on the register
+        // VM, compile the whole script body to a bytecode Module and run it there
+        // instead of the tree-walker. V8 compiles ALL code — including top-level
+        // script code — to Ignition bytecode (there is no tree-walk tier); the hot
+        // top-level loop in a numeric microbench is the bottleneck precisely
+        // because the tree-walker re-walks the loop AST + does string-keyed scope
+        // lookups + re-boxes every iteration. This routes that loop onto the same
+        // proven VM path a *wrapped function* already takes. On ANY decline
+        // (unsupported construct, compile failure, an observably-divergent shape)
+        // it returns None and we fall through to the byte-identical tree-walker.
+        // Skipped when a tier is force-overridden (the A/B oracle drives tiers
+        // itself and must see the tree-walk/VM split it is comparing).
+        if forced_tier().is_none() {
+            if let Some(r) = self.try_run_toplevel_vm(src, &stmts) {
+                // The VM run already wrote globals back; still run the microtask
+                // checkpoint exactly as the tree-walk path does.
+                self.drain_microtasks();
+                return r;
+            }
+        }
         let result = self
             .exec_block(&stmts, &self.global.clone())
             .map(|c| match c {
@@ -13504,6 +14096,84 @@ impl Interp {
         // task on the main thread.
         self.drain_microtasks();
         result
+    }
+
+    /// TOP-LEVEL VM seam (gated by `CV_TOPLEVEL_VM`, DEFAULT OFF). Compile the
+    /// whole top-level script body to a bytecode `Module` and run it on the
+    /// register VM (the SAME path a wrapped function already takes — measured ~5x
+    /// faster than tree-walking the identical loop), returning the script's
+    /// completion value. Returns `None` (a correct fall-through, never a stub) when
+    /// it is not safe to do so byte-identically, so the caller runs the
+    /// tree-walker. `var` hoisting is assumed already done by the caller (it is the
+    /// same for both paths).
+    ///
+    /// Correctness contract — only takes the VM path when the script's TOP-LEVEL
+    /// shape is provably observationally identical to the tree-walker (see
+    /// `toplevel_vm_eligible`): only `var` (never `let`/`const` — the VM script
+    /// frame lowers them to un-TDZ'd `StoreGlobal`), no `import`/`export`, no direct
+    /// `eval`/`with`, and every top-level function declaration referenced ONLY as a
+    /// direct call target (so the module's internal fn-slot copy can never be
+    /// observed to differ in identity from the global binding). Top-level function
+    /// declarations are bound as real globals (tree-walk closures over the global
+    /// scope — exactly what `exec_block` does) BEFORE the run so any later code
+    /// (event handlers, timers, closures) sees them.
+    fn try_run_toplevel_vm(
+        &mut self,
+        src: &str,
+        stmts: &[Stmt],
+    ) -> Option<Result<Value, JsError>> {
+        if !toplevel_vm_enabled() {
+            return None;
+        }
+        if !toplevel_vm_eligible(stmts) {
+            return None;
+        }
+        // Compile the whole program (script body at slot 0, top-level fn decls at
+        // slots 1..N reached via CallFn). A decline here (any unsupported construct
+        // the bytecode compiler can't lower) returns None → tree-walk fallback.
+        let module = match crate::code_cache::compile_program_cached(src) {
+            Ok(m) => m,
+            Err(_) => return None,
+        };
+        // Bind top-level function declarations as REAL globals (tree-walk closures
+        // over the global scope), mirroring exec_block's hoisting, so external code
+        // can call them and their identity is the one the tree-walker would expose.
+        // Eligibility guaranteed these names are only ever *called* in the script,
+        // so the module's internal fn-slot copy is never observably distinct.
+        let env = self.global.clone();
+        for stmt in stmts {
+            if let Stmt::FunctionDecl { name, params, body } = stmt {
+                let f = Value::Function(Rc::new(FunctionValue {
+                    name: Some(name.clone()),
+                    params: params.clone(),
+                    body: FunctionBody::Block(body.clone()),
+                    closure: env.clone(),
+                    props: RefCell::new(HashMap::new()),
+                    is_arrow: false,
+                }));
+                scope_define(&env, name, f, false);
+            }
+        }
+        // Honesty counter: record that THIS run actually took the top-level VM
+        // path (not a fall-through). Tests/benches read `toplevel_vm_took_count()`
+        // to prove a measured win came from the VM, not from luck.
+        TOPLEVEL_VM_TOOK_COUNT.with(|c| c.set(c.get() + 1));
+        // Run the script slot on the VM. `run_module_with_interp` snapshots the
+        // globals (including the fns just bound), runs slot 0, then writes every
+        // final global back into the live global scope — so `var`/assignment side
+        // effects land exactly as the tree-walker's would. Map the VM's
+        // RuntimeError to the interp's JsError so throw parity (and the watchdog
+        // deadline) is preserved byte-for-byte.
+        match crate::bytecode::run_module_with_interp(&module, self) {
+            Ok(v) => Some(Ok(v)),
+            Err(crate::bytecode::RuntimeError::Thrown(v)) => Some(Err(JsError::Throw(v))),
+            Err(crate::bytecode::RuntimeError::Deadline) => {
+                Some(Err(JsError::Internal(
+                    "script execution exceeded time budget (possible infinite loop)".to_string(),
+                )))
+            }
+            Err(other) => Some(Err(JsError::Internal(format!("toplevel vm: {other}")))),
+        }
     }
 
     /// Like `run`, but returns the script's COMPLETION VALUE — the value of the

@@ -222,6 +222,12 @@ struct JsResult {
     t4_exec_count: u64,
     t2_exec_count: u64,
     t2_enabled: bool,
+    /// TOP-LEVEL VM honesty guard: how many of this microbench's `run()` calls
+    /// actually compiled the hot TOP-LEVEL script to bytecode and ran it on the
+    /// register VM (the `CV_TOPLEVEL_VM` lever), vs falling through to the
+    /// tree-walker. >0 proves a faster cold time came from the VM path, not luck.
+    toplevel_vm_took: u64,
+    toplevel_vm_enabled: bool,
 }
 
 // ── TTFP ─────────────────────────────────────────────────────────────────────
@@ -468,6 +474,7 @@ fn measure_js(file: &str, result_global: &str) -> Result<JsResult, String> {
     let mut last_t3 = 0u64;
     let mut last_t4 = 0u64;
     let mut last_t2 = 0u64;
+    let mut last_toplevel_vm = 0u64;
 
     // Warmup iters (not timed) — primes any process-global JIT machinery so the
     // timed cold iters measure a representative fresh-interp run.
@@ -489,11 +496,19 @@ fn measure_js(file: &str, result_global: &str) -> Result<JsResult, String> {
         cv_js::reset_t3_exec_count();
         cv_js::reset_t4_exec_count();
         cv_js::reset_t2_exec_count();
+        // Top-level-VM honesty guard: reset before the cold run so the post-run
+        // count attributes the path to THIS run (whether the hot top-level script
+        // compiled to bytecode + ran on the VM, or fell through to tree-walk).
+        cv_js::reset_toplevel_vm_took_count();
         let tc = Instant::now();
         rt.interp
             .run(&src)
             .map_err(|e| format!("js cold run {file}: {e:?}"))?;
         cold_ms.push(tc.elapsed().as_secs_f64() * 1000.0);
+        // Snapshot the top-level-VM engagement for the COLD run specifically (the
+        // warm run below would add to it). >0 == this microbench's hot top-level
+        // ran on the register VM, the honesty guard for the cold-time win.
+        last_toplevel_vm = cv_js::toplevel_vm_took_count();
         // Confirm the script COMPLETED and produced its result (a real Number),
         // so the timing measures the whole workload, not an early abort.
         // `run_completion_value` returns the value of the last expression (a bare
@@ -537,6 +552,8 @@ fn measure_js(file: &str, result_global: &str) -> Result<JsResult, String> {
         t4_exec_count: last_t4,
         t2_exec_count: last_t2,
         t2_enabled: cv_js::t2_heap_enabled(),
+        toplevel_vm_took: last_toplevel_vm,
+        toplevel_vm_enabled: cv_js::toplevel_vm_enabled(),
     })
 }
 
@@ -975,6 +992,10 @@ fn js_json(r: &JsResult) -> J {
         // Kept for continuity with the prior baseline JSON.
         ("t2_exec_count", J::I(r.t2_exec_count as i64)),
         ("t2_enabled", J::Bool(r.t2_enabled)),
+        // TOP-LEVEL VM (CV_TOPLEVEL_VM) honesty guard: >0 == the hot top-level
+        // script compiled to bytecode and ran on the register VM (not tree-walk).
+        ("toplevel_vm_took", J::I(r.toplevel_vm_took as i64)),
+        ("toplevel_vm_enabled", J::Bool(r.toplevel_vm_enabled)),
     ])
 }
 

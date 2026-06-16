@@ -4380,3 +4380,172 @@ fn feedback_oracle_leg_has_teeth() {
     // And after dropping the hook, the oracle is green again (no leakage).
     assert_tiers_agree(src).expect("oracle must be green again after the hook drops");
 }
+
+// ──────────────────── TOP-LEVEL VM (CV_TOPLEVEL_VM) ───────────────────────
+//
+// These gate the `Interp::run` top-level seam that compiles an eligible hot
+// top-level script body to a bytecode Module and runs it on the register VM
+// (V8/Ignition-shaped). `assert_toplevel_vm_agrees` proves the production path
+// is byte-identical whether the seam is OFF (top level tree-walked) or ON, on
+// throw parity + console side effects + the final value of every touched global.
+
+use crate::ab_oracle::{assert_toplevel_vm_agrees, assert_toplevel_vm_agrees_engaged};
+
+/// THE jit.js SHAPE — the measured bottleneck: a `var`-only top level with a
+/// top-level fn called inside a hot numeric loop accumulating into a global. The
+/// VM path must produce the IDENTICAL `s` global, and it must ACTUALLY engage.
+#[test]
+fn toplevel_vm_jit_shape_agrees_and_engages() {
+    let src = "
+        var fb = (function () {}) instanceof Object;
+        function f(x) { return x*x*0.5 + x*3.0 - 1.0 - x*0.5 + x*x*0.125; }
+        var s = 0;
+        for (var i = 0; i < 2000; i = i + 1) { s = s + f(i); }
+    ";
+    assert_toplevel_vm_agrees_engaged(src).expect("jit-shape top level must agree + engage");
+}
+
+/// Global `var` creation + reassignment, and a bare trailing expression.
+#[test]
+fn toplevel_vm_global_var_agrees() {
+    for src in [
+        "var a = 1; var b = 2; var c = a + b; c;",
+        "var x = 10; x = x * 3; x;",
+        "var arr = [1,2,3]; var sum = 0; for (var i=0;i<arr.length;i=i+1){ sum = sum + arr[i]; } sum;",
+        "var o = {}; o.k = 5; o.k + 1;",
+    ] {
+        assert_toplevel_vm_agrees(src).unwrap_or_else(|d| panic!("{src}\n{d}"));
+    }
+}
+
+/// Top-level FUNCTION HOISTING: a call that precedes the declaration must work
+/// identically (hoisted to a global on both paths).
+#[test]
+fn toplevel_vm_function_hoisting_agrees() {
+    for src in [
+        "var r = early(3); function early(n){ return n + 1; } r;",
+        "function a(){ return b() + 1; } function b(){ return 10; } var z = a(); z;",
+    ] {
+        assert_toplevel_vm_agrees(src).unwrap_or_else(|d| panic!("{src}\n{d}"));
+    }
+}
+
+/// THROW from top level — both paths must throw the same error name+message.
+#[test]
+fn toplevel_vm_throw_agrees() {
+    for src in [
+        "var s = 0; for (var i=0;i<10;i=i+1){ s = s + i; } throw 'BENCH s=' + s;",
+        "throw new TypeError('boom');",
+        "var x = null; x.y;",
+        "function g(){ throw new RangeError('r'); } g();",
+    ] {
+        assert_toplevel_vm_agrees(src).unwrap_or_else(|d| panic!("{src}\n{d}"));
+    }
+}
+
+/// CLOSURE over a top-level var.
+#[test]
+fn toplevel_vm_closure_over_toplevel_var_agrees() {
+    for src in [
+        "var n = 0; var inc = function(){ n = n + 1; return n; }; inc(); inc(); n;",
+        "var total = 0; [1,2,3,4].forEach(function(v){ total = total + v; }); total;",
+    ] {
+        assert_toplevel_vm_agrees(src).unwrap_or_else(|d| panic!("{src}\n{d}"));
+    }
+}
+
+/// Console side effects must be byte-identical (order + content).
+#[test]
+fn toplevel_vm_console_side_effects_agree() {
+    let src = "
+        var s = 0;
+        for (var i = 0; i < 4; i = i + 1) { console.log('i=' + i); s = s + i; }
+        console.log('done ' + s);
+    ";
+    assert_toplevel_vm_agrees(src).unwrap_or_else(|d| panic!("{src}\n{d}"));
+}
+
+/// DECLINE — `let`/`const` at top level must FALL BACK to the tree-walker; result
+/// still byte-identical and the VM path did NOT engage.
+#[test]
+fn toplevel_vm_declines_let_const_but_still_agrees() {
+    for src in [
+        "let a = 1; const b = 2; a + b;",
+        "const PI = 3.14; var r = 2; PI * r * r;",
+    ] {
+        assert_toplevel_vm_agrees(src).unwrap_or_else(|d| panic!("{src}\n{d}"));
+        let _g = crate::interp::TopLevelVmGuard::new(true);
+        crate::interp::reset_toplevel_vm_took_count();
+        let mut interp = Interp::new();
+        interp.install_basic_globals();
+        let _ = interp.run(src);
+        assert_eq!(
+            crate::interp::toplevel_vm_took_count(),
+            0,
+            "let/const at top level MUST decline the VM path: {src}"
+        );
+    }
+}
+
+/// DECLINE — a top-level fn referenced as a VALUE (not just called).
+#[test]
+fn toplevel_vm_declines_fn_used_as_value() {
+    for src in [
+        "function f(){ return 1; } var g = f; g();",
+        "function f(){ return 1; } f.tag = 9; f.tag;",
+        "function f(){ return 1; } [f].length;",
+    ] {
+        assert_toplevel_vm_agrees(src).unwrap_or_else(|d| panic!("{src}\n{d}"));
+        let _g = crate::interp::TopLevelVmGuard::new(true);
+        crate::interp::reset_toplevel_vm_took_count();
+        let mut interp = Interp::new();
+        interp.install_basic_globals();
+        let _ = interp.run(src);
+        assert_eq!(
+            crate::interp::toplevel_vm_took_count(),
+            0,
+            "fn-as-value at top level MUST decline the VM path: {src}"
+        );
+    }
+}
+
+/// DECLINE — direct `eval(...)` anywhere disqualifies.
+#[test]
+fn toplevel_vm_declines_direct_eval() {
+    let src = "var x = 1; eval('var y = 2'); x;";
+    assert_toplevel_vm_agrees(src).unwrap_or_else(|d| panic!("{src}\n{d}"));
+    let _g = crate::interp::TopLevelVmGuard::new(true);
+    crate::interp::reset_toplevel_vm_took_count();
+    let mut interp = Interp::new();
+    interp.install_basic_globals();
+    let _ = interp.run(src);
+    assert_eq!(crate::interp::toplevel_vm_took_count(), 0, "direct eval MUST decline");
+}
+
+/// NON-VACUITY TEETH: prove the ON path really ran the VM (else green is fake).
+#[test]
+fn toplevel_vm_oracle_is_non_vacuous() {
+    let src = "var s = 0; for (var i=0;i<1000;i=i+1){ s = s + i*2 - 1; }";
+    assert_toplevel_vm_agrees_engaged(src)
+        .expect("must agree AND the VM path must actually engage (non-vacuous)");
+}
+
+/// A broad reuse of curated stressors through the top-level oracle.
+#[test]
+fn toplevel_vm_corpus_agrees() {
+    for src in [
+        "var s=0; for(var i=0;i<200;i=i+1){ s = s + (i%3===0 ? i : -i); } s;",
+        "var a=1,b=1; for(var i=0;i<20;i=i+1){ var t=a+b; a=b; b=t; } b;",
+        "function sq(n){ return n*n; } var s=0; for(var i=0;i<50;i=i+1){ s=s+sq(i); } s;",
+        "var s=''; for(var i=0;i<5;i=i+1){ s = s + i; } s.length;",
+        "var o={a:1,b:2,c:3}; var sum=0; for(var k in o){ sum = sum + o[k]; } sum;",
+        "var n=0; while(n<100){ n = n + 7; } n;",
+        "var x=5; var y = x>3 ? (x<10 ? 1 : 2) : 3; y;",
+        "var arr=[]; for(var i=0;i<10;i=i+1){ arr.push(i*i); } arr.length;",
+        "var s=0; try { s = 1; throw 0; } catch(e) { s = s + 10; } finally { s = s + 100; } s;",
+    ] {
+        assert_toplevel_vm_agrees(src).unwrap_or_else(|d| panic!("{src}\n{d}"));
+    }
+}
+
+
