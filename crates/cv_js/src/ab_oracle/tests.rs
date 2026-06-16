@@ -4389,7 +4389,73 @@ fn feedback_oracle_leg_has_teeth() {
 // is byte-identical whether the seam is OFF (top level tree-walked) or ON, on
 // throw parity + console side effects + the final value of every touched global.
 
-use crate::ab_oracle::{assert_toplevel_vm_agrees, assert_toplevel_vm_agrees_engaged};
+use crate::ab_oracle::{
+    assert_inline_leaf_agrees, assert_inline_leaf_agrees_engaged, assert_toplevel_vm_agrees,
+    assert_toplevel_vm_agrees_engaged,
+};
+
+// ──────────────── STAGE 2 — LEAF INLINE + LOOP KERNEL (CV_INLINE_LEAF) ──────────
+//
+// These gate the Stage-2 lever: with the top-level VM ON for BOTH passes, the
+// variable is `CV_INLINE_LEAF`. OFF = the Stage-1 per-iteration `Op::CallFn` to the
+// numeric leaf; ON = the leaf spliced inline AND the counted accumulator loop
+// extracted into one native `__cv_loop_kernel` `CallFn`. `assert_inline_leaf_agrees`
+// proves the inlined+kernelized path is byte-identical to the un-inlined VM on throw
+// parity + console side effects + the production globalThis-read of every touched
+// global; `_engaged` also proves the inliner truly fired (non-vacuous).
+
+/// THE jit.js SHAPE — a `var` top level with a pure numeric leaf called in a hot
+/// counted loop accumulating into a global. The inlined+kernelized path must produce
+/// the IDENTICAL global, and the inliner must actually engage.
+#[test]
+fn inline_leaf_jit_shape_agrees_and_engages() {
+    let src = "
+        var fb = (function () {}) instanceof Object;
+        function f(x) { return ((x*x*0.5 + x*3.0 - 1.0)*(x-2.0) + x*x*x*0.25)/(x+1.0) - x*0.5 + x*x*0.125 - x*7.0; }
+        var s = 0;
+        for (var i = 0; i < 2000; i = i + 1) { s = s + f(i); }
+    ";
+    assert_inline_leaf_agrees_engaged(src).expect("jit-shape leaf inline must agree + engage");
+}
+
+/// THE loop.js SHAPE — a leaf with its OWN inner counted loop, called from an outer
+/// counted loop. (The leaf's inner loop is in `callee_is_inlinable`'s numeric subset,
+/// so `work` inlines; the outer loop kernelizes.)
+#[test]
+fn inline_leaf_loop_shape_agrees_and_engages() {
+    let src = "
+        var fb = (function () {}) instanceof Object;
+        function work(n) { var s = 0; for (var i = 0; i < n; i = i + 1) { s = s + i; } return s; }
+        var r = 0;
+        for (var j = 0; j < 50; j = j + 1) { r = r + work(40); }
+    ";
+    assert_inline_leaf_agrees_engaged(src).expect("loop-shape leaf inline must agree + engage");
+}
+
+/// A spread of leaf-inline-eligible + INELIGIBLE shapes — all must stay byte-
+/// identical whether inlining fires or declines (the fallback path).
+#[test]
+fn inline_leaf_corpus_agrees() {
+    for src in [
+        // Multiple distinct leaf calls in one loop body.
+        "var r=0; function a(x){return x*2;} function b(x){return x+3;} for(var i=0;i<60;i=i+1){ r = r + a(i) + b(i); } r;",
+        // Early-return (multi-Ret) leaf.
+        "var r=0; function g(x){ if (x>5){ return x*10; } return x; } for(var i=0;i<30;i=i+1){ r=r+g(i);} r;",
+        // Leaf that reads a GLOBAL → NOT a pure leaf → declines; must still agree.
+        "var k=10; function f(x){ return x + k; } var r=0; for(var i=0;i<20;i=i+1){ r=r+f(i);} r;",
+        // No loop at all — inliner may splice the call but no kernel; must agree.
+        "function f(x){return x*x + 1;} var a = f(3); var b = f(10); a + b;",
+        // Negative / fractional accumulation (NaN/precision parity).
+        "var s=0; function f(x){ return x*0.5 - 1.0; } for(var i=0;i<33;i=i+1){ s = s + f(i); } s;",
+        // Decreasing step / non-unit increment → kernel declines; must agree.
+        "var s=0; function f(x){return x;} for(var i=0;i<40;i=i+2){ s = s + f(i); } s;",
+        // Throw inside the loop region (a divide producing Infinity is fine; a real
+        // throw shape) — parity on the side-effect path.
+        "var s=0; function f(x){ return x*x; } for(var i=0;i<10;i=i+1){ s=s+f(i);} throw 'S=' + s;",
+    ] {
+        assert_inline_leaf_agrees(src).unwrap_or_else(|d| panic!("{src}\n{d}"));
+    }
+}
 
 /// THE jit.js SHAPE — the measured bottleneck: a `var`-only top level with a
 /// top-level fn called inside a hot numeric loop accumulating into a global. The

@@ -1301,6 +1301,60 @@ mod tests {
         }
     }
 
+    /// ★ STAGE 2 — PRODUCTION-FAITHFUL byte-identity + native-kernel engagement.
+    /// Through the REAL cv_browser `LiveInterp` host (the production path a page takes),
+    /// run jit.js / loop.js with the top-level VM ON and `CV_INLINE_LEAF` OFF vs ON,
+    /// reading the result global back THROUGH `globalThis` (the production observation),
+    /// and require the two flag states to be byte-identical. ALSO require the Stage-2
+    /// path to engage: the leaf is spliced (`leaf_inline_count > 0`) and the whole loop
+    /// runs as ONE native kernel call (`p6_exec_count == 1`, not 1.5M per-iteration
+    /// calls). This is the anti-fake guard for the measured win.
+    #[test]
+    fn stage2_inline_leaf_byte_identical_and_kernelizes() {
+        for (file, result_global) in
+            [("loop.js", "__bench_loop_result"), ("jit.js", "__bench_jit_result")]
+        {
+            let src = read_input(file).expect("read bench input");
+            let blank = "<!doctype html><html><head></head><body></body></html>";
+            let doc = cv_html::parse(blank);
+            let label = "file:///benchfix/stage2id";
+            // Read the result global THROUGH globalThis (the production read path).
+            let probe = format!(
+                "{src}\n;globalThis.__CV_RESULT__ = String(globalThis[{key:?}]);",
+                key = result_global
+            );
+            // Helper: run with inline=on/off, return the globalThis-read result string
+            // plus (leaf_inline_count, p6_exec_count).
+            let run = |inline: bool| -> (String, u64, u64) {
+                let _gv = cv_js::TopLevelVmGuard::new(true);
+                let _gi = cv_js::InlineLeafGuard::new(inline);
+                cv_js::reset_p6_exec_count();
+                cv_js::reset_leaf_inline_count();
+                let mut rt = LiveInterp::new(&doc, label);
+                rt.interp.run(&probe).unwrap_or_else(|e| panic!("{file}: {e:?}"));
+                // Read back __CV_RESULT__ through a trailing run that serializes it.
+                let read = "String(globalThis.__CV_RESULT__)";
+                let v = rt
+                    .interp
+                    .run_completion_value(read)
+                    .map(|v| format!("{v:?}"))
+                    .unwrap_or_else(|e| format!("ERR {e:?}"));
+                (v, cv_js::leaf_inline_count(), cv_js::p6_exec_count())
+            };
+            let (off, _, _) = run(false);
+            let (on, inlined, p6) = run(true);
+            assert_eq!(off, on, "{file}: inline ON must be byte-identical to OFF");
+            assert!(inlined > 0, "{file}: leaf must be spliced inline (count={inlined})");
+            // The whole counted loop must collapse to ONE native kernel call (not a
+            // per-iteration call). loop.js has a nested inner loop kernelized too, so
+            // accept exactly 1 (the outer kernel runs the inner loop natively inline).
+            assert_eq!(
+                p6, 1,
+                "{file}: the fused loop must run as ONE native kernel call (p6={p6})"
+            );
+        }
+    }
+
     /// OFFLINE before/after timing for the two JS microbenches under the
     /// top-level-VM flag OFF (tree-walk top level = the byte-identical baseline)
     /// vs ON (hot top level on the register VM + the leaf routed to P6). Ignored
@@ -1344,6 +1398,58 @@ mod tests {
             let (on, p6, tv) = best_ms(file, true);
             println!(
                 "[timing] {file}: toplevel_vm OFF={off:.2}ms  ON={on:.2}ms  (ON p6_exec={p6} toplevel_took={tv})"
+            );
+        }
+    }
+
+    /// STAGE 2 — OFFLINE before/after timing comparing Stage-1 (top-level VM on,
+    /// leaf as a per-iteration `Op::CallFn`) vs Stage-2 (top-level VM on + leaf
+    /// SPLICED inline via `CV_INLINE_LEAF`). Both are byte-identical (the A/B oracle
+    /// gates that); this isolates the speedup from removing the per-iteration call.
+    /// Ignored by default (timing, not a gate); run in RELEASE:
+    ///   cargo test -p cv_browser --bins --release stage2_leaf_inline_before_after -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn stage2_leaf_inline_before_after() {
+        use std::time::Instant;
+        // (best_ms, p6_exec, toplevel_took, leaf_inline_count)
+        fn best_ms(file: &str, inline_on: bool) -> (f64, u64, u64, u64) {
+            let src = read_input(file).expect("read");
+            let blank = "<!doctype html><html><head></head><body></body></html>";
+            let doc = cv_html::parse(blank);
+            let label = "file:///benchfix/stage2";
+            for _ in 0..3 {
+                let _gv = cv_js::TopLevelVmGuard::new(true);
+                let _gi = cv_js::InlineLeafGuard::new(inline_on);
+                let mut rt = LiveInterp::new(&doc, label);
+                let _ = rt.interp.run(&src);
+            }
+            let mut best = f64::MAX;
+            let (mut p6, mut tv, mut li) = (0u64, 0u64, 0u64);
+            for _ in 0..12 {
+                let _gv = cv_js::TopLevelVmGuard::new(true);
+                let _gi = cv_js::InlineLeafGuard::new(inline_on);
+                cv_js::reset_p6_exec_count();
+                cv_js::reset_toplevel_vm_took_count();
+                cv_js::reset_leaf_inline_count();
+                let mut rt = LiveInterp::new(&doc, label);
+                let t = Instant::now();
+                rt.interp.run(&src).unwrap();
+                let ms = t.elapsed().as_secs_f64() * 1000.0;
+                if ms < best {
+                    best = ms;
+                    p6 = cv_js::p6_exec_count();
+                    tv = cv_js::toplevel_vm_took_count();
+                    li = cv_js::leaf_inline_count();
+                }
+            }
+            (best, p6, tv, li)
+        }
+        for file in ["loop.js", "jit.js"] {
+            let (s1, p6a, _, _) = best_ms(file, false);
+            let (s2, p6b, tv, li) = best_ms(file, true);
+            println!(
+                "[stage2] {file}: STAGE1(call)={s1:.2}ms (p6={p6a})  STAGE2(inline)={s2:.2}ms  (p6={p6b} toplevel_took={tv} leaf_inlined={li})"
             );
         }
     }

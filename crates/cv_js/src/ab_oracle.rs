@@ -525,6 +525,169 @@ fn json_string_literal(s: &str) -> String {
     out
 }
 
+/// STAGE-2 LEAF-INLINE oracle — the differential gate for the `CV_INLINE_LEAF`
+/// lever. The top-level VM is ON for BOTH passes; the variable is `CV_INLINE_LEAF`:
+/// OFF (the Stage-1 per-iteration `Op::CallFn` to the leaf) vs ON (the leaf spliced
+/// inline + the counted loop kernelized into one native `CallFn`). Both are run
+/// through the PRODUCTION `Interp::run` path and observed through the real
+/// `globalThis[key]` read (the same production-faithful observation
+/// `assert_toplevel_vm_agrees` uses), so a script whose snapshot agrees but whose
+/// page-visible global state diverges is still caught. Returns the first
+/// `Divergence`, or `Ok(())` if the inlined+kernelized path is byte-identical to the
+/// un-inlined VM.
+pub fn assert_inline_leaf_agrees(src: &str) -> Result<(), Divergence> {
+    // Run `src` with top-level VM ON and inline-leaf set to `inline`, capturing
+    // throw/value parity, console output, and the post-run touched-global state.
+    fn run_one(src: &str, inline: bool) -> (TierOutcome, Vec<(String, Value)>) {
+        let _no_tier = crate::interp::set_force_tier(None);
+        crate::interp::reset_bc_fn_cache();
+        crate::interp::reset_t1_cache();
+        crate::interp::reset_t2_cache();
+        crate::interp::reset_t3_cache();
+        crate::interp::reset_t4_cache();
+        let _gv = crate::interp::TopLevelVmGuard::new(true);
+        let _gi = crate::bytecode::InlineLeafGuard::new(inline);
+        let mut interp = Interp::new();
+        interp.install_basic_globals();
+        let base = interp.globals_snapshot();
+        let result = match interp.run(src) {
+            Ok(v) => Ok(v),
+            Err(e) => Err(reduce_thrown(&e)),
+        };
+        let after = interp.globals_snapshot();
+        let mut touched: Vec<(String, Value)> = Vec::new();
+        for (k, v) in &after {
+            let changed = match base.get(k) {
+                None => true,
+                Some(old) => !shallow_same(old, v),
+            };
+            if changed {
+                touched.push((k.clone(), v.clone()));
+            }
+        }
+        touched.sort_by(|a, b| a.0.cmp(&b.0));
+        (
+            TierOutcome { result, output: interp.output.clone() },
+            touched,
+        )
+    }
+
+    let (a, ga) = run_one(src, false);
+    let (b, gb) = run_one(src, true);
+    compare_outcomes(&a, &b, "leaf-inline-off", "leaf-inline-on")?;
+
+    // PRODUCTION-FAITHFUL globalThis-read comparison (mirrors the top-level VM
+    // oracle): observe each touched global through the real [[Get]] path on BOTH
+    // flag states and require line-for-line agreement.
+    {
+        let mut keys: Vec<String> = ga.iter().map(|(k, _)| k.clone()).collect();
+        for (k, _) in &gb {
+            if !keys.contains(k) {
+                keys.push(k.clone());
+            }
+        }
+        keys.sort();
+        keys.dedup();
+        if !keys.is_empty() {
+            let obs_off = observe_globals_inline_leaf(src, false, &keys);
+            let obs_on = observe_globals_inline_leaf(src, true, &keys);
+            if obs_off != obs_on {
+                let (off, on, path) = first_output_diff(&obs_off, &obs_on);
+                return Err(Divergence {
+                    kind: DivergenceKind::Value,
+                    path: format!("<globalThis-read>{path}"),
+                    tree_walk: format!("leaf-inline-off: {off}"),
+                    vm: format!("leaf-inline-on: {on}"),
+                });
+            }
+        }
+    }
+
+    // Touched-global set must match key-for-key, value-for-value.
+    if ga.len() != gb.len() {
+        return Err(Divergence {
+            kind: DivergenceKind::Value,
+            path: "<globals>.len".to_string(),
+            tree_walk: format!("{} touched", ga.len()),
+            vm: format!("{} touched", gb.len()),
+        });
+    }
+    for ((ka, va), (kb, vb)) in ga.iter().zip(gb.iter()) {
+        if ka != kb {
+            return Err(Divergence {
+                kind: DivergenceKind::Value,
+                path: "<globals>.<keys>".to_string(),
+                tree_walk: ka.clone(),
+                vm: kb.clone(),
+            });
+        }
+        if let Some(d) = deep_diff(va, vb, &format!("<global>.{ka}"), 0) {
+            return Err(d);
+        }
+    }
+    Ok(())
+}
+
+/// `observe_globals_through_object` with the top-level VM ON and the `CV_INLINE_LEAF`
+/// knob = `inline` (the Stage-2 variable). Appends the same `globalThis[key]` probe so
+/// the read crosses the real [[Get]] path at the production observation point.
+fn observe_globals_inline_leaf(src: &str, inline: bool, keys: &[String]) -> Vec<String> {
+    let _no_tier = crate::interp::set_force_tier(None);
+    crate::interp::reset_bc_fn_cache();
+    crate::interp::reset_t1_cache();
+    crate::interp::reset_t2_cache();
+    crate::interp::reset_t3_cache();
+    crate::interp::reset_t4_cache();
+    let _gv = crate::interp::TopLevelVmGuard::new(true);
+    let _gi = crate::bytecode::InlineLeafGuard::new(inline);
+    let mut interp = Interp::new();
+    interp.install_basic_globals();
+    let mut probe = String::from("\n;(function(){\n");
+    for k in keys {
+        let key_lit = json_string_literal(k);
+        probe.push_str(&format!(
+            "  try {{ var __cv_v = globalThis[{key}]; var __cv_s = (typeof __cv_v === 'function') ? '<callable>' : String(__cv_v); console.log('__CV_OBS__:' + {key} + '=' + (typeof __cv_v) + ':' + __cv_s); }} catch (__cv_e) {{ console.log('__CV_OBS__:' + {key} + '=THROW:' + String(__cv_e)); }}\n",
+            key = key_lit
+        ));
+    }
+    probe.push_str("})();\n");
+    let full = format!("{src}{probe}");
+    let _ = interp.run(&full);
+    interp
+        .output
+        .iter()
+        .filter(|l| l.contains("__CV_OBS__:"))
+        .cloned()
+        .collect()
+}
+
+/// Like `assert_inline_leaf_agrees`, but ALSO requires the inliner to have GENUINELY
+/// spliced ≥1 call (`leaf_inline_count` > 0 on the ON run) — the anti-vacuity guard
+/// so a green oracle can't be a script that never actually inlined.
+pub fn assert_inline_leaf_agrees_engaged(src: &str) -> Result<(), Divergence> {
+    assert_inline_leaf_agrees(src)?;
+    let engaged = {
+        let _no_tier = crate::interp::set_force_tier(None);
+        crate::interp::reset_bc_fn_cache();
+        let _gv = crate::interp::TopLevelVmGuard::new(true);
+        let _gi = crate::bytecode::InlineLeafGuard::new(true);
+        crate::bytecode::reset_leaf_inline_count();
+        let mut interp = Interp::new();
+        interp.install_basic_globals();
+        let _ = interp.run(src);
+        crate::bytecode::leaf_inline_count() > 0
+    };
+    if !engaged {
+        return Err(Divergence {
+            kind: DivergenceKind::SideEffect,
+            path: "<leaf-inline-engagement>".to_string(),
+            tree_walk: "expected the leaf inliner to splice ≥1 call".to_string(),
+            vm: "leaf inliner spliced 0 calls (vacuously green — FAIL)".to_string(),
+        });
+    }
+    Ok(())
+}
+
 /// Like `assert_toplevel_vm_agrees`, but ALSO requires the top-level VM path to
 /// have GENUINELY executed (`toplevel_vm_took_count` > 0 on the `on` run) — the
 /// anti-vacuity guard so a green oracle can't be a script that silently declined

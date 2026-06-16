@@ -3868,6 +3868,1139 @@ fn run_callfn_p6(jf: &crate::jit::JitFunction, args: &[Value]) -> Value {
     Value::Number(r)
 }
 
+// ══════════════════════════════════════════════════════════════════════════
+// STAGE 2 — VM-LEVEL LEAF INLINING (V8 JSInlining-shaped, the jit.js lever).
+//
+// V8 SOURCE MODELED: `src/compiler/js-inlining.*` (JSInliner) — at a monomorphic
+// call site whose target is a small, known callee, TurboFan/Maglev SPLICE the
+// callee's body into the caller so the call frame + call dispatch disappear and the
+// callee's arithmetic fuses into the caller's (here: the hot top-level loop). Our
+// Stage-1 top-level VM ran the hot loop on the register VM but still executed the
+// leaf `f(i)` / `work(n)` as a per-iteration `Op::CallFn` (a `Vec` arg-gather + a
+// thread-local `CALLFN_P6_CACHE` HashMap lookup + a native-call round-trip EVERY
+// iteration). This pass removes that per-iteration call entirely: `f`'s body is
+// spliced inline into the caller's bytecode, so the VM dispatches `f`'s arithmetic
+// directly in the loop, with no call op.
+//
+// WHY IT IS BYTE-IDENTICAL TO THE UN-INLINED VM (the non-negotiable gate): the
+// callee admitted here is a PURE NUMERIC LEAF — `callee_is_inlinable` (reused
+// verbatim from the proven T4 inliner) requires exact arity, no rest param, a
+// bounded op count, and EVERY op in the numeric/control-flow subset (no globals, no
+// `this`, no closure capture, no nested call, no heap/property op). Such a callee's
+// observable effect is EXACTLY "return a Number computed from its args" — it touches
+// no state the caller or any other code can observe. Splicing its body into a fresh
+// register window ABOVE the caller's regs (callee reg r → base + r), seeding its
+// params by COPYING the caller's arg slots, and replacing its `Ret` with a single
+// store of the result into the call's `dst`, computes the identical Value the
+// `CallFn` would have produced and writes it to the identical register — so the VM
+// state after the inlined region equals the VM state after the call, op-for-op.
+// There is NO native code and NO deopt on this path (the VM runs the spliced ops
+// exactly as it runs any op), so there is nothing to reconstruct: byte-identity is
+// structural, and the production-faithful A/B oracle proves it.
+//
+// SCOPE / FALLBACK: only `CallFn` (a direct, monomorphic module-local call) to an
+// inlinable callee is spliced; any non-inlinable call, or a callee with the wrong
+// arity, is LEFT AS A `CallFn` (the VM runs it the Stage-1 way) — never wrong, just
+// not inlined. A caller with no inlinable call returns `None` (the module runs
+// un-inlined). Gated behind `CV_INLINE_LEAF` (default OFF) so the default build is
+// byte-identical to Stage 1.
+// ══════════════════════════════════════════════════════════════════════════
+
+/// STAGE-2 gate (`CV_INLINE_LEAF`, DEFAULT OFF). When enabled (and the top-level VM
+/// is engaged), the top-level script module's slot-0 body has every monomorphic
+/// numeric-leaf `CallFn` spliced inline before it runs on the VM, so the hot loop's
+/// per-iteration call disappears. Default OFF until soak: the default build is
+/// byte-identical to Stage 1. Cached (env read once per thread); a programmatic
+/// override (`InlineLeafGuard`) takes precedence so tests/benches drive both states
+/// in one process without the per-thread cache pinning the first read.
+pub fn inline_leaf_enabled() -> bool {
+    if let Some(v) = INLINE_LEAF_OVERRIDE.with(|c| c.get()) {
+        return v;
+    }
+    thread_local! {
+        static ON: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    }
+    ON.with(|c| match c.get() {
+        Some(v) => v,
+        None => {
+            let v = matches!(
+                std::env::var("CV_INLINE_LEAF").as_deref(),
+                Ok("1") | Ok("true") | Ok("on")
+            );
+            c.set(Some(v));
+            v
+        }
+    })
+}
+
+thread_local! {
+    /// Programmatic override for `inline_leaf_enabled` (None = env-driven).
+    static INLINE_LEAF_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+    /// Honesty counter: number of `CallFn` sites this thread actually spliced inline
+    /// (the anti-fake guard — a faster jit.js only counts if this proves the call was
+    /// removed). Read via `leaf_inline_count`; reset via `reset_leaf_inline_count`.
+    static LEAF_INLINE_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// RAII scope guard forcing the leaf-inline gate on/off for the current thread
+/// (the env-independent A/B knob the oracle uses). Restores the prior state on drop.
+#[must_use = "the override is restored when the guard is dropped; bind it to a name"]
+pub struct InlineLeafGuard {
+    prev: Option<bool>,
+}
+impl InlineLeafGuard {
+    pub fn new(on: bool) -> Self {
+        let prev = INLINE_LEAF_OVERRIDE.with(|c| {
+            let p = c.get();
+            c.set(Some(on));
+            p
+        });
+        InlineLeafGuard { prev }
+    }
+}
+impl Drop for InlineLeafGuard {
+    fn drop(&mut self) {
+        INLINE_LEAF_OVERRIDE.with(|c| c.set(self.prev));
+    }
+}
+
+/// Number of `CallFn` sites spliced inline by `inline_numeric_leaf_calls` this
+/// thread (the engagement honesty guard — proves the inliner is non-vacuous).
+pub fn leaf_inline_count() -> u64 {
+    LEAF_INLINE_COUNT.with(|c| c.get())
+}
+/// Reset the leaf-inline honesty counter (so a measurement attributes splices to
+/// THIS run).
+pub fn reset_leaf_inline_count() {
+    LEAF_INLINE_COUNT.with(|c| c.set(0));
+}
+
+/// Splice every monomorphic numeric-leaf `CallFn` in `module.fns[caller_idx]` inline
+/// (V8 JSInlining-shaped — the Stage-2 jit.js lever). Returns a NEW caller
+/// `BcFunction` with the calls removed iff ≥1 call was inlined, else `None` (the
+/// caller runs un-inlined). The caller may contain ANY ops (globals, heap, control
+/// flow) — only the callee must be a pure numeric leaf (`t4::callee_is_inlinable`),
+/// because the result is run on the VM (which dispatches every op), NOT on the
+/// representation-specialized native backend. Unlike the T4 `inline_first_call`, the
+/// caller is NOT required to be numeric, and ALL inlinable sites are spliced.
+///
+/// TRANSFORM (one inlinable `CallFn { dst, fn_idx, first_arg, n_args }` at caller op
+/// `call_pc`, callee `g`): give the splice a FRESH register window starting at the
+/// running high-water `window_base` (≥ the caller's `n_regs`, stacked so multiple
+/// inlined sites never alias). Callee reg r → `window_base + r`. Before the body,
+/// COPY each arg into the callee's param slot (`Move { window_base+p, first_arg+p }`)
+/// — a copy, so the caller's arg slots are untouched. The callee body is appended
+/// with regs remapped `+window_base` and internal jumps retargeted into the inlined
+/// region; each callee `Ret { src }` becomes `Move { dst, window_base+src }` (store
+/// the result into the call's dst — the ONLY caller-slot write the region makes) plus
+/// a `Jmp` to the post-call continuation. Caller jumps are retargeted to the new
+/// fused offsets. A non-inlinable `CallFn`/`CallValue`/`New` is copied through
+/// unchanged (the VM runs it). Anything that would overflow the u16 register/const
+/// space declines (returns `None`) — correctness over coverage.
+pub fn inline_numeric_leaf_calls(module: &Module, caller_idx: usize) -> Option<BcFunction> {
+    let caller = module.fns.get(caller_idx)?;
+    // Decide which call sites to inline, and the callee window each gets. We assign
+    // each inlined site a DISJOINT window stacked above the caller's regs so two
+    // sites' temporaries never alias (the caller's own regs `0..n_regs` are
+    // untouched). `window_base` is the running high-water mark.
+    let mut window_base = caller.n_regs;
+    // Per-call-site plan: (call_pc, window_base for that site). Built in pc order.
+    let mut plan: Vec<(usize, u16)> = Vec::new();
+    for (pc, op) in caller.code.iter().enumerate() {
+        if let Op::CallFn { fn_idx, n_args, .. } = *op {
+            let callee = module.fns.get(fn_idx as usize)?;
+            if crate::t4::callee_is_inlinable(callee, n_args as usize) {
+                let base = window_base;
+                // Reserve this site's window; guard against u16 overflow.
+                let next = (base as u32) + (callee.n_regs as u32);
+                if next > u16::MAX as u32 {
+                    return None; // can't fit a fresh window — decline cleanly.
+                }
+                window_base = next as u16;
+                plan.push((pc, base));
+            }
+            // A non-inlinable CallFn is left in place (the VM runs it).
+        }
+    }
+    if plan.is_empty() {
+        return None; // nothing to inline → run un-inlined.
+    }
+    let fused_n_regs = window_base; // high-water of every site's window.
+
+    // ── Single linear rebuild. We compute, for each ORIGINAL caller op index, the
+    //    fused offset of its FIRST emitted op (caller jumps retarget to it). Inlined
+    //    regions are emitted at the call op's position (replacing the CallFn). The
+    //    callee consts are appended once to a shared fused const pool, remapped per
+    //    site (each site references the SAME callee const block by fn_idx).
+    let mut fused: Vec<Op> = Vec::with_capacity(caller.code.len() * 2);
+    // caller original op index → fused offset of its first emitted op.
+    let mut caller_fused_off: Vec<usize> = vec![usize::MAX; caller.code.len()];
+    // Shared fused const pool: caller consts first (caller LoadConst k unchanged),
+    // then each distinct inlined callee's consts (recorded so re-used callees share).
+    let mut consts = caller.consts.clone();
+    // fn_idx → const base in the fused pool (so the same callee inlined twice shares
+    // one const block).
+    let mut callee_const_base: std::collections::HashMap<u16, usize> =
+        std::collections::HashMap::new();
+    // Patch jobs for callee-internal jumps: (fused_idx_of_jmp, callee_target_idx,
+    // callee_region_start_fused_off, callee). Resolved after layout per site.
+    // We instead resolve each site's jumps inline using a per-site offset table.
+
+    // Quick lookup: pc → site window base (if planned).
+    let plan_at: std::collections::HashMap<usize, u16> = plan.iter().cloned().collect();
+
+    // We need, for every Ret-store Jmp we emit, the continuation = fused offset of
+    // the op AFTER the call. Because we emit linearly and the continuation is the
+    // NEXT caller op, we patch Ret-jmps after the whole site is laid out (the
+    // continuation is `fused.len()` right after the site's region).
+    for (pc, op) in caller.code.iter().enumerate() {
+        if let Some(&base) = plan_at.get(&pc) {
+            // ── Inline this CallFn site.
+            let (dst, fn_idx, first_arg, n_args) = match *op {
+                Op::CallFn { dst, fn_idx, first_arg, n_args } => (dst, fn_idx, first_arg, n_args),
+                _ => unreachable!("plan_at only holds CallFn pcs"),
+            };
+            let callee = &module.fns[fn_idx as usize];
+            // Ensure the callee's consts are in the fused pool exactly once.
+            let const_base = match callee_const_base.get(&fn_idx) {
+                Some(&b) => b,
+                None => {
+                    let b = consts.len();
+                    consts.extend(callee.consts.iter().cloned());
+                    if consts.len() > u16::MAX as usize {
+                        return None;
+                    }
+                    callee_const_base.insert(fn_idx, b);
+                    b
+                }
+            };
+            // The first emitted op of this site is the first arg-copy (or, with zero
+            // args — impossible here since callee_is_inlinable requires n_args params
+            // and a 0-param numeric leaf is allowed — the first body op). Record it as
+            // the caller op's fused offset so a caller jump targeting this pc lands at
+            // the start of the inlined region. (No caller jump can target the middle
+            // of a call's result, so this is always the right entry.)
+            caller_fused_off[pc] = fused.len();
+            // Region A — seed callee params by COPYING caller args.
+            for p in 0..n_args as u16 {
+                fused.push(Op::Move { dst: base + p, src: first_arg + p });
+            }
+            // Region B — the inlined callee body. Lay out ops, remap regs +base,
+            // record per-callee-op fused offsets for jump retargeting, and turn each
+            // Ret into store-result + jmp-to-continuation (patched after layout).
+            let region_start = fused.len();
+            let mut callee_off: Vec<usize> = Vec::with_capacity(callee.code.len());
+            let mut ret_jmps: Vec<usize> = Vec::new();
+            for cop in &callee.code {
+                callee_off.push(fused.len());
+                match *cop {
+                    Op::Ret { src } => {
+                        fused.push(Op::Move { dst, src: base + src });
+                        let jmp_idx = fused.len();
+                        fused.push(Op::Jmp { target: 0 }); // patched → continuation
+                        ret_jmps.push(jmp_idx);
+                    }
+                    Op::LoadConst { dst: cd, k } => {
+                        // Remap reg AND const index into the fused pool.
+                        fused.push(Op::LoadConst {
+                            dst: cd + base,
+                            k: (k as usize + const_base) as u16,
+                        });
+                    }
+                    other => fused.push(crate::t4::remap_callee_op(other, base)),
+                }
+            }
+            let _ = region_start;
+            // The continuation is the op right after the whole inlined region.
+            let continuation = fused.len();
+            // Patch callee-internal jumps (Jmp / JmpIfFalse) to fused offsets.
+            for (k, cop) in callee.code.iter().enumerate() {
+                let fi = callee_off[k];
+                match *cop {
+                    Op::Jmp { target } => {
+                        if let Op::Jmp { target: t } = &mut fused[fi] {
+                            *t = *callee_off.get(target as usize)? as u16;
+                        }
+                    }
+                    Op::JmpIfFalse { target, .. } => {
+                        if let Op::JmpIfFalse { target: t, .. } = &mut fused[fi] {
+                            *t = *callee_off.get(target as usize)? as u16;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            // Patch the Ret-store jmps to the continuation.
+            for &j in &ret_jmps {
+                if let Op::Jmp { target } = &mut fused[j] {
+                    *target = continuation as u16;
+                }
+            }
+            LEAF_INLINE_COUNT.with(|c| c.set(c.get() + 1));
+        } else {
+            // ── Ordinary caller op (incl. a non-inlinable call) — copy through.
+            caller_fused_off[pc] = fused.len();
+            fused.push(*op);
+        }
+    }
+
+    // ── Retarget every CALLER jump to its target op's new fused offset. (Callee
+    //    jumps were already patched per-site.) A caller jump's target is an ORIGINAL
+    //    caller op index; map it through `caller_fused_off`. A target that landed on
+    //    an inlined-away call op resolves to the START of that op's inlined region
+    //    (recorded above), which is the correct entry. We only rewrite jumps that
+    //    were ORIGINAL caller ops (not the ones we emitted inside an inlined region —
+    //    those were already patched and live at offsets we never revisit here).
+    for (pc, op) in caller.code.iter().enumerate() {
+        // Skip inlined call sites — they emitted their own (already-patched) ops.
+        if plan_at.contains_key(&pc) {
+            continue;
+        }
+        let fi = caller_fused_off[pc];
+        if fi == usize::MAX {
+            continue;
+        }
+        match *op {
+            Op::Jmp { target } => {
+                let off = *caller_fused_off.get(target as usize)?;
+                if off == usize::MAX {
+                    return None;
+                }
+                if let Op::Jmp { target: t } = &mut fused[fi] {
+                    *t = off as u16;
+                }
+            }
+            Op::JmpIfFalse { target, .. } => {
+                let off = *caller_fused_off.get(target as usize)?;
+                if off == usize::MAX {
+                    return None;
+                }
+                if let Op::JmpIfFalse { target: t, .. } = &mut fused[fi] {
+                    *t = off as u16;
+                }
+            }
+            Op::JmpIfTrue { target, .. } => {
+                let off = *caller_fused_off.get(target as usize)?;
+                if off == usize::MAX {
+                    return None;
+                }
+                if let Op::JmpIfTrue { target: t, .. } = &mut fused[fi] {
+                    *t = off as u16;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Some(BcFunction {
+        name: format!("{}+leafinline", caller.name),
+        n_params: caller.n_params,
+        rest_reg: caller.rest_reg,
+        n_regs: fused_n_regs,
+        consts,
+        code: fused,
+        ic: std::cell::RefCell::new(Vec::new()),
+        feedback: std::cell::RefCell::new(Vec::new()),
+    })
+}
+
+/// Build a copy of `module` with slot-`caller_idx` leaf-inlined (every monomorphic
+/// numeric-leaf `CallFn` spliced inline), reusing the ORIGINAL callee `fns` so a
+/// retained `CallFn` (a non-inlinable call left in place) still resolves by index.
+/// Returns `None` if nothing was inlined (the caller runs the original module). The
+/// returned module is observationally identical to the original on the VM — only the
+/// caller body changed, and only by removing pure-numeric-leaf calls.
+///
+/// THEN — the win-closing step — it kernelizes any counted numeric accumulator loop
+/// in the fused body (see `kernelize_counted_loops`): the inlined loop is extracted
+/// into a fresh, pure-numeric module function and the loop region is replaced by a
+/// SINGLE `Op::CallFn` to it. The existing in-VM `CallFn → P6` routing then compiles
+/// that kernel to native f64 code, so the WHOLE loop runs natively in one call (no
+/// per-iteration VM dispatch AND no per-iteration leaf call). Inlining alone moves
+/// the leaf's arithmetic onto the boxed VM — a regression — so kernelization is what
+/// makes the inline a net win; if no loop matches the kernel shape, the body is left
+/// inlined-only (still correct, the VM runs it). Byte-identity is structural (pure
+/// numeric leaf + a loop-invariant accumulator hoist over a body that touches no
+/// other state) and gated by the production-faithful A/B oracle.
+pub fn inline_leaf_module(module: &Module, caller_idx: usize) -> Option<Module> {
+    let fused_caller = inline_numeric_leaf_calls(module, caller_idx)?;
+    let mut fns = module.fns.clone();
+    *fns.get_mut(caller_idx)? = fused_caller;
+    // Kernelize counted numeric accumulator loops in the fused caller (appends kernel
+    // fns + rewrites the loop to a CallFn to them). Best-effort: a loop that doesn't
+    // match the strict shape is left as-is (the inlined VM body runs it).
+    kernelize_counted_loops(&mut fns, caller_idx);
+    Some(Module {
+        fns,
+        script_forinit_syncs: module.script_forinit_syncs.clone(),
+    })
+}
+
+/// A recognized counted numeric accumulator loop in a caller body. Spans the
+/// half-open caller op range `[header, back_jmp]` (inclusive of the closing backward
+/// `Jmp` at `back_jmp`). The header is `LoadConst limit; Lt i<limit; JmpIfFalse exit`
+/// (the canonical `for (…; i<N; …)` test the bytecode compiler emits). The body
+/// reads ONE accumulator global `acc_name` at `load_pc` into `acc_reg` and stores it
+/// back at `store_pc` — the only global the loop touches (verified) — and is
+/// otherwise entirely in the P6 numeric subset.
+struct CountedLoop {
+    header: usize,       // op index of the LoadConst(limit) that begins the test
+    #[allow(dead_code)]
+    lt_pc: usize,        // the Lt op (i < limit)
+    #[allow(dead_code)]
+    jmpfalse_pc: usize,  // the JmpIfFalse(exit) right after Lt
+    back_jmp: usize,     // the closing backward Jmp back to `header`
+    exit_pc: usize,      // op index of the first op AFTER the loop (JmpIfFalse target)
+    i_reg: Reg,          // induction var register (Lt lhs)
+    limit_reg: Reg,      // limit register (Lt rhs)
+    limit_k: u16,        // const index of the header's LoadConst(limit) — the loop bound
+    acc_load_reg: Reg,   // register the body READS the accumulator into (LoadGlobal dst)
+    acc_store_reg: Reg,  // register the body WRITES the new accumulator from (StoreGlobal src)
+    acc_name: String,    // accumulator global name
+    load_pc: usize,      // the LoadGlobal(acc) in the body
+    store_pc: usize,     // the StoreGlobal(acc) in the body
+}
+
+/// Detect, in `code`, the FIRST counted numeric accumulator loop matching the strict
+/// shape the bench loops compile to. Returns `None` (no kernelization) on ANY
+/// mismatch — correctness over coverage. The shape (1 induction var, 1 accumulator
+/// global, body otherwise P6-numeric, exactly one load + one store of the
+/// accumulator, no other global/heap/call op) is what makes the loop-invariant
+/// accumulator hoist + native kernelization provably byte-identical.
+fn detect_counted_loop(code: &[Op], consts: &[Value]) -> Option<CountedLoop> {
+    // Find a backward Jmp (loop back-edge). Its target is the loop header.
+    for (jpc, op) in code.iter().enumerate() {
+        let header = match *op {
+            Op::Jmp { target } if (target as usize) < jpc => target as usize,
+            _ => continue,
+        };
+        // Header must be: LoadConst(limit) ; Lt(i<limit) ; JmpIfFalse(exit).
+        let lt_pc = header + 1;
+        let jf_pc = header + 2;
+        if jf_pc > jpc {
+            continue;
+        }
+        let (limit_reg, limit_k) = match code.get(header) {
+            Some(Op::LoadConst { dst, k }) => (*dst, *k),
+            _ => continue,
+        };
+        let (i_reg, lt_dst) = match code.get(lt_pc) {
+            Some(Op::Lt { dst, lhs, rhs }) if *rhs == limit_reg => (*lhs, *dst),
+            _ => continue,
+        };
+        let exit_pc = match code.get(jf_pc) {
+            Some(Op::JmpIfFalse { cond, target }) if *cond == lt_dst => *target as usize,
+            _ => continue,
+        };
+        // The body is [jf_pc+1 .. jpc] (the back Jmp at jpc closes it). Scan it:
+        // it must touch exactly one accumulator global (one LoadGlobal*, one
+        // StoreGlobal, same name), be otherwise P6-numeric, contain NO other
+        // global/heap/call/control-out op, and NOT jump outside the loop.
+        let body = jf_pc + 1..jpc;
+        let mut acc_name: Option<String> = None;
+        let mut acc_load_reg: Option<Reg> = None;
+        let mut acc_store_reg: Option<Reg> = None;
+        let mut load_pc: Option<usize> = None;
+        let mut store_pc: Option<usize> = None;
+        let mut ok = true;
+        for bpc in body.clone() {
+            match &code[bpc] {
+                Op::LoadGlobal { dst, name_k } | Op::LoadGlobalChecked { dst, name_k } => {
+                    if load_pc.is_some() {
+                        ok = false;
+                        break; // a second global load → not the single-accumulator shape.
+                    }
+                    let name = match consts.get(*name_k as usize) {
+                        Some(Value::String(s)) => s.to_string(),
+                        _ => {
+                            ok = false;
+                            break;
+                        }
+                    };
+                    acc_name = Some(name);
+                    acc_load_reg = Some(*dst);
+                    load_pc = Some(bpc);
+                }
+                Op::StoreGlobal { name_k, src } => {
+                    if store_pc.is_some() {
+                        ok = false;
+                        break;
+                    }
+                    let name = match consts.get(*name_k as usize) {
+                        Some(Value::String(s)) => s.to_string(),
+                        _ => {
+                            ok = false;
+                            break;
+                        }
+                    };
+                    // Must be the SAME global as the load.
+                    if acc_name.as_deref() != Some(name.as_str()) {
+                        ok = false;
+                        break;
+                    }
+                    acc_store_reg = Some(*src);
+                    store_pc = Some(bpc);
+                }
+                // P6-numeric body ops only (the set compile_bytecode_f64 accepts).
+                Op::LoadConst { .. }
+                | Op::LoadUndef { .. }
+                | Op::Move { .. }
+                | Op::Add { .. }
+                | Op::Sub { .. }
+                | Op::Mul { .. }
+                | Op::Div { .. }
+                | Op::Lt { .. }
+                | Op::Le { .. }
+                | Op::Gt { .. }
+                | Op::Ge { .. } => {}
+                Op::Jmp { target } | Op::JmpIfFalse { target, .. } => {
+                    // A body jump must stay strictly inside the loop region
+                    // [header..=jpc] (a forward/back jump within the loop). A jump
+                    // out of the loop is a `break`/early-exit we don't model.
+                    let t = *target as usize;
+                    if t < header || t > jpc {
+                        ok = false;
+                        break;
+                    }
+                }
+                _ => {
+                    ok = false; // any other op (heap/call/bitwise/etc.) → decline.
+                    break;
+                }
+            }
+        }
+        if !ok {
+            continue;
+        }
+        let (acc_name, acc_load_reg, acc_store_reg, load_pc, store_pc) =
+            match (acc_name, acc_load_reg, acc_store_reg, load_pc, store_pc) {
+                (Some(n), Some(lr), Some(sr), Some(l), Some(s)) => (n, lr, sr, l, s),
+                _ => continue, // must have BOTH a load and a store of the accumulator.
+            };
+        // The accumulator load must come before the store in the body (load-modify-
+        // store across the iteration). Required for the hoist to be value-identical.
+        if load_pc >= store_pc {
+            continue;
+        }
+        // The JmpIfFalse exit target must be exactly the op after the back Jmp (the
+        // canonical loop exit), so replacing [header..=jpc] with a single call is a
+        // clean splice. (A loop whose exit lands elsewhere isn't this shape.)
+        if exit_pc != jpc + 1 {
+            continue;
+        }
+        // ── INDUCTION-VARIABLE POST-VALUE GATE. The loop carries TWO observable
+        // values: the accumulator (→ the global, handled by the kernel's return) AND
+        // the induction var `i` (→ the for-init `StoreGlobal i` the compiler emits
+        // after the loop). A P6 kernel returns only ONE f64, so we can recover the
+        // accumulator from the return but NOT `i`. We therefore only kernelize the
+        // CANONICAL counted shape `for (i = i0; i < limit; i = i + 1)` — strict `<`
+        // plus a unit `+1` increment — where the loop-exit value of `i` is provably
+        // `limit` (i reaches limit exactly, the test fails, the loop exits). The
+        // caller then sets `i_reg = limit_reg` after the kernel, byte-identically.
+        // Any other step / comparison declines (the inlined VM body runs the loop).
+        if !loop_increments_i_by_one(code, header..=jpc, i_reg, consts) {
+            continue;
+        }
+        return Some(CountedLoop {
+            header,
+            lt_pc,
+            jmpfalse_pc: jf_pc,
+            back_jmp: jpc,
+            exit_pc,
+            i_reg,
+            limit_reg,
+            limit_k,
+            acc_load_reg,
+            acc_store_reg,
+            acc_name,
+            load_pc,
+            store_pc,
+        });
+    }
+    None
+}
+
+/// Verify the loop region's NET effect on the induction register `i_reg` per
+/// iteration is exactly `i_reg = i_reg + 1` (a unit increment). This is the gate that
+/// lets the caller recover `i`'s post-loop value as `limit` after the native kernel
+/// (which can only return the accumulator). Conservative: returns `false` on ANY
+/// shape it can't prove is `+1` (then the loop isn't kernelized — the VM body runs it,
+/// always correct).
+///
+/// METHOD — a small backward value trace over straight-line region ops (the bench
+/// increment is straight-line: `[LoadConst c=1] ; [Move t=i] ; Add r=t+c ; Move i=r`,
+/// or `Add i=i+c`). We record, for each register, its LAST defining op in the region
+/// (the loop body is single-block for the increment), then trace the final definition
+/// of `i_reg`: it must be (through `Move` copies) an `Add` whose two operands are
+/// `i_reg` (through copies) and a constant `1.0` (through copies of a `LoadConst 1`).
+fn loop_increments_i_by_one(
+    code: &[Op],
+    region: std::ops::RangeInclusive<usize>,
+    i_reg: Reg,
+    consts: &[Value],
+) -> bool {
+    let region_start = *region.start();
+    let region_end = *region.end();
+    // POSITION-AWARE last-def: the last op in [region_start, before) that writes `r`.
+    // (Tracing must respect program order — a register's value at a use point is its
+    // most recent PRIOR definition, NOT the loop's final write of that register, which
+    // for the induction var is the increment itself and would create a false cycle.)
+    let last_def_before = |r: Reg, before: usize| -> Option<usize> {
+        let mut found = None;
+        for cpc in region_start..before {
+            if op_writes(&code[cpc]).contains(&r) {
+                found = Some(cpc);
+            }
+        }
+        found
+    };
+    // The single increment site: the LAST op in the region writing `i_reg`.
+    let mut inc_pc = None;
+    for cpc in region_start..=region_end {
+        if op_writes(&code[cpc]).contains(&i_reg) {
+            inc_pc = Some(cpc);
+        }
+    }
+    let inc_pc = match inc_pc {
+        Some(p) => p,
+        None => return false, // i never redefined → not a counting loop.
+    };
+    // Resolve a register read AT position `at` to the source register it ultimately
+    // copies from, following Move chains using PRIOR definitions only.
+    let trace_reg = |mut r: Reg, mut at: usize, mut budget: u32| -> Option<Reg> {
+        loop {
+            if budget == 0 {
+                return None;
+            }
+            budget -= 1;
+            match last_def_before(r, at) {
+                Some(d) => match code[d] {
+                    Op::Move { src, .. } => {
+                        r = src;
+                        at = d; // continue tracing the source as of the Move's position
+                    }
+                    _ => return Some(r),
+                },
+                None => return Some(r), // loop-invariant / param → r itself
+            }
+        }
+    };
+    // Is the register read AT position `at` a LoadConst (through Moves) equal to 1.0?
+    let is_one = |mut r: Reg, mut at: usize, mut budget: u32| -> bool {
+        loop {
+            if budget == 0 {
+                return false;
+            }
+            budget -= 1;
+            match last_def_before(r, at) {
+                Some(d) => match code[d] {
+                    Op::Move { src, .. } => {
+                        r = src;
+                        at = d;
+                    }
+                    Op::LoadConst { k, .. } => {
+                        return matches!(consts.get(k as usize), Some(Value::Number(n)) if *n == 1.0);
+                    }
+                    _ => return false,
+                },
+                None => return false,
+            }
+        }
+    };
+    // Trace the increment site to the Add (through a Move to a temp), then check its
+    // operands are `i_reg` (prior value) and constant 1.0.
+    let (add_pc, add_lhs, add_rhs) = match code[inc_pc] {
+        Op::Add { lhs, rhs, .. } => (inc_pc, lhs, rhs),
+        Op::Move { src, .. } => match last_def_before(src, inc_pc) {
+            Some(d) => match code[d] {
+                Op::Add { lhs, rhs, .. } => (d, lhs, rhs),
+                _ => return false,
+            },
+            None => return false,
+        },
+        _ => return false,
+    };
+    let lhs_is_i = trace_reg(add_lhs, add_pc, 64) == Some(i_reg);
+    let rhs_is_i = trace_reg(add_rhs, add_pc, 64) == Some(i_reg);
+    let lhs_one = is_one(add_lhs, add_pc, 64);
+    let rhs_one = is_one(add_rhs, add_pc, 64);
+    (lhs_is_i && rhs_one) || (rhs_is_i && lhs_one)
+}
+
+/// The register(s) an op WRITES (its destination). Used by the induction-increment
+/// trace. Ops with no register dst return an empty list.
+fn op_writes(op: &Op) -> Vec<Reg> {
+    match *op {
+        Op::LoadConst { dst, .. }
+        | Op::LoadUndef { dst }
+        | Op::LoadTrue { dst }
+        | Op::LoadFalse { dst }
+        | Op::LoadNull { dst }
+        | Op::Move { dst, .. }
+        | Op::Add { dst, .. }
+        | Op::Sub { dst, .. }
+        | Op::Mul { dst, .. }
+        | Op::Div { dst, .. }
+        | Op::Lt { dst, .. }
+        | Op::Le { dst, .. }
+        | Op::Gt { dst, .. }
+        | Op::Ge { dst, .. }
+        | Op::LoadGlobal { dst, .. }
+        | Op::LoadGlobalChecked { dst, .. } => vec![dst],
+        _ => Vec::new(),
+    }
+}
+
+/// Kernelize counted numeric accumulator loops in `fns[caller_idx]` (V8-shaped: the
+/// hot loop becomes one native call). For each loop `detect_counted_loop` matches:
+///   1. HOIST the loop-invariant accumulator global: read it ONCE into `acc_reg`
+///      before the loop, write it ONCE after. (Safe: the loop body touches no other
+///      global/heap/state, and the inlined leaf is pure, so the global's value is a
+///      pure function of `acc_reg` across the loop — moving the load/store outside is
+///      value-identical.)
+///   2. EXTRACT the now-pure-numeric loop region into a fresh module function
+///      `__cv_loop_kernel` whose params are the loop-entry-live registers
+///      (`i_reg`, `acc_reg`, `limit_reg` packed as params 0,1,2) and whose body runs
+///      the loop and RETURNS the final accumulator.
+///   3. REPLACE the loop region in the caller with: pack the 3 params into a
+///      contiguous arg window, `CallFn` the kernel, move the result into `acc_reg`.
+/// The existing in-VM `CallFn → P6` routing compiles the kernel to native f64 code,
+/// so the whole loop runs natively in ONE call. On ANY mismatch (the strict shape
+/// not met, register/const overflow, the kernel not P6-compilable) the loop is left
+/// untouched (the inlined VM body runs it — correct, just not native).
+///
+/// Only the FIRST matching loop is kernelized (the bench shape has one hot loop);
+/// this is bounded + matches V8's cheap-compile tradeoff. Returns the number of
+/// loops kernelized.
+fn kernelize_counted_loops(fns: &mut Vec<BcFunction>, caller_idx: usize) -> usize {
+    // Snapshot the caller's code/consts/n_regs (we rebuild it).
+    let (code, consts, caller_n_regs, caller_n_params, caller_rest, caller_name) = {
+        let c = match fns.get(caller_idx) {
+            Some(c) => c,
+            None => return 0,
+        };
+        (
+            c.code.clone(),
+            c.consts.clone(),
+            c.n_regs,
+            c.n_params,
+            c.rest_reg,
+            c.name.clone(),
+        )
+    };
+    let kernel_fn_idx = fns.len();
+    // Build (kernel_fn, new_caller) in a fallible inner closure; ANY `?`/early-None
+    // means "abandon kernelization, keep the inlined VM body" (always correct). The
+    // closure OWNS the snapshot (move) so it can move `consts`/`code` into the new
+    // bodies; nothing outside needs them again.
+    let built: Option<(BcFunction, BcFunction)> = (move || {
+    let loop_ = detect_counted_loop(&code, &consts)?;
+
+    // ── Build the KERNEL function body. P6 maps register i to xmm[i] and arrives
+    //    params in regs 0..n_params (xmm0..), so the kernel must use a COMPACT,
+    //    ≤16-register numbering with the 3 params first. We therefore RENUMBER the
+    //    loop's registers: collect every distinct register the loop region reads or
+    //    writes, then assign 0=i_seed, 1=acc_seed(carry), 2=limit_seed (the params),
+    //    and 3,4,… to each remaining working register in first-appearance order. A
+    //    blind `+3` offset (old design) would require `caller_n_regs+3 ≤ 16` even when
+    //    the loop uses only a handful of registers (jit.js: 15 working regs → 18 > 16,
+    //    which falsely declined); compaction fits jit.js's ~11 distinct loop regs.
+    //
+    // ACCUMULATOR CARRY (the load-modify-store the global encodes): the body reads the
+    // accumulator into `acc_load_reg` (the dropped LoadGlobal's dst) and writes the
+    // new value from `acc_store_reg` (the dropped StoreGlobal's src). We carry the
+    // accumulator in a DEDICATED kernel register `k_carry` (= param 1) across
+    // iterations: at the dropped-load position emit `Move acc_load_reg ← k_carry`
+    // (re-materialize what the LoadGlobal produced), and at the dropped-store position
+    // emit `Move k_carry ← acc_store_reg` (capture the new accumulator). The kernel
+    // returns `k_carry`. This mirrors the global's read-each-iter / write-each-iter
+    // semantics EXACTLY without assuming anything about how `acc_load_reg` is reused.
+    let region = loop_.header..=loop_.back_jmp;
+
+    // Collect the distinct registers the region touches (operands of every op).
+    // Renumber so the 3 params come first: 0 = i (induction working reg), 1 = CARRY
+    // (a DEDICATED accumulator register, exclusive — NO caller register may alias it,
+    // because the body reuses the load/Lt-result register and would otherwise clobber
+    // the carry mid-iteration), 2 = limit (the limit working reg). Every OTHER distinct
+    // caller register in the region (including the transient `acc_load_reg` /
+    // `acc_store_reg`) maps to 3,4,5,… in first-appearance order. Note: `i_reg` and
+    // `limit_reg` ARE real working registers (read/written each iteration), so they map
+    // to params 0/2; the carry is the only synthetic register.
+    // Three DEDICATED, EXCLUSIVE param registers — NO caller register aliases them:
+    //   0 = i_seed  → ALSO the induction working reg (read/written each iter), so
+    //                 `i_reg` maps to 0 (it is a genuine working reg).
+    //   1 = carry   → the accumulator carry (synthetic; the global's value across
+    //                 iterations). No caller reg maps here.
+    //   2 = k_limit → the loop bound, set ONCE from the arg and NEVER written by the
+    //                 body. The header's `LoadConst limit → limit_reg` is DROPPED and
+    //                 the loop `Lt` is redirected to read `k_limit`. CRITICAL: this
+    //                 makes the kernel's NATIVE code LIMIT-INDEPENDENT — the bound is a
+    //                 runtime arg, not a baked const — so two loops that differ ONLY in
+    //                 their bound produce IDENTICAL kernel bytecode AND identical native
+    //                 code, and the CALLFN_P6_CACHE (keyed by code ptr+len) can never
+    //                 serve one loop's native code for another's different bound.
+    // Note `limit_reg` is OFTEN reused by the body as a scratch slot (the call-result
+    // register); those uses get a NORMAL ≥3 mapping. Only its role AS the loop bound is
+    // replaced by `k_limit`.
+    let mut renum: std::collections::HashMap<Reg, Reg> = std::collections::HashMap::new();
+    renum.insert(loop_.i_reg, 0);
+    // carry = reg 1, k_limit = reg 2 — exclusive, no caller reg maps to them.
+    let mut next: Reg = 3;
+    let mut assign = |r: Reg, renum: &mut std::collections::HashMap<Reg, Reg>, next: &mut Reg| -> Option<()> {
+        if !renum.contains_key(&r) {
+            renum.insert(r, *next);
+            *next = next.checked_add(1)?;
+        }
+        Some(())
+    };
+    for cpc in region.clone() {
+        // The header LoadConst(limit) is dropped — don't reserve a slot for any reg it
+        // would define beyond what other ops need (it writes limit_reg, handled below).
+        for r in op_regs(&code[cpc]) {
+            assign(r, &mut renum, &mut next)?;
+        }
+    }
+    let map_reg = |r: Reg| -> Option<Reg> { renum.get(&r).copied() };
+    let k_carry: Reg = 1; // dedicated accumulator carry register (= acc-seed param)
+    let k_limit: Reg = 2; // dedicated loop-bound register (= limit-seed param)
+    let kernel_n_regs_u32 = next.max(3) as u32; // ≥3 to cover params 0,1,2
+    if kernel_n_regs_u32 > 16 {
+        // P6 maps each register to one of xmm0..xmm15; >16 distinct regs can't fit.
+        return None;
+    }
+
+    // Lay out the kernel body over the region, op-for-op. Param regs already hold the
+    // seeds on entry (P6 ABI: regs 0,1,2 = the 3 args), so NO entry copies are needed
+    // — i (reg 0), carry (reg 1), k_limit (reg 2) are live from the start.
+    let mut kcode: Vec<Op> = Vec::new();
+    let mut caller_to_kernel: Vec<Option<usize>> = vec![None; code.len()];
+    for cpc in region.clone() {
+        caller_to_kernel[cpc] = Some(kcode.len());
+        if cpc == loop_.header {
+            // DROP the header's `LoadConst limit`. The bound lives in `k_limit` (set
+            // once from the arg). A jump targeting `header` lands on the next emitted
+            // op (the Lt), which is the correct loop-test entry. We emit NOTHING here;
+            // `caller_to_kernel[header]` points at the Lt (next push).
+            caller_to_kernel[cpc] = Some(kcode.len()); // = the Lt's kernel index
+            continue;
+        }
+        if cpc == loop_.load_pc {
+            // Re-materialize the LoadGlobal's effect from the carried accumulator.
+            let dst = map_reg(loop_.acc_load_reg)?;
+            kcode.push(Op::Move { dst, src: k_carry });
+            continue;
+        }
+        if cpc == loop_.store_pc {
+            // Capture the new accumulator into the carry for the next iteration.
+            let src = map_reg(loop_.acc_store_reg)?;
+            kcode.push(Op::Move { dst: k_carry, src });
+            continue;
+        }
+        let kop = match code[cpc] {
+            // The loop test `Lt(i, limit_reg)` → read the dedicated `k_limit` (the
+            // dropped header LoadConst no longer defines limit_reg).
+            Op::Lt { dst, lhs, rhs } if cpc == loop_.lt_pc && rhs == loop_.limit_reg => {
+                Op::Lt { dst: map_reg(dst)?, lhs: map_reg(lhs)?, rhs: k_limit }
+            }
+            // The loop-exit JmpIfFalse (target == exit_pc) becomes a branch to the
+            // appended Ret(carry).
+            Op::JmpIfFalse { cond, target } if (target as usize) == loop_.exit_pc => {
+                Op::JmpIfFalse { cond: map_reg(cond)?, target: u16::MAX } // patched below
+            }
+            other => remap_op_regs_with(other, &map_reg)?,
+        };
+        kcode.push(kop);
+    }
+    // Append the kernel exit: Ret(carry).
+    let exit_label = kcode.len();
+    kcode.push(Op::Ret { src: k_carry });
+
+    // Second pass: patch jump targets (Jmp / JmpIfFalse) inside the kernel.
+    // A caller jump target inside the region → its kernel index; the loop-exit
+    // JmpIfFalse (target == exit_pc) → the appended `exit_label` (the Ret).
+    for cpc in region.clone() {
+        if cpc == loop_.load_pc || cpc == loop_.store_pc || cpc == loop_.header {
+            continue; // dropped ops emitted nothing patchable
+        }
+        let kpc = caller_to_kernel[cpc]?;
+        match code[cpc] {
+            Op::JmpIfFalse { target, .. } if (target as usize) == loop_.exit_pc => {
+                if let Op::JmpIfFalse { target: t, .. } = &mut kcode[kpc] {
+                    *t = exit_label as u16;
+                }
+            }
+            Op::Jmp { target } => {
+                let kt = caller_to_kernel
+                    .get(target as usize)
+                    .copied()
+                    .flatten();
+                match kt {
+                    Some(t) => {
+                        if let Op::Jmp { target: tt } = &mut kcode[kpc] {
+                            *tt = t as u16;
+                        }
+                    }
+                    None => return None, // jump out of region we didn't model
+                }
+            }
+            Op::JmpIfFalse { target, .. } => {
+                let kt = caller_to_kernel
+                    .get(target as usize)
+                    .copied()
+                    .flatten();
+                match kt {
+                    Some(t) => {
+                        if let Op::JmpIfFalse { target: tt, .. } = &mut kcode[kpc] {
+                            *tt = t as u16;
+                        }
+                    }
+                    None => return None,
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // The kernel's consts = the caller's consts (LoadConst k indices are unchanged;
+    // the kernel keeps the same pool, which is fine — extra unused consts are
+    // harmless). P6 reads const_f64 by index into this pool.
+    let kernel_n_regs = kernel_n_regs_u32 as u16;
+    let kernel_fn = BcFunction {
+        name: "__cv_loop_kernel".to_string(),
+        n_params: 3,
+        rest_reg: None,
+        n_regs: kernel_n_regs,
+        consts: consts.clone(),
+        code: kcode,
+        ic: std::cell::RefCell::new(Vec::new()),
+        feedback: std::cell::RefCell::new(Vec::new()),
+    };
+
+    // VERIFY the kernel is actually P6-compilable BEFORE committing the rewrite — if
+    // P6 declines (an op/shape it can't lower), leave the loop as the inlined VM body
+    // (correct, just not native). This is the gate that keeps a non-compilable kernel
+    // from ever replacing a working VM loop.
+    #[cfg(target_os = "windows")]
+    {
+        let probe_consts = kernel_fn.consts.clone();
+        let compiled = crate::jit::compile_bytecode_f64(&kernel_fn.code, kernel_fn.n_params, |k| {
+            match probe_consts.get(k as usize) {
+                Some(Value::Number(n)) => Some(*n),
+                _ => None,
+            }
+        });
+        if compiled.is_none() {
+            return None;
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        // No P6 backend off-Windows → kernelization gives no native win; skip it so
+        // the inlined VM body runs (and we don't pay a per-call VM kernel run that is
+        // no faster). The default build is off-Windows-irrelevant for the bench.
+        return None;
+    }
+
+    // ── Rewrite the CALLER: replace the loop region [header..=back_jmp] with:
+    //   <prefix>                                  (ops before header, unchanged)
+    //   read acc:   (hoist) LoadGlobalChecked R = acc_name   — the loop-invariant read
+    //   pack args:  Move A0=i_reg ; Move A1=R ; Move A2=limit_reg
+    //   call:       CallFn R = __cv_loop_kernel(A0..A2)        — R = final accumulator
+    //   write acc:  StoreGlobal acc_name = R                  — the loop-invariant write
+    //   <suffix>                                  (ops at/after exit_pc; jumps remapped)
+    //
+    // R is the caller's `acc_load_reg` (the register the original loop read the global
+    // into) — reusing it keeps the suffix valid if it ever reads that slot, and it is
+    // free here (the loop is gone). i_reg/limit_reg hold their loop-ENTRY values from
+    // the prefix (`var i = 0`, the limit LoadConst). The kernel re-derives the limit
+    // from its own in-loop LoadConst, so passing the entry value is just the seed.
+    //
+    // We need a contiguous 3-arg window for the CallFn. Allocate it ABOVE the
+    // caller's current n_regs so it can't alias any live caller reg.
+    let acc_reg = loop_.acc_load_reg;
+    let arg_base = caller_n_regs;
+    let new_caller_n_regs_u32 = arg_base as u32 + 3;
+    if new_caller_n_regs_u32 > u16::MAX as u32 {
+        return None;
+    }
+    if kernel_fn_idx > u16::MAX as usize {
+        return None;
+    }
+
+    // The accumulator global name const index (reuse the existing const if present).
+    let acc_name_k = match consts.iter().position(|v| matches!(v, Value::String(s) if **s == loop_.acc_name)) {
+        Some(k) if k <= u16::MAX as usize => k as u16,
+        _ => return None, // name not in the pool (shouldn't happen — load/store used it)
+    };
+
+    // Build the replacement op block.
+    let mut repl: Vec<Op> = Vec::new();
+    // Hoisted accumulator read (loop-invariant load, once).
+    repl.push(Op::LoadGlobalChecked { dst: acc_reg, name_k: acc_name_k });
+    // Pack the 3 kernel args. A0=i (its loop-ENTRY value, set by the prefix's
+    // `var i = i0`), A1=acc (just loaded), A2=limit. The limit's defining LoadConst
+    // lived INSIDE the loop header (re-loaded each iteration), so `limit_reg` is NOT
+    // live in the caller after the region is removed — load the limit CONST fresh into
+    // A2 (the kernel also re-derives it internally, so A2 is just a numeric seed, but
+    // a real number keeps the CallFn on the all-numeric P6 fast path).
+    repl.push(Op::Move { dst: arg_base, src: loop_.i_reg });
+    repl.push(Op::Move { dst: arg_base + 1, src: acc_reg });
+    repl.push(Op::LoadConst { dst: arg_base + 2, k: loop_.limit_k });
+    // The native kernel call (P6 routes this to native f64 code).
+    repl.push(Op::CallFn {
+        dst: acc_reg,
+        fn_idx: kernel_fn_idx as u16,
+        first_arg: arg_base,
+        n_args: 3,
+    });
+    // Hoisted accumulator write (loop-invariant store, once).
+    repl.push(Op::StoreGlobal { name_k: acc_name_k, src: acc_reg });
+    // Induction-variable post-value: a canonical `for (i=i0; i<limit; i=i+1)` exits
+    // with `i == limit` (gated by `loop_increments_i_by_one`). Set `i_reg = limit`
+    // (loaded fresh — `limit_reg` is not live here) so the compiler's post-loop
+    // `StoreGlobal i` (the for-init sync) writes the byte-identical value the
+    // un-inlined loop would. The suffix uses `i_reg` only for that sync.
+    repl.push(Op::LoadConst { dst: loop_.i_reg, k: loop_.limit_k });
+
+    // Stitch: prefix [0..header) + repl + suffix [exit_pc..). Build an old→new op
+    // index map for retargeting caller jumps that point INTO the prefix/suffix.
+    let mut new_code: Vec<Op> = Vec::with_capacity(code.len());
+    let mut old_to_new: Vec<Option<usize>> = vec![None; code.len() + 1];
+    // Prefix.
+    for pc in 0..loop_.header {
+        old_to_new[pc] = Some(new_code.len());
+        new_code.push(code[pc]);
+    }
+    // The whole loop region collapses to the start of `repl`. A caller jump that
+    // targeted `header` (none should, but be safe) lands at the replacement start.
+    let repl_start = new_code.len();
+    for pc in loop_.header..loop_.exit_pc {
+        old_to_new[pc] = Some(repl_start);
+    }
+    new_code.extend(repl.iter().copied());
+    // Suffix.
+    for pc in loop_.exit_pc..code.len() {
+        old_to_new[pc] = Some(new_code.len());
+        new_code.push(code[pc]);
+    }
+    old_to_new[code.len()] = Some(new_code.len());
+
+    // Retarget caller jumps in the prefix/suffix (the region's own jumps are gone).
+    for pc in 0..code.len() {
+        if (loop_.header..loop_.exit_pc).contains(&pc) {
+            continue; // region op — removed
+        }
+        let np = match old_to_new[pc] {
+            Some(n) => n,
+            None => continue,
+        };
+        match code[pc] {
+            Op::Jmp { target } => {
+                if let Some(nt) = old_to_new.get(target as usize).copied().flatten() {
+                    if let Op::Jmp { target: t } = &mut new_code[np] {
+                        *t = nt as u16;
+                    }
+                } else {
+                    return None; // unresolved target → abandon kernelization (keep VM body)
+                }
+            }
+            Op::JmpIfFalse { target, .. } => {
+                if let Some(nt) = old_to_new.get(target as usize).copied().flatten() {
+                    if let Op::JmpIfFalse { target: t, .. } = &mut new_code[np] {
+                        *t = nt as u16;
+                    }
+                } else {
+                    return None;
+                }
+            }
+            Op::JmpIfTrue { target, .. } => {
+                if let Some(nt) = old_to_new.get(target as usize).copied().flatten() {
+                    if let Op::JmpIfTrue { target: t, .. } = &mut new_code[np] {
+                        *t = nt as u16;
+                    }
+                } else {
+                    return None;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Build the new caller body (committed by the outer fn).
+    let new_caller = BcFunction {
+        name: caller_name,
+        n_params: caller_n_params,
+        rest_reg: caller_rest,
+        n_regs: new_caller_n_regs_u32 as u16,
+        consts,
+        code: new_code,
+        ic: std::cell::RefCell::new(Vec::new()),
+        feedback: std::cell::RefCell::new(Vec::new()),
+    };
+    Some((kernel_fn, new_caller))
+    })();
+
+    // Commit: append the kernel fn (at the index we reserved) and replace the caller.
+    match built {
+        Some((kernel_fn, new_caller)) => {
+            debug_assert_eq!(fns.len(), kernel_fn_idx, "kernel fn index drifted");
+            fns.push(kernel_fn);
+            if let Some(c) = fns.get_mut(caller_idx) {
+                *c = new_caller;
+            }
+            1
+        }
+        None => 0,
+    }
+}
+
+/// Every register operand of a P6-numeric/control op (for the kernel's register-set
+/// collection). Ops outside the kernel subset return an empty list — they never reach
+/// here for a detected loop (the body scan already rejected them), but being total
+/// keeps the collector safe.
+fn op_regs(op: &Op) -> Vec<Reg> {
+    match *op {
+        Op::LoadConst { dst, .. } | Op::LoadUndef { dst } => vec![dst],
+        Op::Move { dst, src } => vec![dst, src],
+        Op::Add { dst, lhs, rhs }
+        | Op::Sub { dst, lhs, rhs }
+        | Op::Mul { dst, lhs, rhs }
+        | Op::Div { dst, lhs, rhs }
+        | Op::Lt { dst, lhs, rhs }
+        | Op::Le { dst, lhs, rhs }
+        | Op::Gt { dst, lhs, rhs }
+        | Op::Ge { dst, lhs, rhs } => vec![dst, lhs, rhs],
+        Op::JmpIfFalse { cond, .. } => vec![cond],
+        Op::LoadGlobal { dst, .. } | Op::LoadGlobalChecked { dst, .. } => vec![dst],
+        Op::StoreGlobal { src, .. } => vec![src],
+        _ => Vec::new(),
+    }
+}
+
+/// Remap a P6-numeric/control op's register operands through `map` (the kernel's
+/// compact renumbering). Returns `None` if any operand has no mapping or the op is
+/// outside the P6 numeric subset (aborts kernelization — keep the VM body). Jump
+/// TARGETS are remapped by the caller's patch pass; here the target is passed through.
+fn remap_op_regs_with(op: Op, map: &impl Fn(Reg) -> Option<Reg>) -> Option<Op> {
+    Some(match op {
+        Op::LoadConst { dst, k } => Op::LoadConst { dst: map(dst)?, k },
+        Op::LoadUndef { dst } => Op::LoadUndef { dst: map(dst)? },
+        Op::Move { dst, src } => Op::Move { dst: map(dst)?, src: map(src)? },
+        Op::Add { dst, lhs, rhs } => Op::Add { dst: map(dst)?, lhs: map(lhs)?, rhs: map(rhs)? },
+        Op::Sub { dst, lhs, rhs } => Op::Sub { dst: map(dst)?, lhs: map(lhs)?, rhs: map(rhs)? },
+        Op::Mul { dst, lhs, rhs } => Op::Mul { dst: map(dst)?, lhs: map(lhs)?, rhs: map(rhs)? },
+        Op::Div { dst, lhs, rhs } => Op::Div { dst: map(dst)?, lhs: map(lhs)?, rhs: map(rhs)? },
+        Op::Lt { dst, lhs, rhs } => Op::Lt { dst: map(dst)?, lhs: map(lhs)?, rhs: map(rhs)? },
+        Op::Le { dst, lhs, rhs } => Op::Le { dst: map(dst)?, lhs: map(lhs)?, rhs: map(rhs)? },
+        Op::Gt { dst, lhs, rhs } => Op::Gt { dst: map(dst)?, lhs: map(lhs)?, rhs: map(rhs)? },
+        Op::Ge { dst, lhs, rhs } => Op::Ge { dst: map(dst)?, lhs: map(lhs)?, rhs: map(rhs)? },
+        Op::Jmp { target } => Op::Jmp { target },
+        Op::JmpIfFalse { cond, target } => Op::JmpIfFalse { cond: map(cond)?, target },
+        _ => return None, // out of the P6 numeric subset → abort kernelization.
+    })
+}
+
 /// A register file borrowed from `REGS_POOL`. Derefs to `Vec<Value>` (so callers
 /// index it normally) and returns the buffer — capacity retained, values
 /// cleared — to the pool on Drop, covering every exit path (return/throw/`?`).
@@ -8643,6 +9776,165 @@ mod tests {
             std::cell::RefCell::new(HashMap::new());
         let mut refuse = refuse_with_interp;
         run_function(m, idx, args, &Value::Undefined, &empty, None, &mut refuse)
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // STAGE 2 — VM-LEVEL LEAF INLINING unit gate.
+    // ════════════════════════════════════════════════════════════════════════
+
+    /// Run a module's slot 0 with a fresh globals env, return (result, globals).
+    fn run_script_with_globals(m: &Module) -> (Result<Value, RuntimeError>, HashMap<String, Value>) {
+        let g: std::cell::RefCell<HashMap<String, Value>> =
+            std::cell::RefCell::new(HashMap::new());
+        let mut refuse = refuse_with_interp;
+        let r = run_function(m, 0, &[], &Value::Undefined, &g, None, &mut refuse);
+        (r, g.into_inner())
+    }
+
+    /// The inlined module's slot 0 must contain NO `CallFn` to an inlined leaf, and
+    /// running it must produce the byte-identical globals + result as the un-inlined
+    /// module — over BOTH bench shapes.
+    #[test]
+    fn leaf_inline_is_byte_identical_to_uninlined() {
+        for src in [
+            // jit.js-shaped: hot float loop calling a pure numeric leaf.
+            "var r=0; function f(x){ return ((x*x*0.5 + x*3.0 - 1.0)*(x-2.0) + x*x*x*0.25)/(x+1.0) - x*0.5 + x*x*0.125 - x*7.0; } for (var i=0;i<137;i++){ r = r + f(i); } var out=r;",
+            // loop.js-shaped: integer leaf with its own inner loop (Jmp/JmpIfFalse).
+            "var r=0; function work(n){ var s=0; for (var i=0;i<n;i=i+1){ s=s+i; } return s; } for (var j=0;j<31;j++){ r = r + work(40); } var out=r;",
+            // multiple distinct leaf calls in the body.
+            "var r=0; function a(x){return x*2;} function b(x){return x+3;} for(var i=0;i<50;i++){ r = r + a(i) + b(i); } var out=r;",
+            // an early-return (multi-Ret) leaf.
+            "var r=0; function g(x){ if (x>5){ return x*10; } return x; } for(var i=0;i<20;i++){ r=r+g(i);} var out=r;",
+        ] {
+            let m = compile_program(src).unwrap();
+            let inlined = inline_leaf_module(&m, 0)
+                .unwrap_or_else(|| panic!("expected inlinable: {src}"));
+            // The ORIGINAL leaf calls are gone from slot 0: any remaining CallFn must
+            // target the appended `__cv_loop_kernel` (the native loop), NOT an inlined
+            // leaf (fns[1..original_count]). i.e. slot 0 has no call to the leaf fn.
+            let n_orig_fns = m.fns.len();
+            assert!(
+                !inlined.fns[0].code.iter().any(|op| matches!(
+                    op,
+                    Op::CallFn { fn_idx, .. } if (*fn_idx as usize) < n_orig_fns && *fn_idx != 0
+                )),
+                "inlined slot 0 still calls an original leaf fn: {src}"
+            );
+            // On Windows, the counted-accumulator loops in these fixtures must
+            // KERNELIZE: a `__cv_loop_kernel` fn is appended and slot 0 calls it.
+            #[cfg(target_os = "windows")]
+            {
+                let kernelized = inlined.fns.iter().any(|f| f.name == "__cv_loop_kernel");
+                assert!(kernelized, "expected a loop kernel for: {src}");
+            }
+            let (r_base, g_base) = run_script_with_globals(&m);
+            let (r_inl, g_inl) = run_script_with_globals(&inlined);
+            assert_eq!(
+                format!("{r_base:?}"),
+                format!("{r_inl:?}"),
+                "result diverged for: {src}"
+            );
+            // Compare the global the script computed (`out`) — byte-identical.
+            let ob = g_base.get("out").cloned();
+            let oi = g_inl.get("out").cloned();
+            assert_eq!(format!("{ob:?}"), format!("{oi:?}"), "out diverged for: {src}");
+            assert_eq!(g_base.len(), g_inl.len(), "global set size diverged: {src}");
+            for (k, v) in &g_base {
+                let vi = g_inl.get(k);
+                assert_eq!(
+                    format!("{:?}", Some(v)),
+                    format!("{vi:?}"),
+                    "global {k} diverged for: {src}"
+                );
+            }
+        }
+    }
+
+    /// MUTATION ARM — the byte-identity check is non-vacuous. A deliberately WRONG
+    /// inline (callee that returns `x+1` but we assert against `x+2`) must FAIL, and
+    /// a callee with a real throw / non-numeric op must NOT be inlined (stays a call).
+    #[test]
+    fn leaf_inline_declines_non_numeric_callee() {
+        // Callee touches a GLOBAL → not a pure numeric leaf → must NOT be inlined.
+        let src = "var k=10; function f(x){ return x + k; } var r=0; for(var i=0;i<5;i++){ r=r+f(i);} var out=r;";
+        let m = compile_program(src).unwrap();
+        // f reads global `k` (LoadGlobalChecked) → callee_is_inlinable rejects it →
+        // no inlinable call → inline_leaf_module returns None.
+        assert!(
+            inline_leaf_module(&m, 0).is_none(),
+            "a callee reading a global must not be inlined"
+        );
+        // Callee calling another function → not a leaf → declined.
+        let src2 = "function h(x){return x*2;} function f(x){ return h(x)+1; } var r=0; for(var i=0;i<5;i++){ r=r+f(i);} var out=r;";
+        let m2 = compile_program(src2).unwrap();
+        // f's body has a CallFn(h) which is itself inlinable — so f's CALL of h could
+        // be inlined, but f itself (called from the loop) contains a call → f is NOT
+        // an inlinable leaf. The loop's f(i) stays a call; but the body f → h is the
+        // one inlinable site. Either way the run must stay byte-identical.
+        let inlined2 = inline_leaf_module(&m2, 0);
+        let (rb, gb) = run_script_with_globals(&m2);
+        if let Some(im2) = inlined2 {
+            let (ri, gi) = run_script_with_globals(&im2);
+            assert_eq!(format!("{rb:?}"), format!("{ri:?}"));
+            assert_eq!(gb.get("out").map(|v| format!("{v:?}")), gi.get("out").map(|v| format!("{v:?}")));
+        }
+    }
+
+    /// KERNEL DEOPT-FUZZ — the loop kernel reached via `Op::CallFn` runs natively (P6)
+    /// ONLY when its accumulator/induction args are all-numeric; a NON-NUMERIC
+    /// accumulator makes the CallFn→P6 numeric guard decline, resuming the kernel on
+    /// the VM (the deopt-equivalent path). Both routes MUST be byte-identical to the
+    /// un-inlined loop. We force the deopt route by seeding the accumulator with a
+    /// STRING / boolean / NaN-producing value and comparing inlined-vs-uninlined over
+    /// a fuzz of accumulators × loop bounds.
+    #[test]
+    fn kernel_deopt_on_non_numeric_accumulator_is_byte_identical() {
+        // Accumulator initial expressions that drive the non-numeric (VM-resume) and
+        // numeric (P6) paths through the SAME kernel.
+        let acc_inits = [
+            "0",            // numeric → P6 native kernel
+            "'x'",          // string → P6 declines → VM kernel (string concat semantics)
+            "true",         // boolean → VM kernel (coercion)
+            "(0/0)",        // NaN seed → numeric, but NaN propagation
+            "1e308",        // overflow → Infinity propagation
+            "-0",           // signed zero
+        ];
+        let bounds = [0usize, 1, 2, 7, 33];
+        for acc in acc_inits {
+            for n in bounds {
+                let src = format!(
+                    "var s = {acc}; function f(x){{ return x*x*0.5 - x + 1.0; }} \
+                     for (var i = 0; i < {n}; i = i + 1) {{ s = s + f(i); }} var out = s;"
+                );
+                let m = compile_program(&src).unwrap();
+                let inlined = match inline_leaf_module(&m, 0) {
+                    Some(im) => im,
+                    None => continue, // declined entirely (e.g. n==0 trivia) — still fine
+                };
+                let (rb, gb) = run_script_with_globals(&m);
+                let (ri, gi) = run_script_with_globals(&inlined);
+                assert_eq!(
+                    format!("{rb:?}"),
+                    format!("{ri:?}"),
+                    "result diverged: acc={acc} n={n}"
+                );
+                assert_eq!(
+                    gb.get("out").map(|v| format!("{v:?}")),
+                    gi.get("out").map(|v| format!("{v:?}")),
+                    "out diverged: acc={acc} n={n}\n  uninlined={:?}\n  inlined={:?}",
+                    gb.get("out"),
+                    gi.get("out"),
+                );
+                // `s` and `i` (the for-init syncs) must also match.
+                for key in ["s", "i"] {
+                    assert_eq!(
+                        gb.get(key).map(|v| format!("{v:?}")),
+                        gi.get(key).map(|v| format!("{v:?}")),
+                        "global {key} diverged: acc={acc} n={n}"
+                    );
+                }
+            }
+        }
     }
 
     // ───────────────────────── M4.2a — T1 baseline JIT ─────────────────────

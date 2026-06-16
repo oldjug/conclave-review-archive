@@ -96,7 +96,9 @@ pub mod t4;
 
 pub use ast::{ArrowBody, Expr, ForInit, Stmt, VarDeclarator, VarKind};
 pub use bytecode::{
-    BcFunction, CompileError, Module, Op, RuntimeError, compile_program as bc_compile,
+    BcFunction, CompileError, InlineLeafGuard, Module, Op, RuntimeError,
+    compile_program as bc_compile, inline_leaf_enabled, inline_leaf_module,
+    inline_numeric_leaf_calls, leaf_inline_count, reset_leaf_inline_count,
     run_module as bc_run, run_module_with_globals as bc_run_with_globals,
 };
 pub use ab_oracle::{

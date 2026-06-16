@@ -14165,6 +14165,20 @@ impl Interp {
             Ok(m) => m,
             Err(_) => return None,
         };
+        // ── STAGE 2 — VM-LEVEL LEAF INLINING (V8 JSInlining-shaped; gated
+        // `CV_INLINE_LEAF`, DEFAULT OFF). Splice every monomorphic numeric-leaf
+        // `CallFn` in the script body (slot 0) inline so the hot loop's per-iteration
+        // `f(i)`/`work(n)` call disappears and the callee's arithmetic runs inline on
+        // the VM. The transform is byte-identical to the un-inlined VM (the callee is
+        // a pure numeric leaf — no globals/this/closure/heap/nested-call — so its
+        // spliced body computes the identical Value into the identical register); the
+        // production-faithful A/B oracle proves it. On no inlinable call it returns
+        // `None` and we run the original module unchanged (Stage-1 behavior).
+        let module = if crate::bytecode::inline_leaf_enabled() {
+            crate::bytecode::inline_leaf_module(&module, 0).unwrap_or(module)
+        } else {
+            module
+        };
         // Bind top-level function declarations as REAL globals (tree-walk closures
         // over the global scope), mirroring exec_block's hoisting, so external code
         // can call them and their identity is the one the tree-walker would expose.

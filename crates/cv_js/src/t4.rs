@@ -101,7 +101,7 @@ const INLINE_MAX_CALLEE_OPS: usize = 64;
 /// accepted set — an op the inliner admits but the backend rejects would just make
 /// the fused compile decline (still correct, never wrong), but keeping them aligned
 /// avoids a pointless decline.
-fn op_in_numeric_subset(op: &Op) -> bool {
+pub(crate) fn op_in_numeric_subset(op: &Op) -> bool {
     matches!(
         op,
         Op::LoadConst { .. }
@@ -132,7 +132,7 @@ fn op_in_numeric_subset(op: &Op) -> bool {
 /// have exactly `n_args` params, no rest param, and contain NO call op (so the
 /// inline depth is bounded to 1 — a callee that itself calls would need recursive
 /// inlining + multi-frame deopt translation, deferred). Returns true iff safe.
-fn callee_is_inlinable(callee: &BcFunction, n_args: usize) -> bool {
+pub(crate) fn callee_is_inlinable(callee: &BcFunction, n_args: usize) -> bool {
     if callee.n_params as usize != n_args {
         return false; // arity mismatch — the VM would bind missing/extra args; decline.
     }
@@ -414,7 +414,7 @@ pub fn inline_first_call(_module: &Module, _caller_idx: usize) -> Option<InlineR
 /// target through unchanged and fix it in the patch pass. Only numeric-subset ops
 /// reach here (Ret is handled by the caller). LoadConst's `k` is remapped to the
 /// fused const pool by the caller, not here.
-fn remap_callee_op(op: Op, base: u16) -> Op {
+pub(crate) fn remap_callee_op(op: Op, base: u16) -> Op {
     match op {
         Op::LoadConst { dst, k } => Op::LoadConst { dst: dst + base, k },
         Op::LoadUndef { dst } => Op::LoadUndef { dst: dst + base },
