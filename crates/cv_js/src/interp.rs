@@ -7030,16 +7030,32 @@ impl Interp {
     /// linked). The completion value is discarded (modules have no result).
     fn evaluate_module_body(&mut self, rec: &ModuleRecord) -> Result<(), JsError> {
         let env = rec.env.clone();
-        // Flatten export-declarations + plain statements for hoisting.
-        let stmts: Vec<Stmt> = rec
-            .body
-            .iter()
-            .map(|s| match s {
-                Stmt::Export { decl: Some(d), .. } => (**d).clone(),
-                Stmt::Export { decl: None, .. } | Stmt::Import { .. } => Stmt::Empty,
-                other => other.clone(),
-            })
-            .collect();
+        // Flatten export-declarations + plain statements for hoisting. Each
+        // `export <decl>` contributes its inner declaration AT MODULE LEVEL so
+        // the exported binding lands in the module env (where the export table
+        // points), not a nested scope.
+        //
+        // SPECIAL CASE — `export default function Name(){}` / `export default
+        // class C{}`: the parser wraps the declaration plus its synthetic
+        // `const *default* = Name;` binding in a `Stmt::Block` to keep them
+        // together. If we executed that block as one statement it would create a
+        // CHILD scope, so the `*default*` (and the named binding) would be
+        // invisible to importers (resolve_export points at `rec.env`). Splice
+        // the block's inner statements directly into the module-level list so
+        // they hoist + bind in the module env — matching V8, where a default
+        // HoistableDeclaration binds both `*default*` and its name in the module
+        // environment record (§16.2.1.6.4 InitializeEnvironment).
+        let mut stmts: Vec<Stmt> = Vec::with_capacity(rec.body.len());
+        for s in rec.body.iter() {
+            match s {
+                Stmt::Export { decl: Some(d), .. } => match &**d {
+                    Stmt::Block(inner) => stmts.extend(inner.iter().cloned()),
+                    other => stmts.push(other.clone()),
+                },
+                Stmt::Export { decl: None, .. } | Stmt::Import { .. } => stmts.push(Stmt::Empty),
+                other => stmts.push(other.clone()),
+            }
+        }
         self.hoist_vars_into(&stmts, &env);
         // Hoist top-level function declarations.
         for stmt in &stmts {
@@ -20956,6 +20972,25 @@ impl Interp {
                     captured.push(k.clone());
                 }
             }
+            // ES MODULE LIVE IMPORT BINDINGS (§16.2.1.4.2 CreateImportBinding):
+            // an imported name lives in the module env's `import_links`, NOT its
+            // `bindings`. V8 treats module imports as bindings of the module
+            // Environment Record visible to nested functions (SourceTextModule
+            // InitializeEnvironment), so a function body that references an
+            // import must capture it as an UPVALUE — otherwise the VM compiles
+            // the free reference to a `LoadGlobalChecked` and throws
+            // "ReferenceError: <name> is not defined". The upvalue VALUE is
+            // resolved later via `scope_get(&f.closure, name)`, which follows the
+            // import link to the exporter's live binding — so the captured value
+            // is the current export value at call time (live across calls). This
+            // is the keystone that makes `CV_MODULE_GRAPH` correct for real
+            // bundler output, where imported functions/values are referenced
+            // deep inside module-scope function bodies.
+            for k in b.import_links.keys() {
+                if seen.insert(k.clone()) {
+                    captured.push(k.clone());
+                }
+            }
             cur = b.parent.clone();
         }
         // Arrow lexical `this`: the compiler emits LoadUp("__lexical_this") for
@@ -27176,6 +27211,101 @@ log(probe());
             "a.js",
         );
         assert_eq!(out, vec!["hi x"]);
+    }
+
+    #[test]
+    fn module_named_default_function_export_and_mixed_import() {
+        // `export default function Name(){}` (a NAMED default HoistableDeclaration)
+        // plus a named export, consumed in ONE `import Def, { Named } from`
+        // statement — the exact shape webpack/Vite emit. The parser wraps the
+        // declaration + its synthetic `*default*` binding in a Block;
+        // `evaluate_module_body` must splice that block into the MODULE scope so
+        // both `*default*` and the named export resolve for importers (§16.2.1.6.4
+        // InitializeEnvironment; matches V8 default HoistableDeclaration binding).
+        let out = run_module_files(
+            &[
+                (
+                    "index.js",
+                    "import makeLogger, { LEVEL } from './logger.js'; \
+                     const log = makeLogger('app'); \
+                     console.log(log('hi') + ' lvl=' + LEVEL);",
+                ),
+                (
+                    "logger.js",
+                    "export const LEVEL = 'info'; \
+                     export default function makeLogger(tag){ \
+                       return function(msg){ return '[' + tag + '] ' + msg; }; \
+                     }",
+                ),
+            ],
+            "index.js",
+        );
+        assert_eq!(out, vec!["[app] hi lvl=info"]);
+    }
+
+    #[test]
+    fn module_named_default_function_is_callable_within_own_module() {
+        // The named default function must ALSO be callable by its own name
+        // inside the defining module (it binds both `*default*` AND `Name`).
+        let out = run_module_files(
+            &[(
+                "m.js",
+                "export default function square(n){ return n * n; } \
+                 console.log('sq=' + square(5));",
+            )],
+            "m.js",
+        );
+        assert_eq!(out, vec!["sq=25"]);
+    }
+
+    #[test]
+    fn module_cyclic_function_exports_resolve() {
+        // Mutually-recursive function exports across a cycle (even <-> odd).
+        // Both modules' function decls must be hoisted into their module envs
+        // before either body runs the recursion, so the cross-module imported
+        // function names resolve. (Distinct from `module_cycle_terminates`,
+        // which only checks the cycle does not infinite-loop with const exports.)
+        let out = run_module_files(
+            &[
+                (
+                    "even.js",
+                    "import { isOdd } from './odd.js'; \
+                     export function isEven(n){ return n === 0 ? true : isOdd(n - 1); } \
+                     console.log('isEven(4)=' + isEven(4));",
+                ),
+                (
+                    "odd.js",
+                    "import { isEven } from './even.js'; \
+                     export function isOdd(n){ return n === 0 ? false : isEven(n - 1); }",
+                ),
+            ],
+            "even.js",
+        );
+        assert_eq!(out, vec!["isEven(4)=true"]);
+    }
+
+    #[test]
+    fn module_named_default_class_export_and_import() {
+        // The class analogue of the above: `export default class C {}` consumed
+        // by a default import in another module.
+        let out = run_module_files(
+            &[
+                (
+                    "app.js",
+                    "import Widget from './widget.js'; \
+                     const w = new Widget(3); console.log('area=' + w.area());",
+                ),
+                (
+                    "widget.js",
+                    "export default class Widget { \
+                       constructor(s){ this.s = s; } \
+                       area(){ return this.s * this.s; } \
+                     }",
+                ),
+            ],
+            "app.js",
+        );
+        assert_eq!(out, vec!["area=9"]);
     }
 
     #[test]
