@@ -38403,129 +38403,69 @@ fn make_live_html_collection(
     by_tag: bool,
     query: String,
 ) -> cv_js::Value {
-    use std::cell::RefCell;
-    use std::rc::Rc;
-    use cv_js::{native_fn, Value};
-
-    let get_trap = {
-        let table = table.clone();
-        let query = query.clone();
-        native_fn("get", move |args| {
-            let prop = args
-                .get(1)
-                .map(|v| v.to_display_string())
-                .unwrap_or_default();
-
-            // Re-query the element table for live results.
-            let matches: Vec<Value> = {
-                let t = table.borrow();
-                if by_tag {
-                    let q = query.to_ascii_lowercase();
-                    t.all
-                        .iter()
-                        .filter(|r| q == "*" || r.tag.eq_ignore_ascii_case(&q))
-                        .map(|r| r.js.clone())
-                        .collect()
-                } else {
-                    let qc: Vec<&str> = query.split_whitespace().collect();
-                    t.all
-                        .iter()
-                        .filter(|r| {
-                            !qc.is_empty()
-                                && qc.iter().all(|c| r.classes.iter().any(|k| k == c))
-                        })
-                        .map(|r| r.js.clone())
-                        .collect()
-                }
+    use cv_js::Value;
+    // A live supplier re-queries on EVERY access (WHATWG DOM §4.2.10.2 "represent
+    // a live view") — the legacy-platform-object machinery in cv_js drives the
+    // indexed/named getters, length, item, namedItem, @@iterator, ownKeys,
+    // descriptors, and [[Set]]/[[Delete]]/[[Define]] refusal over this list
+    // (WebIDL §3.9). We scan the LIVE document in tree order so dynamically
+    // created+appended elements (createElement + appendChild) are included and
+    // removed elements drop out — not just the parse-time static table.
+    let supplier = move || -> Vec<Value> {
+        let t = table.borrow();
+        let mut out: Vec<Value> = Vec::new();
+        // Predicate over a record's (tag, classes).
+        let q_lc = query.to_ascii_lowercase();
+        let qc: Vec<String> = query.split_whitespace().map(|s| s.to_string()).collect();
+        // 1. Static parse-time element table (document order).
+        for r in t.all.iter() {
+            let hit = if by_tag {
+                q_lc == "*" || r.tag.eq_ignore_ascii_case(&q_lc)
+            } else {
+                !qc.is_empty() && qc.iter().all(|c| r.classes.iter().any(|k| k == c))
             };
-
-            match prop.as_str() {
-                "length" => Ok(Value::Number(matches.len() as f64)),
-                "item" => {
-                    let m = matches;
-                    Ok(native_fn("item", move |a| {
-                        let idx =
-                            a.first().map(|v| v.to_number() as usize).unwrap_or(0);
-                        Ok(m.get(idx).cloned().unwrap_or(Value::Null))
-                    }))
-                }
-                "namedItem" => {
-                    let m = matches;
-                    Ok(native_fn("namedItem", move |a| {
-                        let name = a
-                            .first()
-                            .map(|v| v.to_display_string())
-                            .unwrap_or_default();
-                        for el in &m {
-                            if let Value::Object(o) = el {
-                                let map = o.borrow();
-                                if matches!(map.get("id"), Some(Value::String(s)) if &**s == name.as_str()) {
-                                    return Ok(el.clone());
-                                }
-                                if matches!(map.get("name"), Some(Value::String(s)) if &**s == name.as_str()) {
-                                    return Ok(el.clone());
-                                }
-                            }
-                        }
-                        Ok(Value::Null)
-                    }))
-                }
-                "@@sym:Symbol.iterator" => {
-                    let m = matches;
-                    Ok(native_fn("[Symbol.iterator]", move |_| {
-                        let items = m.clone();
-                        let idx = Rc::new(RefCell::new(0usize));
-                        let next_fn = {
-                            let idx = idx.clone();
-                            let items = items.clone();
-                            native_fn("next", move |_| {
-                                let i = *idx.borrow();
-                                if i < items.len() {
-                                    *idx.borrow_mut() = i + 1;
-                                    let mut r = cv_js::OrderedMap::new();
-                                    r.insert("value".into(), items[i].clone());
-                                    r.insert("done".into(), Value::Bool(false));
-                                    Ok(Value::Object(Rc::new(RefCell::new(r))))
-                                } else {
-                                    let mut r = cv_js::OrderedMap::new();
-                                    r.insert("value".into(), Value::Undefined);
-                                    r.insert("done".into(), Value::Bool(true));
-                                    Ok(Value::Object(Rc::new(RefCell::new(r))))
-                                }
-                            })
-                        };
-                        let mut iter = cv_js::OrderedMap::new();
-                        iter.insert("next".into(), next_fn);
-                        Ok(Value::Object(Rc::new(RefCell::new(iter))))
-                    }))
-                }
-                _ => {
-                    // Numeric index.
-                    if let Ok(idx) = prop.parse::<usize>() {
-                        Ok(matches.get(idx).cloned().unwrap_or(Value::Undefined))
-                    } else {
-                        Ok(Value::Undefined)
-                    }
-                }
+            if hit {
+                out.push(r.js.clone());
             }
-        })
+        }
+        // 2. Live JS DOM (dynamically created+appended elements not in the
+        //    static table). Combined + deduped exactly like querySelectorAll.
+        let roots = live_document_roots(&t);
+        let records = build_live_element_snapshot(&roots);
+        for r in records.iter() {
+            let hit = if by_tag {
+                q_lc == "*" || r.tag.eq_ignore_ascii_case(&q_lc)
+            } else {
+                !qc.is_empty() && qc.iter().all(|c| r.classes.iter().any(|k| k == c))
+            };
+            if hit {
+                out.push(r.js.clone());
+            }
+        }
+        dedup_by_identity(&mut out);
+        out
     };
+    cv_js::make_legacy_collection(supplier, "HTMLCollection")
+}
 
-    let mut handler = cv_js::OrderedMap::new();
-    handler.insert("get".into(), get_trap);
+/// Build a live `NodeList` (WebIDL legacy platform object, no named getter) from
+/// a supplier closure. Used by `document.getElementsByName` (WHATWG HTML returns
+/// a live NodeList) and any live NodeList surface.
+fn make_live_node_list<F>(supplier: F) -> cv_js::Value
+where
+    F: Fn() -> Vec<cv_js::Value> + 'static,
+{
+    cv_js::make_legacy_collection(supplier, "NodeList")
+}
 
-    let mut proxy_map = cv_js::OrderedMap::new();
-    proxy_map.insert("_isProxy".into(), Value::Bool(true));
-    proxy_map.insert(
-        "_target".into(),
-        Value::Object(Rc::new(RefCell::new(cv_js::OrderedMap::new()))),
-    );
-    proxy_map.insert(
-        "_handler".into(),
-        Value::Object(Rc::new(RefCell::new(handler))),
-    );
-
-    Value::Object(Rc::new(RefCell::new(proxy_map)))
+/// Build a live `HTMLCollection` from an arbitrary supplier closure (for
+/// element-subtree queries / NS queries that don't fit the tag/class table
+/// filter). The supplier is re-run on every access for live semantics.
+fn make_live_html_collection_from<F>(supplier: F) -> cv_js::Value
+where
+    F: Fn() -> Vec<cv_js::Value> + 'static,
+{
+    cv_js::make_legacy_collection(supplier, "HTMLCollection")
 }
 
 /// Phase-0 (Chrome-parity roadmap) bridge: build a real arena DOM
@@ -47737,6 +47677,56 @@ fn install_dom_api(
         Ok(make_live_html_collection(t_for_class.clone(), false, raw))
     });
 
+    // getElementsByTagNameNS(namespace, localName) — WHATWG DOM §4.5. Returns a
+    // LIVE HTMLCollection of descendant elements matching (namespace, localName)
+    // with the wildcard rules ("*" = any; "" = null namespace).
+    let t_for_tagns = table.clone();
+    let get_elements_by_tag_name_ns_doc =
+        cv_js::native_fn("getElementsByTagNameNS", move |args| {
+            let ns_raw = ns_arg_to_option(args.first());
+            let ln = args.get(1).map(|v| v.to_display_string()).unwrap_or_default();
+            let ns_any = ns_raw.as_deref() == Some("*");
+            let want_ns: Option<String> = match ns_raw {
+                Some(s) if s == "*" => None,
+                Some(s) if s.is_empty() => None,
+                other => other,
+            };
+            let ln_any = ln == "*";
+            let table = t_for_tagns.clone();
+            let supplier = move || -> Vec<cv_js::Value> {
+                let t = table.borrow();
+                t.all
+                    .iter()
+                    .filter(|rec| {
+                        let cv_js::Value::Object(o) = &rec.js else {
+                            return false;
+                        };
+                        let b = o.borrow();
+                        if !ln_any {
+                            let el_ln = b
+                                .get("localName")
+                                .map(|x| x.to_display_string())
+                                .or_else(|| b.get("_tag").map(|x| x.to_display_string()))
+                                .unwrap_or_else(|| rec.tag.clone());
+                            if el_ln != ln {
+                                return false;
+                            }
+                        }
+                        if ns_any {
+                            return true;
+                        }
+                        let el_ns = match b.get("namespaceURI") {
+                            Some(cv_js::Value::Null) | Some(cv_js::Value::Undefined) | None => None,
+                            Some(x) => Some(x.to_display_string()),
+                        };
+                        el_ns == want_ns
+                    })
+                    .map(|rec| rec.js.clone())
+                    .collect()
+            };
+            Ok(make_live_html_collection_from(supplier))
+        });
+
     // getElementsByName — elements whose `name` attribute matches. React's
     // ScrollAndFocusHandler uses `document.getElementsByName(hash)[0]` for
     // hash navigation; without it that threw and crashed the component.
@@ -47748,10 +47738,16 @@ fn install_dom_api(
             .first()
             .map(|v| v.to_display_string())
             .unwrap_or_default();
-        let t = t_for_name.borrow();
-        let mut out: Vec<cv_js::Value> = Vec::new();
-        if !wanted.is_empty() {
-            // First: scan the static parse-time element table.
+        // WHATWG HTML §3.1.5: getElementsByName returns a LIVE NodeList of the
+        // elements with a matching `name` attribute. Re-query on every access.
+        let table = t_for_name.clone();
+        let supplier = move || -> Vec<cv_js::Value> {
+            let t = table.borrow();
+            let mut out: Vec<cv_js::Value> = Vec::new();
+            if wanted.is_empty() {
+                return out;
+            }
+            // Static parse-time element table.
             for rec in t.all.iter() {
                 if rec
                     .original_attrs
@@ -47761,8 +47757,7 @@ fn install_dom_api(
                     out.push(rec.js.clone());
                 }
             }
-            // Second: scan the live JS DOM for dynamically created elements that
-            // were not in the static table (added via createElement + appendChild).
+            // Live JS DOM for dynamically created+appended elements.
             let roots = live_document_roots(&t);
             let live_records = build_live_element_snapshot(&roots);
             for live_rec in &live_records {
@@ -47775,10 +47770,9 @@ fn install_dom_api(
                 }
             }
             dedup_by_identity(&mut out);
-        }
-        Ok(cv_js::Value::Array(std::rc::Rc::new(
-            std::cell::RefCell::new(out),
-        )))
+            out
+        };
+        Ok(make_live_node_list(supplier))
     });
 
     // createElement + per-element appendChild.
@@ -49077,34 +49071,36 @@ fn install_dom_api(
                         .split_ascii_whitespace()
                         .map(|s| s.to_string())
                         .collect();
-                    let t = table_for_subtree_class.borrow();
-                    let mut out: Vec<cv_js::Value> = Vec::new();
-                    if wanted.is_empty() {
-                        return Ok(cv_js::Value::Array(std::rc::Rc::new(
-                            std::cell::RefCell::new(out),
-                        )));
-                    }
-                    for rec in t.all.iter() {
-                        if rec.path.len() <= path_for_subtree_class.len()
-                            || !rec.path.starts_with(&path_for_subtree_class)
-                        {
-                            continue;
+                    // Live HTMLCollection over this element's subtree (WHATWG DOM
+                    // §4.5) — re-query on every access (static table descendants +
+                    // live JS descendants, deduped).
+                    let table = table_for_subtree_class.clone();
+                    let path = path_for_subtree_class.clone();
+                    let self_js = self_js_for_subtree_class.clone();
+                    let supplier = move || -> Vec<cv_js::Value> {
+                        let mut out: Vec<cv_js::Value> = Vec::new();
+                        if wanted.is_empty() {
+                            return out;
                         }
-                        if wanted.iter().all(|w| rec.classes.iter().any(|c| c == w)) {
-                            out.push(rec.js.clone());
+                        let t = table.borrow();
+                        for rec in t.all.iter() {
+                            if rec.path.len() <= path.len() || !rec.path.starts_with(&path) {
+                                continue;
+                            }
+                            if wanted.iter().all(|w| rec.classes.iter().any(|c| c == w)) {
+                                out.push(rec.js.clone());
+                            }
                         }
-                    }
-                    let live = build_live_element_snapshot(std::slice::from_ref(
-                        &self_js_for_subtree_class,
-                    ));
-                    for rec in live.into_iter().skip(1) {
-                        if wanted.iter().all(|w| rec.classes.iter().any(|c| c == w)) {
-                            out.push(rec.js);
+                        let live = build_live_element_snapshot(std::slice::from_ref(&self_js));
+                        for rec in live.into_iter().skip(1) {
+                            if wanted.iter().all(|w| rec.classes.iter().any(|c| c == w)) {
+                                out.push(rec.js);
+                            }
                         }
-                    }
-                    Ok(cv_js::Value::Array(std::rc::Rc::new(
-                        std::cell::RefCell::new(out),
-                    )))
+                        dedup_by_identity(&mut out);
+                        out
+                    };
+                    Ok(make_live_html_collection_from(supplier))
                 });
 
             let table_for_subtree_tag = table.clone();
@@ -49116,29 +49112,94 @@ fn install_dom_api(
                         .first()
                         .map(|v| v.to_display_string())
                         .unwrap_or_default();
-                    let all_tags = wanted == "*";
-                    let t = table_for_subtree_tag.borrow();
-                    let mut out: Vec<cv_js::Value> = Vec::new();
-                    for rec in t.all.iter() {
-                        if rec.path.len() <= path_for_subtree_tag.len()
-                            || !rec.path.starts_with(&path_for_subtree_tag)
-                        {
-                            continue;
+                    let table = table_for_subtree_tag.clone();
+                    let path = path_for_subtree_tag.clone();
+                    let self_js = self_js_for_subtree_tag.clone();
+                    let supplier = move || -> Vec<cv_js::Value> {
+                        let all_tags = wanted == "*";
+                        let t = table.borrow();
+                        let mut out: Vec<cv_js::Value> = Vec::new();
+                        for rec in t.all.iter() {
+                            if rec.path.len() <= path.len() || !rec.path.starts_with(&path) {
+                                continue;
+                            }
+                            if all_tags || rec.tag.eq_ignore_ascii_case(&wanted) {
+                                out.push(rec.js.clone());
+                            }
                         }
-                        if all_tags || rec.tag.eq_ignore_ascii_case(&wanted) {
-                            out.push(rec.js.clone());
+                        let live = build_live_element_snapshot(std::slice::from_ref(&self_js));
+                        for rec in live.into_iter().skip(1) {
+                            if all_tags || rec.tag.eq_ignore_ascii_case(&wanted) {
+                                out.push(rec.js);
+                            }
                         }
-                    }
-                    let live =
-                        build_live_element_snapshot(std::slice::from_ref(&self_js_for_subtree_tag));
-                    for rec in live.into_iter().skip(1) {
-                        if all_tags || rec.tag.eq_ignore_ascii_case(&wanted) {
-                            out.push(rec.js);
+                        dedup_by_identity(&mut out);
+                        out
+                    };
+                    Ok(make_live_html_collection_from(supplier))
+                });
+
+            // Subtree getElementsByTagNameNS — live HTMLCollection (WHATWG DOM §4.5).
+            let table_for_subtree_tagns = table.clone();
+            let path_for_subtree_tagns = rec.path.clone();
+            let self_js_for_subtree_tagns = rec.js.clone();
+            let get_elements_by_tag_name_ns_subtree =
+                cv_js::native_fn("getElementsByTagNameNS", move |args| {
+                    let ns_raw = ns_arg_to_option(args.first());
+                    let ln = args.get(1).map(|v| v.to_display_string()).unwrap_or_default();
+                    let ns_any = ns_raw.as_deref() == Some("*");
+                    let want_ns: Option<String> = match ns_raw {
+                        Some(s) if s == "*" => None,
+                        Some(s) if s.is_empty() => None,
+                        other => other,
+                    };
+                    let ln_any = ln == "*";
+                    let table = table_for_subtree_tagns.clone();
+                    let path = path_for_subtree_tagns.clone();
+                    let self_js = self_js_for_subtree_tagns.clone();
+                    let match_rec = move |js: &cv_js::Value, tag: &str| -> bool {
+                        let cv_js::Value::Object(o) = js else { return false };
+                        let b = o.borrow();
+                        if !ln_any {
+                            let el_ln = b
+                                .get("localName")
+                                .map(|x| x.to_display_string())
+                                .or_else(|| b.get("_tag").map(|x| x.to_display_string()))
+                                .unwrap_or_else(|| tag.to_string());
+                            if el_ln != ln {
+                                return false;
+                            }
                         }
-                    }
-                    Ok(cv_js::Value::Array(std::rc::Rc::new(
-                        std::cell::RefCell::new(out),
-                    )))
+                        if ns_any {
+                            return true;
+                        }
+                        let el_ns = match b.get("namespaceURI") {
+                            Some(cv_js::Value::Null) | Some(cv_js::Value::Undefined) | None => None,
+                            Some(x) => Some(x.to_display_string()),
+                        };
+                        el_ns == want_ns
+                    };
+                    let supplier = move || -> Vec<cv_js::Value> {
+                        let t = table.borrow();
+                        let mut out: Vec<cv_js::Value> = Vec::new();
+                        for rec in t.all.iter() {
+                            if rec.path.len() <= path.len() || !rec.path.starts_with(&path) {
+                                continue;
+                            }
+                            if match_rec(&rec.js, &rec.tag) {
+                                out.push(rec.js.clone());
+                            }
+                        }
+                        let live = build_live_element_snapshot(std::slice::from_ref(&self_js));
+                        for rec in live.into_iter().skip(1) {
+                            if match_rec(&rec.js, &rec.tag) {
+                                out.push(rec.js);
+                            }
+                        }
+                        dedup_by_identity(&mut out);
+                        out
+                    };
+                    Ok(make_live_html_collection_from(supplier))
                 });
 
             // nextElementSibling / previousElementSibling — walk the
@@ -49433,6 +49494,10 @@ fn install_dom_api(
                 m.insert(
                     "getElementsByTagName".into(),
                     get_elements_by_tag_name_subtree,
+                );
+                m.insert(
+                    "getElementsByTagNameNS".into(),
+                    get_elements_by_tag_name_ns_subtree,
                 );
                 m.insert("remove".into(), remove_self);
                 // Node interface basics — production code branches on these.
@@ -49748,6 +49813,10 @@ fn install_dom_api(
         m.insert("querySelectorAll".into(), query_selector_all);
         m.insert("getElementsByTagName".into(), get_elements_by_tag_name);
         m.insert("getElementsByClassName".into(), get_elements_by_class_name);
+        m.insert(
+            "getElementsByTagNameNS".into(),
+            get_elements_by_tag_name_ns_doc,
+        );
         m.insert("getElementsByName".into(), get_elements_by_name);
         m.insert("createElement".into(), create_element);
         m.insert("createElementNS".into(), create_element_ns);

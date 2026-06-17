@@ -396,6 +396,7 @@ pub fn inline_first_call(module: &Module, caller_idx: usize) -> Option<InlineRes
         code: fused,
         ic: std::cell::RefCell::new(Vec::new()),
         feedback: std::cell::RefCell::new(Vec::new()),
+        strict: caller.strict,
     };
     Some(InlineResult {
         fused: fused_fn,

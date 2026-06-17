@@ -785,6 +785,12 @@ pub struct BcFunction {
     /// warms across calls; `RefCell` for the same interior-mutability reason as
     /// `ic`. (P5 will serialize it alongside the persisted `PropIc`.)
     pub feedback: std::cell::RefCell<Vec<crate::feedback::TypeFeedback>>,
+    /// True iff this function's body opens with a `"use strict"` directive
+    /// prologue (ECMA-262 §11.2.1). The VM pushes a strict-mode frame around the
+    /// body so refusal-throws (legacy-platform-object [[Set]]/[[Delete]], writes
+    /// to non-writable props) match sloppy/strict semantics. Set at compile time
+    /// where the AST body is available; `false` for placeholders/top-level.
+    pub strict: bool,
 }
 
 impl BcFunction {
@@ -896,6 +902,8 @@ pub fn compile_program(source: &str) -> Result<Module, CompileError> {
         code: Vec::new(),
         ic: std::cell::RefCell::new(Vec::new()),
         feedback: std::cell::RefCell::new(Vec::new()),
+
+        strict: false,
     };
     for _ in 0..=declared.len() {
         fns_pool.borrow_mut().push(placeholder.clone());
@@ -973,6 +981,8 @@ pub fn compile_single_function_arrow(
         code: Vec::new(),
         ic: std::cell::RefCell::new(Vec::new()),
         feedback: std::cell::RefCell::new(Vec::new()),
+
+        strict: false,
     });
     let parent_locals: HashMap<String, Reg> =
         captured_names.iter().map(|n| (n.clone(), 0u16)).collect();
@@ -1373,6 +1383,8 @@ fn compile_function(
             code: c.code,
             ic: std::cell::RefCell::new(Vec::new()),
         feedback: std::cell::RefCell::new(Vec::new()),
+
+        strict: crate::interp::body_is_strict(body),
         },
         uvs,
         script_forinit_syncs,
@@ -1886,6 +1898,8 @@ impl<'a> FnCompiler<'a> {
                         code: Vec::new(),
                         ic: std::cell::RefCell::new(Vec::new()),
         feedback: std::cell::RefCell::new(Vec::new()),
+
+        strict: false,
                     });
                     idx
                 };
@@ -2631,6 +2645,8 @@ impl<'a> FnCompiler<'a> {
                         code: Vec::new(),
                         ic: std::cell::RefCell::new(Vec::new()),
         feedback: std::cell::RefCell::new(Vec::new()),
+
+        strict: false,
                     });
                     idx
                 };
@@ -2667,6 +2683,8 @@ impl<'a> FnCompiler<'a> {
                         code: Vec::new(),
                         ic: std::cell::RefCell::new(Vec::new()),
         feedback: std::cell::RefCell::new(Vec::new()),
+
+        strict: false,
                     });
                     idx
                 };
@@ -3362,6 +3380,8 @@ impl<'a> FnCompiler<'a> {
                         code: Vec::new(),
                         ic: std::cell::RefCell::new(Vec::new()),
         feedback: std::cell::RefCell::new(Vec::new()),
+
+        strict: false,
                     });
                     idx
                 };
@@ -3402,6 +3422,8 @@ impl<'a> FnCompiler<'a> {
                         code: Vec::new(),
                         ic: std::cell::RefCell::new(Vec::new()),
         feedback: std::cell::RefCell::new(Vec::new()),
+
+        strict: false,
                     });
                     idx
                 };
@@ -4460,6 +4482,8 @@ pub fn inline_numeric_leaf_calls(module: &Module, caller_idx: usize) -> Option<B
         code: fused,
         ic: std::cell::RefCell::new(Vec::new()),
         feedback: std::cell::RefCell::new(Vec::new()),
+
+        strict: false,
     })
 }
 
@@ -5047,6 +5071,8 @@ fn kernelize_counted_loops(fns: &mut Vec<BcFunction>, caller_idx: usize) -> usiz
         code: kcode,
         ic: std::cell::RefCell::new(Vec::new()),
         feedback: std::cell::RefCell::new(Vec::new()),
+
+        strict: false,
     };
 
     // VERIFY the kernel is actually P6-compilable BEFORE committing the rewrite — if
@@ -5209,6 +5235,8 @@ fn kernelize_counted_loops(fns: &mut Vec<BcFunction>, caller_idx: usize) -> usiz
         code: new_code,
         ic: std::cell::RefCell::new(Vec::new()),
         feedback: std::cell::RefCell::new(Vec::new()),
+
+        strict: false,
     };
     Some((kernel_fn, new_caller))
     })();
@@ -8409,12 +8437,19 @@ fn run_function(
             regs[ri] = Value::Array(std::rc::Rc::new(std::cell::RefCell::new(rest)));
         }
     }
+    // Strict-mode frame: a `"use strict"` function runs strict (and a function
+    // declared inside strict code inherits it). Pushed around the body so a
+    // refused legacy-platform-object [[Set]]/[[Delete]] throws in strict mode
+    // (the host hooks read `strict_mode_active`). Popped on EVERY exit.
+    let strict_here = f.strict || crate::interp::strict_mode_active();
+    crate::interp::push_strict_frame(strict_here);
     // Seed the register file, then run the interpreter loop from ip=0 (the
     // arg/rest binding above is the only entry-specific setup). The loop body
     // itself lives in `run_function_inner` so the T2 deopt path can RESUME the
     // VM mid-function at an arbitrary `bc_pc` over a reconstructed register file
     // — see T2 Phase 5. For the ip=0 entry this is a pure no-op refactor.
     let result = run_function_inner(module, fn_idx, this, globals, closure, dispatch, &mut regs, 0);
+    crate::interp::pop_strict_frame();
     // SCRIPT FRAME throw-time global flush. A top-level `for (var i = …)` init
     // var is kept in a fast LOCAL register for the hot loop and only synced to its
     // (function-scoped, i.e. global) binding by a post-loop `StoreGlobal`. On a
@@ -9285,10 +9320,12 @@ fn run_function_inner(
                     if is_proxy_val(&recv)
                         || slot_is_accessor(&recv, &key)
                         || crate::interp::value_has_attrs(&recv)
+                        || crate::interp::is_legacy_collection(&recv)
                     {
                         // Route to the host so a Proxy `set` trap fires, a `set x()`
-                        // accessor runs, OR the OrdinarySet write-guard applies for
-                        // a descriptor-aware object (raw property_store would
+                        // accessor runs, a legacy-platform-object [[Set]] refusal
+                        // applies, OR the OrdinarySet write-guard applies for a
+                        // descriptor-aware object (raw property_store would
                         // overwrite either / bypass the writable check).
                         let setter = globals.borrow().get("__tb_host_setprop").cloned();
                         if let Some(g @ Value::NativeFunction(_)) = setter {
@@ -9331,6 +9368,7 @@ fn run_function_inner(
                 if is_proxy_val(&recv)
                     || slot_is_accessor(&recv, &key_str)
                     || crate::interp::value_has_attrs(&recv)
+                    || crate::interp::is_legacy_collection(&recv)
                 {
                     let setter = globals.borrow().get("__tb_host_setprop").cloned();
                     if let Some(g @ Value::NativeFunction(_)) = setter {
@@ -9355,7 +9393,10 @@ fn run_function_inner(
                 // Lenient on non-objects (return false rather than throwing) so
                 // a `typeof x==='object' && k in x` guard against null doesn't
                 // abort the VM run.
-                if is_proxy_val(&recv) {
+                if is_proxy_val(&recv) || crate::interp::is_legacy_collection(&recv) {
+                    // Route a legacy platform object (HTMLCollection/NodeList)
+                    // and a Proxy through the host [[HasProperty]] so the exotic
+                    // index/name/inherited-member resolution applies.
                     let hook = globals.borrow().get("__tb_host_has").cloned();
                     if let Some(g @ Value::NativeFunction(_)) = hook {
                         match dispatch(g, Value::Undefined, vec![recv, Value::str(key)]) {
@@ -9413,8 +9454,9 @@ fn run_function_inner(
                 // the [[Delete]] configurable check (CV_PROP_DESC) are honored
                 // identically to the tree-walk. Plain objects with no attrs take
                 // the raw fast delete (always returns true), unchanged.
-                let route_host =
-                    is_proxy_val(&recv) || crate::interp::value_has_attrs(&recv);
+                let route_host = is_proxy_val(&recv)
+                    || crate::interp::value_has_attrs(&recv)
+                    || crate::interp::is_legacy_collection(&recv);
                 let result = if route_host {
                     let hook = globals.borrow().get("__tb_host_delete").cloned();
                     if let Some(g @ Value::NativeFunction(_)) = hook {
@@ -9440,7 +9482,10 @@ fn run_function_inner(
                 // reactive frameworks' interception.
                 let key = regs[key as usize].to_display_string();
                 let recv = regs[obj as usize].clone();
-                let result = if is_proxy_val(&recv) {
+                let route_host = is_proxy_val(&recv)
+                    || crate::interp::value_has_attrs(&recv)
+                    || crate::interp::is_legacy_collection(&recv);
+                let result = if route_host {
                     let hook = globals.borrow().get("__tb_host_delete").cloned();
                     if let Some(g @ Value::NativeFunction(_)) = hook {
                         match dispatch(g, Value::Undefined, vec![recv, Value::str(key)]) {
@@ -14962,6 +15007,8 @@ mod tests {
             ],
             ic: std::cell::RefCell::new(Vec::new()),
         feedback: std::cell::RefCell::new(Vec::new()),
+
+        strict: false,
         };
         // Callee g(y): regs — 0=y (param), 1=oneconst, 2=ret.
         let g = BcFunction {
@@ -14977,6 +15024,8 @@ mod tests {
             ],
             ic: std::cell::RefCell::new(Vec::new()),
         feedback: std::cell::RefCell::new(Vec::new()),
+
+        strict: false,
         };
         let call_pc = 2;
         (Module { fns: vec![f, g], script_forinit_syncs: Vec::new() }, call_pc)
@@ -15290,6 +15339,8 @@ mod tests {
             ],
             ic: std::cell::RefCell::new(Vec::new()),
             feedback: std::cell::RefCell::new(Vec::new()),
+
+            strict: false,
         };
         // callee g(y): if (y < 0) return 0; return y * 2.
         //   0: LoadConst r1 = 0
@@ -15318,6 +15369,8 @@ mod tests {
             ],
             ic: std::cell::RefCell::new(Vec::new()),
             feedback: std::cell::RefCell::new(Vec::new()),
+
+            strict: false,
         };
         let m = Module { fns: vec![f, g], script_forinit_syncs: Vec::new() };
         let inlined = crate::t4::inline_first_call(&m, 0).expect("inlines the branchy callee");
@@ -15381,6 +15434,8 @@ mod tests {
             ],
             ic: std::cell::RefCell::new(Vec::new()),
             feedback: std::cell::RefCell::new(Vec::new()),
+
+            strict: false,
         };
         // callee g(y): p = y*y; q = y*y; s = y*y; return p + q + s.  (THREE y*y —
         // two are redundant and fold to copies of the first under P4.)
@@ -15400,6 +15455,8 @@ mod tests {
             ],
             ic: std::cell::RefCell::new(Vec::new()),
             feedback: std::cell::RefCell::new(Vec::new()),
+
+            strict: false,
         };
         let m = Module { fns: vec![f, g], script_forinit_syncs: Vec::new() };
 

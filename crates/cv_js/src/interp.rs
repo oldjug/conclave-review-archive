@@ -4819,6 +4819,547 @@ fn own_symbol_keys(v: &Value) -> Vec<Value> {
     }
 }
 
+// ===========================================================================
+// Legacy platform objects — WebIDL §3.9 + WHATWG DOM §4.2.10.2 (HTMLCollection)
+// ---------------------------------------------------------------------------
+// A LIVE collection (HTMLCollection / NodeList) is a WebIDL *legacy platform
+// object*: it has an indexed property getter (and, for HTMLCollection, a named
+// property getter), exotic [[Get]]/[[Set]]/[[GetOwnProperty]]/[[DefineOwn
+// Property]]/[[Delete]]/[[OwnPropertyKeys]] internal methods, and a real
+// interface prototype (`HTMLCollection.prototype`) on its [[Prototype]] chain.
+//
+// We model the live backing as a Rust closure (`supplier`) that re-evaluates a
+// query over the document tree on every access — that closure is supplied by
+// the host (cv_browser) which owns the element table. The closure is parked in
+// a thread-local registry keyed by a u64 id stamped on the object's internal
+// `LEGACY_COLL_KEY` slot, so the object stays a plain `Value::Object` (no new
+// `Value` variant) yet the property machinery can recognise + drive it.
+//
+// Expandos (own data properties the script assigns to a non-index/non-name
+// key) live in the object's own `OrderedMap` like any ordinary property; the
+// exotic methods only intercept INDEX and SUPPORTED-NAME keys.
+// ===========================================================================
+
+/// Internal slot marking a legacy collection; its value is the `Number(id)`
+/// into `LEGACY_COLL_REGISTRY`.
+pub const LEGACY_COLL_KEY: &str = "\u{1}__legacy_collection__";
+
+thread_local! {
+    /// Stack of the CURRENT strict-mode context. A frame is pushed when a
+    /// function whose body starts with a `"use strict"` directive prologue is
+    /// entered (both tiers), and popped on exit. Reading the top tells whether
+    /// the running code is strict — needed so a refused legacy-platform-object
+    /// [[Set]]/[[Delete]], a write to a non-writable property, etc. throw a
+    /// TypeError in strict mode but are silent in sloppy mode (ECMA-262
+    /// §6.2.5.6 Set/§13.5.1.2 delete). This is a real, reusable strict context;
+    /// it does not (yet) drive every sloppy/strict divergence — only the
+    /// refusal-throw decisions that read `strict_mode_active`.
+    static STRICT_STACK: RefCell<Vec<bool>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Push a strict-mode frame (call on function entry); ALWAYS pair with `pop`.
+pub fn push_strict_frame(strict: bool) {
+    STRICT_STACK.with(|s| s.borrow_mut().push(strict));
+}
+
+/// Pop a strict-mode frame (call on function exit, including the error path).
+pub fn pop_strict_frame() {
+    STRICT_STACK.with(|s| {
+        s.borrow_mut().pop();
+    });
+}
+
+/// Whether the currently-running code is in strict mode (top of the strict
+/// stack). Defaults to `false` (sloppy) at the top level when no frame is set.
+pub fn strict_mode_active() -> bool {
+    STRICT_STACK.with(|s| s.borrow().last().copied().unwrap_or(false))
+}
+
+/// Detect a `"use strict"` Directive Prologue at the head of a function/script
+/// body (ECMA-262 §11.2.1): one or more leading string-literal expression
+/// statements, one of which is exactly `"use strict"`. Stops at the first
+/// non-string-literal statement.
+pub fn body_is_strict(body: &[Stmt]) -> bool {
+    for s in body {
+        match s {
+            Stmt::Expression(Expr::String(lit)) => {
+                if &**lit == "use strict" {
+                    return true;
+                }
+                // Another directive (e.g. "use asm") — keep scanning the prologue.
+            }
+            _ => break,
+        }
+    }
+    false
+}
+
+/// One live collection's behaviour: how to (re)compute its element list and
+/// whether it exposes named properties (HTMLCollection: yes; childNodes
+/// NodeList: no).
+pub struct LegacyCollection {
+    /// Re-evaluated on EVERY access → live semantics (DOM §4.2.10.2).
+    pub supplier: Box<dyn Fn() -> Vec<Value>>,
+    /// True for HTMLCollection (named getter active); false for NodeList.
+    pub supports_named: bool,
+    /// Tag for `Object.prototype.toString` / debugging ("HTMLCollection" |
+    /// "NodeList").
+    pub kind: &'static str,
+}
+
+thread_local! {
+    static LEGACY_COLL_REGISTRY: RefCell<HashMap<u64, Rc<LegacyCollection>>> =
+        RefCell::new(HashMap::new());
+    static LEGACY_COLL_NEXT_ID: std::cell::Cell<u64> = const { std::cell::Cell::new(1) };
+}
+
+/// Register a live collection behaviour, returning its registry id. The id is
+/// stamped on the wrapper object's `LEGACY_COLL_KEY` slot.
+pub fn legacy_coll_register(coll: LegacyCollection) -> u64 {
+    let id = LEGACY_COLL_NEXT_ID.with(|c| {
+        let v = c.get();
+        c.set(v + 1);
+        v
+    });
+    LEGACY_COLL_REGISTRY.with(|r| r.borrow_mut().insert(id, Rc::new(coll)));
+    id
+}
+
+/// Fetch the `LegacyCollection` behind a value, if it is one.
+fn legacy_coll_of(v: &Value) -> Option<Rc<LegacyCollection>> {
+    if let Value::Object(o) = v {
+        let id = match o.borrow().get(LEGACY_COLL_KEY) {
+            Some(Value::Number(n)) => *n as u64,
+            _ => return None,
+        };
+        return LEGACY_COLL_REGISTRY.with(|r| r.borrow().get(&id).cloned());
+    }
+    None
+}
+
+/// Quick predicate without cloning the Rc.
+pub fn is_legacy_collection(v: &Value) -> bool {
+    matches!(v, Value::Object(o) if matches!(o.borrow().get(LEGACY_COLL_KEY), Some(Value::Number(_))))
+}
+
+/// WebIDL §3.9.1 — "array index property name": a string that is the canonical
+/// decimal form of an integer in `[0, 2^32 - 1)` (note: STRICTLY less than
+/// 2^32-1, so "4294967295" is NOT an array index). Returns the integer when so.
+fn legacy_array_index(key: &str) -> Option<u32> {
+    // Canonical form only: no leading zeros (except "0"), no sign, no "+".
+    if key.is_empty() {
+        return None;
+    }
+    if key != "0" && key.starts_with('0') {
+        return None;
+    }
+    let n: u64 = key.parse().ok()?;
+    if n < 4294967295 {
+        Some(n as u32)
+    } else {
+        None
+    }
+}
+
+/// The element at `index` in a live collection's current list (DOM §4.2.10.2
+/// "item(index)"), or `None`.
+fn legacy_coll_item(coll: &LegacyCollection, index: u32) -> Option<Value> {
+    (coll.supplier)().get(index as usize).cloned()
+}
+
+/// The supported property names of an HTMLCollection, in tree order with NO
+/// duplicates and NO empty string (DOM §4.2.10.2): for each element, its `id`
+/// (always) and, if it is an HTML element in the HTML namespace, its `name`
+/// attribute. We approximate "HTML element" by the host stamping `name` onto
+/// the element's JS object only for applicable elements (the host sets
+/// `name`/`id` slots directly), and we additionally require the element NOT be
+/// in a foreign namespace via the `namespaceURI` slot.
+fn legacy_supported_names(coll: &LegacyCollection) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if !coll.supports_named {
+        return out;
+    }
+    for el in (coll.supplier)() {
+        if let Value::Object(o) = &el {
+            let b = o.borrow();
+            // `id` contributes for any element.
+            if let Some(Value::String(s)) = b.get("id") {
+                let s = s.to_string();
+                if !s.is_empty() && seen.insert(s.clone()) {
+                    out.push(s);
+                }
+            }
+            // `name` contributes ONLY for HTML-namespace elements (DOM
+            // §4.2.10.2 step: "and is in the HTML namespace"). A foreign
+            // element (`createElementNS('ns','foo')`) does not contribute its
+            // `name`. The host marks foreign elements with a `namespaceURI`
+            // other than the HTML namespace.
+            let is_html_ns = match b.get("namespaceURI") {
+                Some(Value::String(ns)) => &**ns == "http://www.w3.org/1999/xhtml",
+                None | Some(Value::Null) | Some(Value::Undefined) => true,
+                _ => true,
+            };
+            if is_html_ns {
+                if let Some(Value::String(s)) = b.get("name") {
+                    let s = s.to_string();
+                    if !s.is_empty() && seen.insert(s.clone()) {
+                        out.push(s);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// namedItem(name): the FIRST element whose `id` is `name`, or (HTML-namespace
+/// element) whose `name` attribute is `name`; `null` if none (DOM §4.2.10.2).
+/// Empty `name` → `null`.
+fn legacy_named_item(coll: &LegacyCollection, name: &str) -> Value {
+    if name.is_empty() || !coll.supports_named {
+        return Value::Null;
+    }
+    // First pass: id match (any element).
+    for el in (coll.supplier)() {
+        if let Value::Object(o) = &el {
+            if matches!(o.borrow().get("id"), Some(Value::String(s)) if &**s == name) {
+                return el.clone();
+            }
+        }
+    }
+    // Second pass: name match (HTML-namespace elements only).
+    for el in (coll.supplier)() {
+        if let Value::Object(o) = &el {
+            let b = o.borrow();
+            let is_html_ns = match b.get("namespaceURI") {
+                Some(Value::String(ns)) => &**ns == "http://www.w3.org/1999/xhtml",
+                _ => true,
+            };
+            if is_html_ns && matches!(b.get("name"), Some(Value::String(s)) if &**s == name) {
+                return el.clone();
+            }
+        }
+    }
+    Value::Null
+}
+
+/// True iff `name` is a supported property name (DOM §4.2.10.2). Used by [[Get]]
+/// / [[GetOwnProperty]] / [[Set]] / [[Delete]] to decide named-getter behaviour.
+fn legacy_is_supported_name(coll: &LegacyCollection, name: &str) -> bool {
+    if name.is_empty() || !coll.supports_named {
+        return false;
+    }
+    legacy_supported_names(coll).iter().any(|n| n == name)
+}
+
+/// WebIDL §3.9.7 [[OwnPropertyKeys]] for a legacy platform object:
+///   1. the array index property names, in ascending numeric order;
+///   2. (if `all`) the supported property names, in tree order, that aren't
+///      already array indices and aren't own expandos;
+///   3. the own expando string keys, in insertion order;
+///   4. (symbols would follow, handled elsewhere).
+/// `all=false` returns the ENUMERABLE subset (Object.keys/for-in): indices +
+/// enumerable expandos, but NOT the names (HTMLCollection names are
+/// non-enumerable). `all=true` includes names (getOwnPropertyNames).
+fn legacy_own_keys(obj: &Value, coll: &LegacyCollection, all: bool) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let len = (coll.supplier)().len();
+    // 1. indices.
+    for i in 0..len {
+        out.push(i.to_string());
+    }
+    // 2. supported names (full set only). Skip ones that collide with an index
+    //    or an own expando (those are reported by 1 / 3).
+    if all && coll.supports_named {
+        let names = legacy_supported_names(coll);
+        for n in names {
+            if legacy_array_index(&n).map_or(false, |i| (i as usize) < len) {
+                continue;
+            }
+            let is_expando = matches!(obj, Value::Object(o)
+                if o.borrow().contains_key(&n) && !is_internal_key(&n));
+            if is_expando {
+                continue;
+            }
+            out.push(n);
+        }
+    }
+    // 3. own expando keys (string, non-internal, non-symbol), insertion order.
+    if let Value::Object(o) = obj {
+        let ptr = Rc::as_ptr(o) as *const () as usize;
+        for k in o.borrow().keys() {
+            if is_internal_key(k) || is_symbol_key(k) {
+                continue;
+            }
+            // Indices/names already handled; an expando is anything that ISN'T a
+            // supported index/name. (An expando with a numeric key past the end
+            // can't exist — [[DefineOwnProperty]] rejects it.)
+            if legacy_array_index(k).is_some() {
+                continue;
+            }
+            if coll.supports_named && legacy_is_supported_name(coll, k) {
+                // A name that is ALSO an own expando: report once (here, as the
+                // expando) but only in the `all` set if non-enumerable... it's
+                // an ordinary expando key so include per enumerability.
+            }
+            if !all && !is_enumerable_own(ptr, k) {
+                continue;
+            }
+            out.push(k.clone());
+        }
+    }
+    out
+}
+
+/// Whether an own expando slot `key` on a legacy collection is configurable.
+/// With `CV_PROP_DESC` off every present property is configurable (default
+/// true); with it on we read the real C bit from the side table.
+fn legacy_expando_configurable(o: &Rc<RefCell<HashMap<String, Value>>>, key: &str) -> bool {
+    if !prop_desc_enabled() {
+        return true;
+    }
+    let ptr = Rc::as_ptr(o) as *const () as usize;
+    pattr::effective_attr(ptr, key) & pattr::CONFIGURABLE != 0
+}
+
+/// WebIDL §3.9.4 [[GetOwnProperty]] for a legacy platform object. Returns the
+/// descriptor object for an array index / supported name / own expando, or
+/// `None` (→ `undefined`) when `key` is not an own property. Index descriptors
+/// are `{value, writable:false, enumerable:true, configurable:true}`; named
+/// descriptors are `{value, writable:false, enumerable:false (HTMLCollection),
+/// configurable:true}`; expandos use the ordinary descriptor.
+fn legacy_own_descriptor(obj: &Value, coll: &LegacyCollection, key: &str) -> Option<Value> {
+    // Array index.
+    if let Some(idx) = legacy_array_index(key) {
+        if let Some(el) = legacy_coll_item(coll, idx) {
+            let mut m: HashMap<String, Value> = HashMap::new();
+            m.insert("value".into(), el);
+            m.insert("writable".into(), Value::Bool(false));
+            m.insert("enumerable".into(), Value::Bool(true));
+            m.insert("configurable".into(), Value::Bool(true));
+            return Some(Value::Object(Rc::new(RefCell::new(m))));
+        }
+        return None;
+    }
+    // Own expando shadows a supported name (and is its own property).
+    if let Value::Object(o) = obj {
+        if o.borrow().contains_key(key) && !is_internal_key(key) && !is_symbol_key(key) {
+            let v = o.borrow().get(key).cloned().unwrap_or(Value::Undefined);
+            return Some(build_descriptor(obj, key, v));
+        }
+    }
+    // Supported name (named getter).
+    if coll.supports_named && legacy_is_supported_name(coll, key) {
+        let mut m: HashMap<String, Value> = HashMap::new();
+        m.insert("value".into(), legacy_named_item(coll, key));
+        m.insert("writable".into(), Value::Bool(false));
+        // HTMLCollection has [LegacyUnenumerableNamedProperties] → names are
+        // NON-enumerable.
+        m.insert("enumerable".into(), Value::Bool(false));
+        m.insert("configurable".into(), Value::Bool(true));
+        return Some(Value::Object(Rc::new(RefCell::new(m))));
+    }
+    None
+}
+
+thread_local! {
+    /// The realm's `HTMLCollection.prototype` and `NodeList.prototype` — built
+    /// once per thread (stateless brand-checked method bags), so every live
+    /// collection links to the SAME prototype object and `Object.getPrototypeOf
+    /// (coll) === HTMLCollection.prototype` / `coll instanceof HTMLCollection`
+    /// hold (the value-mismatch tests assert this identity).
+    static HTMLCOLLECTION_PROTO: RefCell<Option<Rc<RefCell<HashMap<String, Value>>>>> =
+        const { RefCell::new(None) };
+    static NODELIST_PROTO: RefCell<Option<Rc<RefCell<HashMap<String, Value>>>>> =
+        const { RefCell::new(None) };
+}
+
+/// Accessor for `HTMLCollection.prototype` (lazily built).
+pub fn htmlcollection_proto() -> Rc<RefCell<HashMap<String, Value>>> {
+    HTMLCOLLECTION_PROTO.with(|cell| {
+        if let Some(p) = cell.borrow().as_ref() {
+            return p.clone();
+        }
+        let built = build_legacy_collection_proto("HTMLCollection", true);
+        *cell.borrow_mut() = Some(built.clone());
+        built
+    })
+}
+
+/// Accessor for `NodeList.prototype` (lazily built).
+pub fn nodelist_proto() -> Rc<RefCell<HashMap<String, Value>>> {
+    NODELIST_PROTO.with(|cell| {
+        if let Some(p) = cell.borrow().as_ref() {
+            return p.clone();
+        }
+        let built = build_legacy_collection_proto("NodeList", false);
+        *cell.borrow_mut() = Some(built.clone());
+        built
+    })
+}
+
+/// Brand check: read the `LegacyCollection` from `this`, throwing the WebIDL
+/// "Illegal invocation" TypeError if `this` is not a legacy collection of the
+/// expected `kind`. This is what makes `Object.create(coll).length` throw —
+/// the derived object is NOT itself a collection, so the inherited `length`
+/// getter's brand check fails (WebIDL §3.7.6 + HTMLCollection-as-prototype.html).
+fn legacy_brand_check(this: &Value, kind: &str) -> Result<Rc<LegacyCollection>, JsError> {
+    match legacy_coll_of(this) {
+        Some(c) if c.kind == kind => Ok(c),
+        _ => Err(type_error_throw(format!(
+            "Illegal invocation: '{kind}' brand check failed"
+        ))),
+    }
+}
+
+/// Build a legacy collection's interface prototype (`HTMLCollection.prototype`
+/// or `NodeList.prototype`): the brand-checked `length` accessor, `item`,
+/// `namedItem` (HTMLCollection only), and `@@iterator`. WebIDL §3.7 +
+/// DOM §4.2.10.2.
+fn build_legacy_collection_proto(
+    kind: &'static str,
+    supports_named: bool,
+) -> Rc<RefCell<HashMap<String, Value>>> {
+    let proto = Rc::new(RefCell::new(HashMap::<String, Value>::new()));
+    {
+        let mut m = proto.borrow_mut();
+        // length — an ACCESSOR (getter) so the brand check fires and
+        // `"length" in coll` is true via the prototype. WebIDL exposes `length`
+        // as a getter on the interface prototype.
+        let length_getter = native_fn_with_interp("get length", move |interp, _args| {
+            let this = interp.native_this();
+            let c = legacy_brand_check(&this, kind)?;
+            Ok(Value::Number((c.supplier)().len() as f64))
+        });
+        m.insert(LENGTH_GETTER_KEY.into(), make_accessor(Some(length_getter), None));
+        // item(index) — DOM §4.2.10.2. ToUint32 the argument; out-of-range → null.
+        m.insert(
+            "item".into(),
+            native_fn_with_interp("item", move |interp, args| {
+                let this = interp.native_this();
+                let c = legacy_brand_check(&this, kind)?;
+                let idx = to_uint32_f64(args.first().map(|v| v.to_number()).unwrap_or(0.0));
+                Ok(legacy_coll_item(&c, idx).unwrap_or(Value::Null))
+            }),
+        );
+        if supports_named {
+            m.insert(
+                "namedItem".into(),
+                native_fn_with_interp("namedItem", move |interp, args| {
+                    let this = interp.native_this();
+                    let c = legacy_brand_check(&this, kind)?;
+                    let name = args
+                        .first()
+                        .map(|v| v.to_display_string())
+                        .unwrap_or_default();
+                    Ok(legacy_named_item(&c, &name))
+                }),
+            );
+        } else {
+            // NodeList IS iterable with the value/entries/keys/forEach helpers
+            // (it has [Symbol.iterator] from `iterable<Node>`), but HTMLCollection
+            // is NOT (it only has the @@iterator alias). The iterator test asserts
+            // HTMLCollection does NOT have `values`/`entries`/`forEach`.
+            m.insert(
+                "forEach".into(),
+                native_fn_with_interp("forEach", move |interp, args| {
+                    let this = interp.native_this();
+                    let c = legacy_brand_check(&this, kind)?;
+                    let cb = args.first().cloned().unwrap_or(Value::Undefined);
+                    if !interp.is_callable(&cb) {
+                        return Err(type_error_throw("forEach callback is not a function"));
+                    }
+                    let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
+                    let items = (c.supplier)();
+                    for (i, el) in items.iter().enumerate() {
+                        interp.call_value_with_this(
+                            cb.clone(),
+                            this_arg.clone(),
+                            vec![el.clone(), Value::Number(i as f64), this.clone()],
+                        )?;
+                    }
+                    Ok(Value::Undefined)
+                }),
+            );
+        }
+        // @@iterator — iterate the elements (both HTMLCollection and NodeList).
+        let iter_fn = native_fn_with_interp("[Symbol.iterator]", move |interp, _args| {
+            let this = interp.native_this();
+            let c = legacy_brand_check(&this, kind)?;
+            let items = (c.supplier)();
+            Ok(make_array_value_iterator(items))
+        });
+        m.insert("@@sym:Symbol.iterator".into(), iter_fn);
+        // [Symbol.toStringTag] → "HTMLCollection" / "NodeList".
+        m.insert(
+            "@@sym:Symbol.toStringTag".into(),
+            Value::str(kind.to_string()),
+        );
+    }
+    proto
+}
+
+/// A simple iterator object over a fixed Vec<Value> (snapshot at call time, per
+/// WebIDL default iterator which captures the list when @@iterator runs).
+fn make_array_value_iterator(items: Vec<Value>) -> Value {
+    let idx = Rc::new(RefCell::new(0usize));
+    let next_fn = {
+        let idx = idx.clone();
+        let items = items.clone();
+        native_fn("next", move |_| {
+            let i = *idx.borrow();
+            let mut r: HashMap<String, Value> = HashMap::new();
+            if i < items.len() {
+                *idx.borrow_mut() = i + 1;
+                r.insert("value".into(), items[i].clone());
+                r.insert("done".into(), Value::Bool(false));
+            } else {
+                r.insert("value".into(), Value::Undefined);
+                r.insert("done".into(), Value::Bool(true));
+            }
+            Ok(Value::Object(Rc::new(RefCell::new(r))))
+        })
+    };
+    let mut iter: HashMap<String, Value> = HashMap::new();
+    iter.insert("next".into(), next_fn);
+    // Mark iterator-shaped so it inherits %Iterator.prototype% (and itself is
+    // iterable).
+    iter.insert("__iterator__".into(), Value::Bool(true));
+    Value::Object(Rc::new(RefCell::new(iter)))
+}
+
+/// Construct a live legacy collection Value (HTMLCollection or NodeList) backed
+/// by `supplier` (re-evaluated on every access). Sets its `[[Prototype]]` to the
+/// shared interface prototype so `getPrototypeOf` / `instanceof` / inherited
+/// `length`/`item`/`namedItem`/`@@iterator` all resolve. PUBLIC so the host
+/// (cv_browser) builds collections without reaching into the registry directly.
+pub fn make_legacy_collection<F>(supplier: F, kind: &'static str) -> Value
+where
+    F: Fn() -> Vec<Value> + 'static,
+{
+    let supports_named = kind == "HTMLCollection";
+    let id = legacy_coll_register(LegacyCollection {
+        supplier: Box::new(supplier),
+        supports_named,
+        kind,
+    });
+    let proto = if supports_named {
+        htmlcollection_proto()
+    } else {
+        nodelist_proto()
+    };
+    let mut m: HashMap<String, Value> = HashMap::new();
+    m.insert(LEGACY_COLL_KEY.into(), Value::Number(id as f64));
+    m.insert(PROTO_KEY.into(), Value::Object(proto));
+    Value::Object(Rc::new(RefCell::new(m)))
+}
+
+/// Sentinel for the prototype's `length` accessor slot. We key it as a normal
+/// `length` so `read_property`'s own-prop lookup on the PROTOTYPE finds the
+/// accessor, and the brand-check getter fires.
+const LENGTH_GETTER_KEY: &str = "length";
+
 /// Snapshot of the values that `for...of` should visit. V1 supports arrays
 /// and strings (per-char), plus the special case where an Object exposes a
 /// `length` + numeric index keys (i.e. array-like NodeLists from the DOM
@@ -11289,6 +11830,11 @@ impl Interp {
             native_fn("getOwnPropertyDescriptor", |a| {
                 let key = a.get(1).map(|v| v.to_display_string()).unwrap_or_default();
                 let target = a.first().cloned().unwrap_or(Value::Undefined);
+                // Legacy platform object [[GetOwnProperty]] (WebIDL §3.9.4).
+                if let Some(coll) = legacy_coll_of(&target) {
+                    return Ok(legacy_own_descriptor(&target, &coll, &key)
+                        .unwrap_or(Value::Undefined));
+                }
                 // Function `length`/`name` are reported with their spec attrs by
                 // the shared helper below.
                 if let Some(d) = builtin_fn_length_name_descriptor(&target, &key) {
@@ -12912,6 +13458,11 @@ impl Interp {
             native_fn("getOwnPropertyDescriptor", |a| {
                 let key = a.get(1).map(|v| v.to_display_string()).unwrap_or_default();
                 let target = a.first().cloned().unwrap_or(Value::Undefined);
+                // Legacy platform object [[GetOwnProperty]] (WebIDL §3.9.4).
+                if let Some(coll) = legacy_coll_of(&target) {
+                    return Ok(legacy_own_descriptor(&target, &coll, &key)
+                        .unwrap_or(Value::Undefined));
+                }
                 // A function's own `length`/`name` are data properties with
                 // attributes {writable:false, enumerable:false, configurable:true}
                 // (ECMA-262 §10.2.x), unless shadowed by an explicit own prop.
@@ -14476,6 +15027,42 @@ impl Interp {
         self.define_global("WeakSet", weak_set_ctor);
         self.define_global("Set", set_ctor);
         self.define_global("Map", map_ctor);
+
+        // HTMLCollection / NodeList interface objects (WebIDL §3.7). Each is a
+        // constructor-shaped object whose `.prototype` IS the shared interface
+        // prototype (so `Object.getPrototypeOf(coll) === HTMLCollection.prototype`
+        // and `coll instanceof HTMLCollection` hold). Per WebIDL §3.7.1 the
+        // [[Construct]] of an interface without a constructor throws "Illegal
+        // constructor". We make them callable-objects with a `_construct` that
+        // throws, and link `prototype.constructor` back.
+        for (name, proto) in [
+            ("HTMLCollection", htmlcollection_proto()),
+            ("NodeList", nodelist_proto()),
+        ] {
+            let mut ctor: HashMap<String, Value> = HashMap::new();
+            ctor.insert("prototype".into(), Value::Object(proto.clone()));
+            ctor.insert("name".into(), Value::str(name.to_string()));
+            let nm = name.to_string();
+            ctor.insert(
+                "_construct".into(),
+                native_fn("Illegal constructor", move |_| {
+                    Err(type_error_throw(format!("Illegal constructor: {nm}")))
+                }),
+            );
+            let nm2 = name.to_string();
+            ctor.insert(
+                "_call".into(),
+                native_fn("Illegal constructor", move |_| {
+                    Err(type_error_throw(format!("Illegal constructor: {nm2}")))
+                }),
+            );
+            let ctor_val = Value::Object(Rc::new(RefCell::new(ctor)));
+            // Link prototype.constructor → the interface object.
+            proto
+                .borrow_mut()
+                .insert("constructor".into(), ctor_val.clone());
+            self.define_global(name, ctor_val);
+        }
 
         // URI encoding helpers — the spec is RFC 3986; this is the
         // practical subset (most sites just want to encode query strings).
@@ -17279,6 +17866,33 @@ impl Interp {
         key: &str,
         desc: &Value,
     ) -> Result<(), JsError> {
+        // Legacy platform object [[DefineOwnProperty]] (WebIDL §3.9.5):
+        // `Object.defineProperty` on a supported array index or supported
+        // property name is REJECTED (returns false → defineProperty throws a
+        // TypeError). Defining a NON-index/non-name key creates an ordinary
+        // expando (so `Object.defineProperty(coll, "new-id2", {...})` succeeds
+        // and shadows a name that may be added later).
+        if let Some(coll) = legacy_coll_of(target) {
+            if legacy_array_index(key).is_some() {
+                return Err(type_error_throw(format!(
+                    "Cannot define property {key}: '[object {}]' is not extensible at that index",
+                    coll.kind
+                )));
+            }
+            if coll.supports_named && legacy_is_supported_name(&coll, key) {
+                // Refuse UNLESS an own expando already shadows the name (then it
+                // is an ordinary redefine of the expando).
+                let shadowed = matches!(target, Value::Object(o)
+                    if o.borrow().contains_key(key) && !is_internal_key(key));
+                if !shadowed {
+                    return Err(type_error_throw(format!(
+                        "Cannot redefine named property '{key}' of '[object {}]'",
+                        coll.kind
+                    )));
+                }
+            }
+            // Non-index/non-name key → ordinary expando define (fall through).
+        }
         // The descriptor-model path (CV_PROP_DESC) implements the real
         // ECMA-262 §10.1.6.3 ValidateAndApplyPropertyDescriptor, honoring the
         // W/E/C attribute bits + the configurable:false invariants, and throws
@@ -17495,6 +18109,9 @@ impl Interp {
     /// the pre-descriptor behavior). Unifies what was three duplicated impls
     /// (`Object`/`Reflect.getOwnPropertyDescriptor`, `getOwnPropertyDescriptors`).
     pub fn own_property_descriptor(&self, obj: &Value, key: &str) -> Value {
+        if let Some(coll) = legacy_coll_of(obj) {
+            return legacy_own_descriptor(obj, &coll, key).unwrap_or(Value::Undefined);
+        }
         let found = match obj {
             Value::Object(o) => o.borrow().get(key).cloned(),
             Value::Array(arr) => {
@@ -17905,12 +18522,48 @@ impl Interp {
             if guard > 200 {
                 break;
             }
+            // A legacy platform object (HTMLCollection/NodeList) on the proto
+            // chain resolves indexed / supported-name keys via its EXOTIC
+            // [[GetOwnProperty]] (WebIDL §3.9) — so `Object.create(coll).named`
+            // / `Object.create(coll)[0]` see the collection's element, not an
+            // ordinary own slot.
+            let pv = Value::Object(p.clone());
+            if let Some(coll) = legacy_coll_of(&pv) {
+                if let Some(idx) = legacy_array_index(key) {
+                    if let Some(el) = legacy_coll_item(&coll, idx) {
+                        return Some(el);
+                    }
+                } else if coll.supports_named
+                    && !key.is_empty()
+                    && !p.borrow().contains_key(key)
+                    && legacy_is_supported_name(&coll, key)
+                {
+                    return Some(legacy_named_item(&coll, key));
+                }
+            }
             if let Some(v) = p.borrow().get(key) {
                 return Some(v.clone());
             }
             cur = p.borrow().get(PROTO_KEY).cloned();
         }
         None
+    }
+
+    /// True iff `key` is present anywhere on `obj`'s [[Prototype]] chain
+    /// (explicit `PROTO_KEY` links + the realm `Object.prototype`). Used by the
+    /// legacy-platform-object [[HasProperty]] to resolve inherited members
+    /// (`"length"`/`"item"`/`Symbol.iterator` in coll → true).
+    fn proto_chain_has(&self, obj: &Value, key: &str) -> bool {
+        if let Value::Object(o) = obj {
+            if self.walk_proto_chain(o, key).is_some() {
+                return true;
+            }
+            let ps = protos();
+            if !Rc::ptr_eq(o, &ps.object) && ps.object.borrow().contains_key(key) {
+                return true;
+            }
+        }
+        false
     }
 
     /// Resolve `key` against a non-object value's intrinsic prototype
@@ -18261,8 +18914,20 @@ impl Interp {
             }
             "children" => {
                 stamp(&own_children);
-                let els: Vec<Value> = own_children.into_iter().filter(dom_is_element).collect();
-                Some(Value::Array(Rc::new(RefCell::new(els))))
+                // ParentNode.children is a LIVE HTMLCollection (WHATWG DOM
+                // §4.2.6) — re-read `_children` filtered to elements on every
+                // access so it reflects later mutations, and expose the
+                // legacy-platform-object surface (item/namedItem/length/named
+                // getter/ownKeys). The supplier captures the node `o`.
+                let node = o.clone();
+                let supplier = move || -> Vec<Value> {
+                    let kids = match node.borrow().get("_children") {
+                        Some(Value::Array(a)) => a.borrow().clone(),
+                        _ => Vec::new(),
+                    };
+                    kids.into_iter().filter(dom_is_element).collect()
+                };
+                Some(make_legacy_collection(supplier, "HTMLCollection"))
             }
             "firstElementChild" => {
                 stamp(&own_children);
@@ -18500,6 +19165,40 @@ impl Interp {
         key: &str,
         value: Value,
     ) -> Result<(), JsError> {
+        // Legacy platform object [[Set]] (WebIDL §3.9.2): a write to a supported
+        // array index or a supported property name is REFUSED (returns false)
+        // when the receiver is the platform object itself. In sloppy mode the
+        // write is silently dropped; in strict mode the caller throws a
+        // TypeError (we surface that via `legacy_set` returning Ok(false)).
+        if let Some(coll) = legacy_coll_of(obj) {
+            let refused = if legacy_array_index(key).is_some() {
+                // Any array-index key is an "unforgeable" indexed slot — the
+                // write is always refused (even past the end: [[DefineOwn
+                // Property]] disallows defining an indexed expando).
+                true
+            } else if coll.supports_named && legacy_is_supported_name(&coll, key) {
+                // A supported name is refused UNLESS an own expando already
+                // shadows it (then writing updates the expando — the own-props
+                // "set ... while named property exists" cases keep the named
+                // value, but a PRE-EXISTING expando is writable).
+                !(matches!(obj, Value::Object(o)
+                    if o.borrow().contains_key(key) && !is_internal_key(key)))
+            } else {
+                false
+            };
+            if refused {
+                if strict_mode_active() {
+                    return Err(type_error_throw(format!(
+                        "Cannot assign to read only property '{key}' of object '[object {}]'",
+                        coll.kind
+                    )));
+                }
+                return Ok(());
+            }
+            // Ordinary expando store (non-index, non-name key).
+            self.write_property(obj, key, value);
+            return Ok(());
+        }
         if let Some((target, handler)) = proxy_parts(obj) {
             if let Value::Object(h) = &handler {
                 let trap = h.borrow().get("set").cloned();
@@ -18612,6 +19311,25 @@ impl Interp {
     /// `key in obj` honoring a Proxy `has` trap. Non-proxy → own-property
     /// presence. Used by the tree-walk `in` and the VM's `__tb_host_has` hook.
     pub fn has_property_trapped(&mut self, obj: &Value, key: &str) -> Result<bool, JsError> {
+        // Legacy platform object [[HasProperty]] (WebIDL §3.9.3): true if `key`
+        // is a supported array index in range, a supported property name, an own
+        // expando, or inherited from the prototype chain (length/item/...).
+        if let Some(coll) = legacy_coll_of(obj) {
+            if let Some(idx) = legacy_array_index(key) {
+                if (idx as usize) < (coll.supplier)().len() {
+                    return Ok(true);
+                }
+            } else if coll.supports_named && legacy_is_supported_name(&coll, key) {
+                return Ok(true);
+            }
+            // Own expando or inherited (prototype) property.
+            if let Value::Object(o) = obj {
+                if o.borrow().contains_key(key) && !is_internal_key(key) {
+                    return Ok(true);
+                }
+            }
+            return Ok(self.proto_chain_has(obj, key));
+        }
         if let Some((target, handler)) = proxy_parts(obj) {
             if let Value::Object(h) = &handler {
                 if let Some(trap) = h.borrow().get("has").cloned() {
@@ -18646,6 +19364,62 @@ impl Interp {
     /// `delete obj[key]` honoring a Proxy `deleteProperty` trap. Non-proxy →
     /// remove the own property. Used by the VM's `__tb_host_delete` hook.
     pub fn delete_property_trapped(&mut self, obj: &Value, key: &str) -> Result<bool, JsError> {
+        // Legacy platform object [[Delete]] (WebIDL §3.9.6): deleting a
+        // supported array index or supported property name returns FALSE (the
+        // platform object refuses) — `delete coll[0]` / `delete coll.name` is a
+        // no-op (and throws in strict mode, which the caller decides). Deleting
+        // an own expando removes it normally.
+        if let Some(coll) = legacy_coll_of(obj) {
+            // A refused delete returns false; in strict mode `delete` of a
+            // non-configurable-by-refusal property throws a TypeError
+            // (ECMA-262 §13.5.1.2 step 5.b). We surface that here so BOTH the
+            // tree-walk `delete` and the VM `DeleteProp/Idx` (which only stores
+            // the bool) throw correctly in strict mode.
+            let refuse = |kind: &str| -> Result<bool, JsError> {
+                if strict_mode_active() {
+                    Err(type_error_throw(format!(
+                        "Cannot delete property of [object {kind}]"
+                    )))
+                } else {
+                    Ok(false)
+                }
+            };
+            if let Some(idx) = legacy_array_index(key) {
+                // An in-range index refuses deletion; an out-of-range index is
+                // not a property → delete succeeds (no-op) per [[Delete]].
+                if (idx as usize) < (coll.supplier)().len() {
+                    return refuse(coll.kind);
+                }
+                return Ok(true);
+            }
+            if coll.supports_named && legacy_is_supported_name(&coll, key) {
+                // A supported name refuses deletion UNLESS an own expando
+                // shadows it (then the expando is what gets removed) — and that
+                // expando must be configurable (a non-configurable expando, e.g.
+                // `Object.defineProperty(coll, k, {configurable:false})`, refuses
+                // deletion just like the named property). Per [[Delete]].
+                if let Value::Object(o) = obj {
+                    if o.borrow().contains_key(key) && !is_internal_key(key) {
+                        if legacy_expando_configurable(o, key) {
+                            o.borrow_mut().remove(key);
+                            return Ok(true);
+                        }
+                        return refuse(coll.kind);
+                    }
+                }
+                return refuse(coll.kind);
+            }
+            // Ordinary expando delete — honor a non-configurable expando.
+            if let Value::Object(o) = obj {
+                if o.borrow().contains_key(key) && !is_internal_key(key)
+                    && !legacy_expando_configurable(o, key)
+                {
+                    return refuse(coll.kind);
+                }
+                o.borrow_mut().remove(key);
+            }
+            return Ok(true);
+        }
         if let Some((target, handler)) = proxy_parts(obj) {
             if let Value::Object(h) = &handler {
                 if let Some(trap) = h.borrow().get("deleteProperty").cloned() {
@@ -18707,6 +19481,14 @@ impl Interp {
     /// the handler's `ownKeys` trap — required by Vue 3 / MobX / Pinia
     /// reactivity systems that intercept key enumeration.
     pub fn own_keys_trapped(&mut self, obj: &Value) -> Result<Vec<String>, JsError> {
+        // Legacy platform object [[OwnPropertyKeys]] (WebIDL §3.9.7), ENUMERABLE
+        // subset (Object.keys / for-in / spread / JSON): indices (enumerable),
+        // then own enumerable expandos. Supported NAMES are NON-enumerable for
+        // HTMLCollection ([LegacyUnenumerableNamedProperties]) so they are
+        // EXCLUDED here (they appear only in getOwnPropertyNames).
+        if let Some(coll) = legacy_coll_of(obj) {
+            return Ok(legacy_own_keys(obj, &coll, false));
+        }
         if let Some((target, handler)) = proxy_parts(obj) {
             if let Value::Object(h) = &handler {
                 if let Some(trap) = h.borrow().get("ownKeys").cloned() {
@@ -18747,6 +19529,12 @@ impl Interp {
     /// `own_string_keys_all` (no enumerable filter) instead of
     /// `enumerable_string_keys`.
     pub fn own_keys_all_trapped(&mut self, obj: &Value) -> Result<Vec<String>, JsError> {
+        // Legacy platform object [[OwnPropertyKeys]], FULL set (incl.
+        // non-enumerable) for getOwnPropertyNames / Reflect.ownKeys: indices,
+        // then supported names, then expandos — WebIDL §3.9.7.
+        if let Some(coll) = legacy_coll_of(obj) {
+            return Ok(legacy_own_keys(obj, &coll, true));
+        }
         if let Some((target, handler)) = proxy_parts(obj) {
             if let Value::Object(h) = &handler {
                 if let Some(trap) = h.borrow().get("ownKeys").cloned() {
@@ -18856,6 +19644,40 @@ impl Interp {
     fn read_property_inner(&self, obj: &Value, key: &str) -> Value {
         match obj {
             Value::Object(o) => {
+                // Legacy platform object (HTMLCollection / NodeList) exotic
+                // [[Get]] — WebIDL §3.9.2. An array-index key resolves to the
+                // i-th element; a supported NAME resolves to namedItem — UNLESS
+                // an own expando shadows it (an expando set via [[Set]] on a
+                // non-index/non-name key, or a name-shadowing expando from the
+                // own-props tests). Indices and supported names are NEVER stored
+                // as own slots, so we check the live list first.
+                if let Some(coll) = legacy_coll_of(obj) {
+                    if let Some(idx) = legacy_array_index(key) {
+                        // Indexed getter takes priority over the prototype but
+                        // an out-of-range index falls through to ordinary [[Get]]
+                        // (so `coll.length`/proto methods still resolve and an
+                        // out-of-range numeric is `undefined`).
+                        if let Some(el) = legacy_coll_item(&coll, idx) {
+                            return el;
+                        }
+                        // Out-of-range index: NOT an own prop and not a name →
+                        // fall through to ordinary [[Get]] (prototype chain).
+                    } else if coll.supports_named && !key.is_empty() {
+                        // Named getter: only if NOT an own expando (own props
+                        // shadow the named getter — own-props test) AND it is a
+                        // supported name.
+                        let has_own_expando = {
+                            let b = o.borrow();
+                            b.contains_key(key) && !is_internal_key(key)
+                        };
+                        if !has_own_expando && legacy_is_supported_name(&coll, key) {
+                            return legacy_named_item(&coll, key);
+                        }
+                    }
+                    // Anything else (length, item, namedItem, @@iterator,
+                    // expandos, Object.prototype methods) → ordinary [[Get]]
+                    // below (own slots + prototype chain).
+                }
                 // Typed-array integer-indexed read: `ta[i]` returns the element
                 // from the shared `_bytes` storage at this view's `byteOffset`
                 // window (CanonicalNumericIndexString path, §10.4.5.1
@@ -23050,6 +23872,14 @@ impl Interp {
             JS_FRAME_STACK.with(|s| s.borrow_mut().push(name));
         }
         let mut pushed_callee = false;
+        // Strict-mode context: a function whose body opens with a `"use strict"`
+        // directive runs strict (ECMA-262 §11.2.1). Inherit the caller's strict
+        // mode otherwise (a function declared inside strict code is strict too,
+        // but we conservatively only propagate via an explicit directive +
+        // caller inheritance for the body-level decision). Pushed for ALL block
+        // bodies; popped unconditionally below.
+        let strict_here = body_is_strict_block(&f.body) || strict_mode_active();
+        push_strict_frame(strict_here);
         let result = match &f.body {
             FunctionBody::Block(body) => {
                 // Bind the `arguments` object — array-like, carrying every
@@ -23082,6 +23912,7 @@ impl Interp {
             }
             FunctionBody::ArrowExpr(e) => self.eval(e, &call_scope),
         };
+        pop_strict_frame();
         if pushed_callee {
             CALLEE_STACK.with(|s| {
                 s.borrow_mut().pop();
@@ -23093,6 +23924,16 @@ impl Interp {
             });
         }
         result
+    }
+}
+
+/// A `FunctionBody` is strict iff it is a block whose statement list opens with
+/// a `"use strict"` directive prologue (arrow-expression bodies carry no
+/// prologue).
+fn body_is_strict_block(body: &FunctionBody) -> bool {
+    match body {
+        FunctionBody::Block(stmts) => body_is_strict(stmts),
+        FunctionBody::ArrowExpr(_) => false,
     }
 }
 

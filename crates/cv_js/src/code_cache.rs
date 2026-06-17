@@ -732,6 +732,9 @@ fn read_op(r: &mut Reader) -> Option<Op> {
 fn write_fn(w: &mut Writer, f: &BcFunction) -> bool {
     w.str(&f.name);
     w.u8(f.n_params);
+    // strict-mode flag (ECMA-262 §11.2.1 directive prologue), so a reloaded
+    // function still pushes the right strict frame.
+    w.u8(f.strict as u8);
     // rest_reg: a tag + the value (Reg = u16).
     match f.rest_reg {
         Some(r) => {
@@ -776,6 +779,7 @@ fn write_fn(w: &mut Writer, f: &BcFunction) -> bool {
 fn read_fn(r: &mut Reader, code_len_for_ic: &mut usize) -> Option<BcFunction> {
     let name = r.str()?;
     let n_params = r.u8()?;
+    let strict = r.u8()? != 0;
     let rest_reg = match r.u8()? {
         0 => None,
         1 => Some(r.u16()?),
@@ -841,6 +845,7 @@ fn read_fn(r: &mut Reader, code_len_for_ic: &mut usize) -> Option<BcFunction> {
         // P1 deliberately does not persist them (recording only), so a reload
         // simply re-warms the lattice from scratch.
         feedback: std::cell::RefCell::new(Vec::new()),
+        strict,
     })
 }
 

@@ -265,6 +265,9 @@ struct T3Func {
     bc_to_block: std::collections::HashMap<usize, usize>,
     n_params: u8,
     n_regs: Reg,
+    /// Carried from the source function so the optimized clone preserves its
+    /// strict-mode flag (the VM pushes a strict frame keyed on it).
+    strict: bool,
 }
 
 /// Why T3 declined to optimize a function (diagnostic; all map to "run on T2").
@@ -438,6 +441,7 @@ fn lower(f: &BcFunction) -> Result<T3Func, DeclineReason> {
         bc_to_block,
         n_params: f.n_params,
         n_regs: f.n_regs,
+        strict: f.strict,
     })
 }
 
@@ -1491,6 +1495,7 @@ impl T3Func {
             // the VM recorded into); the optimized clone never records, so an empty
             // vector here is correct and never consulted by the recorder.
             feedback: std::cell::RefCell::new(Vec::new()),
+            strict: self.strict,
         })
     }
 }

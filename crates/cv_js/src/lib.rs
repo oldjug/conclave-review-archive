@@ -113,6 +113,10 @@ pub use ab_oracle::{
     Divergence, DivergenceKind, ThrownError, TierOutcome, assert_tiers_agree,
 };
 pub use interp::{
+    htmlcollection_proto, is_legacy_collection, make_legacy_collection, nodelist_proto,
+    push_strict_frame, pop_strict_frame, strict_mode_active,
+};
+pub use interp::{
     ACCESSOR_GET, ACCESSOR_SET, BankRootGuard, ForcedTier, Interp, JsBigInt, JsError, NativeFn,
     NativeFnBody, NoP6JitGuard, PROTO_KEY, TierGuard, Value, current_native_this, diag_log,
     forced_tier,
