@@ -42245,6 +42245,129 @@ fn index_size_error(method: &str) -> cv_js::JsError {
     )))
 }
 
+/// Install the WHATWG ChildNode mixin (DOM §4.2.8) — `before`, `after`,
+/// `replaceWith`, `remove` — on a detached/created node object (Element / Text /
+/// Comment). These operate on the LIVE snapshot tree (`_parent` + the parent's
+/// `_children`), so they work uniformly for any node built by createElement /
+/// createTextNode / createComment / cloneNode regardless of whether it's yet in
+/// the document. The receiver is resolved via `current_native_this()` (the same
+/// mechanism the CharacterData mutators use), so the methods are shared by value.
+fn install_child_node_mixin(m: &mut cv_js::OrderedMap<String, cv_js::Value>) {
+    use cv_js::{native_fn_with_interp, Value};
+
+    // Find `self`'s parent and its index in the parent's children snapshot.
+    fn self_parent_and_index() -> Option<(Value, std::rc::Rc<std::cell::RefCell<Vec<Value>>>, usize)>
+    {
+        let me = cv_js::current_native_this();
+        let parent = js_node_parent(&me)?;
+        let kids = get_children_snapshot(&parent)?;
+        let idx = kids
+            .borrow()
+            .iter()
+            .position(|c| cv_js::Value::strict_eq(c, &me))?;
+        Some((parent, kids, idx))
+    }
+
+    // Detach ANY node (Element / Text / Comment) from its parent's children.
+    // `detach_element_snapshot_observed` is element-only, so this handles the
+    // CharacterData node case the ChildNode mixin must support.
+    fn detach_any(node: &Value) {
+        if is_element_js_value(node) {
+            detach_element_snapshot_observed(node);
+            return;
+        }
+        let Some(parent) = js_node_parent(node) else { return };
+        if let Some(kids) = get_children_snapshot(&parent) {
+            kids.borrow_mut()
+                .retain(|c| !cv_js::Value::strict_eq(c, node));
+        }
+        set_parent_snapshot(node, Value::Null);
+    }
+
+    // Insert `nodes` into `kids` at `at`, preserving ALL node types (Text /
+    // Comment included — unlike `insert_element_snapshots`, which is
+    // element-only). Detaches each node from its old parent first (move).
+    fn insert_all_at(
+        parent: &Value,
+        kids: &std::rc::Rc<std::cell::RefCell<Vec<Value>>>,
+        at: usize,
+        nodes: &[Value],
+    ) {
+        for n in nodes {
+            detach_any(n);
+        }
+        let mut k = kids.borrow_mut();
+        let at = at.min(k.len());
+        k.splice(at..at, nodes.iter().cloned());
+        drop(k);
+        for n in nodes {
+            set_parent_snapshot(n, parent.clone());
+        }
+    }
+
+    // before(...nodes): insert nodes into the parent's child list just before
+    // `self` (no-op if `self` has no parent — §4.2.8 step "if parent is null").
+    m.insert(
+        "before".into(),
+        native_fn_with_interp("before", |_i, args| {
+            let nodes = normalize_dom_nodes(&args);
+            if let Some((parent, kids, idx)) = self_parent_and_index() {
+                insert_all_at(&parent, &kids, idx, &nodes);
+            }
+            Ok(Value::Undefined)
+        }),
+    );
+
+    // after(...nodes): insert just after `self`.
+    m.insert(
+        "after".into(),
+        native_fn_with_interp("after", |_i, args| {
+            let nodes = normalize_dom_nodes(&args);
+            if let Some((parent, kids, idx)) = self_parent_and_index() {
+                insert_all_at(&parent, &kids, idx + 1, &nodes);
+            }
+            Ok(Value::Undefined)
+        }),
+    );
+
+    // replaceWith(...nodes): replace `self` with nodes in the parent's list
+    // (preserving all node types). No-op if `self` has no parent.
+    m.insert(
+        "replaceWith".into(),
+        native_fn_with_interp("replaceWith", |_i, args| {
+            let me = cv_js::current_native_this();
+            let nodes = normalize_dom_nodes(&args);
+            if let Some((parent, kids, idx)) = self_parent_and_index() {
+                // Don't detach `me` first (it anchors the index); detach the
+                // incoming nodes, then splice them in over `me`.
+                for n in &nodes {
+                    detach_any(n);
+                }
+                {
+                    let mut k = kids.borrow_mut();
+                    let idx = idx.min(k.len().saturating_sub(1));
+                    k.splice(idx..idx + 1, nodes.iter().cloned());
+                }
+                set_parent_snapshot(&me, Value::Null);
+                for n in &nodes {
+                    set_parent_snapshot(n, parent.clone());
+                }
+            }
+            Ok(Value::Undefined)
+        }),
+    );
+
+    // remove(): detach `self` from its parent (§4.2.8). No-op if no parent.
+    m.insert(
+        "remove".into(),
+        native_fn_with_interp("remove", |_i, _args| {
+            let me = cv_js::current_native_this();
+            detach_any(&me);
+            Ok(Value::Undefined)
+        }),
+    );
+}
+
 /// Install the WHATWG CharacterData mutation methods (appendData / insertData /
 /// deleteData / replaceData / substringData) on a text or comment node object.
 /// Offsets are UTF-16 code units per the spec. Each mutator writes back through
@@ -43630,6 +43753,7 @@ fn make_text_node_js(text: &str) -> cv_js::Value {
     });
     m.insert("cloneNode".into(), clone_node);
     install_chardata_methods(&mut m);
+    install_child_node_mixin(&mut m);
     cv_js::Value::Object(Rc::new(RefCell::new(m)))
 }
 
@@ -43656,6 +43780,7 @@ fn make_comment_node_js(text: &str) -> cv_js::Value {
     // Comment is a CharacterData node (DOM §4.11): data/length + substringData/
     // appendData/insertData/deleteData/replaceData + the ChildNode mixin.
     install_chardata_methods(&mut m);
+    install_child_node_mixin(&mut m);
     cv_js::Value::Object(Rc::new(RefCell::new(m)))
 }
 
@@ -47131,6 +47256,10 @@ fn make_new_element_js_with_canvas_registry(
             });
             map.insert("classList".into(), tb_js_accessor(getter, setter));
         }
+        // ChildNode mixin (DOM §4.2.8): before / after / replaceWith / remove,
+        // operating on the live `_parent`/`_children` snapshot. Shared with Text
+        // and Comment via the same helper.
+        install_child_node_mixin(&mut map);
         // Self-contained listener registry on each ad-hoc node (returned
         // by document.createElement / cloneNode etc.) so addEventListener
         // + dispatchEvent actually round-trip without needing a path
@@ -74666,6 +74795,35 @@ var el = document.getElementById('el');
         assert_eq!(window_str(&runtime, "__bytag"), "ok");
         assert_eq!(window_str(&runtime, "__count"), "2");
         assert_eq!(window_str(&runtime, "__none"), "null");
+    }
+
+    // ChildNode mixin (DOM §4.2.8) on created Element / Comment / Text:
+    // before / after / replaceWith / remove operate on the live snapshot tree.
+    #[test]
+    fn child_node_mixin_before_after_replace_remove() {
+        let doc = cv_html::parse("<!doctype html><html><body></body></html>");
+        let mut runtime = LiveInterp::new(&doc, "https://example.com/");
+        runtime
+            .interp
+            .run(
+                "var parent = document.createElement('div'); \
+                 var child = document.createElement('span'); \
+                 parent.appendChild(child); \
+                 var x = document.createElement('x'); child.before(x); \
+                 window.__before = parent.childNodes.length + ':' + (parent.childNodes[0] === x); \
+                 var c = document.createComment('cm'); child.after(c); \
+                 window.__after = (parent.childNodes[2] === c); \
+                 c.remove(); window.__cm_removed = (parent.childNodes.length === 2); \
+                 var y = document.createElement('y'); child.replaceWith(y); \
+                 window.__replaced = (parent.childNodes[1] === y); \
+                 x.remove(); window.__final = parent.childNodes.length;",
+            )
+            .expect("childnode mixin run");
+        assert_eq!(window_str(&runtime, "__before"), "2:true");
+        assert_eq!(window_str(&runtime, "__after"), "true");
+        assert_eq!(window_str(&runtime, "__cm_removed"), "true");
+        assert_eq!(window_str(&runtime, "__replaced"), "true");
+        assert_eq!(window_str(&runtime, "__final"), "1");
     }
 
     // setAttribute('data-x', '') must be retrievable as "" (not null).
