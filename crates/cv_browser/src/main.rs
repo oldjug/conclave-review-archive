@@ -43653,6 +43653,41 @@ fn make_comment_node_js(text: &str) -> cv_js::Value {
         Ok(make_comment_node_js(&text_for_clone))
     });
     m.insert("cloneNode".into(), clone_node);
+    // Comment is a CharacterData node (DOM §4.11): data/length + substringData/
+    // appendData/insertData/deleteData/replaceData + the ChildNode mixin.
+    install_chardata_methods(&mut m);
+    cv_js::Value::Object(Rc::new(RefCell::new(m)))
+}
+
+/// A DOM `DocumentType` node (nodeType 10; WHATWG DOM §4.7). Carries
+/// name/publicId/systemId, `ownerDocument`, and `nodeValue` === null. Used by
+/// `document.implementation.createDocumentType` and `doctype` reflection.
+fn make_doctype_node_js(
+    name: &str,
+    public_id: &str,
+    system_id: &str,
+    owner_document: cv_js::Value,
+) -> cv_js::Value {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use cv_js::OrderedMap as HashMap;
+
+    let mut m: HashMap<String, cv_js::Value> = HashMap::new();
+    m.insert("nodeType".into(), cv_js::Value::Number(10.0));
+    m.insert("nodeName".into(), cv_js::Value::str(name.to_string()));
+    m.insert("name".into(), cv_js::Value::str(name.to_string()));
+    m.insert("publicId".into(), cv_js::Value::str(public_id.to_string()));
+    m.insert("systemId".into(), cv_js::Value::str(system_id.to_string()));
+    // DocumentType is a leaf node: nodeValue/textContent are null per spec.
+    m.insert("nodeValue".into(), cv_js::Value::Null);
+    m.insert("textContent".into(), cv_js::Value::Null);
+    m.insert("ownerDocument".into(), owner_document);
+    let (n, p, s) = (name.to_string(), public_id.to_string(), system_id.to_string());
+    let clone_owner = cv_js::Value::Null;
+    let clone_node = cv_js::native_fn("cloneNode", move |_args| {
+        Ok(make_doctype_node_js(&n, &p, &s, clone_owner.clone()))
+    });
+    m.insert("cloneNode".into(), clone_node);
     cv_js::Value::Object(Rc::new(RefCell::new(m)))
 }
 
@@ -47697,6 +47732,15 @@ fn install_dom_api(
             .unwrap_or_default();
         Ok(make_text_node_js(&text))
     });
+    // document.createComment(data) — WHATWG DOM §4.5: a Comment (CharacterData,
+    // nodeType 8) whose data is the given string (no validation; "--" allowed).
+    let create_comment = cv_js::native_fn("createComment", move |args| {
+        let data = args
+            .first()
+            .map(|v| v.to_display_string())
+            .unwrap_or_default();
+        Ok(make_comment_node_js(&data))
+    });
     // document.createAttribute(localName) — WHATWG DOM §4.5
     // (https://dom.spec.whatwg.org/#dom-document-createattribute). For an HTML
     // document the localName is lowercased; the Attr has a null namespace/prefix
@@ -49539,6 +49583,7 @@ fn install_dom_api(
         m.insert("createAttribute".into(), create_attribute);
         m.insert("createAttributeNS".into(), create_attribute_ns);
         m.insert("createTextNode".into(), create_text_node);
+        m.insert("createComment".into(), create_comment);
         m.insert("createDocumentFragment".into(), create_document_fragment);
         m.insert("createRange".into(), create_range);
         m.insert("createTreeWalker".into(), create_tree_walker);
@@ -49611,6 +49656,9 @@ fn install_dom_api(
         use std::rc::Rc as DocRc;
         let pending_impl = pending.clone();
         let canvas_impl = table.borrow().canvas_contexts_by_js.clone();
+        // The owning document (Rc clone — cheap, doesn't conflict with the live
+        // `m` borrow) for `createDocumentType().ownerDocument`.
+        let owner_doc_for_impl = document.clone();
         let create_html_document = cv_js::native_fn("createHTMLDocument", move |args| {
             let title = args
                 .first()
@@ -49657,6 +49705,41 @@ fn install_dom_api(
                 }
                 Ok(el)
             });
+            // The new document's own DOMImplementation (createDocumentType /
+            // hasFeature), with createDocumentType binding ownerDocument = newdoc.
+            let impl_for_newdoc =
+                cv_js::Value::Object(DocRc::new(DocRefCell::new(cv_js::OrderedMap::new())));
+            if let cv_js::Value::Object(io) = &impl_for_newdoc {
+                let owner_nd = newdoc.clone();
+                io.borrow_mut().insert(
+                    "createDocumentType".into(),
+                    cv_js::native_fn("createDocumentType", move |a| {
+                        let qualified =
+                            a.first().map(|v| v.to_display_string()).unwrap_or_default();
+                        let public_id =
+                            a.get(1).map(|v| v.to_display_string()).unwrap_or_default();
+                        let system_id =
+                            a.get(2).map(|v| v.to_display_string()).unwrap_or_default();
+                        if qualified.chars().any(|c| c.is_ascii_whitespace() || c == '>') {
+                            return Err(cv_js::JsError::Throw(make_dom_exception(
+                                "InvalidCharacterError",
+                                5,
+                                &format!("'{qualified}' is not a valid doctype name"),
+                            )));
+                        }
+                        Ok(make_doctype_node_js(
+                            &qualified,
+                            &public_id,
+                            &system_id,
+                            owner_nd.clone(),
+                        ))
+                    }),
+                );
+                io.borrow_mut().insert(
+                    "hasFeature".into(),
+                    cv_js::native_fn("hasFeature", |_a| Ok(cv_js::Value::Bool(true))),
+                );
+            }
             if let cv_js::Value::Object(o) = &newdoc {
                 let mut dm = o.borrow_mut();
                 dm.insert("nodeType".into(), cv_js::Value::Number(9.0));
@@ -49664,6 +49747,7 @@ fn install_dom_api(
                 dm.insert("body".into(), body_el);
                 dm.insert("documentElement".into(), html_el);
                 dm.insert("createElement".into(), ce);
+                dm.insert("implementation".into(), impl_for_newdoc);
             }
             Ok(newdoc)
         });
@@ -49671,6 +49755,47 @@ fn install_dom_api(
         if let cv_js::Value::Object(o) = &impl_obj {
             o.borrow_mut()
                 .insert("createHTMLDocument".into(), create_html_document);
+
+            // document.implementation.createDocumentType(qualifiedName, publicId,
+            // systemId) — WHATWG DOM §4.5.1. Validate the qualified name
+            // (InvalidCharacterError on a bad Name/QName), then return a
+            // DocumentType (nodeType 10) carrying name/publicId/systemId and
+            // ownerDocument = this document.
+            let owner_doc_dt = owner_doc_for_impl.clone();
+            let create_document_type =
+                cv_js::native_fn("createDocumentType", move |a| {
+                    let qualified = a.first().map(|v| v.to_display_string()).unwrap_or_default();
+                    let public_id = a.get(1).map(|v| v.to_display_string()).unwrap_or_default();
+                    let system_id = a.get(2).map(|v| v.to_display_string()).unwrap_or_default();
+                    // Per the WPT DOMImplementation-createDocumentType matrix
+                    // (Chrome/Blink behavior): the name is accepted as-is EXCEPT
+                    // when it contains a character that can't appear in a serialized
+                    // doctype — ASCII whitespace or U+003E '>' →
+                    // InvalidCharacterError. (Other punctuation, empty string, and
+                    // colons are all permitted.)
+                    if qualified.chars().any(|c| c.is_ascii_whitespace() || c == '>') {
+                        return Err(cv_js::JsError::Throw(make_dom_exception(
+                            "InvalidCharacterError",
+                            5,
+                            &format!("'{qualified}' is not a valid doctype name"),
+                        )));
+                    }
+                    Ok(make_doctype_node_js(
+                        &qualified,
+                        &public_id,
+                        &system_id,
+                        owner_doc_dt.clone(),
+                    ))
+                });
+            o.borrow_mut()
+                .insert("createDocumentType".into(), create_document_type);
+
+            // DOMImplementation.hasFeature() — legacy; per WHATWG DOM §4.5.1 it
+            // MUST always return true regardless of arguments.
+            o.borrow_mut().insert(
+                "hasFeature".into(),
+                cv_js::native_fn("hasFeature", |_a| Ok(cv_js::Value::Bool(true))),
+            );
         }
         m.insert("implementation".into(), impl_obj);
     }
@@ -74411,6 +74536,69 @@ var el = document.getElementById('el');
         assert_eq!(window_str(&runtime, "__f2"), "7", "var in bare block hoists");
         assert_eq!(window_str(&runtime, "__f3"), "9:1", "var in for-body hoists");
         assert_eq!(window_str(&runtime, "__f4"), "a", "var in for-in body hoists");
+    }
+
+    // document.createComment(data) → a Comment node (CharacterData, nodeType 8)
+    // with the full CharacterData mutation API (DOM §4.5 / §4.11).
+    #[test]
+    fn document_create_comment_is_character_data() {
+        let doc = cv_html::parse("<!doctype html><html><body></body></html>");
+        let mut runtime = LiveInterp::new(&doc, "https://example.com/");
+        runtime
+            .interp
+            .run(
+                "var c = document.createComment('hello world'); \
+                 window.__nt = c.nodeType; \
+                 window.__nn = c.nodeName; \
+                 window.__data = c.data; \
+                 window.__sub = c.substringData(0, 5); \
+                 c.appendData('!'); window.__after = c.data; \
+                 c.deleteData(0, 6); window.__del = c.data;",
+            )
+            .expect("createComment run");
+        assert_eq!(window_str(&runtime, "__nt"), "8");
+        assert_eq!(window_str(&runtime, "__nn"), "#comment");
+        assert_eq!(window_str(&runtime, "__data"), "hello world");
+        assert_eq!(window_str(&runtime, "__sub"), "hello");
+        assert_eq!(window_str(&runtime, "__after"), "hello world!");
+        assert_eq!(window_str(&runtime, "__del"), "world!");
+    }
+
+    // document.implementation.createDocumentType + hasFeature (DOM §4.5.1).
+    #[test]
+    fn document_implementation_create_document_type_and_has_feature() {
+        let doc = cv_html::parse("<!doctype html><html><body></body></html>");
+        let mut runtime = LiveInterp::new(&doc, "https://example.com/");
+        runtime
+            .interp
+            .run(
+                "var impl = document.implementation; \
+                 window.__hf = impl.hasFeature('Core', '2.0'); \
+                 var dt = impl.createDocumentType('html', 'pub', 'sys'); \
+                 window.__name = dt.name; \
+                 window.__nn = dt.nodeName; \
+                 window.__pub = dt.publicId; \
+                 window.__sys = dt.systemId; \
+                 window.__nt = dt.nodeType; \
+                 window.__nv = String(dt.nodeValue); \
+                 window.__owner = (dt.ownerDocument === document) ? 'doc' : 'other'; \
+                 function nm(f){ try { f(); return 'no-throw'; } catch(e){ return e.name; } } \
+                 window.__bad = nm(function(){ impl.createDocumentType('a b'); }); \
+                 window.__gt  = nm(function(){ impl.createDocumentType('a>b'); }); \
+                 window.__empty_ok = nm(function(){ impl.createDocumentType('', '', ''); });",
+            )
+            .expect("createDocumentType run");
+        assert_eq!(window_str(&runtime, "__hf"), "true");
+        assert_eq!(window_str(&runtime, "__name"), "html");
+        assert_eq!(window_str(&runtime, "__nn"), "html");
+        assert_eq!(window_str(&runtime, "__pub"), "pub");
+        assert_eq!(window_str(&runtime, "__sys"), "sys");
+        assert_eq!(window_str(&runtime, "__nt"), "10");
+        assert_eq!(window_str(&runtime, "__nv"), "null");
+        assert_eq!(window_str(&runtime, "__owner"), "doc");
+        assert_eq!(window_str(&runtime, "__bad"), "InvalidCharacterError");
+        assert_eq!(window_str(&runtime, "__gt"), "InvalidCharacterError");
+        assert_eq!(window_str(&runtime, "__empty_ok"), "no-throw");
     }
 
     // setAttribute('data-x', '') must be retrievable as "" (not null).
