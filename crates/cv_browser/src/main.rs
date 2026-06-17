@@ -29419,6 +29419,18 @@ fn install_minimal_dom_with_url(interp: &cv_js::Interp, initial_title: String, p
             "CanvasRenderingContext2D",
             make_iface_no_ctor("CanvasRenderingContext2D", &crc2d_proto),
         );
+        // Window interface object (HTML §7.3). Window inherits EventTarget so
+        // its prototype chains off EventTarget.prototype and `Window.prototype`
+        // is patchable / `typeof Window` is defined. NOTE: we intentionally do
+        // NOT stamp the live global object's [[Prototype]] with Window.prototype
+        // — the global object is the lexical scope's backing map, and giving it
+        // a prototype changes global identifier/`window.X` resolution (it caused
+        // a devicePixelRatio/matchMedia resolution flake). So `window instanceof
+        // Window` stays a real FAIL until a dedicated Window-binding slice; the
+        // interface object + prototype existing is the safe unblock here.
+        let window_proto = new_proto_obj();
+        link_proto(&window_proto, &dom_protos.event_target);
+        interp.define_global("Window", make_iface_no_ctor("Window", &window_proto));
     }
 
     // ── Constructable node interfaces (WHATWG DOM): new Document(), new
@@ -65844,6 +65856,18 @@ mod tests {
     }
 
     #[test]
+    fn dom_window_interface_global_exists() {
+        // HTML §7.3 — Window interface object exists with a prototype chained off
+        // EventTarget.prototype. (The live `window instanceof Window` binding is a
+        // separate slice; here we assert the interface object + prototype chain.)
+        assert_ne!(eval_min_dom("typeof Window"), "undefined");
+        assert_eq!(
+            eval_min_dom("Object.getPrototypeOf(Window.prototype) === EventTarget.prototype"),
+            "true"
+        );
+    }
+
+    #[test]
     fn dom_interface_globals_all_exist() {
         // The big-unblock surface: each interface global is defined (not a
         // ReferenceError). `typeof` returns "object" for the interface objects
@@ -65854,7 +65878,7 @@ mod tests {
             "DocumentFragment", "DocumentType", "Attr", "DOMImplementation",
             "EventTarget", "NodeList", "HTMLCollection", "NamedNodeMap",
             "DOMTokenList", "DOMStringMap", "NodeFilter", "NodeIterator",
-            "TreeWalker", "Range", "AbortController", "AbortSignal",
+            "TreeWalker", "Range", "AbortController", "AbortSignal", "Window",
         ] {
             let got = eval_min_dom(&format!("typeof {name}"));
             assert_ne!(got, "undefined", "interface global {name} must exist");
