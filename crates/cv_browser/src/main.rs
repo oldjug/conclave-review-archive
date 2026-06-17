@@ -3901,8 +3901,19 @@ fn inject_wpt_harness(raw: &str, test_path: &std::path::Path) -> String {
     // → `_support/css/support/..`). Resolved relative to the conformance/wpt tree
     // that contains the upstream test set.
     let support_root = upstream_support_root(test_path);
+    // The WPT TREE ROOT (the dir that directly contains `resources/` + `common/` +
+    // the area dirs like `dom/`). WPT-absolute helper paths (`/common/foo.js`,
+    // `/dom/nodes/selectors.js`) resolve against THIS — that is exactly how the
+    // upstream wpt server serves them. Distinct from `_support` (a per-test mirror
+    // convention); both are tried so either corpus layout works.
+    let corpus_root = wpt_corpus_root(test_path);
 
-    let mut html = inline_or_drop_helper_scripts(raw, test_dir.as_deref(), support_root.as_deref());
+    let mut html = inline_or_drop_helper_scripts(
+        raw,
+        test_dir.as_deref(),
+        support_root.as_deref(),
+        corpus_root.as_deref(),
+    );
 
     // Prepend the shim as the very first script (so test()/assert_* exist before
     // the test's own scripts run). The shim MUST precede every author script, so
@@ -3950,6 +3961,34 @@ fn upstream_support_root(test_path: &std::path::Path) -> Option<std::path::PathB
     None
 }
 
+/// The WPT TREE ROOT for a test: the nearest ancestor directory that directly
+/// contains a `resources/` subdir (every WPT checkout has `resources/` at its
+/// root, holding `testharness.js`). WPT-absolute helper paths (`/common/foo.js`,
+/// `/dom/nodes/selectors.js`) are served by the upstream wpt server relative to
+/// this root, so a self-defining helper like `/common/subset-tests-by-key.js`
+/// resolves to a real local file we can inline. Bounded by an `upstream`/
+/// `wpt-src` marker dir so we never escape the corpus.
+fn wpt_corpus_root(test_path: &std::path::Path) -> Option<std::path::PathBuf> {
+    // The ROOT is the ancestor whose `resources/testharness.js` exists — NOT just
+    // any dir with a `resources/` subdir, because many test subdirs (e.g.
+    // `dom/events/resources/`) carry their own local helper `resources/` folder.
+    // Only the corpus root holds the canonical harness, so that is the unambiguous
+    // marker for where WPT-absolute paths are served from.
+    let mut cur = test_path.parent();
+    while let Some(dir) = cur {
+        if dir.join("resources").join("testharness.js").is_file() {
+            return Some(dir.to_path_buf());
+        }
+        // Fallback marker dirs (a sparse corpus may lack a full resources/ tree).
+        let name = dir.file_name().and_then(|n| n.to_str());
+        if matches!(name, Some("upstream") | Some("wpt-src") | Some("wpt")) {
+            return Some(dir.to_path_buf());
+        }
+        cur = dir.parent();
+    }
+    None
+}
+
 /// Walk every `<script ... src="X" ...></script>` and either inline X's local
 /// contents or neutralize it to an empty `data:` URL. Author inline scripts are
 /// untouched. Returns the rewritten HTML.
@@ -3957,6 +3996,7 @@ fn inline_or_drop_helper_scripts(
     raw: &str,
     test_dir: Option<&std::path::Path>,
     support_root: Option<&std::path::Path>,
+    corpus_root: Option<&std::path::Path>,
 ) -> String {
     let mut out = String::with_capacity(raw.len() + 4096);
     let bytes = raw.as_bytes();
@@ -3980,7 +4020,7 @@ fn inline_or_drop_helper_scripts(
         let src_val = extract_attr(open_tag, "src");
         if let Some(src) = src_val {
             let trimmed = src.trim();
-            let resolved = resolve_wpt_helper(trimmed, test_dir, support_root);
+            let resolved = resolve_wpt_helper(trimmed, test_dir, support_root, corpus_root);
             // Find the matching </script> (scripts with src are usually empty).
             let after_open = tag_start + gt_rel + 1;
             let close_rel = lower[after_open..].find("</script>");
@@ -4015,37 +4055,68 @@ fn inline_or_drop_helper_scripts(
 }
 
 /// Resolve a WPT helper `src` to local file contents, or `None` to drop it.
+///
+/// Drop ONLY the harness/automation runtime we shim or can't run offline:
+///   * `testharness*.js` / `testharnessreport.js` → our `TESTHARNESS_SHIM`
+///     replaces them.
+///   * `testdriver*.js` → browser-automation (trusted input synthesis); no
+///     offline equivalent.
+/// Everything ELSE that points at a real local file is INLINED — crucially the
+/// self-defining shared helpers under `/common/` (`subset-tests-by-key.js`
+/// defines `subsetTestByKey`, `get-host-info.sub.js` defines `get_host_info`,
+/// etc.) and `/resources/` non-harness helpers (`SVGAnimationTestCase-…`,
+/// `check-layout-th.js`). Dropping `/common/` wholesale (the old behaviour) made
+/// every test that *used* one of those helpers throw `ReferenceError: <helper>
+/// is not defined` even though the file is right there in the corpus.
+///
+/// Resolution order for a WPT-absolute `/X/Y.js`: the corpus tree root first
+/// (how the upstream server serves it), then the `_support` mirror. A relative
+/// `Y.js` resolves against the test's own directory.
 fn resolve_wpt_helper(
     src: &str,
     test_dir: Option<&std::path::Path>,
     support_root: Option<&std::path::Path>,
+    corpus_root: Option<&std::path::Path>,
 ) -> Option<String> {
-    // Always drop the harness/automation runtime — our shim replaces it.
-    let dropset = [
-        "testharness.js",
-        "testharnessreport.js",
-        "testdriver.js",
-        "testdriver-vendor.js",
-        "/common/",
-        "/service-workers/",
-    ];
-    if dropset.iter().any(|d| src.contains(d)) {
-        return None;
-    }
-    // Strip a query/fragment.
+    // Strip a query/fragment first so `.sub.js?pipe=…` style refs match.
     let clean = src.split(['?', '#']).next().unwrap_or(src);
     if clean.starts_with("data:") || clean.starts_with("http://") || clean.starts_with("https://") {
         return None;
     }
-    let path = if let Some(absrest) = clean.strip_prefix('/') {
-        // WPT-absolute → local mirror under `_support`.
-        support_root.map(|r| r.join(absrest))
+    // The harness/automation runtime we shim or can't run offline. Matched on the
+    // FILE NAME (last path component) so a directory called e.g. `testharness-helpers`
+    // is not caught, and on `testdriver` substrings for the automation family.
+    let file_name = clean.rsplit(['/', '\\']).next().unwrap_or(clean);
+    let is_harness_runtime = matches!(
+        file_name,
+        "testharness.js" | "testharnessreport.js"
+    ) || file_name.starts_with("testdriver");
+    if is_harness_runtime {
+        return None;
+    }
+    let abs_candidates = |rest: &str| -> Vec<std::path::PathBuf> {
+        let mut v = Vec::new();
+        if let Some(r) = corpus_root {
+            v.push(r.join(rest));
+        }
+        if let Some(r) = support_root {
+            v.push(r.join(rest));
+        }
+        v
+    };
+    let candidates: Vec<std::path::PathBuf> = if let Some(absrest) = clean.strip_prefix('/') {
+        // WPT-absolute → corpus root, then `_support` mirror.
+        abs_candidates(absrest)
     } else {
         // Relative → against the test's own directory.
-        test_dir.map(|d| d.join(clean))
+        test_dir.map(|d| vec![d.join(clean)]).unwrap_or_default()
     };
-    let path = path?;
-    std::fs::read_to_string(&path).ok()
+    for p in candidates {
+        if let Ok(s) = std::fs::read_to_string(&p) {
+            return Some(s);
+        }
+    }
+    None
 }
 
 /// Extract `name="value"` / `name='value'` from an opening tag (first match,
@@ -61657,6 +61728,102 @@ mod tests {
         let shim_at = out.find("globalThis.__wpt").unwrap();
         let test_at = out.find("test(()=>{}, 'a')").unwrap();
         assert!(shim_at < test_at);
+    }
+
+    /// Build a throwaway WPT-shaped corpus under a unique temp dir:
+    ///   <root>/resources/testharness.js   (the canonical-root marker)
+    ///   <root>/common/helper.js           (self-defining shared helper)
+    ///   <root>/dom/nodes/sel.js           (WPT-absolute area helper)
+    ///   <root>/dom/nodes/rel.js           (relative sibling helper)
+    ///   <root>/dom/nodes/resources/local.js (a per-subdir resources/ helper:
+    ///                                         proves the root finder is not fooled)
+    /// Returns the root and the test-file path inside it.
+    fn build_wpt_corpus_fixture() -> (std::path::PathBuf, std::path::PathBuf) {
+        use std::io::Write;
+        let root = std::env::temp_dir().join(format!(
+            "cv_wpt_fixture_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mk = |rel: &str, body: &str| {
+            let p = root.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            let mut f = std::fs::File::create(&p).unwrap();
+            f.write_all(body.as_bytes()).unwrap();
+        };
+        mk("resources/testharness.js", "// real harness (dropped)");
+        mk("common/helper.js", "self.commonHelper = function(){return 1;};");
+        mk("dom/nodes/sel.js", "function selHelper(){return 2;}");
+        mk("dom/nodes/rel.js", "function relHelper(){return 3;}");
+        mk(
+            "dom/nodes/resources/local.js",
+            "// per-subdir resources (must NOT become the corpus root)",
+        );
+        let test = root.join("dom/nodes/test.html");
+        (root, test)
+    }
+
+    #[test]
+    fn wpt_corpus_root_uses_canonical_harness_not_nested_resources() {
+        let (root, test) = build_wpt_corpus_fixture();
+        // The nearest ancestor with a `resources/` dir is dom/nodes/, but only the
+        // root's resources/ holds testharness.js → that is the corpus root.
+        let found = wpt_corpus_root(&test).expect("root resolves");
+        assert_eq!(
+            std::fs::canonicalize(&found).unwrap(),
+            std::fs::canonicalize(&root).unwrap(),
+            "corpus root must be the dir holding resources/testharness.js, not a per-subdir resources/"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn wpt_resolve_helper_inlines_common_absolute_and_relative_drops_harness() {
+        let (root, test) = build_wpt_corpus_fixture();
+        let test_dir = test.parent().map(|p| p.to_path_buf());
+        let corpus = wpt_corpus_root(&test);
+        // The real harness runtime is dropped (we shim it).
+        assert_eq!(
+            resolve_wpt_helper("/resources/testharness.js", test_dir.as_deref(), None, corpus.as_deref()),
+            None
+        );
+        // testdriver automation is dropped.
+        assert_eq!(
+            resolve_wpt_helper("/resources/testdriver.js", test_dir.as_deref(), None, corpus.as_deref()),
+            None
+        );
+        // A `/common/` self-defining helper is INLINED (the key regression).
+        assert_eq!(
+            resolve_wpt_helper("/common/helper.js", test_dir.as_deref(), None, corpus.as_deref())
+                .as_deref(),
+            Some("self.commonHelper = function(){return 1;};")
+        );
+        // A WPT-absolute area helper resolves against the corpus root.
+        assert_eq!(
+            resolve_wpt_helper("/dom/nodes/sel.js", test_dir.as_deref(), None, corpus.as_deref())
+                .as_deref(),
+            Some("function selHelper(){return 2;}")
+        );
+        // A relative sibling helper resolves against the test's own dir.
+        assert_eq!(
+            resolve_wpt_helper("rel.js", test_dir.as_deref(), None, corpus.as_deref()).as_deref(),
+            Some("function relHelper(){return 3;}")
+        );
+        // A query/fragment is stripped before resolution.
+        assert_eq!(
+            resolve_wpt_helper("rel.js?pipe=x", test_dir.as_deref(), None, corpus.as_deref())
+                .as_deref(),
+            Some("function relHelper(){return 3;}")
+        );
+        // Remote/data URLs are never fetched.
+        assert_eq!(
+            resolve_wpt_helper("https://example.com/x.js", test_dir.as_deref(), None, corpus.as_deref()),
+            None
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
