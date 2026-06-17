@@ -19645,7 +19645,8 @@ fn build_event_value(
         let mut g = pd.borrow_mut();
         if matches!(g.get("cancelable"), Some(cv_js::Value::Bool(true))) {
             g.insert("defaultPrevented".into(), cv_js::Value::Bool(true));
-            g.insert("returnValue".into(), cv_js::Value::Bool(false));
+            // NOTE: `returnValue` is a live accessor over `defaultPrevented`
+            // (see below) — do NOT write a plain field here or it clobbers it.
         }
         Ok(cv_js::Value::Undefined)
     });
@@ -19702,7 +19703,8 @@ fn build_event_value(
         g.insert("\u{1}stopImmediate".into(), cv_js::Value::Bool(false));
         g.insert("cancelBubble".into(), cv_js::Value::Bool(false));
         g.insert("defaultPrevented".into(), cv_js::Value::Bool(false));
-        g.insert("returnValue".into(), cv_js::Value::Bool(true));
+        // `returnValue` is a live accessor over `defaultPrevented` — resetting
+        // defaultPrevented above already restores returnValue to true.
         g.insert("type".into(), cv_js::Value::str(ty));
         g.insert("bubbles".into(), cv_js::Value::Bool(bubbles));
         g.insert("cancelable".into(), cv_js::Value::Bool(cancelable));
@@ -19715,6 +19717,39 @@ fn build_event_value(
         g.insert("stopImmediatePropagation".into(), stop_immediate);
         g.insert("composedPath".into(), composed_path);
         g.insert("initEvent".into(), init_event);
+    }
+
+    // ── Legacy event members (WHATWG DOM §2.2): `returnValue` is the historical
+    // alias for the inverse of the canceled flag; `cancelBubble` is the alias for
+    // the propagation-stopped flag. Expose `returnValue` as a real accessor:
+    //   get → !defaultPrevented; set false → preventDefault() (cancelable only),
+    //   set true → no-op (you cannot un-cancel). The internal canceled-flag
+    //   storage stays `defaultPrevented`, so the accessor and preventDefault()
+    //   agree. (We keep `cancelBubble` a plain settable field — the dispatch
+    //   engine reads it as the stop flag, and `e.cancelBubble = true` writes that
+    //   same flag — rather than an accessor, which would break those reads.) ──
+    {
+        let rv_get = me.clone();
+        let getter = cv_js::native_fn("get returnValue", move |_| {
+            let canceled = matches!(
+                rv_get.borrow().get("defaultPrevented"),
+                Some(cv_js::Value::Bool(true))
+            );
+            Ok(cv_js::Value::Bool(!canceled))
+        });
+        let rv_set = me.clone();
+        let setter = cv_js::native_fn("set returnValue", move |args| {
+            let v = args.first().map(|x| x.to_bool()).unwrap_or(true);
+            if !v {
+                let mut g = rv_set.borrow_mut();
+                if matches!(g.get("cancelable"), Some(cv_js::Value::Bool(true))) {
+                    g.insert("defaultPrevented".into(), cv_js::Value::Bool(true));
+                }
+            }
+            Ok(cv_js::Value::Undefined)
+        });
+        me.borrow_mut()
+            .insert("returnValue".into(), tb_js_accessor(getter, setter));
     }
     if matches!(kind, EventKind::CustomEvent) {
         // initCustomEvent(type, bubbles, cancelable, detail) — legacy CustomEvent.
@@ -52775,6 +52810,61 @@ fn install_dom_api(
                 m.insert("nextElementSibling".into(), next_es);
                 m.insert("previousElementSibling".into(), prev_es);
 
+                // HTML §8.1.7.2.1 — the Window-reflecting body/frameset event
+                // handlers. For these specific on<event> IDL attributes, reading
+                // or writing `document.body.on<event>` reflects the corresponding
+                // WINDOW handler (NOT a body-element handler). The non-reflecting
+                // on<event> (onclick etc.) stay on the body element itself.
+                // We install real accessors that forward get/set to window.on<event>.
+                if rec.tag == "body" || rec.tag == "frameset" {
+                    const WINDOW_REFLECTING: &[&str] = &[
+                        "onblur", "onerror", "onfocus", "onload", "onresize",
+                        "onscroll", "onafterprint", "onbeforeprint",
+                        "onbeforeunload", "onhashchange", "onlanguagechange",
+                        "onmessage", "onmessageerror", "onoffline", "ononline",
+                        "onpagehide", "onpageshow", "onpopstate", "onrejectionhandled",
+                        "onstorage", "onunhandledrejection", "onunload",
+                    ];
+                    for &handler in WINDOW_REFLECTING {
+                        let hname = handler.to_string();
+                        let getter = cv_js::native_fn_with_interp(
+                            "get window-reflecting handler",
+                            {
+                                let hname = hname.clone();
+                                move |interp, _| {
+                                    let win = interp
+                                        .get_global("window")
+                                        .unwrap_or(cv_js::Value::Undefined);
+                                    Ok(match &win {
+                                        cv_js::Value::Object(o) => o
+                                            .borrow()
+                                            .get(&hname)
+                                            .cloned()
+                                            .unwrap_or(cv_js::Value::Null),
+                                        _ => cv_js::Value::Null,
+                                    })
+                                }
+                            },
+                        );
+                        let setter = cv_js::native_fn_with_interp(
+                            "set window-reflecting handler",
+                            {
+                                let hname = hname.clone();
+                                move |interp, args| {
+                                    let v = args.first().cloned().unwrap_or(cv_js::Value::Null);
+                                    if let Some(cv_js::Value::Object(o)) =
+                                        interp.get_global("window")
+                                    {
+                                        o.borrow_mut().insert(hname.clone(), v);
+                                    }
+                                    Ok(cv_js::Value::Undefined)
+                                }
+                            },
+                        );
+                        m.insert(handler.into(), tb_js_accessor(getter, setter));
+                    }
+                }
+
                 // <select>.value accessor: getter returns the current
                 // selected option value; setter writes through to the HTML
                 // node via attr_writes so collect_form_fields sees the live
@@ -78856,6 +78946,71 @@ var el = document.getElementById('el');
             .expect("create node run");
         assert_eq!(window_str(&runtime, "__t_owner"), "doc");
         assert_eq!(window_str(&runtime, "__c_owner"), "doc");
+    }
+
+    // HTML §8.1.7.2.1 — the Window-reflecting body event handlers: reading /
+    // writing document.body.onload reflects window.onload (and vice versa); a
+    // non-reflecting handler (onclick) stays on the body element itself.
+    #[test]
+    fn body_window_reflecting_event_handlers_forward_to_window() {
+        let doc = cv_html::parse("<!doctype html><html><body></body></html>");
+        let mut runtime = LiveInterp::new(&doc, "https://dom.test/");
+        runtime
+            .interp
+            .run(
+                "var b = document.body; \
+                 var f = function(){}; \
+                 b.onload = f; \
+                 window.__body_onload_is_win = (window.onload === f) ? 'yes' : 'no'; \
+                 var g = function(){}; \
+                 window.onresize = g; \
+                 window.__body_reads_win = (b.onresize === g) ? 'yes' : 'no'; \
+                 var h = function(){}; \
+                 b.onclick = h; \
+                 window.__onclick_not_forwarded = (window.onclick === h) ? 'forwarded' : 'local';",
+            )
+            .expect("body window-reflecting run");
+        assert_eq!(window_str(&runtime, "__body_onload_is_win"), "yes");
+        assert_eq!(window_str(&runtime, "__body_reads_win"), "yes");
+        // onclick is NOT in the Window-reflecting set — stays on the body.
+        assert_eq!(window_str(&runtime, "__onclick_not_forwarded"), "local");
+    }
+
+    // WHATWG DOM §2.2 legacy event members — `event.returnValue` getter is
+    // !defaultPrevented; setting it false calls preventDefault (cancelable only);
+    // `event.cancelBubble = true` stops propagation (no ancestor sees the event).
+    #[test]
+    fn event_legacy_return_value_and_cancel_bubble_aliases() {
+        let doc = cv_html::parse(
+            "<!doctype html><html><body><div id='o'><span id='s'>x</span></div></body></html>",
+        );
+        let mut runtime = LiveInterp::new(&doc, "https://dom.test/");
+        runtime
+            .interp
+            .run(
+                "var e = new Event('x', {bubbles:true, cancelable:true}); \
+                 window.__rv_default = String(e.returnValue); \
+                 e.returnValue = false; \
+                 window.__rv_after_set = String(e.returnValue); \
+                 window.__dp_after_set = String(e.defaultPrevented); \
+                 var e2 = new Event('y', {cancelable:true}); \
+                 e2.preventDefault(); \
+                 window.__rv_after_pd = String(e2.returnValue); \
+                 var hits = ''; \
+                 var o = document.getElementById('o'); var s = document.getElementById('s'); \
+                 o.addEventListener('cb', function(){ hits += 'o'; }); \
+                 s.addEventListener('cb', function(ev){ hits += 's'; ev.cancelBubble = true; }); \
+                 var ce = new Event('cb', {bubbles:true}); \
+                 s.dispatchEvent(ce); \
+                 window.__cb_hits = hits;",
+            )
+            .expect("legacy aliases run");
+        assert_eq!(window_str(&runtime, "__rv_default"), "true");
+        assert_eq!(window_str(&runtime, "__rv_after_set"), "false");
+        assert_eq!(window_str(&runtime, "__dp_after_set"), "true");
+        assert_eq!(window_str(&runtime, "__rv_after_pd"), "false");
+        // cancelBubble in the target listener stops the bubble to the ancestor.
+        assert_eq!(window_str(&runtime, "__cb_hits"), "s");
     }
 
     // WHATWG DOM §2.9 dispatch step 1 — dispatchEvent throws InvalidStateError
