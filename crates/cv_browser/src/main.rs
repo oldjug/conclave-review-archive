@@ -3814,6 +3814,9 @@ fn run_wpt_one(cli: &Cli) -> Result<(), String> {
     }
 
     let html = inject_wpt_harness(&raw, std::path::Path::new(path));
+    if let Ok(dump) = std::env::var("CV_WPT_DUMP_HTML") {
+        let _ = std::fs::write(&dump, &html);
+    }
 
     // A synthetic, non-resolvable base so any stray relative subresource can't
     // accidentally resolve to a real host.

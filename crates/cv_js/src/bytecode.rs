@@ -1359,6 +1359,44 @@ fn compile_function(
         }
     }
 
+    // SCRIPT-FRAME TOP-LEVEL FUNCTION HOISTING (ECMA-262 §16.1.7 GlobalDeclaration-
+    // Instantiation step 17 + §9.1.1.4.16 CreateGlobalFunctionBinding): a top-level
+    // `function f(){…}` in a classic script creates a PROPERTY `f` on the global
+    // object, visible to every later script on the page. `compile_program` splits
+    // these decls into module fn-slots reached internally via `CallFn`, but never
+    // bound them on the live global bindings table — so a SECOND `<script>` (the
+    // ubiquitous WPT pattern: a helper `<script>function attr_is(){…}</script>`
+    // followed by a test `<script>… attr_is(…) …</script>`) saw `ReferenceError:
+    // attr_is is not defined`. The tree-walk tier (`exec_block`) hoists these into
+    // the global scope correctly; this makes the default-on bytecode VM match.
+    //
+    // Each top-level fn closes over global scope (no captured locals), so its
+    // closure is a zero-upvalue `MakeClosure` over the module fn-slot recorded in
+    // `fn_index`, then bound by `StoreGlobal`. Materialising it from the compiled
+    // bytecode (rather than a separate Module field) keeps it byte-identical
+    // across the disk code-cache with no extra serialization. Emitted at the very
+    // top of the script frame so the bindings exist for all subsequent statements.
+    // NB: `compile_program` filters top-level `FunctionDecl`s OUT of the script
+    // body (they live in dedicated module fn-slots), so iterate `fn_index` —
+    // sorted by slot index, which `compile_program` assigns in source order — to
+    // recover every top-level fn name + its slot deterministically.
+    if is_script && !c.fn_index.is_empty() {
+        let mut decls: Vec<(u16, String)> =
+            c.fn_index.iter().map(|(n, i)| (*i, n.clone())).collect();
+        decls.sort_by_key(|(i, _)| *i);
+        for (fn_idx, name) in decls {
+            let dst = c.alloc_reg();
+            c.emit(Op::MakeClosure {
+                dst,
+                fn_idx,
+                first_upvalue: 0,
+                n_upvalues: 0,
+            });
+            let name_k = c.add_const(Value::str(name));
+            c.emit(Op::StoreGlobal { name_k, src: dst });
+        }
+    }
+
     for s in body {
         c.compile_stmt(s)?;
     }
@@ -12577,6 +12615,35 @@ mod tests {
         };
         let r = run_function(&m, 1, &[], &Value::Undefined, &globals, None, &mut dispatch).unwrap();
         assert!(matches!(r, Value::Number(n) if (n - 42.0).abs() < 1e-9));
+    }
+
+    #[test]
+    fn toplevel_fn_decl_binds_as_global() {
+        // ECMA-262 §16.1.7 / §9.1.1.4.16: a top-level `function f(){…}` in a
+        // classic script creates a PROPERTY on the global object, visible to a
+        // SUBSEQUENT script. `compile_program` splits top-level decls into module
+        // fn-slots (reached internally via CallFn), so without the script-frame
+        // hoisting prologue the second script's `helper` would be unbound. Run two
+        // separate modules against the SAME live interp globals (exactly the
+        // multi-`<script>` page model) and assert the first's fn is callable in
+        // the second.
+        let mut interp = crate::interp::Interp::new();
+        let m1 = compile_program("function helper(x){ return x*2; }").unwrap();
+        run_module_with_interp(&m1, &mut interp).unwrap();
+        // Second module sees `helper` as a global (set by m1's script frame).
+        let m2 = compile_program("var out = helper(21);").unwrap();
+        run_module_with_interp(&m2, &mut interp).unwrap();
+        let out = interp.get_global("out").unwrap();
+        assert!(
+            matches!(out, Value::Number(n) if (n - 42.0).abs() < 1e-9),
+            "expected helper() visible across scripts to yield 42, got {out:?}"
+        );
+        // The binding is the function itself, callable.
+        let helper = interp.get_global("helper").unwrap();
+        assert!(
+            matches!(helper, Value::BcClosure(_) | Value::Function(_)),
+            "helper should be a function global, got {helper:?}"
+        );
     }
 
     #[test]
