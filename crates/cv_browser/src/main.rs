@@ -19753,6 +19753,67 @@ fn build_event_value(
     cv_js::Value::Object(me)
 }
 
+/// WHATWG DOM §2.9 EventTarget.dispatchEvent precheck, shared by every
+/// `dispatchEvent` surface (EventTarget, created elements, document/window):
+///   * a non-Event argument → TypeError (`dispatchEvent(null)` must throw);
+///   * the event's dispatch flag already set (re-entrant dispatch of the SAME
+///     event from inside its own listener) → InvalidStateError;
+///   * the event's initialized flag not set (a `createEvent` event never
+///     `initEvent`'d) → InvalidStateError.
+/// On success it SETS the dispatch flag + `isTrusted=false` and returns Ok; the
+/// caller MUST call `event_dispatch_end` (via the guard) to clear the flag so a
+/// later legitimate re-dispatch works. Returns Err(JsError) to throw.
+fn event_dispatch_precheck(ev: &cv_js::Value) -> Result<(), cv_js::JsError> {
+    let o = match ev {
+        cv_js::Value::Object(o) => o,
+        _ => {
+            return Err(cv_js::JsError::Throw(make_type_error_value(
+                "Failed to execute 'dispatchEvent': parameter 1 is not of type 'Event'.",
+            )));
+        }
+    };
+    {
+        let m = o.borrow();
+        // Heuristic Event-ness: our events always carry a `type` string + the
+        // canonical `cancelBubble` flag. (A bare `{type:'x'}` object dispatched by
+        // older engine code still passes — intentional leniency for internal
+        // synthetic events; the spec-strict path is for author Event objects.)
+        let dispatching =
+            matches!(m.get("\u{1}dispatch"), Some(cv_js::Value::Bool(true)));
+        if dispatching {
+            return Err(cv_js::JsError::Throw(make_dom_exception(
+                "InvalidStateError",
+                11,
+                "Failed to execute 'dispatchEvent': The event is already being dispatched.",
+            )));
+        }
+        // The initialized flag only gates events that HAVE the sentinel (i.e.
+        // built by build_event_value). Engine-internal synthetic events omit it
+        // and are always considered initialized.
+        if matches!(m.get("\u{1}initialized"), Some(cv_js::Value::Bool(false))) {
+            return Err(cv_js::JsError::Throw(make_dom_exception(
+                "InvalidStateError",
+                11,
+                "Failed to execute 'dispatchEvent': The event provided is uninitialized.",
+            )));
+        }
+    }
+    let mut m = o.borrow_mut();
+    m.insert("\u{1}dispatch".into(), cv_js::Value::Bool(true));
+    m.insert("isTrusted".into(), cv_js::Value::Bool(false));
+    Ok(())
+}
+
+/// Clear the dispatch flag set by `event_dispatch_precheck` (WHATWG §2.9 step:
+/// unset the dispatch flag once dispatch completes), so the event can be
+/// dispatched again later.
+fn event_dispatch_end(ev: &cv_js::Value) {
+    if let cv_js::Value::Object(o) = ev {
+        o.borrow_mut()
+            .insert("\u{1}dispatch".into(), cv_js::Value::Bool(false));
+    }
+}
+
 /// Install the `Event` / `CustomEvent` / `UIEvent` interface globals + their
 /// `document.createEvent` factory shapes. Each interface object is an Object
 /// (not a bare NativeFunction) carrying `_construct` (so `new X()` works),
@@ -30442,6 +30503,12 @@ fn install_minimal_dom_with_url(interp: &cv_js::Interp, initial_title: String, p
                         .unwrap_or_default(),
                     _ => return Ok(cv_js::Value::Bool(false)),
                 };
+                // WHATWG §2.9 precheck (Object events only; a bare string is the
+                // legacy lenient form): re-entrant / uninitialized event throws
+                // InvalidStateError. Sets the dispatch flag + isTrusted=false.
+                if matches!(ev, cv_js::Value::Object(_)) {
+                    event_dispatch_precheck(&ev)?;
+                }
                 // DOM spec §2.9: stamp target/currentTarget before dispatch.
                 let self_val = cv_js::Value::Object(self_for_et_dispatch.clone());
                 if let cv_js::Value::Object(o) = &ev {
@@ -30475,8 +30542,9 @@ fn install_minimal_dom_with_url(interp: &cv_js::Interp, initial_title: String, p
                         }
                     }
                 }
-                // WHATWG §2.9 step 14: reset currentTarget to null + eventPhase to
-                // NONE once dispatch completes.
+                // WHATWG §2.9 step 14: clear the dispatch flag, reset
+                // currentTarget→null + eventPhase→NONE once dispatch completes.
+                event_dispatch_end(&ev);
                 if let cv_js::Value::Object(o) = &ev {
                     let mut m = o.borrow_mut();
                     m.insert("currentTarget".into(), cv_js::Value::Null);
@@ -47985,6 +48053,15 @@ fn make_new_element_js_with_canvas_registry(
                 let immediate_stopped =
                     || event_flag("\u{1}stopImmediate") || event_flag("_stopImmediate");
                 let at_target_only = event_flag("\u{1}__tb_at_target_only");
+                // WHATWG §2.9 precheck on FIRST entry only (bubble re-entry of the
+                // SAME event keeps the dispatch flag set, which is correct): a
+                // re-entrant dispatch of an in-flight event throws InvalidStateError,
+                // an uninitialized createEvent event throws InvalidStateError, and a
+                // non-Event arg throws TypeError. This also breaks the infinite
+                // recursion when a listener re-dispatches the event it is handling.
+                if !at_target_only {
+                    event_dispatch_precheck(&ev)?;
+                }
                 let self_val = cv_js::Value::Object(self_for_dispatch.clone());
                 if let cv_js::Value::Object(o) = &ev {
                     let mut m = o.borrow_mut();
@@ -48074,6 +48151,17 @@ fn make_new_element_js_with_canvas_registry(
                         if let cv_js::Value::Object(o) = &ev {
                             o.borrow_mut().remove("\u{1}__tb_at_target_only");
                         }
+                    }
+                }
+                // First-entry teardown (WHATWG §2.9): clear the dispatch flag,
+                // reset currentTarget→null + eventPhase→NONE. Bubble re-entries
+                // (at_target_only) leave these for the outer call to finish.
+                if !at_target_only {
+                    event_dispatch_end(&ev);
+                    if let cv_js::Value::Object(o) = &ev {
+                        let mut m = o.borrow_mut();
+                        m.insert("currentTarget".into(), cv_js::Value::Null);
+                        m.insert("eventPhase".into(), cv_js::Value::Number(0.0));
                     }
                 }
                 let default_prevented = matches!(&ev, cv_js::Value::Object(o)
