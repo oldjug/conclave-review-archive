@@ -16,6 +16,17 @@ Cargo.lock.bak
 
 conformance/tmp/
 
+# website (separate project, not part of the browser)
+/site/
+
+# secrets / TLS test artifacts — never commit keys or session material
+*.pem
+*.key
+/tools/tls12_test/
+keylog*.txt
+*_pms_*.txt
+*_ms_*.txt
+
 # internal planning / analysis notes (not part of the browser source)
 /*_PLAN.md
 /MASTER_DESIGN_BEAT_CHROME.md
