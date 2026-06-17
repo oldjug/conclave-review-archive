@@ -38414,16 +38414,43 @@ fn make_live_html_collection(
     let supplier = move || -> Vec<Value> {
         let t = table.borrow();
         let mut out: Vec<Value> = Vec::new();
-        // Predicate over a record's (tag, classes).
-        let q_lc = query.to_ascii_lowercase();
+        // getElementsByTagName matching is the WHATWG DOM §4.5 "list of elements
+        // with qualified name" algorithm (namespace-aware, ASCII-case-folding for
+        // HTML elements only) — read off each element's JS object so a foreign
+        // (createElementNS) element in the document is matched correctly. Class
+        // matching is the unordered-set-of-tokens test (DOM §4.5
+        // getElementsByClassName).
         let qc: Vec<String> = query.split_whitespace().map(|s| s.to_string()).collect();
+        let tag_hit = |js: &Value| -> bool {
+            if let Value::Object(o) = js {
+                gebtn_element_matches(&o.borrow(), &query)
+            } else {
+                false
+            }
+        };
+        // Class matching reads the element's LIVE `className`/`class` off its JS
+        // object (NOT the parse-time `classes` snapshot) so a runtime
+        // `el.className = "b"` is reflected — the collection is live (DOM
+        // §4.2.10.2). Matching is the unordered set-of-tokens test.
+        let class_hit = |js: &Value| -> bool {
+            if qc.is_empty() {
+                return false;
+            }
+            let Value::Object(o) = js else { return false };
+            let b = o.borrow();
+            let cn = match b.get("className") {
+                Some(Value::String(s)) => s.to_string(),
+                _ => match b.get("class") {
+                    Some(Value::String(s)) => s.to_string(),
+                    _ => String::new(),
+                },
+            };
+            let have: Vec<&str> = cn.split_ascii_whitespace().collect();
+            qc.iter().all(|c| have.contains(&c.as_str()))
+        };
         // 1. Static parse-time element table (document order).
         for r in t.all.iter() {
-            let hit = if by_tag {
-                q_lc == "*" || r.tag.eq_ignore_ascii_case(&q_lc)
-            } else {
-                !qc.is_empty() && qc.iter().all(|c| r.classes.iter().any(|k| k == c))
-            };
+            let hit = if by_tag { tag_hit(&r.js) } else { class_hit(&r.js) };
             if hit {
                 out.push(r.js.clone());
             }
@@ -38433,11 +38460,7 @@ fn make_live_html_collection(
         let roots = live_document_roots(&t);
         let records = build_live_element_snapshot(&roots);
         for r in records.iter() {
-            let hit = if by_tag {
-                q_lc == "*" || r.tag.eq_ignore_ascii_case(&q_lc)
-            } else {
-                !qc.is_empty() && qc.iter().all(|c| r.classes.iter().any(|k| k == c))
-            };
+            let hit = if by_tag { tag_hit(&r.js) } else { class_hit(&r.js) };
             if hit {
                 out.push(r.js.clone());
             }
@@ -40556,6 +40579,143 @@ const HTML_NAMESPACE: &str = "http://www.w3.org/1999/xhtml";
 const XML_NAMESPACE: &str = "http://www.w3.org/XML/1998/namespace";
 /// The XMLNS namespace (https://infra.spec.whatwg.org/#xmlns-namespace).
 const XMLNS_NAMESPACE: &str = "http://www.w3.org/2000/xmlns/";
+
+/// Read an element JS object's namespace, returning `None` for the null
+/// namespace (which we treat as the HTML namespace for parse-time elements that
+/// never set `namespaceURI`). `null`/`undefined`/absent → None.
+fn element_namespace(b: &cv_js::OrderedMap<String, cv_js::Value>) -> Option<String> {
+    match b.get("namespaceURI") {
+        Some(cv_js::Value::Null) | Some(cv_js::Value::Undefined) | None => None,
+        Some(x) => Some(x.to_display_string()),
+    }
+}
+
+/// True iff the element JS object is in the HTML namespace. Parse-time HTML
+/// elements carry `namespaceURI == HTML_NAMESPACE` OR (for the static table) NO
+/// `namespaceURI` key at all — both count as HTML (the document is an HTML
+/// document). An EXPLICIT null namespace (`createElementNS("", …)`) is a FOREIGN
+/// element, so it is NOT HTML (its qualified name is matched case-sensitively).
+fn element_is_html_ns(b: &cv_js::OrderedMap<String, cv_js::Value>) -> bool {
+    match b.get("namespaceURI") {
+        // Key absent (or undefined) → parse-time HTML default.
+        None | Some(cv_js::Value::Undefined) => true,
+        // Explicit null → foreign (null namespace).
+        Some(cv_js::Value::Null) => false,
+        Some(v) => v.to_display_string() == HTML_NAMESPACE,
+    }
+}
+
+/// The element's **qualified name** (WHATWG DOM: prefix ? prefix ":" localName :
+/// localName), in its AUTHORED case. We reconstruct it from `prefix`+`localName`
+/// (the spec-true source), falling back to `_tag` (lowercased parse-time tag) or
+/// the lowercased `tagName`. We do NOT use `tagName`/`nodeName` directly because
+/// those are ASCII-uppercased for HTML-namespace elements.
+fn element_qualified_name(b: &cv_js::OrderedMap<String, cv_js::Value>) -> String {
+    let local = b
+        .get("localName")
+        .map(|x| x.to_display_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| b.get("_tag").map(|x| x.to_display_string()))
+        .or_else(|| {
+            b.get("tagName")
+                .map(|x| x.to_display_string().to_ascii_lowercase())
+        })
+        .unwrap_or_default();
+    match b.get("prefix") {
+        Some(cv_js::Value::String(p)) if !p.is_empty() => format!("{p}:{local}"),
+        _ => local,
+    }
+}
+
+/// The element's **local name** in AUTHORED case (never uppercased). Used by the
+/// `*NS` matcher, which is case-sensitive per WHATWG DOM §4.5. (Distinct from
+/// `element_local_name`, which ASCII-lowercases for the layout/cascade path.)
+fn element_local_name_authored(b: &cv_js::OrderedMap<String, cv_js::Value>) -> String {
+    b.get("localName")
+        .map(|x| x.to_display_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| b.get("_tag").map(|x| x.to_display_string()))
+        .or_else(|| {
+            b.get("tagName")
+                .map(|x| x.to_display_string().to_ascii_lowercase())
+        })
+        .unwrap_or_default()
+}
+
+/// True iff this JS node object is an ELEMENT (nodeType 1). getElementsByTagName
+/// / *NS only ever return elements, so the subtree walks (which include text +
+/// comment nodes in `_children`) must filter through this. An explicit
+/// `nodeType` decides; absent (static-table records are always elements) → an
+/// element unless `nodeName` is a `#`-prefixed special node name.
+fn js_is_element_node(b: &cv_js::OrderedMap<String, cv_js::Value>) -> bool {
+    match b.get("nodeType") {
+        Some(cv_js::Value::Number(n)) => (*n - 1.0).abs() < f64::EPSILON,
+        _ => !matches!(
+            b.get("nodeName"),
+            Some(cv_js::Value::String(s)) if s.starts_with('#')
+        ),
+    }
+}
+
+/// WHATWG DOM §4.5 — "list of elements with qualified name `qualifiedName`"
+/// (https://dom.spec.whatwg.org/#concept-getelementsbytagname). Conclave models
+/// every document as an HTML document, so:
+///   * `qualifiedName == "*"` → matches every element;
+///   * an element in the HTML namespace matches when its qualified name equals
+///     `qualifiedName` ASCII-lowercased (so uppercase queries find HTML tags,
+///     but a non-ASCII letter like Ç is NOT folded);
+///   * an element NOT in the HTML namespace matches `qualifiedName` exactly
+///     (case-sensitive).
+/// Only ELEMENTS ever match (text/comment nodes never do, even for `"*"`).
+fn gebtn_element_matches(b: &cv_js::OrderedMap<String, cv_js::Value>, qualified_name: &str) -> bool {
+    if !js_is_element_node(b) {
+        return false;
+    }
+    if qualified_name == "*" {
+        return true;
+    }
+    let qn = element_qualified_name(b);
+    if element_is_html_ns(b) {
+        qn == qualified_name.to_ascii_lowercase()
+    } else {
+        qn == qualified_name
+    }
+}
+
+/// WHATWG DOM §4.5 — "list of elements with namespace `namespace` and local name
+/// `localName`" (https://dom.spec.whatwg.org/#concept-getelementsbytagnamens).
+/// `ns_filter == Some("*")` is the namespace wildcard; `ns_filter == None` is the
+/// **null** namespace (the empty-string argument maps to None upstream).
+/// `local == "*"` is the localName wildcard. localName is case-sensitive.
+fn gebtnns_element_matches(
+    b: &cv_js::OrderedMap<String, cv_js::Value>,
+    ns_filter: &Option<String>,
+    ns_any: bool,
+    local: &str,
+) -> bool {
+    if !js_is_element_node(b) {
+        return false;
+    }
+    if local != "*" {
+        // localName comparison is case-sensitive (no folding) per spec.
+        if element_local_name_authored(b) != local {
+            return false;
+        }
+    }
+    if ns_any {
+        return true;
+    }
+    // EFFECTIVE namespace for matching: an ABSENT `namespaceURI` key is a
+    // parse-time HTML element → the HTML namespace (so `*NS("", "*")` does NOT
+    // match it). An EXPLICIT null (`createElementNS("", …)`) is the null
+    // namespace. The `ns_filter` "" argument was mapped to `None` (null) upstream.
+    let effective_ns: Option<String> = match b.get("namespaceURI") {
+        None | Some(cv_js::Value::Undefined) => Some(HTML_NAMESPACE.to_string()),
+        Some(cv_js::Value::Null) => None,
+        Some(v) => Some(v.to_display_string()),
+    };
+    effective_ns == *ns_filter
+}
 
 /// XML 1.0 `NameStartChar` (https://www.w3.org/TR/xml/#NT-NameStartChar),
 /// minus ':' (handled separately by QName splitting).
@@ -45748,7 +45908,12 @@ fn make_new_element_js_with_canvas_registry(
     use std::cell::RefCell;
     use std::rc::Rc;
     use cv_js::OrderedMap as HashMap;
-    let tag_lc = tag.to_lowercase();
+    // WHATWG DOM §4.5 createElement: in an HTML document the local name is the
+    // tag name *ASCII-lowercased* (NOT full-Unicode-lowercased) — so e.g.
+    // `createElement("aÇ").localName === "aÇ"` (the Ç is left untouched).
+    // Likewise tagName is the ASCII-UPPERCASE of the qualified name for HTML
+    // elements. (createElementNS overrides localName/tagName afterward.)
+    let tag_lc = tag.to_ascii_lowercase();
     let mut m: HashMap<String, cv_js::Value> = HashMap::new();
     // Stable node identity (roadmap #3) — assigned at creation so this element
     // can be resolved by id when its DOM mutations are applied later.
@@ -45758,8 +45923,8 @@ fn make_new_element_js_with_canvas_registry(
     );
     m.insert("_isNewElement".into(), cv_js::Value::Bool(true));
     m.insert("_tag".into(), cv_js::Value::str(tag_lc.clone()));
-    m.insert("tagName".into(), cv_js::Value::str(tag.to_uppercase()));
-    m.insert("nodeName".into(), cv_js::Value::str(tag.to_uppercase()));
+    m.insert("tagName".into(), cv_js::Value::str(tag.to_ascii_uppercase()));
+    m.insert("nodeName".into(), cv_js::Value::str(tag.to_ascii_uppercase()));
     // Namespace surface (WHATWG DOM §4.4 Element). `createElement` produces an
     // element in the HTML namespace with a null prefix and a lowercased local
     // name; `createElementNS` overrides namespaceURI/prefix/localName/tagName
@@ -45841,8 +46006,96 @@ fn make_new_element_js_with_canvas_registry(
         }
     });
     m.insert("appendChild".into(), append_inner);
+    // removeChild(child) — WHATWG DOM §4.5 (pre-remove a child). Removes `child`
+    // from this element's child list by identity, returning it; throws a
+    // NotFoundError DOMException if `child` is not a child (the WPT cleanup
+    // helpers rely on this — without it elements accumulate across subtests).
+    let nested_for_remove_child = nested.clone();
+    let remove_child = cv_js::native_fn("removeChild", move |args| {
+        let child = args.first().cloned().unwrap_or(cv_js::Value::Undefined);
+        let child_id = js_object_identity(&child);
+        let mut kids = nested_for_remove_child.borrow_mut();
+        if let Some(pos) = kids
+            .iter()
+            .position(|k| child_id.is_some() && js_object_identity(k) == child_id)
+        {
+            let removed = kids.remove(pos);
+            drop(kids);
+            // Detach: clear the parent back-pointer + connectivity.
+            if let cv_js::Value::Object(o) = &removed {
+                let mut b = o.borrow_mut();
+                b.insert("_parent".into(), cv_js::Value::Null);
+                b.insert("parentNode".into(), cv_js::Value::Null);
+                b.insert("parentElement".into(), cv_js::Value::Null);
+                b.insert("isConnected".into(), cv_js::Value::Bool(false));
+            }
+            return Ok(removed);
+        }
+        Err(cv_js::JsError::Throw(make_not_found_dom_exception(
+            "The node to be removed is not a child of this node.",
+        )))
+    });
+    m.insert("removeChild".into(), remove_child);
+    // insertBefore(node, ref) — insert `node` before `ref` (or append if `ref`
+    // is null/undefined). Throws NotFoundError if `ref` is non-null but not a
+    // child (WHATWG DOM §4.5 pre-insert).
+    let nested_for_insert_before = nested.clone();
+    let insert_before = cv_js::native_fn("insertBefore", move |args| {
+        let node = args.first().cloned().unwrap_or(cv_js::Value::Undefined);
+        let reference = args.get(1).cloned().unwrap_or(cv_js::Value::Null);
+        let nodes = normalize_single_dom_node(&node);
+        queue_injected_scripts_in_nodes(&nodes);
+        let mut kids = nested_for_insert_before.borrow_mut();
+        match &reference {
+            cv_js::Value::Null | cv_js::Value::Undefined => {
+                kids.extend(nodes);
+            }
+            _ => {
+                let ref_id = js_object_identity(&reference);
+                if let Some(pos) = kids
+                    .iter()
+                    .position(|k| ref_id.is_some() && js_object_identity(k) == ref_id)
+                {
+                    for (i, n) in nodes.into_iter().enumerate() {
+                        kids.insert(pos + i, n);
+                    }
+                } else {
+                    return Err(cv_js::JsError::Throw(make_not_found_dom_exception(
+                        "The node before which the new node is to be inserted is not a child of this node.",
+                    )));
+                }
+            }
+        }
+        Ok(node)
+    });
+    m.insert("insertBefore".into(), insert_before);
+    // replaceChild(node, child) — replace `child` with `node`; returns the
+    // replaced child. NotFoundError if `child` is not a child.
+    let nested_for_replace_child = nested.clone();
+    let replace_child = cv_js::native_fn("replaceChild", move |args| {
+        let node = args.first().cloned().unwrap_or(cv_js::Value::Undefined);
+        let child = args.get(1).cloned().unwrap_or(cv_js::Value::Undefined);
+        let child_id = js_object_identity(&child);
+        let mut kids = nested_for_replace_child.borrow_mut();
+        if let Some(pos) = kids
+            .iter()
+            .position(|k| child_id.is_some() && js_object_identity(k) == child_id)
+        {
+            kids[pos] = node;
+            Ok(child)
+        } else {
+            Err(cv_js::JsError::Throw(make_not_found_dom_exception(
+                "The node to be replaced is not a child of this node.",
+            )))
+        }
+    });
+    m.insert("replaceChild".into(), replace_child);
     // Element-scoped queries over this created element's own subtree (it's not
     // in the static element table, so we walk `_children` live).
+    // Element.getElementsByClassName — a LIVE HTMLCollection (WHATWG DOM §4.5 /
+    // §4.2.10.2) over this created element's own `_children` subtree. The
+    // supplier re-walks on every access so appends/removes are reflected and the
+    // returned object is a real legacy platform object (instanceof HTMLCollection).
     let nested_for_gecn = nested.clone();
     m.insert(
         "getElementsByClassName".into(),
@@ -45855,26 +46108,35 @@ fn make_new_element_js_with_canvas_registry(
                 .split_ascii_whitespace()
                 .map(|s| s.to_string())
                 .collect();
-            let mut out: Vec<cv_js::Value> = Vec::new();
-            if !wanted.is_empty() {
-                let kids = nested_for_gecn.borrow().clone();
-                collect_created_descendants_by(
-                    &kids,
-                    &|v| {
-                        if let cv_js::Value::Object(o) = v {
-                            if let Some(cv_js::Value::String(cn)) = o.borrow().get("className") {
-                                let have: Vec<&str> = cn.split_ascii_whitespace().collect();
-                                return wanted.iter().all(|w| have.contains(&w.as_str()));
+            let nested = nested_for_gecn.clone();
+            let supplier = move || -> Vec<cv_js::Value> {
+                let mut out: Vec<cv_js::Value> = Vec::new();
+                if !wanted.is_empty() {
+                    let kids = nested.borrow().clone();
+                    collect_created_descendants_by(
+                        &kids,
+                        &|v| {
+                            if let cv_js::Value::Object(o) = v {
+                                if let Some(cv_js::Value::String(cn)) =
+                                    o.borrow().get("className")
+                                {
+                                    let have: Vec<&str> = cn.split_ascii_whitespace().collect();
+                                    return wanted.iter().all(|w| have.contains(&w.as_str()));
+                                }
                             }
-                        }
-                        false
-                    },
-                    &mut out,
-                );
-            }
-            Ok(cv_js::Value::Array(Rc::new(RefCell::new(out))))
+                            false
+                        },
+                        &mut out,
+                    );
+                }
+                out
+            };
+            Ok(make_live_html_collection_from(supplier))
         }),
     );
+    // Element.getElementsByTagName — a LIVE HTMLCollection using the WHATWG DOM
+    // §4.5 "list of elements with qualified name" matcher (namespace-aware,
+    // ASCII case folding for HTML elements only).
     let nested_for_getn = nested.clone();
     m.insert(
         "getElementsByTagName".into(),
@@ -45883,25 +46145,24 @@ fn make_new_element_js_with_canvas_registry(
                 .first()
                 .map(|v| v.to_display_string())
                 .unwrap_or_default();
-            let all = wanted == "*";
-            let mut out: Vec<cv_js::Value> = Vec::new();
-            let kids = nested_for_getn.borrow().clone();
-            collect_created_descendants_by(
-                &kids,
-                &|v| {
-                    if all {
-                        return true;
-                    }
-                    if let cv_js::Value::Object(o) = v {
-                        if let Some(cv_js::Value::String(t)) = o.borrow().get("_tag") {
-                            return t.eq_ignore_ascii_case(&wanted);
+            let nested = nested_for_getn.clone();
+            let supplier = move || -> Vec<cv_js::Value> {
+                let mut out: Vec<cv_js::Value> = Vec::new();
+                let kids = nested.borrow().clone();
+                collect_created_descendants_by(
+                    &kids,
+                    &|v| {
+                        if let cv_js::Value::Object(o) = v {
+                            gebtn_element_matches(&o.borrow(), &wanted)
+                        } else {
+                            false
                         }
-                    }
-                    false
-                },
-                &mut out,
-            );
-            Ok(cv_js::Value::Array(Rc::new(RefCell::new(out))))
+                    },
+                    &mut out,
+                );
+                out
+            };
+            Ok(make_live_html_collection_from(supplier))
         }),
     );
     let nested_for_append = nested.clone();
@@ -46912,9 +47173,9 @@ fn make_new_element_js_with_canvas_registry(
 
     // getElementsByTagNameNS(namespace, localName) — §4.5
     // (https://dom.spec.whatwg.org/#dom-element-getelementsbytagnamens). Returns
-    // a (here static-snapshot) collection of descendant elements matching
-    // (namespace, localName) with the wildcard rules: "*" matches any, "" maps
-    // to the null namespace.
+    // a LIVE HTMLCollection of descendant elements matching (namespace,
+    // localName) with the wildcard rules: "*" matches any, "" maps to the null
+    // namespace; localName comparison is case-sensitive.
     let nested_for_getn_ns = nested.clone();
     let get_elements_by_tag_name_ns = cv_js::native_fn("getElementsByTagNameNS", move |args| {
         let ns_raw = ns_arg_to_option(args.first());
@@ -46926,37 +47187,24 @@ fn make_new_element_js_with_canvas_registry(
             Some(s) if s.is_empty() => None,
             other => other,
         };
-        let ln_any = ln == "*";
-        let mut out: Vec<cv_js::Value> = Vec::new();
-        let kids = nested_for_getn_ns.borrow().clone();
-        collect_created_descendants_by(
-            &kids,
-            &|v| {
-                let cv_js::Value::Object(o) = v else { return false };
-                let b = o.borrow();
-                // localName match (case-sensitive per spec for *NS).
-                if !ln_any {
-                    let el_ln = b
-                        .get("localName")
-                        .map(|x| x.to_display_string())
-                        .or_else(|| b.get("_tag").map(|x| x.to_display_string()))
-                        .unwrap_or_default();
-                    if el_ln != ln {
-                        return false;
+        let nested = nested_for_getn_ns.clone();
+        let supplier = move || -> Vec<cv_js::Value> {
+            let mut out: Vec<cv_js::Value> = Vec::new();
+            let kids = nested.borrow().clone();
+            collect_created_descendants_by(
+                &kids,
+                &|v| {
+                    if let cv_js::Value::Object(o) = v {
+                        gebtnns_element_matches(&o.borrow(), &want_ns, ns_any, &ln)
+                    } else {
+                        false
                     }
-                }
-                if ns_any {
-                    return true;
-                }
-                let el_ns = match b.get("namespaceURI") {
-                    Some(cv_js::Value::Null) | Some(cv_js::Value::Undefined) | None => None,
-                    Some(x) => Some(x.to_display_string()),
-                };
-                el_ns == want_ns
-            },
-            &mut out,
-        );
-        Ok(cv_js::Value::Array(std::rc::Rc::new(std::cell::RefCell::new(out))))
+                },
+                &mut out,
+            );
+            out
+        };
+        Ok(make_live_html_collection_from(supplier))
     });
 
     // el.attributes — live NamedNodeMap over the authoritative list.
@@ -47691,38 +47939,33 @@ fn install_dom_api(
                 Some(s) if s.is_empty() => None,
                 other => other,
             };
-            let ln_any = ln == "*";
             let table = t_for_tagns.clone();
             let supplier = move || -> Vec<cv_js::Value> {
                 let t = table.borrow();
-                t.all
-                    .iter()
-                    .filter(|rec| {
-                        let cv_js::Value::Object(o) = &rec.js else {
-                            return false;
-                        };
-                        let b = o.borrow();
-                        if !ln_any {
-                            let el_ln = b
-                                .get("localName")
-                                .map(|x| x.to_display_string())
-                                .or_else(|| b.get("_tag").map(|x| x.to_display_string()))
-                                .unwrap_or_else(|| rec.tag.clone());
-                            if el_ln != ln {
-                                return false;
-                            }
-                        }
-                        if ns_any {
-                            return true;
-                        }
-                        let el_ns = match b.get("namespaceURI") {
-                            Some(cv_js::Value::Null) | Some(cv_js::Value::Undefined) | None => None,
-                            Some(x) => Some(x.to_display_string()),
-                        };
-                        el_ns == want_ns
-                    })
-                    .map(|rec| rec.js.clone())
-                    .collect()
+                let mut out: Vec<cv_js::Value> = Vec::new();
+                let hit = |js: &cv_js::Value| -> bool {
+                    if let cv_js::Value::Object(o) = js {
+                        gebtnns_element_matches(&o.borrow(), &want_ns, ns_any, &ln)
+                    } else {
+                        false
+                    }
+                };
+                // Static parse-time element table (document order).
+                for rec in t.all.iter() {
+                    if hit(&rec.js) {
+                        out.push(rec.js.clone());
+                    }
+                }
+                // Live JS DOM (dynamically created+appended elements).
+                let roots = live_document_roots(&t);
+                let live_records = build_live_element_snapshot(&roots);
+                for live_rec in &live_records {
+                    if hit(&live_rec.js) {
+                        out.push(live_rec.js.clone());
+                    }
+                }
+                dedup_by_identity(&mut out);
+                out
             };
             Ok(make_live_html_collection_from(supplier))
         });

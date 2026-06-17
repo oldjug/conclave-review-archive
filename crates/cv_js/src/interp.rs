@@ -4942,6 +4942,13 @@ pub fn is_legacy_collection(v: &Value) -> bool {
     matches!(v, Value::Object(o) if matches!(o.borrow().get(LEGACY_COLL_KEY), Some(Value::Number(_))))
 }
 
+/// True iff `v` is a DOM node-like object (carries a `nodeType` slot). Used to
+/// route the `in` operator through the host [[HasProperty]] so the live
+/// tree-traversal accessors + the nodeType CONSTANTS resolve as present.
+pub fn value_is_node_like(v: &Value) -> bool {
+    matches!(v, Value::Object(o) if o.borrow().contains_key("nodeType"))
+}
+
 /// WebIDL §3.9.1 — "array index property name": a string that is the canonical
 /// decimal form of an integer in `[0, 2^32 - 1)` (note: STRICTLY less than
 /// 2^32-1, so "4294967295" is NOT an array index). Returns the integer when so.
@@ -4995,10 +5002,15 @@ fn legacy_supported_names(coll: &LegacyCollection) -> Vec<String> {
             // element (`createElementNS('ns','foo')`) does not contribute its
             // `name`. The host marks foreign elements with a `namespaceURI`
             // other than the HTML namespace.
+            // `name` contributes ONLY for HTML-namespace elements (DOM
+            // §4.2.10.2). An EXPLICIT null namespace (`createElementNS("", …)`)
+            // is a FOREIGN element → it does NOT contribute its `name`. An ABSENT
+            // `namespaceURI` key is the parse-time HTML default → HTML.
             let is_html_ns = match b.get("namespaceURI") {
                 Some(Value::String(ns)) => &**ns == "http://www.w3.org/1999/xhtml",
-                None | Some(Value::Null) | Some(Value::Undefined) => true,
-                _ => true,
+                Some(Value::Null) => false,
+                None | Some(Value::Undefined) => true,
+                _ => false,
             };
             if is_html_ns {
                 if let Some(Value::String(s)) = b.get("name") {
@@ -5028,13 +5040,16 @@ fn legacy_named_item(coll: &LegacyCollection, name: &str) -> Value {
             }
         }
     }
-    // Second pass: name match (HTML-namespace elements only).
+    // Second pass: name match (HTML-namespace elements only — an explicit null
+    // namespace is foreign and does not match on `name`).
     for el in (coll.supplier)() {
         if let Value::Object(o) = &el {
             let b = o.borrow();
             let is_html_ns = match b.get("namespaceURI") {
                 Some(Value::String(ns)) => &**ns == "http://www.w3.org/1999/xhtml",
-                _ => true,
+                Some(Value::Null) => false,
+                None | Some(Value::Undefined) => true,
+                _ => false,
             };
             if is_html_ns && matches!(b.get("name"), Some(Value::String(s)) if &**s == name) {
                 return el.clone();
@@ -8105,6 +8120,37 @@ fn dom_is_traversal_key(key: &str) -> bool {
     )
 }
 
+/// The numeric value of a WHATWG DOM `Node` interface nodeType CONSTANT
+/// (`ELEMENT_NODE` = 1 … `NOTATION_NODE` = 12), or `None` if `key` is not one.
+/// These constants are exposed on every Node (and the `Node` interface object);
+/// many WPT/real-page tree walks compare `child.nodeType === child.ELEMENT_NODE`,
+/// so they must resolve on any node-like object (one carrying `nodeType`).
+fn node_type_constant(key: &str) -> Option<f64> {
+    Some(match key {
+        "ELEMENT_NODE" => 1.0,
+        "ATTRIBUTE_NODE" => 2.0,
+        "TEXT_NODE" => 3.0,
+        "CDATA_SECTION_NODE" => 4.0,
+        "ENTITY_REFERENCE_NODE" => 5.0,
+        "ENTITY_NODE" => 6.0,
+        "PROCESSING_INSTRUCTION_NODE" => 7.0,
+        "COMMENT_NODE" => 8.0,
+        "DOCUMENT_NODE" => 9.0,
+        "DOCUMENT_TYPE_NODE" => 10.0,
+        "DOCUMENT_FRAGMENT_NODE" => 11.0,
+        "NOTATION_NODE" => 12.0,
+        // DocumentPosition bit-flags (Node.compareDocumentPosition) live on the
+        // same interface and are likewise read off nodes.
+        "DOCUMENT_POSITION_DISCONNECTED" => 1.0,
+        "DOCUMENT_POSITION_PRECEDING" => 2.0,
+        "DOCUMENT_POSITION_FOLLOWING" => 4.0,
+        "DOCUMENT_POSITION_CONTAINS" => 8.0,
+        "DOCUMENT_POSITION_CONTAINED_BY" => 16.0,
+        "DOCUMENT_POSITION_IMPLEMENTATION_SPECIFIC" => 32.0,
+        _ => return None,
+    })
+}
+
 /// Whether a DOM node value is an Element (nodeType === 1).
 fn dom_is_element(v: &Value) -> bool {
     matches!(v, Value::Object(o)
@@ -8597,7 +8643,20 @@ fn value_get_own(v: &Value, key: &str) -> Value {
 
 fn value_has_own(v: &Value, key: &str) -> bool {
     match v {
-        Value::Object(o) => o.borrow().contains_key(key),
+        Value::Object(o) => {
+            // Legacy platform object (HTMLCollection / NodeList): an array-index
+            // or supported-name key is an OWN property reported by the exotic
+            // [[GetOwnProperty]] (WebIDL §3.9.4) even though it is not a stored
+            // slot — so `coll.hasOwnProperty(0)` / `hasOwnProperty('id')` must be
+            // true, matching `Object.getOwnPropertyNames`. (assert_array_equals
+            // relies on `hasOwnProperty(i)` for every index.)
+            if let Some(coll) = legacy_coll_of(v) {
+                if legacy_own_descriptor(v, &coll, key).is_some() {
+                    return true;
+                }
+            }
+            o.borrow().contains_key(key)
+        }
         Value::Array(a) => {
             key == "length"
                 || key
@@ -19346,7 +19405,23 @@ impl Interp {
             return Ok(matches!(&target, Value::Object(o) if o.borrow().contains_key(key)));
         }
         let present = match obj {
-            Value::Object(o) => o.borrow().contains_key(key),
+            Value::Object(o) => {
+                if o.borrow().contains_key(key) {
+                    true
+                } else if o.borrow().contains_key("nodeType")
+                    && (dom_is_traversal_key(key) || node_type_constant(key).is_some())
+                {
+                    // Node-like object: the live tree-traversal accessors
+                    // (children/firstElementChild/childElementCount/…) and the
+                    // nodeType/DocumentPosition CONSTANTS are present on every
+                    // node even when not stored as own slots (WHATWG DOM §4.4) —
+                    // so `"childElementCount" in el` / `"ELEMENT_NODE" in node`
+                    // are true.
+                    true
+                } else {
+                    false
+                }
+            }
             Value::Array(a) => {
                 if let Ok(i) = key.parse::<usize>() {
                     let arr = a.borrow();
@@ -19754,6 +19829,15 @@ impl Interp {
                 // 1. Own property.
                 if let Some(v) = o.borrow().get(key) {
                     return v.clone();
+                }
+                // 1b. Node interface nodeType / DocumentPosition CONSTANTS
+                //     (WHATWG DOM §4.4) — `ELEMENT_NODE` = 1, etc. Exposed on
+                //     every node-like object (one carrying `nodeType`), since
+                //     tree walks read `child.ELEMENT_NODE`. Own props shadow them.
+                if let Some(n) = node_type_constant(key) {
+                    if o.borrow().contains_key("nodeType") {
+                        return Value::Number(n);
+                    }
                 }
                 // 2. `__proto__` accessor returns the prototype.
                 if key == "__proto__" {

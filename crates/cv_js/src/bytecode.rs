@@ -9393,10 +9393,14 @@ fn run_function_inner(
                 // Lenient on non-objects (return false rather than throwing) so
                 // a `typeof x==='object' && k in x` guard against null doesn't
                 // abort the VM run.
-                if is_proxy_val(&recv) || crate::interp::is_legacy_collection(&recv) {
-                    // Route a legacy platform object (HTMLCollection/NodeList)
-                    // and a Proxy through the host [[HasProperty]] so the exotic
-                    // index/name/inherited-member resolution applies.
+                if is_proxy_val(&recv)
+                    || crate::interp::is_legacy_collection(&recv)
+                    || crate::interp::value_is_node_like(&recv)
+                {
+                    // Route a legacy platform object (HTMLCollection/NodeList), a
+                    // Proxy, and any DOM node through the host [[HasProperty]] so
+                    // the exotic index/name resolution, the live tree-traversal
+                    // accessors, and the nodeType CONSTANTS all resolve for `in`.
                     let hook = globals.borrow().get("__tb_host_has").cloned();
                     if let Some(g @ Value::NativeFunction(_)) = hook {
                         match dispatch(g, Value::Undefined, vec![recv, Value::str(key)]) {
