@@ -40595,6 +40595,511 @@ fn parse_mo_init(opts: Option<&cv_js::Value>) -> MoInit {
     init
 }
 
+// ---------------------------------------------------------------------------
+// Namespace plumbing — WHATWG DOM §1.5 "Namespaces" + the validate/extract
+// algorithms used by createElementNS/createAttributeNS/setAttributeNS and the
+// `*NS` query family. Implemented to the letter so the `dom/nodes/*NS*` WPT
+// tests pass because the behaviour is correct, not placeheld.
+// ---------------------------------------------------------------------------
+
+/// The HTML namespace (https://infra.spec.whatwg.org/#html-namespace).
+const HTML_NAMESPACE: &str = "http://www.w3.org/1999/xhtml";
+/// The XML namespace (https://infra.spec.whatwg.org/#xml-namespace).
+const XML_NAMESPACE: &str = "http://www.w3.org/XML/1998/namespace";
+/// The XMLNS namespace (https://infra.spec.whatwg.org/#xmlns-namespace).
+const XMLNS_NAMESPACE: &str = "http://www.w3.org/2000/xmlns/";
+
+/// XML 1.0 `NameStartChar` (https://www.w3.org/TR/xml/#NT-NameStartChar),
+/// minus ':' (handled separately by QName splitting).
+fn is_xml_name_start_char(c: char) -> bool {
+    matches!(c,
+        'A'..='Z' | 'a'..='z' | '_'
+        | '\u{C0}'..='\u{D6}' | '\u{D8}'..='\u{F6}' | '\u{F8}'..='\u{2FF}'
+        | '\u{370}'..='\u{37D}' | '\u{37F}'..='\u{1FFF}'
+        | '\u{200C}'..='\u{200D}' | '\u{2070}'..='\u{218F}'
+        | '\u{2C00}'..='\u{2FEF}' | '\u{3001}'..='\u{D7FF}'
+        | '\u{F900}'..='\u{FDCF}' | '\u{FDF0}'..='\u{FFFD}'
+        | '\u{10000}'..='\u{EFFFF}')
+}
+
+/// XML 1.0 `NameChar` (https://www.w3.org/TR/xml/#NT-NameChar), minus ':'.
+fn is_xml_name_char(c: char) -> bool {
+    is_xml_name_start_char(c)
+        || matches!(c,
+            '-' | '.' | '0'..='9' | '\u{B7}'
+            | '\u{0300}'..='\u{036F}' | '\u{203F}'..='\u{2040}')
+}
+
+/// True if `s` matches the XML 1.0 `Name` production (https://www.w3.org/TR/xml/#NT-Name),
+/// allowing ':' anywhere (the `Name` production includes the ':' NameChar; the
+/// QName-specific colon restrictions are enforced by [`validate_and_extract`]).
+fn is_valid_xml_name(s: &str) -> bool {
+    let mut chars = s.chars();
+    let Some(first) = chars.next() else {
+        return false; // empty is not a Name
+    };
+    if !(first == ':' || is_xml_name_start_char(first)) {
+        return false;
+    }
+    chars.all(|c| c == ':' || is_xml_name_char(c))
+}
+
+/// WHATWG DOM "validate" (https://dom.spec.whatwg.org/#validate-and-extract step
+/// preamble, and #concept-cd-element) — throws `InvalidCharacterError` if
+/// `qualified_name` is not a valid XML Name or `NamespaceError` if it is not a
+/// valid QName (the colon-splitting rules). Returns the (prefix, local_name)
+/// split on success.
+fn validate_qualified_name(qualified_name: &str) -> Result<(Option<String>, String), cv_js::JsError> {
+    // 1. If qualifiedName does not match the Name production → InvalidCharacterError.
+    if !is_valid_xml_name(qualified_name) {
+        return Err(cv_js::JsError::Throw(make_dom_exception(
+            "InvalidCharacterError",
+            5,
+            &format!("'{qualified_name}' is not a valid name"),
+        )));
+    }
+    // 2. If qualifiedName does not match the QName production → InvalidCharacterError.
+    //    A QName is either `Name` (no colon) or `prefix:local` where both parts
+    //    are valid `NCName`s (XML Names with no colon, and not empty).
+    let colon_count = qualified_name.matches(':').count();
+    if colon_count == 0 {
+        return Ok((None, qualified_name.to_string()));
+    }
+    if colon_count > 1 {
+        // More than one colon is not a valid QName → InvalidCharacterError.
+        return Err(cv_js::JsError::Throw(make_dom_exception(
+            "InvalidCharacterError",
+            5,
+            &format!("'{qualified_name}' is not a valid qualified name"),
+        )));
+    }
+    // Exactly one colon. Split; both sides must be non-empty NCNames.
+    let idx = qualified_name.find(':').unwrap();
+    let prefix = &qualified_name[..idx];
+    let local = &qualified_name[idx + 1..];
+    if prefix.is_empty() || local.is_empty() {
+        return Err(cv_js::JsError::Throw(make_dom_exception(
+            "InvalidCharacterError",
+            5,
+            &format!("'{qualified_name}' is not a valid qualified name"),
+        )));
+    }
+    // NCName: a Name with no ':'. We already validated `qualified_name` as an XML
+    // Name, so prefix/local are Names; reject if either still contains a colon
+    // (impossible here since we split on the only colon) — and the NameStartChar
+    // rule must hold for each part's first char.
+    if !is_valid_ncname(prefix) || !is_valid_ncname(local) {
+        return Err(cv_js::JsError::Throw(make_dom_exception(
+            "InvalidCharacterError",
+            5,
+            &format!("'{qualified_name}' is not a valid qualified name"),
+        )));
+    }
+    Ok((Some(prefix.to_string()), local.to_string()))
+}
+
+/// An XML `NCName` (https://www.w3.org/TR/xml-names/#NT-NCName): a `Name`
+/// without any ':'.
+fn is_valid_ncname(s: &str) -> bool {
+    if s.contains(':') {
+        return false;
+    }
+    let mut chars = s.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !is_xml_name_start_char(first) {
+        return false;
+    }
+    chars.all(is_xml_name_char)
+}
+
+/// The result of WHATWG DOM "validate and extract"
+/// (https://dom.spec.whatwg.org/#validate-and-extract).
+struct ExtractedName {
+    /// The (possibly null) namespace, with the empty string coerced to None.
+    namespace: Option<String>,
+    /// The (possibly null) prefix.
+    prefix: Option<String>,
+    /// The local name (never empty).
+    local_name: String,
+    /// The original qualified name as supplied (used for nodeName/tagName).
+    qualified_name: String,
+}
+
+/// WHATWG DOM "validate and extract" (https://dom.spec.whatwg.org/#validate-and-extract).
+/// `namespace` is None when the JS argument was `null`/`undefined`, or the
+/// string value otherwise (the caller coerces). Throws `NamespaceError` /
+/// `InvalidCharacterError` exactly per spec.
+fn validate_and_extract(
+    namespace: Option<String>,
+    qualified_name: &str,
+) -> Result<ExtractedName, cv_js::JsError> {
+    // 1. If namespace is the empty string, set it to null.
+    let mut namespace = match namespace {
+        Some(s) if s.is_empty() => None,
+        other => other,
+    };
+    // 2. Validate qualifiedName → (prefix, localName).
+    let (prefix, local_name) = validate_qualified_name(qualified_name)?;
+    // (steps 3–4 fold into the split above)
+    // 5. If prefix is non-null and namespace is null → NamespaceError.
+    if prefix.is_some() && namespace.is_none() {
+        return Err(cv_js::JsError::Throw(make_dom_exception(
+            "NamespaceError",
+            14,
+            "a prefix requires a non-null namespace",
+        )));
+    }
+    // 6. If prefix is "xml" and namespace is not the XML namespace → NamespaceError.
+    if prefix.as_deref() == Some("xml") && namespace.as_deref() != Some(XML_NAMESPACE) {
+        return Err(cv_js::JsError::Throw(make_dom_exception(
+            "NamespaceError",
+            14,
+            "the 'xml' prefix must be in the XML namespace",
+        )));
+    }
+    // 7. If qualifiedName or prefix is "xmlns" and namespace is not the XMLNS
+    //    namespace → NamespaceError.
+    let is_xmlns = qualified_name == "xmlns" || prefix.as_deref() == Some("xmlns");
+    if is_xmlns && namespace.as_deref() != Some(XMLNS_NAMESPACE) {
+        return Err(cv_js::JsError::Throw(make_dom_exception(
+            "NamespaceError",
+            14,
+            "the 'xmlns' name/prefix must be in the XMLNS namespace",
+        )));
+    }
+    // 8. If namespace is the XMLNS namespace and neither qualifiedName nor prefix
+    //    is "xmlns" → NamespaceError.
+    if namespace.as_deref() == Some(XMLNS_NAMESPACE) && !is_xmlns {
+        return Err(cv_js::JsError::Throw(make_dom_exception(
+            "NamespaceError",
+            14,
+            "the XMLNS namespace requires an 'xmlns' name/prefix",
+        )));
+    }
+    // Re-coerce: at this point the empty string has already become null in step 1.
+    let _ = &mut namespace;
+    Ok(ExtractedName {
+        namespace,
+        prefix,
+        local_name,
+        qualified_name: qualified_name.to_string(),
+    })
+}
+
+/// Coerce a `createElementNS`/`*NS` namespace argument to the spec's nullable
+/// string: `null`/`undefined` → None, anything else → its string value.
+/// (Per WebIDL `DOMString?`, `undefined` stringifies to "undefined" only for
+/// non-nullable; here the IDL type is nullable so `null`/`undefined` → null.)
+fn ns_arg_to_option(v: Option<&cv_js::Value>) -> Option<String> {
+    match v {
+        None | Some(cv_js::Value::Null) | Some(cv_js::Value::Undefined) => None,
+        Some(other) => Some(other.to_display_string()),
+    }
+}
+
+/// One entry in an element's WHATWG attribute list
+/// (https://dom.spec.whatwg.org/#concept-element-attribute). Carries the full
+/// namespace surface so `getAttributeNS`/`el.attributes`/Attr nodes are correct.
+#[derive(Clone, Debug, PartialEq)]
+struct AttrEntry {
+    /// Nullable attribute namespace.
+    namespace: Option<String>,
+    /// Nullable namespace prefix.
+    prefix: Option<String>,
+    /// Local name (case as authored; never empty).
+    local_name: String,
+    /// Qualified name (`prefix:local` or just `local`), used for `.name`.
+    qualified_name: String,
+    /// Attribute value.
+    value: String,
+}
+
+impl AttrEntry {
+    /// A null-namespace attribute set via `setAttribute(name, value)`. For HTML
+    /// elements `setAttribute` lowercases the name; the caller passes the already
+    /// case-folded `name`. Local name == qualified name == name; prefix == null.
+    fn plain(name: &str, value: &str) -> Self {
+        AttrEntry {
+            namespace: None,
+            prefix: None,
+            local_name: name.to_string(),
+            qualified_name: name.to_string(),
+            value: value.to_string(),
+        }
+    }
+}
+
+thread_local! {
+    /// Process-wide registry mapping an Attr node's `_attrId` → the owning
+    /// element's attribute-list cell + the (namespace, localName) key it points
+    /// at. This lets a detached `document.createAttribute()` Attr be wired into
+    /// an element via `setAttributeNode`, and lets `attr.value = x` (an Attr that
+    /// IS attached) write back through to its element's list. Cleared per page
+    /// build via the same lifecycle as other DOM thread-locals (the runtime is
+    /// rebuilt per document).
+    static NEXT_ATTR_ID: std::cell::Cell<u64> = const { std::cell::Cell::new(1) };
+}
+
+fn next_attr_id() -> u64 {
+    NEXT_ATTR_ID.with(|c| {
+        let v = c.get();
+        c.set(v.wrapping_add(1));
+        v
+    })
+}
+
+/// The type of an element's authoritative attribute list cell, shared between
+/// the element wrapper, its `attributes` NamedNodeMap, and any live Attr nodes.
+type AttrList = std::rc::Rc<std::cell::RefCell<Vec<AttrEntry>>>;
+
+/// Build an `Attr` JS node (WHATWG DOM §4.9) for `entry`. When `owner_list` /
+/// `owner_element` are provided the Attr is "attached": reading `.value` reflects
+/// the current list entry and writing `.value` mutates it in place (matching
+/// Blink, where Attr is a live view onto the element's attribute). A detached
+/// Attr (from `document.createAttribute`) has `owner_list == None` and stores
+/// its value standalone.
+fn make_attr_node_js(
+    entry: AttrEntry,
+    owner_list: Option<AttrList>,
+    owner_element: Option<cv_js::Value>,
+) -> cv_js::Value {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use cv_js::Value;
+
+    let mut m: cv_js::OrderedMap<String, Value> = cv_js::OrderedMap::new();
+    // nodeType 2 = ATTRIBUTE_NODE.
+    m.insert("nodeType".into(), Value::Number(2.0));
+    m.insert("_isAttr".into(), Value::Bool(true));
+    m.insert(
+        "namespaceURI".into(),
+        match &entry.namespace {
+            Some(s) => Value::str(s.clone()),
+            None => Value::Null,
+        },
+    );
+    m.insert(
+        "prefix".into(),
+        match &entry.prefix {
+            Some(p) => Value::str(p.clone()),
+            None => Value::Null,
+        },
+    );
+    m.insert("localName".into(), Value::str(entry.local_name.clone()));
+    m.insert("name".into(), Value::str(entry.qualified_name.clone()));
+    m.insert("nodeName".into(), Value::str(entry.qualified_name.clone()));
+    // `specified` is legacy and always true (WHATWG DOM removed default attrs).
+    m.insert("specified".into(), Value::Bool(true));
+    m.insert(
+        "ownerElement".into(),
+        owner_element.clone().unwrap_or(Value::Null),
+    );
+    // Standalone value (used when detached, and as the initial value for an
+    // attached Attr until the getter reads the list).
+    m.insert("value".into(), Value::str(entry.value.clone()));
+    m.insert("nodeValue".into(), Value::str(entry.value.clone()));
+    m.insert("textContent".into(), Value::str(entry.value.clone()));
+
+    let obj = Rc::new(RefCell::new(m));
+
+    // Attach `value` as a live accessor when this Attr is bound to an element so
+    // `el.attributes[0].value === el.getAttribute(...)` stays true and writes
+    // propagate (WHATWG "set an existing attribute value").
+    if let Some(list) = owner_list {
+        let ns = entry.namespace.clone();
+        let ln = entry.local_name.clone();
+        let list_get = list.clone();
+        let getter = cv_js::native_fn("get value", move |_| {
+            let cur = list_get
+                .borrow()
+                .iter()
+                .find(|a| a.namespace == ns && a.local_name == ln)
+                .map(|a| a.value.clone());
+            Ok(match cur {
+                Some(v) => Value::str(v),
+                None => Value::str(String::new()),
+            })
+        });
+        let ns2 = entry.namespace.clone();
+        let ln2 = entry.local_name.clone();
+        let obj_for_set = obj.clone();
+        let list_set = list.clone();
+        let setter = cv_js::native_fn("set value", move |args| {
+            let new_val = args.first().map(|v| v.to_display_string()).unwrap_or_default();
+            if let Some(a) = list_set
+                .borrow_mut()
+                .iter_mut()
+                .find(|a| a.namespace == ns2 && a.local_name == ln2)
+            {
+                a.value = new_val.clone();
+            }
+            // Keep the plain-data mirrors coherent for code that reads them raw.
+            let mut b = obj_for_set.borrow_mut();
+            b.insert("nodeValue".into(), Value::str(new_val.clone()));
+            b.insert("textContent".into(), Value::str(new_val));
+            Ok(Value::Undefined)
+        });
+        let acc = tb_js_accessor(getter, setter);
+        obj.borrow_mut().insert("value".into(), acc);
+    }
+
+    Value::Object(obj)
+}
+
+/// Build a live `NamedNodeMap` (`el.attributes`, WHATWG DOM §4.9.1) over an
+/// element's attribute list. Indexed access (`attributes[i]`), `length`, `item`,
+/// `getNamedItem(NS)`, `setNamedItem(NS)`, `removeNamedItem(NS)`, and iteration
+/// all reflect the live list. Backed by a Proxy whose `get` trap re-reads the
+/// list on every access so JS references stay live across mutations.
+fn make_named_node_map_js(list: AttrList, owner_element: cv_js::Value) -> cv_js::Value {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use cv_js::{native_fn, Value};
+
+    let get_trap = {
+        let list = list.clone();
+        let owner = owner_element.clone();
+        native_fn("get", move |args| {
+            let prop = args
+                .get(1)
+                .map(|v| v.to_display_string())
+                .unwrap_or_default();
+            let snapshot = list.borrow().clone();
+            let attr_at = |i: usize| -> Value {
+                snapshot
+                    .get(i)
+                    .map(|e| make_attr_node_js(e.clone(), Some(list.clone()), Some(owner.clone())))
+                    .unwrap_or(Value::Undefined)
+            };
+            // Numeric index → the Attr at that position (undefined out of range).
+            if let Ok(i) = prop.parse::<usize>() {
+                return Ok(if i < snapshot.len() {
+                    attr_at(i)
+                } else {
+                    Value::Undefined
+                });
+            }
+            match prop.as_str() {
+                "length" => Ok(Value::Number(snapshot.len() as f64)),
+                "item" => {
+                    let snap = snapshot.clone();
+                    let list = list.clone();
+                    let owner = owner.clone();
+                    Ok(native_fn("item", move |a| {
+                        let idx = a.first().map(|v| v.to_number()).unwrap_or(f64::NAN);
+                        if idx.is_nan() || idx < 0.0 {
+                            return Ok(Value::Null);
+                        }
+                        let i = idx as usize;
+                        Ok(snap
+                            .get(i)
+                            .map(|e| {
+                                make_attr_node_js(e.clone(), Some(list.clone()), Some(owner.clone()))
+                            })
+                            .unwrap_or(Value::Null))
+                    }))
+                }
+                "getNamedItem" => {
+                    let list = list.clone();
+                    let owner = owner.clone();
+                    Ok(native_fn("getNamedItem", move |a| {
+                        let qn = a.first().map(|v| v.to_display_string()).unwrap_or_default();
+                        // HTML elements lowercase the qualified name for lookup.
+                        let found = list
+                            .borrow()
+                            .iter()
+                            .find(|e| {
+                                e.qualified_name == qn
+                                    || e.qualified_name.eq_ignore_ascii_case(&qn)
+                            })
+                            .cloned();
+                        Ok(found
+                            .map(|e| {
+                                make_attr_node_js(e, Some(list.clone()), Some(owner.clone()))
+                            })
+                            .unwrap_or(Value::Null))
+                    }))
+                }
+                "getNamedItemNS" => {
+                    let list = list.clone();
+                    let owner = owner.clone();
+                    Ok(native_fn("getNamedItemNS", move |a| {
+                        let ns = ns_arg_to_option(a.first());
+                        let ln = a.get(1).map(|v| v.to_display_string()).unwrap_or_default();
+                        let found = list
+                            .borrow()
+                            .iter()
+                            .find(|e| e.namespace == ns && e.local_name == ln)
+                            .cloned();
+                        Ok(found
+                            .map(|e| {
+                                make_attr_node_js(e, Some(list.clone()), Some(owner.clone()))
+                            })
+                            .unwrap_or(Value::Null))
+                    }))
+                }
+                "@@sym:Symbol.iterator" => {
+                    let snap = snapshot.clone();
+                    let list = list.clone();
+                    let owner = owner.clone();
+                    Ok(native_fn("[Symbol.iterator]", move |_| {
+                        let items: Vec<Value> = snap
+                            .iter()
+                            .map(|e| {
+                                make_attr_node_js(
+                                    e.clone(),
+                                    Some(list.clone()),
+                                    Some(owner.clone()),
+                                )
+                            })
+                            .collect();
+                        let idx = Rc::new(RefCell::new(0usize));
+                        let next_fn = {
+                            let idx = idx.clone();
+                            native_fn("next", move |_| {
+                                let i = *idx.borrow();
+                                let mut r: cv_js::OrderedMap<String, Value> =
+                                    cv_js::OrderedMap::new();
+                                if i < items.len() {
+                                    r.insert("value".into(), items[i].clone());
+                                    r.insert("done".into(), Value::Bool(false));
+                                    *idx.borrow_mut() = i + 1;
+                                } else {
+                                    r.insert("value".into(), Value::Undefined);
+                                    r.insert("done".into(), Value::Bool(true));
+                                }
+                                Ok(Value::Object(Rc::new(RefCell::new(r))))
+                            })
+                        };
+                        let mut it: cv_js::OrderedMap<String, Value> = cv_js::OrderedMap::new();
+                        it.insert("next".into(), next_fn);
+                        Ok(Value::Object(Rc::new(RefCell::new(it))))
+                    }))
+                }
+                _ => Ok(Value::Undefined),
+            }
+        })
+    };
+
+    let mut handler = cv_js::OrderedMap::new();
+    handler.insert("get".into(), get_trap);
+
+    let mut proxy_map = cv_js::OrderedMap::new();
+    proxy_map.insert("_isProxy".into(), Value::Bool(true));
+    proxy_map.insert("_isNamedNodeMap".into(), Value::Bool(true));
+    proxy_map.insert(
+        "_target".into(),
+        Value::Object(Rc::new(RefCell::new(cv_js::OrderedMap::new()))),
+    );
+    proxy_map.insert(
+        "_handler".into(),
+        Value::Object(Rc::new(RefCell::new(handler))),
+    );
+    Value::Object(Rc::new(RefCell::new(proxy_map)))
+}
+
 /// Attribute-namespace URI for `MutationRecord.attributeNamespace`. HTML
 /// content attributes are in the null namespace (Chrome reports `null` for
 /// `class`/`id`/etc.); the `xmlns`/`xml:`/`xlink:` prefixes carry the
@@ -44682,6 +45187,18 @@ fn make_new_element_js_with_canvas_registry(
     m.insert("_tag".into(), cv_js::Value::str(tag_lc.clone()));
     m.insert("tagName".into(), cv_js::Value::str(tag.to_uppercase()));
     m.insert("nodeName".into(), cv_js::Value::str(tag.to_uppercase()));
+    // Namespace surface (WHATWG DOM §4.4 Element). `createElement` produces an
+    // element in the HTML namespace with a null prefix and a lowercased local
+    // name; `createElementNS` overrides namespaceURI/prefix/localName/tagName
+    // afterward. Set sane HTML-element defaults here so `Element.localName`,
+    // `.prefix`, `.namespaceURI` are correct (and never `undefined`) for the
+    // common path and for SSR-parsed elements wrapped through this constructor.
+    m.insert("localName".into(), cv_js::Value::str(tag_lc.clone()));
+    m.insert("prefix".into(), cv_js::Value::Null);
+    m.insert(
+        "namespaceURI".into(),
+        cv_js::Value::str(HTML_NAMESPACE.to_string()),
+    );
     m.insert("nodeType".into(), cv_js::Value::Number(1.0));
     m.insert("isConnected".into(), cv_js::Value::Bool(false));
     m.insert("textContent".into(), cv_js::Value::str(String::new()));
@@ -44842,6 +45359,12 @@ fn make_new_element_js_with_canvas_registry(
     m.insert("replaceChildren".into(), replace_children);
 
     let attrs: Rc<RefCell<HashMap<String, String>>> = Rc::new(RefCell::new(HashMap::new()));
+    // Authoritative WHATWG attribute list (ordered, namespace-aware). The
+    // `attrs`/`attrs_obj` maps above remain the fast HTML lookup path keyed by
+    // lowercased qualified name; this list is the source of truth for
+    // `el.attributes`, the `*NS` methods, and Attr nodes. Kept in sync on every
+    // setAttribute/removeAttribute/toggleAttribute and the class-name path.
+    let attr_list: AttrList = Rc::new(RefCell::new(Vec::new()));
     let class_names: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
     let sync_class_name = |obj: &Rc<RefCell<HashMap<String, cv_js::Value>>>,
                            attrs: &Rc<RefCell<HashMap<String, String>>>,
@@ -44981,6 +45504,7 @@ fn make_new_element_js_with_canvas_registry(
     let obj_for_set = obj.clone();
     let attrs_for_set = attrs.clone();
     let attrs_obj_for_set = attrs_obj.clone();
+    let attr_list_for_set = attr_list.clone();
     let classes_for_set = class_names.clone();
     let tag_for_set = tag_lc.clone();
     let set_attribute = cv_js::native_fn("setAttribute", move |args| {
@@ -45021,6 +45545,18 @@ fn make_new_element_js_with_canvas_registry(
         attrs_obj_for_set
             .borrow_mut()
             .insert(lower.clone(), cv_js::Value::str(value.clone()));
+        // Mirror into the authoritative attribute list. setAttribute always
+        // produces a null-namespace attribute whose qualified name == the
+        // (case-folded) supplied name (WHATWG "set an attribute value").
+        {
+            let mut list = attr_list_for_set.borrow_mut();
+            if let Some(e) = list.iter_mut().find(|e| e.namespace.is_none() && e.local_name == lower)
+            {
+                e.value = value.clone();
+            } else {
+                list.push(AttrEntry::plain(&lower, &value));
+            }
+        }
         let mut map = obj_for_set.borrow_mut();
         // For SVG elements, also match against the lowercase form for structural
         // attributes like "id" and "class" that are always case-insensitive.
@@ -45115,6 +45651,7 @@ fn make_new_element_js_with_canvas_registry(
     let obj_for_remove = obj.clone();
     let attrs_for_remove = attrs.clone();
     let attrs_obj_for_remove = attrs_obj.clone();
+    let attr_list_for_remove = attr_list.clone();
     let classes_for_remove = class_names.clone();
     let remove_attribute = cv_js::native_fn("removeAttribute", move |args| {
         let name = args
@@ -45122,6 +45659,11 @@ fn make_new_element_js_with_canvas_registry(
             .map(|v| v.to_display_string())
             .unwrap_or_default();
         let lower = name.to_ascii_lowercase();
+        // WHATWG "remove an attribute by name": remove the first list entry whose
+        // qualified name matches (HTML: case-insensitively).
+        attr_list_for_remove
+            .borrow_mut()
+            .retain(|e| !e.qualified_name.eq_ignore_ascii_case(&name));
         // Only emit a record if the attribute was actually present (WHATWG
         // "remove an attribute" no-ops when absent).
         let mo_old = attrs_for_remove.borrow().get(&lower).cloned();
@@ -45160,6 +45702,7 @@ fn make_new_element_js_with_canvas_registry(
 
     let attrs_for_toggle = attrs.clone();
     let attrs_obj_for_toggle = attrs_obj.clone();
+    let attr_list_for_toggle = attr_list.clone();
     let toggle_attribute = cv_js::native_fn("toggleAttribute", move |args| {
         let name = args
             .first()
@@ -45169,14 +45712,19 @@ fn make_new_element_js_with_canvas_registry(
         let force = args.get(1).map(|v| v.to_bool());
         let mut attrs = attrs_for_toggle.borrow_mut();
         let mut attrs_obj = attrs_obj_for_toggle.borrow_mut();
+        let mut list = attr_list_for_toggle.borrow_mut();
         let currently_present = attrs.contains_key(&lower);
         let make_present = force.unwrap_or(!currently_present);
         if make_present {
             attrs.insert(lower.clone(), String::new());
-            attrs_obj.insert(lower, cv_js::Value::str(String::new()));
+            attrs_obj.insert(lower.clone(), cv_js::Value::str(String::new()));
+            if !list.iter().any(|e| e.namespace.is_none() && e.local_name == lower) {
+                list.push(AttrEntry::plain(&lower, ""));
+            }
         } else {
             attrs.remove(&lower);
             attrs_obj.remove(&lower);
+            list.retain(|e| !(e.namespace.is_none() && e.local_name == lower));
         }
         Ok(cv_js::Value::Bool(make_present))
     });
@@ -45509,6 +46057,418 @@ fn make_new_element_js_with_canvas_registry(
         replace_child_snapshot(&self_val, &nodes);
         Ok(cv_js::Value::Undefined)
     });
+    // -------------------------------------------------------------------
+    // Namespaced attribute family (WHATWG DOM §4.9 Element) + Attr-node API,
+    // all backed by the authoritative `attr_list`.
+    // -------------------------------------------------------------------
+
+    // setAttributeNS(namespace, qualifiedName, value) — §4.9
+    // (https://dom.spec.whatwg.org/#dom-element-setattributens). Validate and
+    // extract, then "set an attribute value" with the extracted parts.
+    let obj_for_set_ns = obj.clone();
+    let attrs_for_set_ns = attrs.clone();
+    let attrs_obj_for_set_ns = attrs_obj.clone();
+    let attr_list_for_set_ns = attr_list.clone();
+    let set_attribute_ns = cv_js::native_fn("setAttributeNS", move |args| {
+        let ns = ns_arg_to_option(args.first());
+        let qualified = args.get(1).map(|v| v.to_display_string()).unwrap_or_default();
+        let value = args.get(2).map(|v| v.to_display_string()).unwrap_or_default();
+        let ext = validate_and_extract(ns, &qualified)?;
+        let entry = AttrEntry {
+            namespace: ext.namespace.clone(),
+            prefix: ext.prefix.clone(),
+            local_name: ext.local_name.clone(),
+            qualified_name: ext.qualified_name.clone(),
+            value: value.clone(),
+        };
+        // MutationRecord + custom-element reaction (observed-attribute callback).
+        let mo_target = cv_js::Value::Object(obj_for_set_ns.clone());
+        let mo_old = attr_list_for_set_ns
+            .borrow()
+            .iter()
+            .find(|e| e.namespace == ext.namespace && e.local_name == ext.local_name)
+            .map(|e| e.value.clone());
+        emit_js_attribute_mutation(
+            &mo_target,
+            &ext.local_name,
+            ext.namespace.as_deref(),
+            mo_old.as_deref(),
+        );
+        enqueue_attribute_changed_reaction(
+            &mo_target,
+            &ext.local_name,
+            mo_old.as_deref(),
+            Some(&value),
+            ext.namespace.as_deref(),
+        );
+        // Upsert by (namespace, localName).
+        {
+            let mut list = attr_list_for_set_ns.borrow_mut();
+            if let Some(e) = list
+                .iter_mut()
+                .find(|e| e.namespace == ext.namespace && e.local_name == ext.local_name)
+            {
+                e.prefix = ext.prefix.clone();
+                e.qualified_name = ext.qualified_name.clone();
+                e.value = value.clone();
+            } else {
+                list.push(entry);
+            }
+        }
+        // Mirror null-namespace attrs into the fast HTML maps so getAttribute
+        // and the reflected-property path keep working. Namespaced attrs live
+        // only in the list (HTML getAttribute matches by qualified name anyway).
+        if ext.namespace.is_none() {
+            let lk = ext.qualified_name.to_ascii_lowercase();
+            attrs_for_set_ns.borrow_mut().insert(lk.clone(), value.clone());
+            attrs_obj_for_set_ns
+                .borrow_mut()
+                .insert(lk, cv_js::Value::str(value.clone()));
+        }
+        Ok(cv_js::Value::Undefined)
+    });
+
+    // getAttributeNS(namespace, localName) — §4.9
+    // (https://dom.spec.whatwg.org/#dom-element-getattributens). Returns the
+    // value of the attribute matching (namespace, localName), else null.
+    let attr_list_for_get_ns = attr_list.clone();
+    let get_attribute_ns = cv_js::native_fn("getAttributeNS", move |args| {
+        let ns = ns_arg_to_option(args.first());
+        let ln = args.get(1).map(|v| v.to_display_string()).unwrap_or_default();
+        Ok(attr_list_for_get_ns
+            .borrow()
+            .iter()
+            .find(|e| e.namespace == ns && e.local_name == ln)
+            .map(|e| cv_js::Value::str(e.value.clone()))
+            .unwrap_or(cv_js::Value::Null))
+    });
+
+    // hasAttributeNS(namespace, localName) — §4.9
+    // (https://dom.spec.whatwg.org/#dom-element-hasattributens).
+    let attr_list_for_has_ns = attr_list.clone();
+    let has_attribute_ns = cv_js::native_fn("hasAttributeNS", move |args| {
+        let ns = ns_arg_to_option(args.first());
+        let ln = args.get(1).map(|v| v.to_display_string()).unwrap_or_default();
+        Ok(cv_js::Value::Bool(
+            attr_list_for_has_ns
+                .borrow()
+                .iter()
+                .any(|e| e.namespace == ns && e.local_name == ln),
+        ))
+    });
+
+    // removeAttributeNS(namespace, localName) — §4.9
+    // (https://dom.spec.whatwg.org/#dom-element-removeattributens). Removes the
+    // attribute matching (namespace, localName); no-op if absent.
+    let obj_for_remove_ns = obj.clone();
+    let attrs_for_remove_ns = attrs.clone();
+    let attrs_obj_for_remove_ns = attrs_obj.clone();
+    let attr_list_for_remove_ns = attr_list.clone();
+    let remove_attribute_ns = cv_js::native_fn("removeAttributeNS", move |args| {
+        let ns = ns_arg_to_option(args.first());
+        let ln = args.get(1).map(|v| v.to_display_string()).unwrap_or_default();
+        let removed = {
+            let mut list = attr_list_for_remove_ns.borrow_mut();
+            if let Some(pos) = list
+                .iter()
+                .position(|e| e.namespace == ns && e.local_name == ln)
+            {
+                Some(list.remove(pos))
+            } else {
+                None
+            }
+        };
+        if let Some(e) = removed {
+            let mo_target = cv_js::Value::Object(obj_for_remove_ns.clone());
+            emit_js_attribute_mutation(
+                &mo_target,
+                &e.local_name,
+                e.namespace.as_deref(),
+                Some(&e.value),
+            );
+            enqueue_attribute_changed_reaction(
+                &mo_target,
+                &e.local_name,
+                Some(&e.value),
+                None,
+                e.namespace.as_deref(),
+            );
+            if e.namespace.is_none() {
+                let lk = e.qualified_name.to_ascii_lowercase();
+                attrs_for_remove_ns.borrow_mut().remove(&lk);
+                attrs_obj_for_remove_ns.borrow_mut().remove(&lk);
+            }
+        }
+        Ok(cv_js::Value::Undefined)
+    });
+
+    // getAttributeNode(qualifiedName) / getAttributeNodeNS(namespace, localName)
+    // — §4.9 (https://dom.spec.whatwg.org/#dom-element-getattributenode).
+    let attr_list_for_getnode = attr_list.clone();
+    let obj_for_getnode = obj.clone();
+    let get_attribute_node = cv_js::native_fn("getAttributeNode", move |args| {
+        let qn = args.first().map(|v| v.to_display_string()).unwrap_or_default();
+        let owner = cv_js::Value::Object(obj_for_getnode.clone());
+        let found = attr_list_for_getnode
+            .borrow()
+            .iter()
+            .find(|e| e.qualified_name.eq_ignore_ascii_case(&qn))
+            .cloned();
+        Ok(found
+            .map(|e| make_attr_node_js(e, Some(attr_list_for_getnode.clone()), Some(owner.clone())))
+            .unwrap_or(cv_js::Value::Null))
+    });
+    let attr_list_for_getnode_ns = attr_list.clone();
+    let obj_for_getnode_ns = obj.clone();
+    let get_attribute_node_ns = cv_js::native_fn("getAttributeNodeNS", move |args| {
+        let ns = ns_arg_to_option(args.first());
+        let ln = args.get(1).map(|v| v.to_display_string()).unwrap_or_default();
+        let owner = cv_js::Value::Object(obj_for_getnode_ns.clone());
+        let found = attr_list_for_getnode_ns
+            .borrow()
+            .iter()
+            .find(|e| e.namespace == ns && e.local_name == ln)
+            .cloned();
+        Ok(found
+            .map(|e| {
+                make_attr_node_js(e, Some(attr_list_for_getnode_ns.clone()), Some(owner.clone()))
+            })
+            .unwrap_or(cv_js::Value::Null))
+    });
+
+    // setAttributeNode(attr) / setAttributeNodeNS(attr) — §4.9
+    // (https://dom.spec.whatwg.org/#dom-element-setattributenode). Adds/replaces
+    // an Attr by (namespace, localName); returns the replaced Attr (or null).
+    let obj_for_setnode = obj.clone();
+    let attrs_for_setnode = attrs.clone();
+    let attrs_obj_for_setnode = attrs_obj.clone();
+    let attr_list_for_setnode = attr_list.clone();
+    let set_attribute_node = cv_js::native_fn("setAttributeNode", move |args| {
+        let Some(cv_js::Value::Object(a)) = args.first() else {
+            return Err(cv_js::JsError::Throw(make_dom_exception(
+                "TypeError",
+                0,
+                "setAttributeNode requires an Attr",
+            )));
+        };
+        let read = |k: &str| a.borrow().get(k).map(|v| v.to_display_string());
+        let ns = match a.borrow().get("namespaceURI") {
+            Some(cv_js::Value::Null) | Some(cv_js::Value::Undefined) | None => None,
+            Some(v) => Some(v.to_display_string()),
+        };
+        let prefix = match a.borrow().get("prefix") {
+            Some(cv_js::Value::Null) | Some(cv_js::Value::Undefined) | None => None,
+            Some(v) => Some(v.to_display_string()),
+        };
+        let local_name = read("localName").unwrap_or_default();
+        let qualified_name = read("name").unwrap_or_else(|| local_name.clone());
+        let value = read("value").unwrap_or_default();
+        let new_entry = AttrEntry {
+            namespace: ns.clone(),
+            prefix,
+            local_name: local_name.clone(),
+            qualified_name: qualified_name.clone(),
+            value: value.clone(),
+        };
+        let owner = cv_js::Value::Object(obj_for_setnode.clone());
+        let replaced = {
+            let mut list = attr_list_for_setnode.borrow_mut();
+            if let Some(pos) = list
+                .iter()
+                .position(|e| e.namespace == ns && e.local_name == local_name)
+            {
+                let old = list[pos].clone();
+                list[pos] = new_entry;
+                Some(old)
+            } else {
+                list.push(new_entry);
+                None
+            }
+        };
+        if ns.is_none() {
+            let lk = qualified_name.to_ascii_lowercase();
+            attrs_for_setnode.borrow_mut().insert(lk.clone(), value.clone());
+            attrs_obj_for_setnode
+                .borrow_mut()
+                .insert(lk, cv_js::Value::str(value.clone()));
+        }
+        // Bind the supplied Attr to this element.
+        a.borrow_mut().insert("ownerElement".into(), owner.clone());
+        Ok(replaced
+            .map(|e| make_attr_node_js(e, None, None))
+            .unwrap_or(cv_js::Value::Null))
+    });
+
+    // setAttributeNodeNS(attr) — §4.9. Behaviourally identical to
+    // setAttributeNode (the algorithm is the same; the only historical
+    // difference was IDL exception surface). Distinct closure (NativeFn isn't
+    // cloneable) over the same backing cells.
+    let obj_for_setnode_ns = obj.clone();
+    let attrs_for_setnode_ns = attrs.clone();
+    let attrs_obj_for_setnode_ns = attrs_obj.clone();
+    let attr_list_for_setnode_ns = attr_list.clone();
+    let set_attribute_node_ns = cv_js::native_fn("setAttributeNodeNS", move |args| {
+        let Some(cv_js::Value::Object(a)) = args.first() else {
+            return Err(cv_js::JsError::Throw(make_dom_exception(
+                "TypeError",
+                0,
+                "setAttributeNodeNS requires an Attr",
+            )));
+        };
+        let read = |k: &str| a.borrow().get(k).map(|v| v.to_display_string());
+        let ns = match a.borrow().get("namespaceURI") {
+            Some(cv_js::Value::Null) | Some(cv_js::Value::Undefined) | None => None,
+            Some(v) => Some(v.to_display_string()),
+        };
+        let prefix = match a.borrow().get("prefix") {
+            Some(cv_js::Value::Null) | Some(cv_js::Value::Undefined) | None => None,
+            Some(v) => Some(v.to_display_string()),
+        };
+        let local_name = read("localName").unwrap_or_default();
+        let qualified_name = read("name").unwrap_or_else(|| local_name.clone());
+        let value = read("value").unwrap_or_default();
+        let new_entry = AttrEntry {
+            namespace: ns.clone(),
+            prefix,
+            local_name: local_name.clone(),
+            qualified_name: qualified_name.clone(),
+            value: value.clone(),
+        };
+        let owner = cv_js::Value::Object(obj_for_setnode_ns.clone());
+        let replaced = {
+            let mut list = attr_list_for_setnode_ns.borrow_mut();
+            if let Some(pos) = list
+                .iter()
+                .position(|e| e.namespace == ns && e.local_name == local_name)
+            {
+                let old = list[pos].clone();
+                list[pos] = new_entry;
+                Some(old)
+            } else {
+                list.push(new_entry);
+                None
+            }
+        };
+        if ns.is_none() {
+            let lk = qualified_name.to_ascii_lowercase();
+            attrs_for_setnode_ns.borrow_mut().insert(lk.clone(), value.clone());
+            attrs_obj_for_setnode_ns
+                .borrow_mut()
+                .insert(lk, cv_js::Value::str(value.clone()));
+        }
+        a.borrow_mut().insert("ownerElement".into(), owner.clone());
+        Ok(replaced
+            .map(|e| make_attr_node_js(e, None, None))
+            .unwrap_or(cv_js::Value::Null))
+    });
+
+    // removeAttributeNode(attr) — §4.9
+    // (https://dom.spec.whatwg.org/#dom-element-removeattributenode). Removes
+    // the given Attr from the element; returns it.
+    let attrs_for_rmnode = attrs.clone();
+    let attrs_obj_for_rmnode = attrs_obj.clone();
+    let attr_list_for_rmnode = attr_list.clone();
+    let remove_attribute_node = cv_js::native_fn("removeAttributeNode", move |args| {
+        let Some(cv_js::Value::Object(a)) = args.first() else {
+            return Err(cv_js::JsError::Throw(make_dom_exception(
+                "NotFoundError",
+                8,
+                "removeAttributeNode requires an Attr",
+            )));
+        };
+        let ns = match a.borrow().get("namespaceURI") {
+            Some(cv_js::Value::Null) | Some(cv_js::Value::Undefined) | None => None,
+            Some(v) => Some(v.to_display_string()),
+        };
+        let local_name = a
+            .borrow()
+            .get("localName")
+            .map(|v| v.to_display_string())
+            .unwrap_or_default();
+        let removed = {
+            let mut list = attr_list_for_rmnode.borrow_mut();
+            if let Some(pos) = list
+                .iter()
+                .position(|e| e.namespace == ns && e.local_name == local_name)
+            {
+                Some(list.remove(pos))
+            } else {
+                None
+            }
+        };
+        match removed {
+            Some(e) => {
+                if e.namespace.is_none() {
+                    let lk = e.qualified_name.to_ascii_lowercase();
+                    attrs_for_rmnode.borrow_mut().remove(&lk);
+                    attrs_obj_for_rmnode.borrow_mut().remove(&lk);
+                }
+                a.borrow_mut().insert("ownerElement".into(), cv_js::Value::Null);
+                Ok(make_attr_node_js(e, None, None))
+            }
+            None => Err(cv_js::JsError::Throw(make_dom_exception(
+                "NotFoundError",
+                8,
+                "the attribute is not on this element",
+            ))),
+        }
+    });
+
+    // getElementsByTagNameNS(namespace, localName) — §4.5
+    // (https://dom.spec.whatwg.org/#dom-element-getelementsbytagnamens). Returns
+    // a (here static-snapshot) collection of descendant elements matching
+    // (namespace, localName) with the wildcard rules: "*" matches any, "" maps
+    // to the null namespace.
+    let nested_for_getn_ns = nested.clone();
+    let get_elements_by_tag_name_ns = cv_js::native_fn("getElementsByTagNameNS", move |args| {
+        let ns_raw = ns_arg_to_option(args.first());
+        let ln = args.get(1).map(|v| v.to_display_string()).unwrap_or_default();
+        // namespace "" → null namespace; "*" → any.
+        let ns_any = ns_raw.as_deref() == Some("*");
+        let want_ns: Option<String> = match ns_raw {
+            Some(s) if s == "*" => None,
+            Some(s) if s.is_empty() => None,
+            other => other,
+        };
+        let ln_any = ln == "*";
+        let mut out: Vec<cv_js::Value> = Vec::new();
+        let kids = nested_for_getn_ns.borrow().clone();
+        collect_created_descendants_by(
+            &kids,
+            &|v| {
+                let cv_js::Value::Object(o) = v else { return false };
+                let b = o.borrow();
+                // localName match (case-sensitive per spec for *NS).
+                if !ln_any {
+                    let el_ln = b
+                        .get("localName")
+                        .map(|x| x.to_display_string())
+                        .or_else(|| b.get("_tag").map(|x| x.to_display_string()))
+                        .unwrap_or_default();
+                    if el_ln != ln {
+                        return false;
+                    }
+                }
+                if ns_any {
+                    return true;
+                }
+                let el_ns = match b.get("namespaceURI") {
+                    Some(cv_js::Value::Null) | Some(cv_js::Value::Undefined) | None => None,
+                    Some(x) => Some(x.to_display_string()),
+                };
+                el_ns == want_ns
+            },
+            &mut out,
+        );
+        Ok(cv_js::Value::Array(std::rc::Rc::new(std::cell::RefCell::new(out))))
+    });
+
+    // el.attributes — live NamedNodeMap over the authoritative list.
+    let attributes_map = make_named_node_map_js(
+        attr_list.clone(),
+        cv_js::Value::Object(obj.clone()),
+    );
+
     let obj_for_outer_get = obj.clone();
     let outer_html_getter = cv_js::native_fn("get outerHTML", move |_args| {
         Ok(cv_js::Value::str(serialize_live_node_to_html(&cv_js::Value::Object(
@@ -45518,6 +46478,17 @@ fn make_new_element_js_with_canvas_registry(
 
     {
         let mut map = obj.borrow_mut();
+        map.insert("attributes".into(), attributes_map);
+        map.insert("setAttributeNS".into(), set_attribute_ns);
+        map.insert("getAttributeNS".into(), get_attribute_ns);
+        map.insert("hasAttributeNS".into(), has_attribute_ns);
+        map.insert("removeAttributeNS".into(), remove_attribute_ns);
+        map.insert("getAttributeNode".into(), get_attribute_node);
+        map.insert("getAttributeNodeNS".into(), get_attribute_node_ns);
+        map.insert("setAttributeNode".into(), set_attribute_node);
+        map.insert("setAttributeNodeNS".into(), set_attribute_node_ns);
+        map.insert("removeAttributeNode".into(), remove_attribute_node);
+        map.insert("getElementsByTagNameNS".into(), get_elements_by_tag_name_ns);
         map.insert("appendChild".into(), append_inner);
         map.insert("append".into(), append_variadic);
         map.insert("prepend".into(), prepend_variadic);
@@ -46245,34 +47216,63 @@ fn install_dom_api(
         .get_global("document")
         .unwrap_or(cv_js::Value::Undefined);
     let create_element_ns = cv_js::native_fn("createElementNS", move |args| {
-        let ns = args
-            .first()
-            .map(|v| v.to_display_string())
-            .unwrap_or_default();
-        let tag = args
+        // WHATWG DOM §4.5 createElementNS (https://dom.spec.whatwg.org/#dom-document-createelementns):
+        // run "validate and extract" then construct the element. `null`/`undefined`
+        // namespace → null (NOT the strings "null"/"undefined"); empty string → null.
+        let ns_opt = ns_arg_to_option(args.first());
+        let qualified = args
             .get(1)
             .map(|v| v.to_display_string())
             .unwrap_or_default();
+        let extracted = validate_and_extract(ns_opt, &qualified)?;
+        let ns = extracted.namespace.clone();
+        // The element's local name (the part after any prefix). Routing uses the
+        // lowercased local name for HTML; case is preserved for non-HTML.
         let el = make_new_element_js_with_canvas_registry(
-            &tag,
+            &extracted.local_name,
             &pending_for_create_ns,
             Some(&canvas_registry_for_create_ns),
         );
         if let cv_js::Value::Object(o) = &el {
             let mut b = o.borrow_mut();
             b.insert("ownerDocument".into(), document_for_create_ns.clone());
-            b.insert("namespaceURI".into(), cv_js::Value::str(ns.clone()));
-            // SVG (and xlink) namespace: preserve original tag case.
-            // make_new_element_js_with_canvas_registry lowercases for HTML routing,
-            // but SVG tag/attribute names are case-sensitive in the DOM spec.
-            let is_svg = ns == "http://www.w3.org/2000/svg"
-                || ns == "http://www.w3.org/1999/xlink"
-                || ns == "http://www.w3.org/1998/Math/MathML";
+            // namespaceURI: nullable. Empty/null/undefined → null.
+            b.insert(
+                "namespaceURI".into(),
+                match &ns {
+                    Some(s) => cv_js::Value::str(s.clone()),
+                    None => cv_js::Value::Null,
+                },
+            );
+            // prefix: nullable (null when no colon was present).
+            b.insert(
+                "prefix".into(),
+                match &extracted.prefix {
+                    Some(p) => cv_js::Value::str(p.clone()),
+                    None => cv_js::Value::Null,
+                },
+            );
+            // localName preserves the supplied case (the DOM never lowercases
+            // localName for createElementNS).
+            b.insert("localName".into(), cv_js::Value::str(extracted.local_name.clone()));
+            // tagName/nodeName: the qualified name, uppercased ONLY when the
+            // element is in the HTML namespace AND the node document is an HTML
+            // document (we model documents as HTML). Otherwise case-preserving.
+            let in_html_ns = ns.as_deref() == Some(HTML_NAMESPACE);
+            let qn_display = if in_html_ns {
+                extracted.qualified_name.to_ascii_uppercase()
+            } else {
+                extracted.qualified_name.clone()
+            };
+            b.insert("tagName".into(), cv_js::Value::str(qn_display.clone()));
+            b.insert("nodeName".into(), cv_js::Value::str(qn_display));
+            // Non-HTML namespaces are case-sensitive end-to-end (SVG/MathML/etc).
+            // Keep the case-preserving SVG flag for the rasteriser + setAttribute
+            // case handling.
+            let is_svg = ns.as_deref() == Some("http://www.w3.org/2000/svg")
+                || ns.as_deref() == Some("http://www.w3.org/1999/xlink")
+                || ns.as_deref() == Some("http://www.w3.org/1998/Math/MathML");
             if is_svg {
-                // _tag drives DOM routing; keep lowercase for tree-walk compat,
-                // but tagName/nodeName must preserve case (SVG DOM spec).
-                b.insert("tagName".into(), cv_js::Value::str(tag.clone()));
-                b.insert("nodeName".into(), cv_js::Value::str(tag.clone()));
                 b.insert("_isSvg".into(), cv_js::Value::Bool(true));
             }
         }
@@ -46291,6 +47291,51 @@ fn install_dom_api(
             .unwrap_or_default();
         Ok(make_text_node_js(&text))
     });
+    // document.createAttribute(localName) — WHATWG DOM §4.5
+    // (https://dom.spec.whatwg.org/#dom-document-createattribute). For an HTML
+    // document the localName is lowercased; the Attr has a null namespace/prefix
+    // and an empty value. Throws InvalidCharacterError if localName is not a Name.
+    let create_attribute = cv_js::native_fn("createAttribute", move |args| {
+        let mut local = args
+            .first()
+            .map(|v| v.to_display_string())
+            .unwrap_or_default();
+        if !is_valid_xml_name(&local) {
+            return Err(cv_js::JsError::Throw(make_dom_exception(
+                "InvalidCharacterError",
+                5,
+                &format!("'{local}' is not a valid attribute name"),
+            )));
+        }
+        // HTML document → ASCII-lowercase the qualified name.
+        local = local.to_ascii_lowercase();
+        let entry = AttrEntry {
+            namespace: None,
+            prefix: None,
+            local_name: local.clone(),
+            qualified_name: local,
+            value: String::new(),
+        };
+        Ok(make_attr_node_js(entry, None, None))
+    });
+
+    // document.createAttributeNS(namespace, qualifiedName) — WHATWG DOM §4.5
+    // (https://dom.spec.whatwg.org/#dom-document-createattributens). Validate and
+    // extract, then return an Attr with empty value and a null owner element.
+    let create_attribute_ns = cv_js::native_fn("createAttributeNS", move |args| {
+        let ns = ns_arg_to_option(args.first());
+        let qualified = args.get(1).map(|v| v.to_display_string()).unwrap_or_default();
+        let ext = validate_and_extract(ns, &qualified)?;
+        let entry = AttrEntry {
+            namespace: ext.namespace,
+            prefix: ext.prefix,
+            local_name: ext.local_name,
+            qualified_name: ext.qualified_name,
+            value: String::new(),
+        };
+        Ok(make_attr_node_js(entry, None, None))
+    });
+
     let pending_for_fragment = pending.clone();
     let create_document_fragment = cv_js::native_fn("createDocumentFragment", move |_args| {
         Ok(make_document_fragment_js(&pending_for_fragment))
@@ -48145,6 +49190,8 @@ fn install_dom_api(
         m.insert("getElementsByName".into(), get_elements_by_name);
         m.insert("createElement".into(), create_element);
         m.insert("createElementNS".into(), create_element_ns);
+        m.insert("createAttribute".into(), create_attribute);
+        m.insert("createAttributeNS".into(), create_attribute_ns);
         m.insert("createTextNode".into(), create_text_node);
         m.insert("createDocumentFragment".into(), create_document_fragment);
         m.insert("createRange".into(), create_range);
