@@ -45362,7 +45362,12 @@ fn adjust_ranges_replace_data(node: &cv_js::Value, offset: usize, count: usize, 
                 continue;
             }
             if o > offset && o <= offset + count {
-                live_set_boundary_raw(range, side, c, offset + data_len);
+                // WHATWG DOM §4.5 "replace data" steps 8–9: a boundary point
+                // whose offset is in (offset, offset+count] is set to `offset`
+                // (NOT offset+data_len) — it collapses to the start of the
+                // replaced span, then surviving boundaries past the span shift
+                // by data_len-count in the next branch.
+                live_set_boundary_raw(range, side, c, offset);
                 modified = true;
             } else if o > offset + count {
                 let new_off = o + data_len - count;
