@@ -27484,6 +27484,36 @@ fn node_proto(name: &str) -> Option<ProtoRc> {
     DOM_NODE_PROTOS.with(|m| m.borrow().get(name).cloned())
 }
 
+thread_local! {
+    /// The live `document` JS value (the node-tree the page is parsed into).
+    /// Stashed at `document`-binding time (`set_live_document`) so the proto-LESS
+    /// parse-time node factories (`make_text_node_js`/`make_comment_node_js`),
+    /// which are plain `native_fn`s with no `interp` handle, can stamp
+    /// `Node.ownerDocument` (WHATWG DOM §4.4 — "the node document of a node") on
+    /// every parse-built CharacterData node. Without this, `textNode.ownerDocument`
+    /// is `undefined`, which cascades into thousands of WPT Range/Node failures
+    /// (`startContainer.ownerDocument.createRange()` throws). Foreign/XML-document
+    /// nodes pass their owning doc explicitly to `make_chardata_node_with_iface`,
+    /// so this thread-local is only the fallback for the LIVE document's parse tree.
+    static LIVE_DOCUMENT_JS: std::cell::RefCell<Option<cv_js::Value>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Record the live `document` JS value so the parse-time node factories can stamp
+/// `ownerDocument` (WHATWG DOM §4.4). Idempotent / last-writer-wins; called at
+/// `define_global("document", …)` time.
+fn set_live_document(doc: &cv_js::Value) {
+    LIVE_DOCUMENT_JS.with(|d| *d.borrow_mut() = Some(doc.clone()));
+}
+
+/// The live `document` JS value for `ownerDocument` stamping, or `Null` if no
+/// document has been bound yet (WHATWG DOM §4.4 — a node with no node document
+/// is rare for parse-built nodes; we return `Null`, never `undefined`, so the
+/// property is at least present and spec-shaped).
+fn live_document_for_owner() -> cv_js::Value {
+    LIVE_DOCUMENT_JS.with(|d| d.borrow().clone()).unwrap_or(cv_js::Value::Null)
+}
+
 struct DomProtos {
     event_target: std::rc::Rc<std::cell::RefCell<cv_js::OrderedMap<String, cv_js::Value>>>,
     node: std::rc::Rc<std::cell::RefCell<cv_js::OrderedMap<String, cv_js::Value>>>,
@@ -29431,6 +29461,8 @@ fn install_minimal_dom_with_url(interp: &cv_js::Interp, initial_title: String, p
             .insert("defaultView".into(), window.clone());
     }
 
+    // Stash for parse-time node factories' ownerDocument stamping (DOM §4.4).
+    set_live_document(&document);
     interp.define_global("document", document);
     interp.define_global("window", window);
     interp.define_global(
@@ -45676,6 +45708,11 @@ fn make_text_node_js(text: &str) -> cv_js::Value {
     m.insert("nodeValue".into(), cv_js::Value::str(text.to_string()));
     m.insert("textContent".into(), cv_js::Value::str(text.to_string()));
     m.insert("data".into(), cv_js::Value::str(text.to_string()));
+    // WHATWG DOM §4.4 Node.ownerDocument — a parse-built Text node's node
+    // document is the live document. Without this, `textNode.ownerDocument` is
+    // `undefined` and `startContainer.ownerDocument.createRange()` throws,
+    // cascading into thousands of WPT Range/Node subtest failures.
+    m.insert("ownerDocument".into(), live_document_for_owner());
     let text_for_clone = text.to_string();
     let clone_node = cv_js::native_fn("cloneNode", move |_args| {
         Ok(make_text_node_js(&text_for_clone))
@@ -45706,6 +45743,8 @@ fn make_comment_node_js(text: &str) -> cv_js::Value {
     m.insert("nodeValue".into(), cv_js::Value::str(text.to_string()));
     m.insert("data".into(), cv_js::Value::str(text.to_string()));
     m.insert("textContent".into(), cv_js::Value::str(text.to_string()));
+    // WHATWG DOM §4.4 Node.ownerDocument — the live document (see make_text_node_js).
+    m.insert("ownerDocument".into(), live_document_for_owner());
     let text_for_clone = text.to_string();
     let clone_node = cv_js::native_fn("cloneNode", move |_args| {
         Ok(make_comment_node_js(&text_for_clone))
@@ -46102,6 +46141,18 @@ fn make_blank_document(
     doc_rc
         .borrow_mut()
         .insert("createDocumentFragment".into(), create_fragment);
+
+    // createRange() — WHATWG DOM §4.5 / §5.5: a live Range whose start/end are
+    // (this document, 0). dom/common.js setupRangeTests() runs against a
+    // DOMImplementation/createDocument-built document, so the Range tests need
+    // createRange on these foreign/XML documents (not just the live document).
+    let owner_for_range = doc_val.clone();
+    let create_range = cv_js::native_fn("createRange", move |_args| {
+        Ok(make_range_js(owner_for_range.clone()))
+    });
+    doc_rc
+        .borrow_mut()
+        .insert("createRange".into(), create_range);
 
     // createCDATASection(data) — WHATWG DOM §4.5. On a NON-HTML (XML) document
     // step 1's "NotSupportedError" does NOT apply, so CDATA creation succeeds.
@@ -53041,6 +53092,8 @@ fn install_dom_api(
         }
         m.insert("implementation".into(), impl_obj);
     }
+    // Stash for parse-time node factories' ownerDocument stamping (DOM §4.4).
+    set_live_document(&document);
     interp.define_global("document", document);
 
     // Stash the pending queue on the table so the post-script pass can
@@ -53067,7 +53120,19 @@ fn install_dom_api(
         drop(t);
         if let Some(document) = interp.get_global("document") {
             if let cv_js::Value::Object(o) = &document {
+                // WHATWG DOM §4.5 Document.doctype / §4.7 DocumentType — surface a
+                // REAL DocumentType node for a parsed document that has a DOCTYPE,
+                // else null (NEVER fabricate one for a doc with no DOCTYPE). The
+                // HTML parser records only the doctype NAME (publicId/systemId are
+                // empty for `<!DOCTYPE html>`), which is the common case. This
+                // un-cascades the WPT compareDocumentPosition/contains/cloneNode
+                // failures whose receiver was `document.doctype` (was undefined).
+                let doctype_val = match &doc.doctype_name {
+                    Some(name) => make_doctype_node_js(name, "", "", document.clone()),
+                    None => cv_js::Value::Null,
+                };
                 let mut m = o.borrow_mut();
+                m.insert("doctype".into(), doctype_val);
                 m.insert("body".into(), body_js);
                 m.insert("head".into(), head_js);
                 m.insert("documentElement".into(), html_js.clone());
@@ -78413,6 +78478,94 @@ var el = document.getElementById('el');
         assert_eq!(window_str(&runtime, "__bad"), "InvalidCharacterError");
         assert_eq!(window_str(&runtime, "__gt"), "InvalidCharacterError");
         assert_eq!(window_str(&runtime, "__empty_ok"), "no-throw");
+    }
+
+    // WHATWG DOM §4.4 Node.ownerDocument — a TEXT node reached by walking the
+    // LIVE parsed tree (firstChild) has its node document set to the live
+    // `document`; reading `node.ownerDocument.createRange()` must NOT throw.
+    // This is the root-cause un-cascade for the WPT Range cluster
+    // (Range-mutations.js does `startContainer.ownerDocument.createRange()`).
+    #[test]
+    fn parse_built_text_node_owner_document_is_live_document() {
+        let doc = cv_html::parse("<!doctype html><html><body><p>hello</p></body></html>");
+        let mut runtime = LiveInterp::new(&doc, "https://dom.test/");
+        runtime
+            .interp
+            .run(
+                "var p = document.querySelector('p'); \
+                 var t = p.firstChild; \
+                 window.__nt = t.nodeType; \
+                 window.__owner_def = (typeof t.ownerDocument); \
+                 window.__owner_is_doc = (t.ownerDocument === document) ? 'doc' : 'other'; \
+                 window.__range_ok = (function(){ try { var r = t.ownerDocument.createRange(); return (typeof r.setStart === 'function') ? 'ok' : 'norange'; } catch(e){ return 'throw:'+e; } })();",
+            )
+            .expect("ownerDocument walk run");
+        assert_eq!(window_str(&runtime, "__nt"), "3");
+        assert_eq!(window_str(&runtime, "__owner_def"), "object");
+        assert_eq!(window_str(&runtime, "__owner_is_doc"), "doc");
+        assert_eq!(window_str(&runtime, "__range_ok"), "ok");
+    }
+
+    // WHATWG DOM §4.4 — createTextNode / createComment nodes carry ownerDocument.
+    #[test]
+    fn created_text_and_comment_nodes_have_owner_document() {
+        let doc = cv_html::parse("<!doctype html><html><body></body></html>");
+        let mut runtime = LiveInterp::new(&doc, "https://dom.test/");
+        runtime
+            .interp
+            .run(
+                "var t = document.createTextNode('x'); \
+                 var c = document.createComment('y'); \
+                 window.__t_owner = (t.ownerDocument === document) ? 'doc' : String(typeof t.ownerDocument); \
+                 window.__c_owner = (c.ownerDocument === document) ? 'doc' : String(typeof c.ownerDocument);",
+            )
+            .expect("create node run");
+        assert_eq!(window_str(&runtime, "__t_owner"), "doc");
+        assert_eq!(window_str(&runtime, "__c_owner"), "doc");
+    }
+
+    // WHATWG DOM §4.5 Document.doctype / §4.7 DocumentType — a parsed document
+    // with a DOCTYPE surfaces a real DocumentType node; methods inherited from
+    // Node.prototype (compareDocumentPosition/contains) work on that receiver.
+    #[test]
+    fn document_doctype_is_real_node_with_inherited_methods() {
+        let doc = cv_html::parse("<!doctype html><html><body><div id='d'></div></body></html>");
+        let mut runtime = LiveInterp::new(&doc, "https://dom.test/");
+        runtime
+            .interp
+            .run(
+                "var dt = document.doctype; \
+                 window.__def = (typeof dt); \
+                 window.__nt = dt ? dt.nodeType : -1; \
+                 window.__nn = dt ? dt.nodeName : ''; \
+                 window.__name = dt ? dt.name : ''; \
+                 window.__owner = (dt && dt.ownerDocument === document) ? 'doc' : 'other'; \
+                 var de = document.documentElement; \
+                 window.__cdp = (dt && typeof dt.compareDocumentPosition === 'function') ? (dt.compareDocumentPosition(de) & 4) : -1;",
+            )
+            .expect("doctype run");
+        assert_eq!(window_str(&runtime, "__def"), "object");
+        assert_eq!(window_str(&runtime, "__nt"), "10");
+        assert_eq!(window_str(&runtime, "__nn"), "html");
+        assert_eq!(window_str(&runtime, "__name"), "html");
+        assert_eq!(window_str(&runtime, "__owner"), "doc");
+        // compareDocumentPosition must be callable on the doctype receiver
+        // (it returns a bitmask; 4 = DOCUMENT_POSITION_FOLLOWING). The point
+        // here is it does NOT throw "undefined is not a function".
+        assert_ne!(window_str(&runtime, "__cdp"), "-1");
+    }
+
+    // WHATWG DOM §4.5 — a document with NO DOCTYPE has document.doctype === null
+    // (we must NOT fabricate a DocumentType node).
+    #[test]
+    fn document_without_doctype_has_null_doctype() {
+        let doc = cv_html::parse("<html><body></body></html>");
+        let mut runtime = LiveInterp::new(&doc, "https://dom.test/");
+        runtime
+            .interp
+            .run("window.__d = (document.doctype === null) ? 'null' : String(typeof document.doctype);")
+            .expect("no-doctype run");
+        assert_eq!(window_str(&runtime, "__d"), "null");
     }
 
     // ParentNode.querySelector / querySelectorAll on a CREATED element search
