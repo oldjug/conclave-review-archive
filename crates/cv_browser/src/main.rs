@@ -46936,6 +46936,48 @@ fn make_new_element_js_with_canvas_registry(
         map.insert("hasAttribute".into(), has_attribute);
         map.insert("removeAttribute".into(), remove_attribute);
         map.insert("toggleAttribute".into(), toggle_attribute);
+        // ParentNode.querySelector / querySelectorAll (DOM §4.2.6) over THIS
+        // element's subtree (the live `_children` snapshot). `include_roots=false`
+        // so the element itself is excluded — only descendants are matched, per
+        // spec ("scope" is the context node, matches are its descendants).
+        {
+            let self_qs = cv_js::Value::Object(obj.clone());
+            map.insert(
+                "querySelector".into(),
+                cv_js::native_fn("querySelector", move |args| {
+                    let sel_src = args.first().map(|v| v.to_display_string()).unwrap_or_default();
+                    let toks: Vec<cv_css::CssToken> = cv_css::tokenize(&sel_src)
+                        .into_iter()
+                        .filter(|t| !matches!(t, cv_css::CssToken::Eof))
+                        .collect();
+                    let selectors = cv_css::selectors::parse_selector_list(&toks);
+                    Ok(live_query_selector_from_roots(
+                        std::slice::from_ref(&self_qs),
+                        &selectors,
+                        false,
+                    )
+                    .unwrap_or(cv_js::Value::Null))
+                }),
+            );
+            let self_qsa = cv_js::Value::Object(obj.clone());
+            map.insert(
+                "querySelectorAll".into(),
+                cv_js::native_fn("querySelectorAll", move |args| {
+                    let sel_src = args.first().map(|v| v.to_display_string()).unwrap_or_default();
+                    let toks: Vec<cv_css::CssToken> = cv_css::tokenize(&sel_src)
+                        .into_iter()
+                        .filter(|t| !matches!(t, cv_css::CssToken::Eof))
+                        .collect();
+                    let selectors = cv_css::selectors::parse_selector_list(&toks);
+                    let out = live_query_selector_all_from_roots(
+                        std::slice::from_ref(&self_qsa),
+                        &selectors,
+                        false,
+                    );
+                    Ok(cv_js::Value::Array(std::rc::Rc::new(std::cell::RefCell::new(out))))
+                }),
+            );
+        }
         // Live DOMStringMap: el.dataset.fooBar reads/writes data-foo-bar via
         // the live `attrs` HashMap (same backing as setAttribute above).
         {
@@ -74599,6 +74641,31 @@ var el = document.getElementById('el');
         assert_eq!(window_str(&runtime, "__bad"), "InvalidCharacterError");
         assert_eq!(window_str(&runtime, "__gt"), "InvalidCharacterError");
         assert_eq!(window_str(&runtime, "__empty_ok"), "no-throw");
+    }
+
+    // ParentNode.querySelector / querySelectorAll on a CREATED element search
+    // its subtree (descendants only), not the element itself (DOM §4.2.6).
+    #[test]
+    fn created_element_query_selector_searches_subtree() {
+        let doc = cv_html::parse("<!doctype html><html><body></body></html>");
+        let mut runtime = LiveInterp::new(&doc, "https://example.com/");
+        runtime
+            .interp
+            .run(
+                "var container = document.createElement('div'); \
+                 var a = document.createElement('span'); a.id = 'foo'; a.className = 'x'; \
+                 var b = document.createElement('span'); b.className = 'x'; \
+                 container.appendChild(a); container.appendChild(b); \
+                 window.__byid = (container.querySelector('#foo') === a) ? 'ok' : 'fail'; \
+                 window.__bytag = (container.querySelector('span') === a) ? 'ok' : 'fail'; \
+                 window.__count = container.querySelectorAll('.x').length; \
+                 window.__none = String(container.querySelector('#nope'));",
+            )
+            .expect("querySelector run");
+        assert_eq!(window_str(&runtime, "__byid"), "ok");
+        assert_eq!(window_str(&runtime, "__bytag"), "ok");
+        assert_eq!(window_str(&runtime, "__count"), "2");
+        assert_eq!(window_str(&runtime, "__none"), "null");
     }
 
     // setAttribute('data-x', '') must be retrievable as "" (not null).
