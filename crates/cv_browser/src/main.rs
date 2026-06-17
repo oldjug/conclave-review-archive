@@ -30382,7 +30382,13 @@ fn install_minimal_dom_with_url(interp: &cv_js::Interp, initial_title: String, p
     // listeners registered with `signal.addEventListener("abort", ...)`
     // fire when the controller's `.abort()` is called, and
     // `signal.throwIfAborted()` / `signal.reason` round-trip per spec.
-    fn make_abort_signal() -> cv_js::Value {
+    // `make_abort_signal` is a closure (not a nested fn) so it can capture the
+    // shared AbortSignal.prototype handle from `dom_protos` and stamp it onto
+    // each signal's [[Prototype]] — making `signal instanceof AbortSignal` /
+    // `instanceof EventTarget` and `Object.getPrototypeOf(signal) ===
+    // AbortSignal.prototype` hold (WebIDL §3.7.4 / WHATWG DOM §3.2).
+    let signal_proto = dom_protos.abort_signal.clone();
+    let make_abort_signal = move || -> cv_js::Value {
         use std::cell::RefCell;
         use std::rc::Rc;
         use cv_js::OrderedMap as HashMap;
@@ -30390,8 +30396,16 @@ fn install_minimal_dom_with_url(interp: &cv_js::Interp, initial_title: String, p
         let m: Rc<RefCell<HashMap<String, cv_js::Value>>> = Rc::new(RefCell::new(HashMap::new()));
         {
             let mut g = m.borrow_mut();
+            g.insert(
+                cv_js::PROTO_KEY.into(),
+                cv_js::Value::Object(signal_proto.clone()),
+            );
             g.insert("aborted".into(), cv_js::Value::Bool(false));
             g.insert("reason".into(), cv_js::Value::Undefined);
+            // `onabort` IDL attribute (WHATWG DOM §3.2): a reflecting handler,
+            // null until set. Stored as a plain slot; the abort algorithm reads
+            // it. Initialised to null so `"onabort" in signal` and reads work.
+            g.insert("onabort".into(), cv_js::Value::Null);
         }
         let l_add = listeners.clone();
         let add_listener = cv_js::native_fn("addEventListener", move |args| {
@@ -30415,6 +30429,7 @@ fn install_minimal_dom_with_url(interp: &cv_js::Interp, initial_title: String, p
             Ok(cv_js::Value::Undefined)
         });
         let l_dispatch = listeners.clone();
+        let m_for_dispatch = m.clone();
         let dispatch = cv_js::native_fn_with_interp("dispatchEvent", move |interp, args| {
             let ev = args.first().cloned().unwrap_or(cv_js::Value::Undefined);
             let name = match &ev {
@@ -30426,6 +30441,22 @@ fn install_minimal_dom_with_url(interp: &cv_js::Interp, initial_title: String, p
                     .unwrap_or_default(),
                 _ => return Ok(cv_js::Value::Bool(false)),
             };
+            // The `onXYZ` event-handler IDL attribute fires alongside the
+            // addEventListener listeners (WHATWG HTML — the handler is treated
+            // as a listener). For "abort", invoke `onabort` first if callable.
+            if name == "abort" {
+                let handler = m_for_dispatch.borrow().get("onabort").cloned();
+                if let Some(h) = handler {
+                    if matches!(
+                        h,
+                        cv_js::Value::Function(_)
+                            | cv_js::Value::NativeFunction(_)
+                            | cv_js::Value::BcClosure(_)
+                    ) {
+                        let _ = interp.call_value(h, vec![ev.clone()]);
+                    }
+                }
+            }
             let to_fire: Vec<cv_js::Value> = l_dispatch
                 .borrow()
                 .iter()
@@ -30439,6 +30470,8 @@ fn install_minimal_dom_with_url(interp: &cv_js::Interp, initial_title: String, p
         });
         let m_for_tia = m.clone();
         let throw_if_aborted = cv_js::native_fn("throwIfAborted", move |_| {
+            // WHATWG DOM §3.2: if aborted, throw signal's abort reason. Reason is
+            // always set (default AbortError DOMException) when aborted.
             if matches!(
                 m_for_tia.borrow().get("aborted"),
                 Some(cv_js::Value::Bool(true))
@@ -30448,269 +30481,253 @@ fn install_minimal_dom_with_url(interp: &cv_js::Interp, initial_title: String, p
                     .get("reason")
                     .cloned()
                     .unwrap_or(cv_js::Value::Undefined);
-                // If reason is undefined (shouldn't normally happen after abort()),
-                // throw a plain AbortError string as fallback; otherwise throw the reason.
-                let throw_val = if matches!(reason, cv_js::Value::Undefined) {
-                    cv_js::Value::String("AbortError".into())
-                } else {
-                    reason
-                };
-                Err(cv_js::JsError::Throw(throw_val))
+                Err(cv_js::JsError::Throw(reason))
             } else {
                 Ok(cv_js::Value::Undefined)
             }
         });
-        // Stash listeners on the signal object so the controller's
-        // .abort() can find them via a marker key.
         {
             let mut g = m.borrow_mut();
             g.insert("addEventListener".into(), add_listener);
             g.insert("removeEventListener".into(), remove_listener);
             g.insert("dispatchEvent".into(), dispatch);
             g.insert("throwIfAborted".into(), throw_if_aborted);
-            // _listeners holds the Rc the controller closure needs.
-            // It's not a value JS code uses; the controller mutates it
-            // via dispatchEvent on this same signal object.
-        }
-        // Hide the listener Rc as a sidecar so abort() can fire events.
-        // We hide it in `_abort_listeners` so other JS code doesn't see
-        // it on iteration (V1 has no enumerable/non-enumerable split,
-        // but the leading underscore signals "implementation private").
-        {
-            // Build a fake JS array-of-pairs wrapping the Rc by length.
-            // Listeners stay accessible because we capture l_*.clone()
-            // in the abort closure below — no sidecar needed.
         }
         let _ = listeners; // (captured by closures above)
         cv_js::Value::Object(m)
+    };
+
+    // The "signal abort" algorithm (WHATWG DOM §3.2): if not already aborted,
+    // set aborted=true + reason, then dispatch a trusted, non-bubbling "abort"
+    // Event at the signal. Idempotent — a second call does nothing (so a handler
+    // fires AT MOST once). `default_reason` is the already-constructed reason for
+    // a missing/undefined argument (an "AbortError" DOMException).
+    fn run_signal_abort(
+        interp: &mut cv_js::Interp,
+        signal: &cv_js::Value,
+        reason: cv_js::Value,
+    ) {
+        let cv_js::Value::Object(o) = signal else {
+            return;
+        };
+        // Already aborted → no-op (idempotent abort).
+        if matches!(o.borrow().get("aborted"), Some(cv_js::Value::Bool(true))) {
+            return;
+        }
+        {
+            let mut g = o.borrow_mut();
+            g.insert("aborted".into(), cv_js::Value::Bool(true));
+            g.insert("reason".into(), reason);
+        }
+        // A trusted, non-bubbling "abort" Event whose target is the signal.
+        let mut ev: cv_js::OrderedMap<String, cv_js::Value> = cv_js::OrderedMap::new();
+        ev.insert("type".into(), cv_js::Value::String("abort".into()));
+        ev.insert("target".into(), signal.clone());
+        ev.insert("currentTarget".into(), signal.clone());
+        ev.insert("bubbles".into(), cv_js::Value::Bool(false));
+        ev.insert("cancelable".into(), cv_js::Value::Bool(false));
+        ev.insert("isTrusted".into(), cv_js::Value::Bool(true));
+        ev.insert("defaultPrevented".into(), cv_js::Value::Bool(false));
+        let ev_val = cv_js::Value::Object(std::rc::Rc::new(std::cell::RefCell::new(ev)));
+        let dispatch = o.borrow().get("dispatchEvent").cloned();
+        if let Some(d) = dispatch {
+            let _ = interp.call_value(d, vec![ev_val]);
+        }
     }
-    let abort_ctor = cv_js::native_ctor_pure("AbortController", 0, move |_args| {
+
+    // The default abort reason: an "AbortError" DOMException built via the real
+    // DOMException constructor (so `reason instanceof DOMException`, the right
+    // `.name`/`.code`, and reason-identity stability all hold).
+    fn default_abort_reason(interp: &mut cv_js::Interp) -> cv_js::Value {
+        if let Some(de_ctor) = interp.get_global("DOMException") {
+            // Construct via the interface object's `_construct` (prototype-linked
+            // real DOMException + stable identity).
+            if let cv_js::Value::Object(o) = &de_ctor {
+                let construct = o.borrow().get("_construct").cloned();
+                if let Some(c) = construct {
+                    if let Ok(v) = interp.call_value(
+                        c,
+                        vec![
+                            cv_js::Value::String("signal is aborted without reason".into()),
+                            cv_js::Value::String("AbortError".into()),
+                        ],
+                    ) {
+                        return v;
+                    }
+                }
+            }
+        }
+        // Fallback when no DOMException global is installed (e.g. a minimal
+        // interp): a DOMException-tagged object so `reason instanceof
+        // DOMException` (tag fallback) + `.name`/`.code` still hold.
+        make_dom_exception("AbortError", 20, "signal is aborted without reason")
+    }
+
+    let make_signal_for_ctor = make_abort_signal.clone();
+    let abort_ctor = cv_js::native_ctor("AbortController", 0, move |_interp, _args| {
         use std::cell::RefCell;
         use std::rc::Rc;
         use cv_js::OrderedMap as HashMap;
-        let signal = make_abort_signal();
+        let signal = make_signal_for_ctor();
         let mut m: HashMap<String, cv_js::Value> = HashMap::new();
         m.insert("signal".into(), signal.clone());
         let signal_for_abort = signal.clone();
         let abort_fn = cv_js::native_fn_with_interp("abort", move |interp, args| {
-            // Spec: set aborted=true, set reason (from arg or default
-            // AbortError DOMException), dispatch the "abort" event on the signal.
-            let reason = args.first().cloned().unwrap_or_else(|| {
-                // Default reason is an AbortError DOMException (not a string).
-                let mut ex: cv_js::OrderedMap<String, cv_js::Value> =
-                    cv_js::OrderedMap::new();
-                ex.insert(
-                    "name".into(),
-                    cv_js::Value::String("AbortError".into()),
-                );
-                ex.insert(
-                    "message".into(),
-                    cv_js::Value::String("signal is aborted without reason".into()),
-                );
-                ex.insert("code".into(), cv_js::Value::Number(20.0));
-                ex.insert(
-                    "stack".into(),
-                    cv_js::Value::String(
-                        "AbortError: signal is aborted without reason".into(),
-                    ),
-                );
-                ex.insert("_isError".into(), cv_js::Value::Bool(true));
-                ex.insert(
-                    "_errorClasses".into(),
-                    cv_js::Value::Array(Rc::new(RefCell::new(vec![
-                        cv_js::Value::String("DOMException".into()),
-                    ]))),
-                );
-                cv_js::Value::Object(Rc::new(RefCell::new(ex)))
-            });
-            if let cv_js::Value::Object(o) = &signal_for_abort {
-                {
-                    let mut g = o.borrow_mut();
-                    g.insert("aborted".into(), cv_js::Value::Bool(true));
-                    g.insert("reason".into(), reason);
-                }
-                // Construct a minimal Event object with type:"abort" and
-                // hand it to the signal's dispatchEvent — which our
-                // listener loop above will route through.
-                let mut ev: HashMap<String, cv_js::Value> = HashMap::new();
-                ev.insert("type".into(), cv_js::Value::String("abort".into()));
-                ev.insert("target".into(), signal_for_abort.clone());
-                let ev_val = cv_js::Value::Object(Rc::new(RefCell::new(ev)));
-                if let Some(dispatch) = o.borrow().get("dispatchEvent").cloned() {
-                    let _ = interp.call_value(dispatch, vec![ev_val]);
-                }
-            }
+            // `controller.abort(reason?)` — WHATWG DOM §3.2 step: signal abort
+            // with `reason` (or an AbortError DOMException when missing/undefined;
+            // an explicit `null` is kept as the reason).
+            let reason = match args.first() {
+                None | Some(cv_js::Value::Undefined) => default_abort_reason(interp),
+                Some(v) => v.clone(),
+            };
+            run_signal_abort(interp, &signal_for_abort, reason);
             Ok(cv_js::Value::Undefined)
         });
         m.insert("abort".into(), abort_fn);
         Ok(cv_js::Value::Object(Rc::new(RefCell::new(m))))
     });
-    interp.define_global("AbortController", abort_ctor);
-
-    // `AbortSignal.timeout(ms)` and `AbortSignal.any(signals)` static
-    // factories. We can't fire `timeout` automatically without a real
-    // timer-driven event loop tied to the signal lifetime; expose the
-    // shape so feature-tests pass, and aboard a synthetic "abort" once
-    // any owner calls .abort() on the constructed controller.
-    let mut signal_ns: cv_js::OrderedMap<String, cv_js::Value> = cv_js::OrderedMap::new();
-    signal_ns.insert(
-        "timeout".into(),
-        cv_js::native_fn_with_interp("timeout", |interp, args| {
-            // Spec: return a signal that aborts after `ms` milliseconds.
-            let ms = args
-                .first()
-                .and_then(|v| match v {
-                    cv_js::Value::Number(n) => Some(*n),
-                    _ => None,
-                })
-                .unwrap_or(0.0);
-            let sig = make_abort_signal();
-            let sig_for_timer = sig.clone();
-            let abort_cb =
-                cv_js::native_fn_with_interp("_timeout_abort_cb", move |interp, _| {
-                    if let cv_js::Value::Object(o) = &sig_for_timer {
-                        {
-                            let mut g = o.borrow_mut();
-                            g.insert("aborted".into(), cv_js::Value::Bool(true));
-                            g.insert(
-                                "reason".into(),
-                                cv_js::Value::String("TimeoutError".into()),
-                            );
-                        }
-                        let mut evm = cv_js::OrderedMap::<String, cv_js::Value>::new();
-                        evm.insert("type".into(), cv_js::Value::String("abort".into()));
-                        evm.insert("target".into(), sig_for_timer.clone());
-                        let ev_val = cv_js::Value::Object(std::rc::Rc::new(
-                            std::cell::RefCell::new(evm),
-                        ));
-                        if let Some(d) = o.borrow().get("dispatchEvent").cloned() {
-                            let _ = interp.call_value(d, vec![ev_val]);
-                        }
-                    }
-                    Ok(cv_js::Value::Undefined)
-                });
-            if let Some(set_timeout) = interp.get_global("setTimeout") {
-                let _ = interp
-                    .call_value(set_timeout, vec![abort_cb, cv_js::Value::Number(ms)]);
-            }
-            // No event loop in unit tests — signal stays non-aborted, harmless.
-            Ok(sig)
-        }),
-    );
-    signal_ns.insert(
-        "any".into(),
-        cv_js::native_fn_with_interp("any", |interp, args| {
-            // Spec: return a signal that aborts when ANY input signal aborts.
-            let sig = make_abort_signal();
-            let signals: Vec<cv_js::Value> = match args.first() {
-                Some(cv_js::Value::Object(arr)) => {
-                    let g = arr.borrow();
-                    let len = match g.get("length") {
-                        Some(cv_js::Value::Number(n)) => *n as usize,
-                        _ => 0,
-                    };
-                    (0..len)
-                        .filter_map(|i| g.get(&i.to_string()).cloned())
-                        .collect()
-                }
-                _ => vec![],
-            };
-            for input_sig in &signals {
-                let already = if let cv_js::Value::Object(o) = input_sig {
-                    matches!(
-                        o.borrow().get("aborted"),
-                        Some(cv_js::Value::Bool(true))
-                    )
-                } else {
-                    false
-                };
-                if already {
-                    // One input is already aborted — immediately abort composite.
-                    let reason = if let cv_js::Value::Object(o) = input_sig {
-                        o.borrow()
-                            .get("reason")
-                            .cloned()
-                            .unwrap_or(cv_js::Value::Undefined)
-                    } else {
-                        cv_js::Value::Undefined
-                    };
-                    if let cv_js::Value::Object(o) = &sig {
-                        let mut g = o.borrow_mut();
-                        g.insert("aborted".into(), cv_js::Value::Bool(true));
-                        g.insert("reason".into(), reason);
-                    }
-                    break;
-                }
-                // Subscribe: relay this input's future abort to the composite signal.
-                let sig_relay = sig.clone();
-                let input_clone = input_sig.clone();
-                let relay_cb =
-                    cv_js::native_fn_with_interp("_any_relay", move |interp, _| {
-                        let reason = if let cv_js::Value::Object(o) = &input_clone {
-                            o.borrow()
-                                .get("reason")
-                                .cloned()
-                                .unwrap_or(cv_js::Value::Undefined)
-                        } else {
-                            cv_js::Value::Undefined
-                        };
-                        if let cv_js::Value::Object(o) = &sig_relay {
-                            {
-                                let mut g = o.borrow_mut();
-                                if matches!(
-                                    g.get("aborted"),
-                                    Some(cv_js::Value::Bool(true))
-                                ) {
-                                    return Ok(cv_js::Value::Undefined);
-                                }
-                                g.insert("aborted".into(), cv_js::Value::Bool(true));
-                                g.insert("reason".into(), reason);
-                            }
-                            let mut evm = cv_js::OrderedMap::<String, cv_js::Value>::new();
-                            evm.insert("type".into(), cv_js::Value::String("abort".into()));
-                            evm.insert("target".into(), sig_relay.clone());
-                            let ev_val = cv_js::Value::Object(std::rc::Rc::new(
-                                std::cell::RefCell::new(evm),
-                            ));
-                            if let Some(d) = o.borrow().get("dispatchEvent").cloned() {
-                                let _ = interp.call_value(d, vec![ev_val]);
-                            }
-                        }
-                        Ok(cv_js::Value::Undefined)
-                    });
-                if let cv_js::Value::Object(o) = input_sig {
-                    if let Some(add_ev) = o.borrow().get("addEventListener").cloned() {
-                        let _ = interp.call_value(
-                            add_ev,
-                            vec![cv_js::Value::String("abort".into()), relay_cb],
-                        );
-                    }
-                }
-            }
-            Ok(sig)
-        }),
-    );
-    signal_ns.insert(
-        "abort".into(),
-        cv_js::native_fn("abort", |args| {
-            // `AbortSignal.abort(reason?)` returns an already-aborted
-            // signal. Construct one and immediately flip its flag.
-            let sig = make_abort_signal();
-            if let cv_js::Value::Object(o) = &sig {
-                let mut g = o.borrow_mut();
-                g.insert("aborted".into(), cv_js::Value::Bool(true));
-                g.insert(
-                    "reason".into(),
-                    args.first().cloned().unwrap_or(cv_js::Value::Undefined),
-                );
-            }
-            Ok(sig)
-        }),
-    );
     interp.define_global(
-        "AbortSignal",
-        cv_js::Value::Object(std::rc::Rc::new(std::cell::RefCell::new(signal_ns))),
+        "AbortController",
+        make_iface_with_ctor("AbortController", 0, &new_proto_obj(), abort_ctor),
     );
+
+    // AbortSignal interface object (WHATWG DOM §3.2). `new AbortSignal()` is
+    // illegal (no [Constructor]); instances come from a controller, the static
+    // factories, or fetch. Carries the static `abort`/`timeout`/`any`.
+    let abort_signal_proto = dom_protos.abort_signal.clone();
+    let abort_signal_iface = make_iface_no_ctor("AbortSignal", &abort_signal_proto);
+
+    // AbortSignal.timeout(ms) — a signal that aborts with a "TimeoutError"
+    // DOMException after `ms` ms (driven by the real setTimeout/event loop).
+    let make_signal_timeout = make_abort_signal.clone();
+    let timeout_fn = cv_js::native_fn_with_interp("timeout", move |interp, args| {
+        let ms = args
+            .first()
+            .and_then(|v| match v {
+                cv_js::Value::Number(n) => Some(*n),
+                _ => None,
+            })
+            .unwrap_or(0.0);
+        let sig = make_signal_timeout();
+        let sig_for_timer = sig.clone();
+        let abort_cb = cv_js::native_fn_with_interp("_timeout_abort_cb", move |interp, _| {
+            // Build a TimeoutError DOMException as the abort reason.
+            let reason = if let Some(de_ctor) = interp.get_global("DOMException") {
+                if let cv_js::Value::Object(o) = &de_ctor {
+                    let c = o.borrow().get("_construct").cloned();
+                    match c {
+                        Some(c) => interp
+                            .call_value(
+                                c,
+                                vec![
+                                    cv_js::Value::String("signal timed out".into()),
+                                    cv_js::Value::String("TimeoutError".into()),
+                                ],
+                            )
+                            .unwrap_or(cv_js::Value::Undefined),
+                        None => cv_js::Value::Undefined,
+                    }
+                } else {
+                    cv_js::Value::Undefined
+                }
+            } else {
+                cv_js::Value::Undefined
+            };
+            run_signal_abort(interp, &sig_for_timer, reason);
+            Ok(cv_js::Value::Undefined)
+        });
+        if let Some(set_timeout) = interp.get_global("setTimeout") {
+            let _ = interp.call_value(set_timeout, vec![abort_cb, cv_js::Value::Number(ms)]);
+        }
+        Ok(sig)
+    });
+
+    // AbortSignal.any(signals) — a composite signal that aborts when ANY input
+    // aborts (relaying the input's reason).
+    let make_signal_any = make_abort_signal.clone();
+    let any_fn = cv_js::native_fn_with_interp("any", move |interp, args| {
+        let sig = make_signal_any();
+        let signals: Vec<cv_js::Value> = match args.first() {
+            Some(cv_js::Value::Array(arr)) => arr.borrow().clone(),
+            Some(cv_js::Value::Object(arr)) => {
+                let g = arr.borrow();
+                let len = match g.get("length") {
+                    Some(cv_js::Value::Number(n)) => *n as usize,
+                    _ => 0,
+                };
+                (0..len)
+                    .filter_map(|i| g.get(&i.to_string()).cloned())
+                    .collect()
+            }
+            _ => vec![],
+        };
+        for input_sig in &signals {
+            let (already, reason) = if let cv_js::Value::Object(o) = input_sig {
+                (
+                    matches!(o.borrow().get("aborted"), Some(cv_js::Value::Bool(true))),
+                    o.borrow()
+                        .get("reason")
+                        .cloned()
+                        .unwrap_or(cv_js::Value::Undefined),
+                )
+            } else {
+                (false, cv_js::Value::Undefined)
+            };
+            if already {
+                run_signal_abort(interp, &sig, reason);
+                break;
+            }
+            let sig_relay = sig.clone();
+            let input_clone = input_sig.clone();
+            let relay_cb = cv_js::native_fn_with_interp("_any_relay", move |interp, _| {
+                let reason = if let cv_js::Value::Object(o) = &input_clone {
+                    o.borrow()
+                        .get("reason")
+                        .cloned()
+                        .unwrap_or(cv_js::Value::Undefined)
+                } else {
+                    cv_js::Value::Undefined
+                };
+                run_signal_abort(interp, &sig_relay, reason);
+                Ok(cv_js::Value::Undefined)
+            });
+            if let cv_js::Value::Object(o) = input_sig {
+                if let Some(add_ev) = o.borrow().get("addEventListener").cloned() {
+                    let _ = interp.call_value(
+                        add_ev,
+                        vec![cv_js::Value::String("abort".into()), relay_cb],
+                    );
+                }
+            }
+        }
+        Ok(sig)
+    });
+
+    // AbortSignal.abort(reason?) — an already-aborted signal (reason defaults to
+    // an AbortError DOMException; aborted set WITHOUT dispatching, per spec the
+    // signal is created already-aborted).
+    let make_signal_static_abort = make_abort_signal.clone();
+    let static_abort_fn = cv_js::native_fn_with_interp("abort", move |interp, args| {
+        let sig = make_signal_static_abort();
+        let reason = match args.first() {
+            None | Some(cv_js::Value::Undefined) => default_abort_reason(interp),
+            Some(v) => v.clone(),
+        };
+        if let cv_js::Value::Object(o) = &sig {
+            let mut g = o.borrow_mut();
+            g.insert("aborted".into(), cv_js::Value::Bool(true));
+            g.insert("reason".into(), reason);
+        }
+        Ok(sig)
+    });
+
+    if let cv_js::Value::Object(o) = &abort_signal_iface {
+        let mut g = o.borrow_mut();
+        g.insert("timeout".into(), timeout_fn);
+        g.insert("any".into(), any_fn);
+        g.insert("abort".into(), static_abort_fn);
+    }
+    interp.define_global("AbortSignal", abort_signal_iface);
 
     // FormData — minimal: append/get/has/delete.
     let formdata_ctor = cv_js::native_ctor_pure("FormData", 0, |_args| {
@@ -65657,6 +65674,91 @@ mod tests {
         assert_eq!(
             eval_min_dom("Object.getPrototypeOf(new DocumentFragment()) === DocumentFragment.prototype"),
             "true"
+        );
+    }
+
+    #[test]
+    fn dom_abort_signal_instanceof_and_reason() {
+        // WHATWG DOM §3.2 — AbortSignal is a real interface object; the signal is
+        // an instance of AbortSignal (and EventTarget). Default abort reason is an
+        // AbortError DOMException.
+        assert_eq!(
+            eval_min_dom("(new AbortController()).signal instanceof AbortSignal"),
+            "true"
+        );
+        assert_eq!(
+            eval_min_dom("(new AbortController()).signal instanceof EventTarget"),
+            "true"
+        );
+        // Default abort reason is a DOMException-shaped object named AbortError.
+        // (`instanceof DOMException` requires the DOMException global, which is
+        // installed on the full page-build path and verified via the WPT runner;
+        // here we assert the shape + name in the minimal interp.)
+        assert_eq!(
+            eval_min_dom("(function(){ var c=new AbortController(); c.abort(); return typeof c.signal.reason; })()"),
+            "object"
+        );
+        assert_eq!(
+            eval_min_dom("(function(){ var c=new AbortController(); c.abort(); return c.signal.reason.name; })()"),
+            "AbortError"
+        );
+        assert_eq!(
+            eval_min_dom("(function(){ var c=new AbortController(); c.abort(); return c.signal.reason.code; })()"),
+            "20"
+        );
+        // Reason identity is stable across reads.
+        assert_eq!(
+            eval_min_dom("(function(){ var c=new AbortController(); c.abort(); return c.signal.reason === c.signal.reason; })()"),
+            "true"
+        );
+    }
+
+    #[test]
+    fn dom_abort_signal_onabort_and_once() {
+        // onabort fires once; second abort() is a no-op (WHATWG DOM §3.2).
+        assert_eq!(
+            eval_min_dom("(function(){ var c=new AbortController(),n=0; c.signal.onabort=function(){++n;}; c.abort(); c.abort(); return n; })()"),
+            "1"
+        );
+        // abort event properties: type/target/bubbles/isTrusted.
+        assert_eq!(
+            eval_min_dom("(function(){ var c=new AbortController(),s=c.signal,r=''; s.onabort=function(e){ r=e.type+','+(e.target===s)+','+e.bubbles+','+e.isTrusted; }; c.abort(); return r; })()"),
+            "abort,true,false,true"
+        );
+        // abort(reason) sets reason; abort(null) keeps null.
+        assert_eq!(
+            eval_min_dom("(function(){ var c=new AbortController(),x=new Error('h'); c.abort(x); return c.signal.reason===x; })()"),
+            "true"
+        );
+        assert_eq!(
+            eval_min_dom("(function(){ var c=new AbortController(); c.abort(null); return c.signal.reason; })()"),
+            "null"
+        );
+    }
+
+    #[test]
+    fn dom_abort_signal_static_and_throw_if_aborted() {
+        // AbortSignal.abort() static factory → already-aborted with AbortError.
+        assert_eq!(
+            eval_min_dom("AbortSignal.abort().aborted"),
+            "true"
+        );
+        assert_eq!(
+            eval_min_dom("AbortSignal.abort().reason.name"),
+            "AbortError"
+        );
+        assert_eq!(
+            eval_min_dom("(function(){ var x=new Error('e'); return AbortSignal.abort(x).reason===x; })()"),
+            "true"
+        );
+        // throwIfAborted throws the reason exactly; no-op when not aborted.
+        assert_eq!(
+            eval_min_dom("(function(){ var x=new Error('e'),s=AbortSignal.abort(x); try { s.throwIfAborted(); return 'no'; } catch(e){ return e===x ? 'threw-reason':'other'; } })()"),
+            "threw-reason"
+        );
+        assert_eq!(
+            eval_min_dom("(function(){ var c=new AbortController(); c.signal.throwIfAborted(); return 'ok'; })()"),
+            "ok"
         );
     }
 
