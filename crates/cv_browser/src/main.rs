@@ -27749,6 +27749,15 @@ fn install_dom_interface_objects(interp: &cv_js::Interp) -> DomProtos {
     //          createHTMLDocument, createDocument) callable for the first time. ----
     install_node_prototype_methods(&node);
 
+    // ---- 2c. Populate HTMLElement.prototype with the `this`-generic
+    //          HTMLElement methods click()/focus()/blur() (WHATWG DOM §2.9
+    //          dispatch + activation behavior; HTML §6 focusing). All elements
+    //          inherit them via the chain, replacing the former per-instance
+    //          inert no-op methods (a click() that didn't toggle a checkbox /
+    //          run the activation behavior wasn't real). Installed on
+    //          HTMLElement (not Node) so Text/Comment/Document get no click(). ----
+    install_element_prototype_methods(&html_element);
+
     // ---- 3. Build + register the no-constructor interface objects. ----
     // (Document/Text/Comment/DocumentFragment get real constructors in their
     // own group; here we register Node/Element/etc. and re-register the four
@@ -40131,28 +40140,18 @@ fn walk_for_table(
             Ok(cv_js::Value::Object(Rc::new(RefCell::new(m))))
         });
         el_map.insert("getBoundingClientRect".into(), bcr);
-        // `element.focus()` / `blur()` — accepted as no-ops; real focus
-        // tracking lives in PageState driven by clicks and Tab.
-        el_map.insert(
-            "focus".into(),
-            cv_js::native_fn("focus", move |_args| Ok(cv_js::Value::Undefined)),
-        );
-        el_map.insert(
-            "blur".into(),
-            cv_js::native_fn("blur", move |_args| Ok(cv_js::Value::Undefined)),
-        );
-        // `element.scrollIntoView()` — also accepted as a no-op.
+        // `element.scrollIntoView()` — accepted as a no-op (geometry scrolling is
+        // a paint-side concern; the method existing is what scripts gate on).
         el_map.insert(
             "scrollIntoView".into(),
             cv_js::native_fn("scrollIntoView", move |_args| Ok(cv_js::Value::Undefined)),
         );
-        // `element.click()` — synthesize a click via dispatchEvent on
-        // this element later. For V1 it's a no-op since dispatchEvent
-        // isn't yet exposed off the element here.
-        el_map.insert(
-            "click".into(),
-            cv_js::native_fn("click", move |_args| Ok(cv_js::Value::Undefined)),
-        );
+        // NOTE: `click()` / `focus()` / `blur()` are NO LONGER stamped here as
+        // inert no-ops. The install_dom_api enrichment pass stamps the REAL
+        // shared implementations (run_synthetic_click / run_element_focus /
+        // run_element_blur — DOM §2.9 dispatch + activation behavior, HTML §6
+        // focusing) onto every element record, so they actually toggle
+        // checkboxes / fire input+change / submit forms / move focus.
 
         // <canvas> wiring: allocate a CanvasContext2D (or reuse the
         // existing one keyed by path so the bitmap survives across
@@ -44435,6 +44434,292 @@ fn install_node_prototype_methods(
             Ok(Value::Bool(default.as_deref() == ns.as_deref()))
         }),
     );
+}
+
+/// Read a string-valued own property off a JS object node (`""` if absent /
+/// non-object / non-string). Used by the click-activation behavior to inspect
+/// an element's `tagName`/`type`/`checked` without threading the interp.
+fn js_obj_string_prop(node: &cv_js::Value, key: &str) -> String {
+    if let cv_js::Value::Object(o) = node {
+        if let Some(v) = o.borrow().get(key) {
+            return v.to_display_string();
+        }
+    }
+    String::new()
+}
+
+/// Read a bool-valued own property (truthy/`"true"`/`Bool(true)`); absent → false.
+fn js_obj_bool_prop(node: &cv_js::Value, key: &str) -> bool {
+    if let cv_js::Value::Object(o) = node {
+        match o.borrow().get(key) {
+            Some(cv_js::Value::Bool(b)) => return *b,
+            Some(cv_js::Value::String(s)) => return s.as_str() == "true",
+            _ => {}
+        }
+    }
+    false
+}
+
+/// The lowercased tag name of a JS element node (`""` if not an element).
+fn js_element_tag_lower(node: &cv_js::Value) -> String {
+    // Prefer the live `_tag` (createElement sets it lowercased) then fall back
+    // to ASCII-lowercasing `tagName`/`nodeName` (parser-built / cloned nodes).
+    let t = js_obj_string_prop(node, "_tag");
+    if !t.is_empty() {
+        return t;
+    }
+    let tn = js_obj_string_prop(node, "tagName");
+    if !tn.is_empty() {
+        return tn.to_ascii_lowercase();
+    }
+    js_obj_string_prop(node, "nodeName").to_ascii_lowercase()
+}
+
+/// Walk `_parent`/`parentNode` to the nearest ancestor `<form>` element
+/// (HTML form association — the simple DOM-tree-ancestor case, sufficient for
+/// synthetic-click submit/reset activation). Bounded depth.
+fn js_owning_form(node: &cv_js::Value) -> Option<cv_js::Value> {
+    let mut cur = js_node_parent(node);
+    let mut guard = 0usize;
+    while let Some(n) = cur {
+        guard += 1;
+        if guard > 4096 {
+            break;
+        }
+        if js_element_tag_lower(&n) == "form" {
+            return Some(n);
+        }
+        cur = js_node_parent(&n);
+    }
+    None
+}
+
+/// Set a boolean-ish property on a JS object node in place.
+fn js_obj_set_bool(node: &cv_js::Value, key: &str, val: bool) {
+    if let cv_js::Value::Object(o) = node {
+        o.borrow_mut()
+            .insert(key.into(), cv_js::Value::Bool(val));
+    }
+}
+
+/// Look up a callable method on a JS node and invoke it with `this == node`
+/// and the given args, draining the result. Returns the call's result value
+/// (or `Undefined` if the method is absent / not callable).
+fn js_call_method_on(
+    interp: &mut cv_js::Interp,
+    node: &cv_js::Value,
+    method: &str,
+    args: Vec<cv_js::Value>,
+) -> cv_js::Value {
+    let fnv = match node {
+        cv_js::Value::Object(o) => o.borrow().get(method).cloned(),
+        _ => None,
+    };
+    let Some(fnv) = fnv else {
+        return cv_js::Value::Undefined;
+    };
+    if !matches!(
+        fnv,
+        cv_js::Value::Function(_)
+            | cv_js::Value::NativeFunction(_)
+            | cv_js::Value::BcClosure(_)
+    ) {
+        return cv_js::Value::Undefined;
+    }
+    interp
+        .call_value_with_this(fnv, node.clone(), args)
+        .unwrap_or(cv_js::Value::Undefined)
+}
+
+/// Dispatch a simple (non-activation) event of `event_type` at `node` via the
+/// node's OWN `dispatchEvent` (so capture/target/bubble + on<type> handlers run
+/// through the one real dispatch engine). `bubbles`/`cancelable` follow the
+/// per-type table in `build_event_object`. Used to fire the `input`/`change`/
+/// `submit`/`reset`/`toggle` events that follow a synthetic click's activation
+/// behavior. Returns `true` unless a listener called `preventDefault()`.
+fn js_fire_event_on(
+    interp: &mut cv_js::Interp,
+    node: &cv_js::Value,
+    event_type: &str,
+) -> bool {
+    let ev = build_event_object(event_type, node.clone(), cv_js::Value::Null);
+    let ret = js_call_method_on(interp, node, "dispatchEvent", vec![ev]);
+    !matches!(ret, cv_js::Value::Bool(false))
+}
+
+/// The shared HTMLElement.click() implementation — WHATWG DOM §2.9 "dispatch"
+/// WITH activation behavior + HTML "fire a synthetic pointer event". `me` is the
+/// already-resolved element receiver. Steps:
+///   1. (Disabled form controls have no activation behavior and don't dispatch.)
+///   2. Legacy-pre-activation behavior (checkbox/radio toggle `checked`).
+///   3. Dispatch an untrusted `click` PointerEvent (bubbles/cancelable/composed)
+///      through the element's OWN dispatchEvent (real capture/target/bubble path).
+///   4. If canceled (a listener called preventDefault): canceled-activation
+///      behavior reverts the pre-activation toggle.
+///   5. Else: activation behavior — checkbox/radio fire `input`+`change`; form
+///      submit/reset controls fire `submit`/`reset` on the owning <form>;
+///      `<details>`/`<summary>` toggle `open` + fire `toggle`.
+fn run_synthetic_click(interp: &mut cv_js::Interp, me: &cv_js::Value) {
+    use cv_js::Value;
+    if !matches!(me, Value::Object(_)) {
+        return;
+    }
+    let tag = js_element_tag_lower(me);
+    let input_type = js_obj_string_prop(me, "type").to_ascii_lowercase();
+    let disabled = js_obj_bool_prop(me, "disabled")
+        || matches!(
+            me, Value::Object(o) if matches!(o.borrow().get("disabled"), Some(Value::String(s)) if !s.is_empty())
+        );
+
+    // A disabled form control has no activation behavior and its click event is
+    // not dispatched (HTML "disabled" + DOM activation).
+    let is_form_control = tag == "input" || tag == "button" || tag == "select";
+    if disabled && is_form_control {
+        return;
+    }
+
+    // ── Legacy-pre-activation behavior (DOM §2.9). ──
+    let is_checkbox = tag == "input" && input_type == "checkbox";
+    let is_radio = tag == "input" && input_type == "radio";
+    let pre_checked = js_obj_bool_prop(me, "checked");
+    if is_checkbox {
+        js_obj_set_bool(me, "checked", !pre_checked);
+    } else if is_radio && !pre_checked {
+        js_obj_set_bool(me, "checked", true);
+    }
+
+    // ── Dispatch the synthetic click PointerEvent through the element's OWN
+    // dispatchEvent. The dispatch precheck flips isTrusted→false. ──
+    let ev = build_pointer_event_with_mods(
+        "click",
+        me.clone(),
+        Value::Null,
+        0.0,
+        0.0,
+        false,
+        false,
+        false,
+        false,
+    );
+    let dispatch_ret = js_call_method_on(interp, me, "dispatchEvent", vec![ev]);
+    let canceled = matches!(dispatch_ret, Value::Bool(false));
+
+    if canceled {
+        // ── Canceled activation behavior (DOM §2.9): undo the pre-toggle. ──
+        if is_checkbox {
+            js_obj_set_bool(me, "checked", pre_checked);
+        } else if is_radio && !pre_checked {
+            js_obj_set_bool(me, "checked", false);
+        }
+        return;
+    }
+
+    // ── Activation behavior (DOM §2.9 + HTML per-element). ──
+    if is_checkbox || is_radio {
+        js_fire_event_on(interp, me, "input");
+        js_fire_event_on(interp, me, "change");
+    } else if tag == "input" && (input_type == "submit" || input_type == "image") {
+        if let Some(form) = js_owning_form(me) {
+            js_fire_event_on(interp, &form, "submit");
+        }
+    } else if tag == "input" && input_type == "reset" {
+        if let Some(form) = js_owning_form(me) {
+            js_fire_event_on(interp, &form, "reset");
+        }
+    } else if tag == "button" {
+        let btn_type = if input_type.is_empty() { "submit" } else { input_type.as_str() };
+        if btn_type == "submit" {
+            if let Some(form) = js_owning_form(me) {
+                js_fire_event_on(interp, &form, "submit");
+            }
+        } else if btn_type == "reset" {
+            if let Some(form) = js_owning_form(me) {
+                js_fire_event_on(interp, &form, "reset");
+            }
+        }
+    } else if tag == "details" {
+        let now_open = !js_obj_bool_prop(me, "open");
+        js_obj_set_bool(me, "open", now_open);
+        js_fire_event_on(interp, me, "toggle");
+    } else if tag == "summary" {
+        if let Some(parent) = js_node_parent(me) {
+            if js_element_tag_lower(&parent) == "details" {
+                let now_open = !js_obj_bool_prop(&parent, "open");
+                js_obj_set_bool(&parent, "open", now_open);
+                js_fire_event_on(interp, &parent, "toggle");
+            }
+        }
+    }
+}
+
+/// The shared HTMLElement.focus() — HTML §6 focusing steps (scriptable surface):
+/// set `document.activeElement` to `me` and fire the non-bubbling `focus` event.
+fn run_element_focus(interp: &mut cv_js::Interp, me: &cv_js::Value) {
+    if !matches!(me, cv_js::Value::Object(_)) {
+        return;
+    }
+    if let Some(doc) = interp.get_global("document") {
+        if let cv_js::Value::Object(o) = &doc {
+            o.borrow_mut().insert("activeElement".into(), me.clone());
+        }
+    }
+    js_fire_event_on(interp, me, "focus");
+}
+
+/// The shared HTMLElement.blur() — HTML §6 unfocusing steps: reset
+/// `document.activeElement` to `<body>` and fire the non-bubbling `blur` event.
+fn run_element_blur(interp: &mut cv_js::Interp, me: &cv_js::Value) {
+    if !matches!(me, cv_js::Value::Object(_)) {
+        return;
+    }
+    if let Some(doc) = interp.get_global("document") {
+        if let cv_js::Value::Object(o) = &doc {
+            let body = o.borrow().get("body").cloned().unwrap_or(cv_js::Value::Null);
+            o.borrow_mut().insert("activeElement".into(), body);
+        }
+    }
+    js_fire_event_on(interp, me, "blur");
+}
+
+/// Build the three shared `this`-generic HTMLElement methods
+/// (`click`/`focus`/`blur`) that resolve their receiver via
+/// `current_native_this()`. Used both to populate HTMLElement.prototype (for
+/// createElement / constructed elements) and to stamp the per-instance parser
+/// element records (which carry no `[[Prototype]]`), so BOTH element flavors get
+/// the SAME real implementation (no more inert no-ops).
+fn element_activation_methods() -> (cv_js::Value, cv_js::Value, cv_js::Value) {
+    use cv_js::native_fn_with_interp;
+    let click = native_fn_with_interp("click", |interp, _args| {
+        let me = cv_js::current_native_this();
+        run_synthetic_click(interp, &me);
+        Ok(cv_js::Value::Undefined)
+    });
+    let focus = native_fn_with_interp("focus", |interp, _args| {
+        let me = cv_js::current_native_this();
+        run_element_focus(interp, &me);
+        Ok(cv_js::Value::Undefined)
+    });
+    let blur = native_fn_with_interp("blur", |interp, _args| {
+        let me = cv_js::current_native_this();
+        run_element_blur(interp, &me);
+        Ok(cv_js::Value::Undefined)
+    });
+    (click, focus, blur)
+}
+
+/// Install the HTMLElement-level `this`-generic methods (`click`/`focus`/`blur`)
+/// on the shared HTMLElement prototype so createElement'd / constructed elements
+/// inherit them (replacing the former undefined / per-instance inert no-ops). The
+/// receiver is resolved via `current_native_this()`. See [`run_synthetic_click`]
+/// for the activation-behavior algorithm.
+fn install_element_prototype_methods(
+    proto: &std::rc::Rc<std::cell::RefCell<cv_js::OrderedMap<String, cv_js::Value>>>,
+) {
+    let (click, focus, blur) = element_activation_methods();
+    let mut m = proto.borrow_mut();
+    m.insert("click".into(), click);
+    m.insert("focus".into(), focus);
+    m.insert("blur".into(), blur);
 }
 
 // ============================================================================
@@ -50116,6 +50401,34 @@ fn make_new_element_js_with_canvas_registry(
                         break;
                     }
                 }
+                // `el.onclick = fn` event-handler PROPERTY (DOM "event handler
+                // IDL attributes"): behaves as a non-capturing listener at this
+                // node, firing in the target + bubble phases. Without this the
+                // ubiquitous `input.onclick = …` idiom never ran for
+                // createElement'd / constructed elements, so element.click() did
+                // not invoke the handler (WPT Event-dispatch-click "basic with
+                // click()" reads input.checked inside onclick).
+                if !immediate_stopped() {
+                    let on_handler = {
+                        let prop = format!("on{name}");
+                        self_for_dispatch.borrow().get(&prop).and_then(|h| {
+                            matches!(
+                                h,
+                                cv_js::Value::Function(_)
+                                    | cv_js::Value::NativeFunction(_)
+                                    | cv_js::Value::BcClosure(_)
+                            )
+                            .then(|| h.clone())
+                        })
+                    };
+                    if let Some(h) = on_handler {
+                        let _ = interp.call_value_with_this(
+                            h,
+                            self_val.clone(),
+                            vec![ev.clone()],
+                        );
+                    }
+                }
                 // Bubble propagation. Per DOM Living Standard §"event
                 // dispatch": after firing at-target listeners, if `bubbles`
                 // is true and propagation hasn't been stopped, walk up via
@@ -51296,6 +51609,16 @@ fn install_dom_api(
                         cv_js::Value::String(s) => s.to_string(),
                         _ => return Ok(cv_js::Value::Bool(false)),
                     };
+                    // WHATWG DOM §2.9 dispatch step 1 (Object events only; a bare
+                    // string is the legacy lenient form): throw InvalidStateError
+                    // for an in-flight (dispatch-flag-set) or uninitialized
+                    // (createEvent-without-initEvent) event. Sets the dispatch
+                    // flag + isTrusted=false; cleared in event_dispatch_end after
+                    // the walk so a later legitimate re-dispatch succeeds. This
+                    // wraps — does not modify — the shared dispatch engine.
+                    if matches!(ev_obj, cv_js::Value::Object(_)) {
+                        event_dispatch_precheck(&ev_obj)?;
+                    }
                     // Full capture → at-target → bubble propagation (shared with
                     // host-driven clicks/keys). Returns !defaultPrevented per spec.
                     let (_fired, prevented) = dispatch_event_to_path(
@@ -51305,6 +51628,7 @@ fn install_dom_api(
                         &event_name,
                         &ev_obj,
                     );
+                    event_dispatch_end(&ev_obj);
                     Ok(cv_js::Value::Bool(!prevented))
                 });
 
@@ -52396,6 +52720,16 @@ fn install_dom_api(
                 m.insert("addEventListener".into(), add_listener);
                 m.insert("removeEventListener".into(), remove_listener);
                 m.insert("dispatchEvent".into(), dispatch_event);
+                // Real HTMLElement.click()/focus()/blur() (DOM §2.9 dispatch +
+                // activation behavior; HTML §6 focusing). Parser-built element
+                // records carry no [[Prototype]], so the shared methods are
+                // stamped here (replacing the former per-instance inert no-ops).
+                {
+                    let (click_fn, focus_fn, blur_fn) = element_activation_methods();
+                    m.insert("click".into(), click_fn);
+                    m.insert("focus".into(), focus_fn);
+                    m.insert("blur".into(), blur_fn);
+                }
                 m.insert("matches".into(), matches_fn);
                 m.insert("closest".into(), closest_fn);
                 m.insert("contains".into(), contains_fn);
@@ -78522,6 +78856,185 @@ var el = document.getElementById('el');
             .expect("create node run");
         assert_eq!(window_str(&runtime, "__t_owner"), "doc");
         assert_eq!(window_str(&runtime, "__c_owner"), "doc");
+    }
+
+    // WHATWG DOM §2.9 dispatch step 1 — dispatchEvent throws InvalidStateError
+    // for (a) an event already being dispatched (dispatch flag set; re-entrant
+    // redispatch from inside a listener) and (b) an uninitialized createEvent
+    // event (initialized flag unset until initEvent). A normal re-dispatch AFTER
+    // completion succeeds (dispatch flag cleared on every exit path).
+    #[test]
+    fn dispatch_event_invalid_state_error_in_flight_and_uninitialized() {
+        let doc = cv_html::parse("<!doctype html><html><body><div id='d'></div></body></html>");
+        let mut runtime = LiveInterp::new(&doc, "https://dom.test/");
+        runtime
+            .interp
+            .run(
+                "var d = document.getElementById('d'); \
+                 function nm(f){ try { f(); return 'no-throw'; } catch(e){ return (e && e.name) ? e.name : ('ERR:'+e); } } \
+                 var ue = document.createEvent('Event'); \
+                 window.__uninit = nm(function(){ d.dispatchEvent(ue); }); \
+                 ue.initEvent('boom', true, true); \
+                 window.__after_init = nm(function(){ d.dispatchEvent(ue); }); \
+                 var inflight = 'LISTENER_NEVER_FIRED'; \
+                 var ev1 = new Event('ping', {bubbles:true}); \
+                 d.addEventListener('ping', function(e){ if (inflight==='LISTENER_NEVER_FIRED') inflight = nm(function(){ d.dispatchEvent(e); }); }); \
+                 d.dispatchEvent(ev1); \
+                 window.__inflight = inflight; \
+                 window.__redispatch_after = nm(function(){ d.dispatchEvent(ev1); });",
+            )
+            .expect("invalid-state run");
+        assert_eq!(window_str(&runtime, "__uninit"), "InvalidStateError");
+        assert_eq!(window_str(&runtime, "__after_init"), "no-throw");
+        assert_eq!(window_str(&runtime, "__inflight"), "InvalidStateError");
+        assert_eq!(window_str(&runtime, "__redispatch_after"), "no-throw");
+    }
+
+    // WHATWG DOM §2.9 dispatch + HTML activation behavior — element.click() on a
+    // PARSER-BUILT <input type=checkbox> toggles `checked` AND the click listener
+    // observes the toggled value (legacy-pre-activation behavior), then fires
+    // input + change. Replaces the former inert no-op.
+    #[test]
+    fn parser_input_click_toggles_checkbox_and_runs_activation() {
+        let doc = cv_html::parse(
+            "<!doctype html><html><body><input id='c' type='checkbox'></body></html>",
+        );
+        let mut runtime = LiveInterp::new(&doc, "https://dom.test/");
+        runtime
+            .interp
+            .run(
+                "var c = document.getElementById('c'); \
+                 window.__before = !!c.checked; \
+                 window.__seen_in_click = null; \
+                 window.__input_fired = 0; window.__change_fired = 0; \
+                 c.addEventListener('click', function(){ window.__seen_in_click = !!c.checked; }); \
+                 c.addEventListener('input', function(){ window.__input_fired++; }); \
+                 c.addEventListener('change', function(){ window.__change_fired++; }); \
+                 c.click(); \
+                 window.__after = !!c.checked;",
+            )
+            .expect("click run");
+        assert_eq!(window_str(&runtime, "__before"), "false");
+        // Listener observes the toggled value (pre-activation toggled it true).
+        assert_eq!(window_str(&runtime, "__seen_in_click"), "true");
+        assert_eq!(window_str(&runtime, "__after"), "true");
+        assert_eq!(window_str(&runtime, "__input_fired"), "1");
+        assert_eq!(window_str(&runtime, "__change_fired"), "1");
+    }
+
+    // DOM §2.9 — a click listener that calls preventDefault() runs the
+    // canceled-activation behavior: the checkbox toggle is REVERTED.
+    #[test]
+    fn input_click_prevent_default_reverts_checkbox() {
+        let doc = cv_html::parse(
+            "<!doctype html><html><body><input id='c' type='checkbox'></body></html>",
+        );
+        let mut runtime = LiveInterp::new(&doc, "https://dom.test/");
+        runtime
+            .interp
+            .run(
+                "var c = document.getElementById('c'); \
+                 c.addEventListener('click', function(e){ e.preventDefault(); }); \
+                 c.click(); \
+                 window.__after = !!c.checked;",
+            )
+            .expect("prevented click run");
+        assert_eq!(window_str(&runtime, "__after"), "false");
+    }
+
+    // DOM §2.9 — element.click() on a createElement'd <input type=checkbox>
+    // (inherits HTMLElement.prototype.click) toggles + the onclick handler sees
+    // checked===true (mirrors WPT Event-dispatch-click.html "basic with click()").
+    #[test]
+    fn created_input_click_toggles_and_onclick_sees_checked() {
+        let doc = cv_html::parse("<!doctype html><html><body></body></html>");
+        let mut runtime = LiveInterp::new(&doc, "https://dom.test/");
+        runtime
+            .interp
+            .run(
+                "var input = document.createElement('input'); \
+                 input.type = 'checkbox'; \
+                 document.body.appendChild(input); \
+                 window.__seen = null; \
+                 input.onclick = function(){ window.__seen = !!input.checked; }; \
+                 window.__has_click = (typeof input.click === 'function'); \
+                 input.click(); \
+                 window.__after = !!input.checked;",
+            )
+            .expect("created click run");
+        assert_eq!(window_str(&runtime, "__has_click"), "true");
+        assert_eq!(window_str(&runtime, "__seen"), "true");
+        assert_eq!(window_str(&runtime, "__after"), "true");
+    }
+
+    // HTMLElement.click is on the prototype (Chrome shape), so a createElement
+    // element inherits it (NOT an own property).
+    #[test]
+    fn click_is_inherited_from_prototype_not_own_prop() {
+        let doc = cv_html::parse("<!doctype html><html><body></body></html>");
+        let mut runtime = LiveInterp::new(&doc, "https://dom.test/");
+        runtime
+            .interp
+            .run(
+                "var d = document.createElement('div'); \
+                 window.__has = (typeof d.click === 'function'); \
+                 window.__own = d.hasOwnProperty('click'); \
+                 window.__proto_has = (typeof HTMLElement.prototype.click === 'function');",
+            )
+            .expect("proto click run");
+        assert_eq!(window_str(&runtime, "__has"), "true");
+        assert_eq!(window_str(&runtime, "__own"), "false");
+        assert_eq!(window_str(&runtime, "__proto_has"), "true");
+    }
+
+    // HTML §6 focusing — element.focus()/blur() are real: they fire the
+    // (non-bubbling) focus/blur events and move document.activeElement.
+    #[test]
+    fn focus_blur_fire_events_and_move_active_element() {
+        let doc = cv_html::parse(
+            "<!doctype html><html><body><input id='a'><input id='b'></body></html>",
+        );
+        let mut runtime = LiveInterp::new(&doc, "https://dom.test/");
+        runtime
+            .interp
+            .run(
+                "var a = document.getElementById('a'); \
+                 window.__focus_fired = 0; window.__blur_fired = 0; \
+                 a.addEventListener('focus', function(){ window.__focus_fired++; }); \
+                 a.addEventListener('blur', function(){ window.__blur_fired++; }); \
+                 a.focus(); \
+                 window.__active_after_focus = (document.activeElement === a) ? 'a' : 'other'; \
+                 a.blur(); \
+                 window.__active_after_blur = (document.activeElement === a) ? 'a' : 'notA';",
+            )
+            .expect("focus/blur run");
+        assert_eq!(window_str(&runtime, "__focus_fired"), "1");
+        assert_eq!(window_str(&runtime, "__blur_fired"), "1");
+        assert_eq!(window_str(&runtime, "__active_after_focus"), "a");
+        assert_eq!(window_str(&runtime, "__active_after_blur"), "notA");
+    }
+
+    // DOM §2.9 — a button[type=submit] inside a form fires `submit` on the form
+    // when clicked (activation behavior). A submit listener that preventDefaults
+    // the click does NOT suppress submit (preventDefault on click only cancels
+    // the click's own default, not subsequent activation events here) — but a
+    // form submit listener can be observed firing.
+    #[test]
+    fn submit_button_click_fires_form_submit() {
+        let doc = cv_html::parse(
+            "<!doctype html><html><body><form id='f'><button id='b' type='submit'>go</button></form></body></html>",
+        );
+        let mut runtime = LiveInterp::new(&doc, "https://dom.test/");
+        runtime
+            .interp
+            .run(
+                "var b = document.getElementById('b'); var f = document.getElementById('f'); \
+                 window.__submit_fired = 0; \
+                 f.addEventListener('submit', function(e){ window.__submit_fired++; e.preventDefault(); }); \
+                 b.click();",
+            )
+            .expect("submit click run");
+        assert_eq!(window_str(&runtime, "__submit_fired"), "1");
     }
 
     // WHATWG DOM §4.5 Document.doctype / §4.7 DocumentType — a parsed document
