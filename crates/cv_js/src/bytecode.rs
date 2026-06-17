@@ -10683,18 +10683,30 @@ fn property_store(obj: &Value, key: &str, value: Value) {
             // first, silently DROPPING the change. Mirror the write across all
             // three so every reader agrees. Cheap key-gate first.
             if matches!(key, "data" | "nodeValue" | "textContent") {
-                let is_chardata = {
+                let node_type = {
                     let b = o.borrow();
-                    matches!(
-                        b.get("nodeType"),
-                        Some(Value::Number(n)) if *n == 3.0 || *n == 8.0
-                    )
+                    match b.get("nodeType") {
+                        Some(Value::Number(n)) => *n,
+                        _ => f64::NAN,
+                    }
                 };
-                if is_chardata {
+                // WHATWG DOM §4.9 textContent set on an ELEMENT (nodeType 1):
+                // route to the host "string replace all" rebuild (mirrors the
+                // tree-walk `write_property` path) so `el.firstChild` is rebuilt.
+                if key == "textContent"
+                    && node_type == 1.0
+                    && crate::interp::run_element_textcontent_hook(o, &value)
+                {
+                    return;
+                }
+                if node_type == 3.0 || node_type == 8.0 {
+                    // [LegacyNullToEmptyString] DOMString coercion (mirrors the
+                    // tree-walk path): null → "", else ToString.
+                    let coerced = crate::interp::coerce_chardata_value(&value);
                     let mut b = o.borrow_mut();
-                    b.insert("data".into(), value.clone());
-                    b.insert("nodeValue".into(), value.clone());
-                    b.insert("textContent".into(), value);
+                    b.insert("data".into(), coerced.clone());
+                    b.insert("nodeValue".into(), coerced.clone());
+                    b.insert("textContent".into(), coerced);
                     return;
                 }
             }

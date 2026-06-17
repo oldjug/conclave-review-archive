@@ -2113,6 +2113,52 @@ impl Drop for ForceEligibleGuard {
     }
 }
 
+type ElementTextContentHook = std::rc::Rc<dyn Fn(&Rc<RefCell<HashMap<String, Value>>>, &Value)>;
+
+thread_local! {
+    /// Host hook for the WHATWG DOM §4.9 `Node.textContent` SETTER on an ELEMENT
+    /// (nodeType 1). cv_js stores element properties as plain slots, so a write
+    /// `el.textContent = "x"` would only overwrite the `textContent` string slot
+    /// and leave the element's live `_children`/`childNodes` (firstChild, etc.)
+    /// untouched — but the spec's "string replace all" replaces ALL children with
+    /// a single new Text node (or none for ""). The browser registers this hook
+    /// (it owns `make_text_node_js` + the live snapshot helpers) so cv_js can ask
+    /// it to rebuild the child list on every element textContent write. Without
+    /// it, `paras[N].textContent = "..."; paras[N].firstChild` is null and the
+    /// whole dom/ranges setup (which does `.firstChild.ownerDocument.createRange()`)
+    /// aborts. None in pure cv_js unit tests (no DOM) — then a plain slot write.
+    static ELEMENT_TEXTCONTENT_HOOK: RefCell<Option<ElementTextContentHook>> =
+        const { RefCell::new(None) };
+}
+
+/// Register the host element-textContent rebuild hook (see ELEMENT_TEXTCONTENT_HOOK).
+pub fn set_element_textcontent_hook(f: ElementTextContentHook) {
+    ELEMENT_TEXTCONTENT_HOOK.with(|h| *h.borrow_mut() = Some(f));
+}
+
+/// Invoke the element-textContent hook if registered. Returns true if it handled
+/// the write (the caller must then NOT do its own slot store).
+pub fn run_element_textcontent_hook(o: &Rc<RefCell<HashMap<String, Value>>>, value: &Value) -> bool {
+    if let Some(hook) = ELEMENT_TEXTCONTENT_HOOK.with(|h| h.borrow().clone()) {
+        hook(o, value);
+        true
+    } else {
+        false
+    }
+}
+
+/// Coerce a value about to be stored into a CharacterData node's `data`/
+/// `nodeValue`/`textContent` slot per WebIDL `[LegacyNullToEmptyString]
+/// DOMString` (null → "", else ToString). Shared by the tree-walk
+/// `write_property` and the VM `property_store` so both tiers agree.
+pub fn coerce_chardata_value(value: &Value) -> Value {
+    match value {
+        Value::Null => Value::str(String::new()),
+        Value::String(_) => value.clone(),
+        other => Value::str(other.to_display_string()),
+    }
+}
+
 thread_local! {
     /// Honesty counter: how many times a top-level script actually ran on the VM
     /// (`try_run_toplevel_vm` succeeded), NOT a fall-through to the tree-walker.
@@ -22111,20 +22157,42 @@ impl Interp {
                 // so all readers agree. Gated on the cheap key check first; the
                 // nodeType borrow only happens for these three names.
                 if matches!(key, "data" | "nodeValue" | "textContent") {
-                    let is_chardata = {
+                    let node_type = {
                         let b = o.borrow();
-                        matches!(
-                            b.get("nodeType"),
-                            Some(Value::Number(n)) if *n == 3.0 || *n == 8.0
-                        )
+                        match b.get("nodeType") {
+                            Some(Value::Number(n)) => *n,
+                            _ => f64::NAN,
+                        }
                     };
+                    // WHATWG DOM §4.9 textContent set on an ELEMENT (nodeType 1):
+                    // run the host "string replace all" rebuild (replaces every
+                    // child with one Text node, or none for ""). The hook owns the
+                    // real Text-node construction + the live snapshot. Falls
+                    // through to a plain slot store when no host hook is installed
+                    // (pure cv_js tests) so existing behavior is preserved.
+                    if key == "textContent" && node_type == 1.0
+                        && run_element_textcontent_hook(o, &value)
+                    {
+                        return;
+                    }
+                    let is_chardata = node_type == 3.0 || node_type == 8.0;
                     if is_chardata {
+                        // WHATWG DOM §4.11 / WebIDL: `data` is
+                        // `[LegacyNullToEmptyString] attribute DOMString`, and
+                        // setting `nodeValue`/`textContent` on a CharacterData
+                        // node likewise treats null as "" (the "replace data" /
+                        // "string replace all" steps). Every non-null value is
+                        // ToString-coerced (undefined→"undefined", 0→"0"). So
+                        // store the COERCED string, not the raw Value — a raw
+                        // `null`/number left the slots non-string and failed the
+                        // CharacterData-data WPT assertions.
+                        let coerced = coerce_chardata_value(&value);
                         // B4 write barrier: an old object gaining a young child.
-                        gen_gc_write_barrier(Rc::as_ptr(o) as *const () as usize, &value);
+                        gen_gc_write_barrier(Rc::as_ptr(o) as *const () as usize, &coerced);
                         let mut b = o.borrow_mut();
-                        b.insert("data".into(), value.clone());
-                        b.insert("nodeValue".into(), value.clone());
-                        b.insert("textContent".into(), value);
+                        b.insert("data".into(), coerced.clone());
+                        b.insert("nodeValue".into(), coerced.clone());
+                        b.insert("textContent".into(), coerced);
                         return;
                     }
                 }

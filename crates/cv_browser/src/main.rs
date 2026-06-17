@@ -30409,6 +30409,17 @@ fn install_minimal_dom_with_url(interp: &cv_js::Interp, initial_title: String, p
         },
     ));
 
+    // WHATWG DOM §4.9 Node.textContent SETTER on an element: cv_js routes every
+    // `el.textContent = …` write here so the live child list is rebuilt (one
+    // Text node, or none for "") — without it `el.firstChild` stays null and the
+    // whole dom/ranges setup (`.firstChild.ownerDocument.createRange()`) aborts.
+    cv_js::set_element_textcontent_hook(std::rc::Rc::new(
+        |o: &std::rc::Rc<std::cell::RefCell<cv_js::OrderedMap<String, cv_js::Value>>>,
+         value: &cv_js::Value| {
+            element_set_text_content(o, value);
+        },
+    ));
+
     // Event constructors that don't currently fire from the engine but
     // whose names are widely feature-tested. Each returns an object
     // shaped like the corresponding DOM event with `type`, the
@@ -43466,10 +43477,18 @@ fn chardata_set_all(
     b.insert("textContent".into(), cv_js::Value::str(new_data));
 }
 
+/// WHATWG DOM §2.7 / WebIDL — an `IndexSizeError` raised as a real
+/// `DOMException` (name "IndexSizeError", legacy code 1), NOT a bare string.
+/// The CharacterData mutators (substringData/insertData/deleteData/replaceData)
+/// and Text.splitText throw this when `offset > length`; WPT asserts it with
+/// `assert_throws_dom("IndexSizeError", …)`, which requires a DOMException whose
+/// `.name`/`.code` match — a plain string fails that check.
 fn index_size_error(method: &str) -> cv_js::JsError {
-    cv_js::JsError::Throw(cv_js::Value::str(format!(
-        "IndexSizeError: offset out of bounds in {method}"
-    )))
+    cv_js::JsError::Throw(make_dom_exception(
+        "IndexSizeError",
+        1,
+        &format!("offset out of bounds in {method}"),
+    ))
 }
 
 /// Install the WHATWG ChildNode mixin (DOM §4.2.8) — `before`, `after`,
@@ -43613,6 +43632,33 @@ fn install_child_node_mixin(m: &mut cv_js::OrderedMap<String, cv_js::Value>) {
 /// sync and the host text reconciler (single-text-child + mixed-content paths)
 /// then propagates the change to the legacy doc, dirtying the containing block.
 fn install_chardata_methods(m: &mut cv_js::OrderedMap<String, cv_js::Value>) {
+    // CharacterData.length (WHATWG DOM §4.11): "the number of code units in this
+    // node's data" — i.e. the UTF-16 code-unit length of `data`. Installed as a
+    // LIVE accessor (a `\u{1}__get__` wrapper) so it re-reads `data` on every
+    // access and stays correct after appendData/deleteData/etc. mutate the node;
+    // a plain data slot would go stale. The getter resolves the receiver via
+    // `current_native_this()` (the same mechanism the CharacterData mutators
+    // use), so it is shared by value across every text/comment node. Without it,
+    // `node.length` is `undefined`, failing the testReplaceDataAlgorithm /
+    // testSplitText precondition in dom/ranges and the CharacterData-data length
+    // assertions.
+    {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        use cv_js::OrderedMap as HashMap;
+        let length_getter = cv_js::native_fn_with_interp("length", |_i, _args| {
+            let cur = chardata_this_string()
+                .map(|(_, s)| s)
+                .unwrap_or_default();
+            Ok(cv_js::Value::Number(cur.encode_utf16().count() as f64))
+        });
+        let mut length_acc: HashMap<String, cv_js::Value> = HashMap::new();
+        length_acc.insert(cv_js::ACCESSOR_GET.into(), length_getter);
+        m.insert(
+            "length".into(),
+            cv_js::Value::Object(Rc::new(RefCell::new(length_acc))),
+        );
+    }
     // appendData(arg): data = data + arg. These are `WithInterp` so the bytecode
     // VM routes them through `dispatch` → `call_value_with_this`, which pushes the
     // receiver onto the native-`this` stack — a `Pure` native fn called via the VM
@@ -46041,6 +46087,74 @@ fn make_text_node_js(text: &str) -> cv_js::Value {
     install_chardata_methods(&mut m);
     install_child_node_mixin(&mut m);
     cv_js::Value::Object(Rc::new(RefCell::new(m)))
+}
+
+/// WHATWG DOM §4.9 `Node.textContent` SETTER on an ELEMENT (the "string replace
+/// all" algorithm): replace ALL of the element's children with a single new Text
+/// node whose data is `value` (or with NOTHING when `value` is the empty string).
+/// This is the host side of `ELEMENT_TEXTCONTENT_HOOK` (registered into cv_js):
+/// cv_js stores element props as plain slots and cannot build a real Text node,
+/// so it calls here on every `el.textContent = …` write. We:
+///   1. ToString-coerce `value` (null → "" per the §4.9 "string replace all"
+///      treat-null-as-empty step the setter applies).
+///   2. detach the OLD children (clear their `_parent`), then
+///   3. install the new `_children`/`childNodes` (one Text node, or empty), with
+///      the Text node's `_parent` = the element and `ownerDocument` inherited
+///      from the element so `el.firstChild.ownerDocument.createRange()` works.
+///   4. keep the `textContent` string slot in sync (serialize_live_node_inner
+///      reads it lazily) and refresh firstElementChild/childElementCount.
+/// Empty string installs an EMPTY child list (NOT an empty Text node) so
+/// `childNodes.length === 0`, matching the spec.
+fn element_set_text_content(
+    o: &std::rc::Rc<std::cell::RefCell<cv_js::OrderedMap<String, cv_js::Value>>>,
+    value: &cv_js::Value,
+) {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    // §4.9 setter: null is treated as the empty string; otherwise ToString.
+    let text = match value {
+        cv_js::Value::Null => String::new(),
+        cv_js::Value::String(s) => s.to_string(),
+        other => other.to_display_string(),
+    };
+    let el = cv_js::Value::Object(o.clone());
+    // 1. Detach the old children so a held reference to a removed child reports
+    //    a null parent (the spec "remove" clears each old child's parent).
+    if let Some(old) = get_children_snapshot(&el) {
+        let prev: Vec<cv_js::Value> = old.borrow().clone();
+        for c in &prev {
+            set_parent_snapshot(c, cv_js::Value::Null);
+        }
+    }
+    // 2. Build the new child list: one Text node for non-empty data, else none.
+    let new_kids: Vec<cv_js::Value> = if text.is_empty() {
+        Vec::new()
+    } else {
+        let tn = make_text_node_js(&text);
+        // Inherit the element's ownerDocument (make_text_node_js defaults to the
+        // live document, but a detached/foreign element may own a different doc).
+        if let cv_js::Value::Object(to) = &tn {
+            let owner = o.borrow().get("ownerDocument").cloned();
+            if let Some(owner) = owner {
+                if !matches!(owner, cv_js::Value::Null | cv_js::Value::Undefined) {
+                    to.borrow_mut().insert("ownerDocument".into(), owner);
+                }
+            }
+        }
+        set_parent_snapshot(&tn, el.clone());
+        vec![tn]
+    };
+    // 3. Install the new `_children`/`childNodes` array (shared Rc so both alias
+    //    the same live list, mirroring ensure_children_array).
+    let arr: Rc<RefCell<Vec<cv_js::Value>>> = Rc::new(RefCell::new(new_kids));
+    {
+        let mut m = o.borrow_mut();
+        m.insert("_children".into(), cv_js::Value::Array(arr.clone()));
+        m.insert("childNodes".into(), cv_js::Value::Array(arr.clone()));
+        // 4. Keep the textContent string slot in sync (lazy serialize reader).
+        m.insert("textContent".into(), cv_js::Value::str(text));
+    }
+    refresh_parent_snapshot(&el);
 }
 
 /// A DOM Comment node (nodeType 8). React's RSC hydration walks the DOM
@@ -73445,6 +73559,93 @@ mod tests {
         assert!(
             find_element_by_id(copy, "kid").is_some(),
             "parsed child id should survive commit"
+        );
+    }
+
+    /// WHATWG DOM §4.9 textContent setter "string replace all": setting an
+    /// element's textContent must REBUILD the live JS child list so
+    /// `el.firstChild` is a real Text node (nodeType 3) carrying the data — the
+    /// gate that unblocks the dom/ranges setup (`.firstChild.ownerDocument
+    /// .createRange()`). We encode the JS-observed results into data-* attributes
+    /// so they survive into the committed doc and can be asserted here.
+    fn find_attr(node: &cv_html::Node, wanted_id: &str, attr: &str) -> Option<String> {
+        if let cv_html::NodeKind::Element { attrs, .. } = &node.kind {
+            if attrs.iter().any(|a| a.name == "id" && a.value == wanted_id) {
+                return attrs
+                    .iter()
+                    .find(|a| a.name == attr)
+                    .map(|a| a.value.clone());
+            }
+        }
+        for child in &node.children {
+            if let Some(v) = find_attr(child, wanted_id, attr) {
+                return Some(v);
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn element_text_content_setter_rebuilds_live_first_child() {
+        let html = "<!doctype html><html><body><p id='p1'></p><script>\
+            var p=document.getElementById('p1');\
+            p.textContent='Hello';\
+            var fc=p.firstChild;\
+            p.setAttribute('data-fc-type', fc?String(fc.nodeType):'null');\
+            p.setAttribute('data-fc-data', fc?String(fc.data):'null');\
+            p.setAttribute('data-fc-len', fc?String(fc.length):'null');\
+            p.setAttribute('data-can-range', (fc&&fc.ownerDocument&&typeof fc.ownerDocument.createRange==='function')?'yes':'no');\
+            </script></body></html>";
+        let cfg = cv_layout::LayoutConfig::default();
+        let (_runtime, doc, _sheets, _paint) =
+            build_runtime_and_first_paint(html, "https://example.com/", &cfg, "")
+                .expect("render ok");
+        assert_eq!(find_attr(&doc.root, "p1", "data-fc-type").as_deref(), Some("3"));
+        assert_eq!(find_attr(&doc.root, "p1", "data-fc-data").as_deref(), Some("Hello"));
+        assert_eq!(find_attr(&doc.root, "p1", "data-fc-len").as_deref(), Some("5"));
+        assert_eq!(find_attr(&doc.root, "p1", "data-can-range").as_deref(), Some("yes"));
+    }
+
+    #[test]
+    fn element_text_content_empty_string_clears_children() {
+        // §4.9: setting textContent to "" installs an EMPTY child list (NOT an
+        // empty Text node) — childNodes.length must be 0 and firstChild null.
+        let html = "<!doctype html><html><body><p id='p1'>existing<b>kid</b></p><script>\
+            var p=document.getElementById('p1');\
+            p.textContent='';\
+            p.setAttribute('data-count', String(p.childNodes.length));\
+            p.setAttribute('data-fc', p.firstChild===null?'null':'notnull');\
+            </script></body></html>";
+        let cfg = cv_layout::LayoutConfig::default();
+        let (_runtime, doc, _sheets, _paint) =
+            build_runtime_and_first_paint(html, "https://example.com/", &cfg, "")
+                .expect("render ok");
+        assert_eq!(find_attr(&doc.root, "p1", "data-count").as_deref(), Some("0"));
+        assert_eq!(find_attr(&doc.root, "p1", "data-fc").as_deref(), Some("null"));
+    }
+
+    #[test]
+    fn character_data_length_is_utf16_code_units() {
+        // WHATWG DOM §4.11 CharacterData.length is the UTF-16 code-unit count
+        // (astral chars count 2). index_size_error must be a real DOMException.
+        let html = "<!doctype html><html><body><p id='p1'></p><script>\
+            var p=document.getElementById('p1');\
+            var t=document.createTextNode('a\\u{1F600}b');\
+            p.appendChild(t);\
+            p.setAttribute('data-len', String(t.length));\
+            var threw='no';\
+            try { t.substringData(99, 1); } catch(e) { threw = (e&&e.name)||'err'; }\
+            p.setAttribute('data-throw', threw);\
+            </script></body></html>";
+        let cfg = cv_layout::LayoutConfig::default();
+        let (_runtime, doc, _sheets, _paint) =
+            build_runtime_and_first_paint(html, "https://example.com/", &cfg, "")
+                .expect("render ok");
+        // 'a' + 😀 (2 code units) + 'b' = 4 UTF-16 code units.
+        assert_eq!(find_attr(&doc.root, "p1", "data-len").as_deref(), Some("4"));
+        assert_eq!(
+            find_attr(&doc.root, "p1", "data-throw").as_deref(),
+            Some("IndexSizeError")
         );
     }
 
