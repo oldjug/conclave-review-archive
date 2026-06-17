@@ -11,7 +11,22 @@ Cargo.lock.bak
 /tmp/
 
 /.remember/
+/.claude/
 *.output
 
 conformance/tmp/
+
+# internal planning / analysis notes (not part of the browser source)
+/MASTER_DESIGN_BEAT_CHROME.md
+/ENGINE_VS_CHROME_AUDIT.md
+/CHROME_PARITY_ROADMAP.md
+/CHROME_PARITY_PLATFORM_AUDIT.md
+/CHROME_PARITY_RENDER_AUDIT.md
+/CHROME_PARITY_GAPS.json
+/CHROME_DIVERGENCE_AUDIT.md
+/CHROME_DIVERGENCE_FINDINGS.json
+/AUDIT_PROPERTY_ASSIGNMENT.md
+/crates/cv_js/ASYNC_SUSPENSION_DESIGN.md
+/tools/run_audit.ps1
+/tools/audit_sites.txt
 
