@@ -43915,19 +43915,24 @@ fn js_compare_document_position(this: &cv_js::Value, other: &cv_js::Value) -> f6
         return f64::from(DISCONNECTED | IMPLEMENTATION_SPECIFIC | dir);
     }
 
-    // other contains this (other is an ancestor of this) → CONTAINS + PRECEDING.
-    if b_chain
-        .iter()
-        .skip(1)
-        .any(|n| cv_js::Value::strict_eq(n, this))
-    {
-        return f64::from(CONTAINS | PRECEDING);
-    }
-    // this contains other → CONTAINED_BY + FOLLOWING.
+    // §4.4 compareDocumentPosition returns flags describing OTHER relative to
+    // THIS. `a_chain` is THIS's inclusive-ancestor chain, `b_chain` is OTHER's.
+    //
+    // other is an ANCESTOR of this  ⟺ other ∈ this's ancestors (a_chain, skip
+    //   self) ⟹ "other contains this": CONTAINS + PRECEDING.
     if a_chain
         .iter()
         .skip(1)
         .any(|n| cv_js::Value::strict_eq(n, other))
+    {
+        return f64::from(CONTAINS | PRECEDING);
+    }
+    // other is a DESCENDANT of this ⟺ this ∈ other's ancestors (b_chain, skip
+    //   self) ⟹ "this contains other": CONTAINED_BY + FOLLOWING.
+    if b_chain
+        .iter()
+        .skip(1)
+        .any(|n| cv_js::Value::strict_eq(n, this))
     {
         return f64::from(CONTAINED_BY | FOLLOWING);
     }
@@ -44957,6 +44962,75 @@ fn js_node_root(node: &cv_js::Value) -> cv_js::Value {
 
 /// Read a hidden boundary-point pair off a Range JS object: returns
 /// `(container, offset)` for the `start`/`end` side.
+/// WHATWG DOM §5.3 "position of the boundary point (nodeA, offsetA) relative to
+/// the boundary point (nodeB, offsetB)" — returns Less (before) / Equal / Greater
+/// (after). Precondition: nodeA and nodeB share a root (callers that need the
+/// cross-root WrongDocumentError check it first). This is the single comparator
+/// behind comparePoint / isPointInRange / intersectsNode / compareBoundaryPoints.
+/// Mirrors the reference `getPosition` in dom/common.js exactly.
+fn boundary_point_position(
+    node_a: &cv_js::Value,
+    offset_a: usize,
+    node_b: &cv_js::Value,
+    offset_b: usize,
+) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    // "If nodeA is nodeB: return equal/before/after by comparing the offsets."
+    if cv_js::Value::strict_eq(node_a, node_b) {
+        return offset_a.cmp(&offset_b);
+    }
+    // DOCUMENT_POSITION_* bits as computed by js_compare_document_position.
+    const FOLLOWING: u32 = 0x04;
+    const CONTAINS: u32 = 0x08;
+    // "If nodeA is after nodeB in tree order" (i.e. compareDocumentPosition(nodeB
+    // → nodeA) reports nodeA FOLLOWING nodeB): compute the position of B relative
+    // to A and invert it.
+    let b_to_a = js_compare_document_position(node_b, node_a) as u32;
+    if b_to_a & FOLLOWING != 0 {
+        return match boundary_point_position(node_b, offset_b, node_a, offset_a) {
+            Ordering::Less => Ordering::Greater,
+            Ordering::Greater => Ordering::Less,
+            Ordering::Equal => Ordering::Equal,
+        };
+    }
+    // "If nodeA is an ancestor of nodeB" (nodeB.compareDocumentPosition(nodeA)
+    // has DOCUMENT_POSITION_CONTAINS): walk B's ancestor chain up to the child of
+    // A; if that child's index < offsetA, A's point is AFTER B's point.
+    if b_to_a & CONTAINS != 0 {
+        let mut child = node_b.clone();
+        let mut guard = 0usize;
+        while let Some(parent) = js_node_parent(&child) {
+            if cv_js::Value::strict_eq(&parent, node_a) {
+                break;
+            }
+            child = parent;
+            guard += 1;
+            if guard > 65536 {
+                break;
+            }
+        }
+        if let Some(idx) = js_node_index(&child) {
+            if idx < offset_a {
+                return Ordering::Greater;
+            }
+        }
+    }
+    // "Return before."
+    Ordering::Less
+}
+
+/// ECMA-262 ToUint32 of a JS number — the WebIDL `unsigned long` conversion the
+/// Range point methods apply to their `offset` argument (so `-1` becomes
+/// 4294967295, which then exceeds any node length → IndexSizeError, matching the
+/// WPT comparePoint/isPointInRange expectations).
+fn to_uint32(n: f64) -> u32 {
+    if !n.is_finite() {
+        return 0;
+    }
+    let m = n.trunc();
+    (m.rem_euclid(4294967296.0)) as u32
+}
+
 fn range_boundary(range: &cv_js::Value, side: &str) -> (cv_js::Value, usize) {
     if let cv_js::Value::Object(o) = range {
         let b = o.borrow();
@@ -45207,7 +45281,7 @@ fn make_range_js(initial_node: cv_js::Value) -> cv_js::Value {
                 let Some(parent) = js_node_parent(&node) else {
                     return Err(cv_js::JsError::Throw(make_dom_exception(
                         "InvalidNodeTypeError",
-                        9,
+                        24,
                         "node has no parent",
                     )));
                 };
@@ -45243,7 +45317,7 @@ fn make_range_js(initial_node: cv_js::Value) -> cv_js::Value {
             let Some(parent) = js_node_parent(&node) else {
                 return Err(cv_js::JsError::Throw(make_dom_exception(
                     "InvalidNodeTypeError",
-                    9,
+                    24,
                     "node has no parent",
                 )));
             };
@@ -45353,8 +45427,192 @@ fn make_range_js(initial_node: cv_js::Value) -> cv_js::Value {
         "detach".into(),
         cv_js::native_fn("detach", |_| Ok(cv_js::Value::Undefined)),
     );
-    // isPointInRange / comparePoint stubs deferred (rarely used); insertNode
-    // routed through the live tree if a richer model is needed later.
+    // comparePoint(node, offset) — WHATWG DOM §5.5. Returns -1 if (node,offset)
+    // is before the range's start, 1 if after its end, else 0. Throws:
+    //   WrongDocumentError  if node's root != range's root,
+    //   InvalidNodeTypeError if node is a DocumentType,
+    //   IndexSizeError      if (ToUint32) offset > node's length.
+    m.insert(
+        "comparePoint".into(),
+        cv_js::native_fn_with_interp("comparePoint", |_i, args| {
+            use std::cmp::Ordering;
+            let range = cv_js::current_native_this();
+            let node = args.first().cloned().unwrap_or(cv_js::Value::Null);
+            // WebIDL: the `node` argument is a non-nullable Node; passing null/a
+            // non-object is a TypeError (NOT a DOMException).
+            if !matches!(node, cv_js::Value::Object(_)) {
+                return Err(cv_js::JsError::Throw(cv_js::Value::str(
+                    "TypeError: comparePoint requires a Node argument".to_string(),
+                )));
+            }
+            let offset = to_uint32(args.get(1).map(|v| v.to_number()).unwrap_or(0.0)) as usize;
+            let (sc, so) = range_boundary(&range, "start");
+            // §5.5 step 1: different roots → WrongDocumentError (legacy code 4).
+            if !cv_js::Value::strict_eq(&js_node_root(&node), &js_node_root(&sc)) {
+                return Err(cv_js::JsError::Throw(make_dom_exception(
+                    "WrongDocumentError",
+                    4,
+                    "node is in a different document than the range",
+                )));
+            }
+            // §5.5 step 2: a doctype node → InvalidNodeTypeError (legacy code 24).
+            if js_node_type(&node) == 10 {
+                return Err(cv_js::JsError::Throw(make_dom_exception(
+                    "InvalidNodeTypeError",
+                    24,
+                    "node is a doctype",
+                )));
+            }
+            // §5.5 step 3: offset past the node's length → IndexSizeError.
+            if offset > js_node_length(&node) {
+                return Err(index_size_error("comparePoint"));
+            }
+            let (ec, eo) = range_boundary(&range, "end");
+            if boundary_point_position(&node, offset, &sc, so) == Ordering::Less {
+                return Ok(cv_js::Value::Number(-1.0));
+            }
+            if boundary_point_position(&node, offset, &ec, eo) == Ordering::Greater {
+                return Ok(cv_js::Value::Number(1.0));
+            }
+            Ok(cv_js::Value::Number(0.0))
+        }),
+    );
+    // isPointInRange(node, offset) — WHATWG DOM §5.5. Returns true iff the point
+    // is within the range (>= start and <= end). Different root → false (NOT an
+    // error). Still throws InvalidNodeTypeError (doctype) + IndexSizeError.
+    m.insert(
+        "isPointInRange".into(),
+        cv_js::native_fn_with_interp("isPointInRange", |_i, args| {
+            use std::cmp::Ordering;
+            let range = cv_js::current_native_this();
+            let node = args.first().cloned().unwrap_or(cv_js::Value::Null);
+            let offset = to_uint32(args.get(1).map(|v| v.to_number()).unwrap_or(0.0)) as usize;
+            let (sc, so) = range_boundary(&range, "start");
+            // §5.5 step 1: range has no root OR different root → false.
+            if matches!(sc, cv_js::Value::Null)
+                || !cv_js::Value::strict_eq(&js_node_root(&node), &js_node_root(&sc))
+            {
+                return Ok(cv_js::Value::Bool(false));
+            }
+            if js_node_type(&node) == 10 {
+                return Err(cv_js::JsError::Throw(make_dom_exception(
+                    "InvalidNodeTypeError",
+                    24,
+                    "node is a doctype",
+                )));
+            }
+            if offset > js_node_length(&node) {
+                return Err(index_size_error("isPointInRange"));
+            }
+            let (ec, eo) = range_boundary(&range, "end");
+            // (node,offset) is before start OR after end → not in range.
+            let before_start =
+                boundary_point_position(&node, offset, &sc, so) == Ordering::Less;
+            let after_end =
+                boundary_point_position(&node, offset, &ec, eo) == Ordering::Greater;
+            Ok(cv_js::Value::Bool(!before_start && !after_end))
+        }),
+    );
+    // intersectsNode(node) — WHATWG DOM §5.5. True iff `node` (a whole node) and
+    // the range overlap. Different root → false. The spec test:
+    //   parent = node's parent; offset = node's index;
+    //   (parent, offset) < range end  AND  (parent, offset+1) > range start.
+    m.insert(
+        "intersectsNode".into(),
+        cv_js::native_fn_with_interp("intersectsNode", |_i, args| {
+            use std::cmp::Ordering;
+            let range = cv_js::current_native_this();
+            let node = args.first().cloned().unwrap_or(cv_js::Value::Null);
+            let (sc, so) = range_boundary(&range, "start");
+            // §5.5 step 1: different root (or no root) → false.
+            if matches!(sc, cv_js::Value::Null)
+                || !cv_js::Value::strict_eq(&js_node_root(&node), &js_node_root(&sc))
+            {
+                return Ok(cv_js::Value::Bool(false));
+            }
+            // §5.5 step 3: a node with no parent (e.g. the root itself) — the
+            // spec returns true (its root equals the range's root).
+            let Some(parent) = js_node_parent(&node) else {
+                return Ok(cv_js::Value::Bool(true));
+            };
+            let offset = js_node_index(&node).unwrap_or(0);
+            let (ec, eo) = range_boundary(&range, "end");
+            // (parent, offset) is before end AND (parent, offset+1) is after start.
+            let before_end =
+                boundary_point_position(&parent, offset, &ec, eo) == Ordering::Less;
+            let after_start =
+                boundary_point_position(&parent, offset + 1, &sc, so) == Ordering::Greater;
+            Ok(cv_js::Value::Bool(before_end && after_start))
+        }),
+    );
+    // compareBoundaryPoints(how, sourceRange) — WHATWG DOM §5.5. `how` is a
+    // WebIDL `unsigned short` (ToUint16); if not 0..3 → NotSupportedError. If the
+    // two ranges have different roots → WrongDocumentError. Otherwise compare the
+    // two selected boundary points and return -1/0/1.
+    m.insert(
+        "compareBoundaryPoints".into(),
+        cv_js::native_fn_with_interp("compareBoundaryPoints", |_i, args| {
+            use std::cmp::Ordering;
+            let range = cv_js::current_native_this();
+            let how_raw = args.first().map(|v| v.to_number()).unwrap_or(0.0);
+            // WebIDL `unsigned short` ToUint16: NaN/±0/±Inf → 0, else
+            // sign*floor(abs) mod 2^16.
+            let how = if !how_raw.is_finite() || how_raw == 0.0 {
+                0u32
+            } else {
+                let pos_int = how_raw.signum() * how_raw.abs().floor();
+                (pos_int.rem_euclid(65536.0)) as u32
+            };
+            if how > 3 {
+                return Err(cv_js::JsError::Throw(make_dom_exception(
+                    "NotSupportedError",
+                    9,
+                    "how is not one of START_TO_START/START_TO_END/END_TO_END/END_TO_START",
+                )));
+            }
+            let source = args.get(1).cloned().unwrap_or(cv_js::Value::Null);
+            // The argument must be a Range (carries the hidden \u{1}isRange flag).
+            let is_range = matches!(&source, cv_js::Value::Object(o)
+                if matches!(o.borrow().get("\u{1}isRange"), Some(cv_js::Value::Bool(true))));
+            if !is_range {
+                return Err(cv_js::JsError::Throw(make_dom_exception(
+                    "TypeMismatchError",
+                    17,
+                    "sourceRange is not a Range",
+                )));
+            }
+            let (this_sc, _) = range_boundary(&range, "start");
+            let (src_sc, _) = range_boundary(&source, "start");
+            if !cv_js::Value::strict_eq(&js_node_root(&this_sc), &js_node_root(&src_sc)) {
+                return Err(cv_js::JsError::Throw(make_dom_exception(
+                    "WrongDocumentError",
+                    4,
+                    "the two ranges are in different documents",
+                )));
+            }
+            // §5.5: map `how` to (this point, other point).
+            // START_TO_START(0): this.start vs src.start
+            // START_TO_END(1):   this.end   vs src.start
+            // END_TO_END(2):     this.end   vs src.end
+            // END_TO_START(3):   this.start vs src.end
+            let (this_node, this_off) = if how == 0 || how == 3 {
+                range_boundary(&range, "start")
+            } else {
+                range_boundary(&range, "end")
+            };
+            let (other_node, other_off) = if how == 0 || how == 1 {
+                range_boundary(&source, "start")
+            } else {
+                range_boundary(&source, "end")
+            };
+            let n = match boundary_point_position(&this_node, this_off, &other_node, other_off) {
+                Ordering::Less => -1.0,
+                Ordering::Equal => 0.0,
+                Ordering::Greater => 1.0,
+            };
+            Ok(cv_js::Value::Number(n))
+        }),
+    );
 
     let range = cv_js::Value::Object(Rc::new(RefCell::new(m)));
     range_sync_public(&range);
@@ -53473,6 +53731,29 @@ fn install_dom_api(
                     "hasFeature".into(),
                     cv_js::native_fn("hasFeature", |_a| Ok(cv_js::Value::Bool(true))),
                 );
+            }
+            // WHATWG DOM §4.5.1: every node in the new document has node document
+            // == newdoc. Stamp ownerDocument on html/head/body so
+            // `foreignDoc.documentElement.ownerDocument.createRange()` resolves
+            // (the dom/ranges setup creates ranges off foreign-doc nodes). We do
+            // NOT link html._parent = newdoc here: the document node does not
+            // carry the full Node.prototype method surface (compareDocumentPosition
+            // etc.), so making it reachable as an ancestor would break the
+            // reference getPosition() walk — ownerDocument alone is what the
+            // createRange resolution needs.
+            for el in [&html_el, &head_el, &body_el] {
+                if let cv_js::Value::Object(o) = el {
+                    o.borrow_mut()
+                        .insert("ownerDocument".into(), newdoc.clone());
+                }
+            }
+            for el in [&head_el, &body_el] {
+                if let cv_js::Value::Object(o) = el {
+                    let mut em = o.borrow_mut();
+                    em.insert("_parent".into(), html_el.clone());
+                    em.insert("parentNode".into(), html_el.clone());
+                    em.insert("parentElement".into(), html_el.clone());
+                }
             }
             if let cv_js::Value::Object(o) = &newdoc {
                 let mut dm = o.borrow_mut();
@@ -73648,6 +73929,48 @@ mod tests {
             Some("IndexSizeError")
         );
     }
+
+    #[test]
+    fn range_comparison_methods_implement_section_5_5() {
+        // WHATWG DOM §5.5 + §5.3: comparePoint / isPointInRange / intersectsNode /
+        // compareBoundaryPoints over the boundary-point position algorithm. Also
+        // exercises the §4.4 compareDocumentPosition CONTAINS/CONTAINED_BY
+        // direction (the swap fix) via an ancestor boundary point.
+        let html = "<!doctype html><html><body><p id='p1'>Hello world</p><p id='p2'>Second</p><script>\
+            var p1=document.getElementById('p1'), p2=document.getElementById('p2');\
+            var tn=p1.firstChild, body=p1.parentNode, idx=Array.prototype.indexOf.call(body.childNodes,p1);\
+            var r=document.createRange(); r.setStart(tn,2); r.setEnd(tn,8);\
+            var out=document.getElementById('p1');\
+            out.setAttribute('data-cp-before', String(r.comparePoint(tn,0)));\
+            out.setAttribute('data-cp-in', String(r.comparePoint(tn,5)));\
+            out.setAttribute('data-cp-after', String(r.comparePoint(tn,10)));\
+            out.setAttribute('data-cp-ancestor', String(r.comparePoint(body,idx)));\
+            out.setAttribute('data-in-yes', String(r.isPointInRange(tn,5)));\
+            out.setAttribute('data-in-no', String(r.isPointInRange(tn,0)));\
+            out.setAttribute('data-int-p1', String(r.intersectsNode(p1)));\
+            out.setAttribute('data-int-p2', String(r.intersectsNode(p2)));\
+            var r2=document.createRange(); r2.setStart(tn,4); r2.setEnd(tn,6);\
+            out.setAttribute('data-cbp-ss', String(r.compareBoundaryPoints(Range.START_TO_START,r2)));\
+            var threw='no'; try{ r.comparePoint(99,0); }catch(e){ threw=(e&&e.name)||'TypeError'; }\
+            out.setAttribute('data-cp-nan', threw);\
+            </script></body></html>";
+        let cfg = cv_layout::LayoutConfig::default();
+        let (_runtime, doc, _sheets, _paint) =
+            build_runtime_and_first_paint(html, "https://example.com/", &cfg, "")
+                .expect("render ok");
+        assert_eq!(find_attr(&doc.root, "p1", "data-cp-before").as_deref(), Some("-1"));
+        assert_eq!(find_attr(&doc.root, "p1", "data-cp-in").as_deref(), Some("0"));
+        assert_eq!(find_attr(&doc.root, "p1", "data-cp-after").as_deref(), Some("1"));
+        // (body, index-of-p1) is BEFORE the range start (which is inside p1) → -1.
+        assert_eq!(find_attr(&doc.root, "p1", "data-cp-ancestor").as_deref(), Some("-1"));
+        assert_eq!(find_attr(&doc.root, "p1", "data-in-yes").as_deref(), Some("true"));
+        assert_eq!(find_attr(&doc.root, "p1", "data-in-no").as_deref(), Some("false"));
+        assert_eq!(find_attr(&doc.root, "p1", "data-int-p1").as_deref(), Some("true"));
+        assert_eq!(find_attr(&doc.root, "p1", "data-int-p2").as_deref(), Some("false"));
+        // r.start (tn,2) vs r2.start (tn,4): r before r2 → -1.
+        assert_eq!(find_attr(&doc.root, "p1", "data-cbp-ss").as_deref(), Some("-1"));
+    }
+
 
     #[test]
     fn appending_document_fragment_consumes_its_children() {
