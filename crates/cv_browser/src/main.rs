@@ -39040,10 +39040,15 @@ fn walk_for_table(
             .find(|a| a.name == "id")
             .map(|a| a.value.trim().to_string())
             .filter(|s| !s.is_empty());
-        let classes: Vec<String> = attrs
+        // Literal `class` attribute value (preserves whitespace + duplicates) —
+        // `className`/`classList.value` must return it verbatim (DOM §7.1).
+        let class_attr_literal: Option<String> = attrs
             .iter()
             .find(|a| a.name == "class")
-            .map(|a| a.value.split_whitespace().map(String::from).collect())
+            .map(|a| a.value.clone());
+        let classes: Vec<String> = class_attr_literal
+            .as_deref()
+            .map(ordered_set_parse)
             .unwrap_or_default();
 
         let mut text = String::new();
@@ -39065,7 +39070,10 @@ fn walk_for_table(
         }
         el_map.insert("tagName".into(), cv_js::Value::str(name.to_uppercase()));
         el_map.insert("nodeName".into(), cv_js::Value::str(name.to_uppercase()));
-        el_map.insert("className".into(), cv_js::Value::str(classes.join(" ")));
+        el_map.insert(
+            "className".into(),
+            cv_js::Value::str(class_attr_literal.clone().unwrap_or_default()),
+        );
         el_map.insert("textContent".into(), cv_js::Value::str(text_content.clone()));
         el_map.insert("innerText".into(), cv_js::Value::str(inner_text));
         el_map.insert("innerHTML".into(), cv_js::Value::str(String::new()));
@@ -40946,6 +40954,471 @@ fn make_attr_node_js(
     }
 
     Value::Object(obj)
+}
+
+/// Split a string into tokens on ASCII whitespace (WHATWG DOM §1.5 "split a
+/// string on ASCII whitespace"). Empty tokens (runs of whitespace) are dropped.
+/// HTML "ASCII whitespace" is TAB/LF/FF/CR/SPACE, which is exactly Rust's
+/// `char::is_ascii_whitespace` set (it excludes U+000B vertical tab).
+fn split_on_ascii_whitespace(s: &str) -> Vec<String> {
+    s.split(|c: char| c.is_ascii_whitespace())
+        .filter(|t| !t.is_empty())
+        .map(|t| t.to_string())
+        .collect()
+}
+
+/// The ordered set of tokens for a `class`-style attribute value: split on
+/// ASCII whitespace, then deduplicate preserving first-seen order (WHATWG DOM
+/// §1.5 "ordered set parser" — case-SENSITIVE).
+fn ordered_set_parse(s: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for tok in split_on_ascii_whitespace(s) {
+        if !out.contains(&tok) {
+            out.push(tok);
+        }
+    }
+    out
+}
+
+/// Serialize an ordered set of tokens to its attribute string: join with a
+/// single U+0020 SPACE (WHATWG DOM §1.5 "ordered set serializer").
+fn ordered_set_serialize(tokens: &[String]) -> String {
+    tokens.join(" ")
+}
+
+/// Validate a single DOMTokenList token (WHATWG DOM §7.1
+/// "DOMTokenList validation steps"): empty → SyntaxError; contains ASCII
+/// whitespace → InvalidCharacterError. Returns the matching DOMException value
+/// on failure.
+fn validate_token(tok: &str) -> Result<(), cv_js::Value> {
+    if tok.is_empty() {
+        return Err(make_syntax_dom_exception(
+            "The token provided must not be empty.",
+        ));
+    }
+    if tok.chars().any(|c| c.is_ascii_whitespace()) {
+        return Err(make_dom_exception(
+            "InvalidCharacterError",
+            5,
+            "The token provided contains HTML space characters, which are not valid in tokens.",
+        ));
+    }
+    Ok(())
+}
+
+/// DOMTokenList "update steps" (DOM §7.1): set the associated attribute to
+/// `serialized` — EXCEPT when the element has no such attribute AND the token set
+/// is empty (then the steps return without creating the attribute, so a no-op
+/// `remove`/`toggle(false)` on an element without a `class` attribute leaves it
+/// absent rather than materializing `class=""`).
+fn dtl_run_update(
+    get_raw: &std::rc::Rc<dyn Fn() -> Option<String>>,
+    set_raw: &std::rc::Rc<dyn Fn(&str)>,
+    serialized: &str,
+) {
+    if serialized.is_empty() && get_raw().is_none() {
+        return;
+    }
+    set_raw(serialized);
+}
+
+/// Build a live WHATWG `DOMTokenList` (DOM §7.1) — the object returned by
+/// `element.classList`. All state derives from re-reading the backing attribute
+/// (`get_raw`) on every access, and mutations write the serialized ordered set
+/// back through `set_raw`, so the list stays live and shares one source of truth
+/// with `getAttribute("class")`/`setAttribute("class", …)`.
+///
+/// Implements: indexed access (`list[i]`), `length`, `value` (get/set,
+/// `[PutForwards=value]`), `item`, `contains`, `add`, `remove`, `toggle(force)`,
+/// `replace`, `supports` (throws TypeError — no supported-tokens set for class),
+/// `toString`/`Symbol.toPrimitive`, `forEach`, `keys`/`values`/`entries`, and
+/// `Symbol.iterator`. Mutating methods validate each token (empty → SyntaxError,
+/// whitespace → InvalidCharacterError).
+///
+/// Backed by a Proxy whose `get`/`set` traps re-read the live attribute.
+fn make_dom_token_list_js(
+    get_raw: std::rc::Rc<dyn Fn() -> Option<String>>,
+    set_raw: std::rc::Rc<dyn Fn(&str)>,
+) -> cv_js::Value {
+    use cv_js::{native_fn, native_fn_with_interp, Value};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    // Current ordered set of tokens (deduped, whitespace-split).
+    let tokens = {
+        let g = get_raw.clone();
+        Rc::new(move || ordered_set_parse(&g().unwrap_or_default()))
+    };
+
+    let get_trap = {
+        let get_raw = get_raw.clone();
+        let set_raw = set_raw.clone();
+        let tokens = tokens.clone();
+        native_fn("get", move |args| {
+            let prop = args
+                .get(1)
+                .map(|v| v.to_display_string())
+                .unwrap_or_default();
+            // Numeric index → the i-th token (undefined out of range). The
+            // ordered set is the supported property index set (DOM §7.1).
+            if let Ok(i) = prop.parse::<usize>() {
+                let toks = tokens();
+                return Ok(toks.get(i).map(|t| Value::str(t.clone())).unwrap_or(Value::Undefined));
+            }
+            match prop.as_str() {
+                "length" => Ok(Value::Number(tokens().len() as f64)),
+                // `value` is the literal serialization of the attribute (the
+                // associated attribute's value verbatim), or "" when absent.
+                "value" => Ok(Value::str(get_raw().unwrap_or_default())),
+                "item" => {
+                    let tokens = tokens.clone();
+                    Ok(native_fn("item", move |a| {
+                        let idx = a.first().map(|v| v.to_number()).unwrap_or(f64::NAN);
+                        if idx.is_nan() || idx < 0.0 || idx >= 4294967295.0 {
+                            // Out-of-range / >= 2^32-1 → null (index coerces to
+                            // an unsigned long that can't be a valid index).
+                            return Ok(Value::Null);
+                        }
+                        let i = idx as usize;
+                        let toks = tokens();
+                        Ok(toks.get(i).map(|t| Value::str(t.clone())).unwrap_or(Value::Null))
+                    }))
+                }
+                "contains" => {
+                    let tokens = tokens.clone();
+                    Ok(native_fn("contains", move |a| {
+                        let tok = a.first().map(|v| v.to_display_string()).unwrap_or_default();
+                        Ok(Value::Bool(tokens().contains(&tok)))
+                    }))
+                }
+                "add" => {
+                    let tokens = tokens.clone();
+                    let set_raw = set_raw.clone();
+                    let get_raw = get_raw.clone();
+                    Ok(native_fn("add", move |a| {
+                        // 1. Validate every token first (whole call atomic).
+                        let mut new_tokens: Vec<String> = Vec::new();
+                        for arg in &a {
+                            let t = arg.to_display_string();
+                            if let Err(e) = validate_token(&t) {
+                                return Err(cv_js::JsError::Throw(e));
+                            }
+                            new_tokens.push(t);
+                        }
+                        // 2. Append each missing token, then run update steps.
+                        let mut set = tokens();
+                        for t in new_tokens {
+                            if !set.contains(&t) {
+                                set.push(t);
+                            }
+                        }
+                        dtl_run_update(&get_raw, &set_raw, &ordered_set_serialize(&set));
+                        Ok(Value::Undefined)
+                    }))
+                }
+                "remove" => {
+                    let tokens = tokens.clone();
+                    let set_raw = set_raw.clone();
+                    let get_raw = get_raw.clone();
+                    Ok(native_fn("remove", move |a| {
+                        let mut targets: Vec<String> = Vec::new();
+                        for arg in &a {
+                            let t = arg.to_display_string();
+                            if let Err(e) = validate_token(&t) {
+                                return Err(cv_js::JsError::Throw(e));
+                            }
+                            targets.push(t);
+                        }
+                        let mut set = tokens();
+                        set.retain(|t| !targets.contains(t));
+                        // remove() always runs the update steps (re-serializes),
+                        // except the no-op-on-absent-empty case handled by run_update.
+                        dtl_run_update(&get_raw, &set_raw, &ordered_set_serialize(&set));
+                        Ok(Value::Undefined)
+                    }))
+                }
+                "toggle" => {
+                    let tokens = tokens.clone();
+                    let set_raw = set_raw.clone();
+                    let get_raw = get_raw.clone();
+                    Ok(native_fn("toggle", move |a| {
+                        let tok = a.first().map(|v| v.to_display_string()).unwrap_or_default();
+                        if let Err(e) = validate_token(&tok) {
+                            return Err(cv_js::JsError::Throw(e));
+                        }
+                        let force = a.get(1).map(|v| v.to_bool());
+                        let mut set = tokens();
+                        let present = set.contains(&tok);
+                        let result;
+                        match force {
+                            // force=true: ensure present. If already present → no
+                            // update steps run (a true no-op).
+                            Some(true) => {
+                                if !present {
+                                    set.push(tok);
+                                    dtl_run_update(&get_raw, &set_raw, &ordered_set_serialize(&set));
+                                }
+                                result = true;
+                            }
+                            // force=false: ensure absent. If already absent → no
+                            // update steps run.
+                            Some(false) => {
+                                if present {
+                                    set.retain(|t| t != &tok);
+                                    dtl_run_update(&get_raw, &set_raw, &ordered_set_serialize(&set));
+                                }
+                                result = false;
+                            }
+                            None => {
+                                if present {
+                                    set.retain(|t| t != &tok);
+                                    result = false;
+                                } else {
+                                    set.push(tok);
+                                    result = true;
+                                }
+                                dtl_run_update(&get_raw, &set_raw, &ordered_set_serialize(&set));
+                            }
+                        }
+                        Ok(Value::Bool(result))
+                    }))
+                }
+                "replace" => {
+                    let tokens = tokens.clone();
+                    let set_raw = set_raw.clone();
+                    let get_raw = get_raw.clone();
+                    Ok(native_fn("replace", move |a| {
+                        let old = a.first().map(|v| v.to_display_string()).unwrap_or_default();
+                        let new_t = a.get(1).map(|v| v.to_display_string()).unwrap_or_default();
+                        // DOM §7.1 replace(): BOTH empty-checks (SyntaxError) run
+                        // before BOTH whitespace-checks (InvalidCharacterError).
+                        if old.is_empty() || new_t.is_empty() {
+                            return Err(cv_js::JsError::Throw(make_syntax_dom_exception(
+                                "The token provided must not be empty.",
+                            )));
+                        }
+                        if old.chars().any(|c| c.is_ascii_whitespace())
+                            || new_t.chars().any(|c| c.is_ascii_whitespace())
+                        {
+                            return Err(cv_js::JsError::Throw(make_dom_exception(
+                                "InvalidCharacterError",
+                                5,
+                                "The token provided contains HTML space characters, which are not valid in tokens.",
+                            )));
+                        }
+                        let mut set = tokens();
+                        if !set.iter().any(|t| t == &old) {
+                            // old not in set → return false, no update steps.
+                            return Ok(Value::Bool(false));
+                        }
+                        // Infra "replace within a list": set the FIRST occurrence
+                        // of (old OR new) to new, and drop the remaining
+                        // occurrences of either — preserving that first position.
+                        // E.g. {c,b,a} replace c→a ⇒ {a,b} (NOT {b,a}).
+                        let first = set
+                            .iter()
+                            .position(|t| t == &old || t == &new_t)
+                            .unwrap();
+                        let mut out: Vec<String> = Vec::with_capacity(set.len());
+                        for (i, t) in set.drain(..).enumerate() {
+                            if i == first {
+                                out.push(new_t.clone());
+                            } else if t != old && t != new_t {
+                                out.push(t);
+                            }
+                        }
+                        dtl_run_update(&get_raw, &set_raw, &ordered_set_serialize(&out));
+                        Ok(Value::Bool(true))
+                    }))
+                }
+                // DOMTokenList for `class` has no supported-tokens set, so
+                // `supports()` must throw a TypeError (DOM §7.1).
+                "supports" => Ok(native_fn("supports", move |_a| {
+                    Err(cv_js::JsError::Throw(make_type_error_value(
+                        "classList.supports is not supported for the 'class' attribute",
+                    )))
+                })),
+                "toString" => {
+                    let get_raw = get_raw.clone();
+                    Ok(native_fn("toString", move |_| {
+                        Ok(Value::str(get_raw().unwrap_or_default()))
+                    }))
+                }
+                "@@sym:Symbol.toPrimitive" => {
+                    let get_raw = get_raw.clone();
+                    Ok(native_fn("[Symbol.toPrimitive]", move |_| {
+                        Ok(Value::str(get_raw().unwrap_or_default()))
+                    }))
+                }
+                "forEach" => {
+                    let tokens = tokens.clone();
+                    Ok(native_fn_with_interp("forEach", move |interp, a| {
+                        let cb = a.first().cloned().unwrap_or(Value::Undefined);
+                        let this_arg = a.get(1).cloned().unwrap_or(Value::Undefined);
+                        let list_self = a.last().cloned().unwrap_or(Value::Undefined);
+                        let toks = tokens();
+                        for (i, t) in toks.iter().enumerate() {
+                            interp.call_value_with_this(
+                                cb.clone(),
+                                this_arg.clone(),
+                                vec![Value::str(t.clone()), Value::Number(i as f64), list_self.clone()],
+                            )?;
+                        }
+                        Ok(Value::Undefined)
+                    }))
+                }
+                "values" | "@@sym:Symbol.iterator" => {
+                    let tokens = tokens.clone();
+                    Ok(native_fn("values", move |_| {
+                        let items: Vec<Value> =
+                            tokens().into_iter().map(Value::str).collect();
+                        Ok(cv_js::interp::build_value_iterator(items))
+                    }))
+                }
+                "keys" => {
+                    let tokens = tokens.clone();
+                    Ok(native_fn("keys", move |_| {
+                        let items: Vec<Value> = (0..tokens().len())
+                            .map(|i| Value::Number(i as f64))
+                            .collect();
+                        Ok(cv_js::interp::build_value_iterator(items))
+                    }))
+                }
+                "entries" => {
+                    let tokens = tokens.clone();
+                    Ok(native_fn("entries", move |_| {
+                        let items: Vec<Value> = tokens()
+                            .into_iter()
+                            .enumerate()
+                            .map(|(i, t)| {
+                                Value::Array(Rc::new(RefCell::new(vec![
+                                    Value::Number(i as f64),
+                                    Value::str(t),
+                                ])))
+                            })
+                            .collect();
+                        Ok(cv_js::interp::build_value_iterator(items))
+                    }))
+                }
+                // For-of / spread reads `__iterator__` directly off the object.
+                "__iterator__" => {
+                    let items: Vec<Value> =
+                        tokens().into_iter().map(Value::str).collect();
+                    Ok(Value::Array(Rc::new(RefCell::new(items))))
+                }
+                // `Object.prototype.toString.call(classList)` → "[object DOMTokenList]".
+                "@@sym:Symbol.toStringTag" => Ok(Value::str("DOMTokenList".to_string())),
+                _ => Ok(Value::Undefined),
+            }
+        })
+    };
+
+    // `has` trap so the `in` operator works: own DOMTokenList members, numeric
+    // indices in range, and the iterator/toStringTag symbols.
+    let has_trap = {
+        let tokens = tokens.clone();
+        native_fn("has", move |args| {
+            let prop = args
+                .get(1)
+                .map(|v| v.to_display_string())
+                .unwrap_or_default();
+            if let Ok(i) = prop.parse::<usize>() {
+                return Ok(cv_js::Value::Bool(i < tokens().len()));
+            }
+            let known = matches!(
+                prop.as_str(),
+                "length"
+                    | "value"
+                    | "item"
+                    | "contains"
+                    | "add"
+                    | "remove"
+                    | "toggle"
+                    | "replace"
+                    | "supports"
+                    | "toString"
+                    | "forEach"
+                    | "keys"
+                    | "values"
+                    | "entries"
+                    | "@@sym:Symbol.iterator"
+                    | "@@sym:Symbol.toStringTag"
+            );
+            Ok(cv_js::Value::Bool(known))
+        })
+    };
+
+    let set_trap = {
+        let set_raw = set_raw.clone();
+        native_fn("set", move |args| {
+            let prop = args
+                .get(1)
+                .map(|v| v.to_display_string())
+                .unwrap_or_default();
+            // Only `value` is settable ([PutForwards=value]); indexed/other
+            // writes are silently ignored (DOMTokenList has read-only indices).
+            if prop == "value" {
+                let v = args.get(2).map(|v| v.to_display_string()).unwrap_or_default();
+                set_raw(&v);
+            }
+            Ok(cv_js::Value::Bool(true))
+        })
+    };
+
+    let mut handler = cv_js::OrderedMap::new();
+    handler.insert("get".into(), get_trap);
+    handler.insert("set".into(), set_trap);
+    handler.insert("has".into(), has_trap);
+
+    // The proxy TARGET carries symbol-keyed members as REAL own keys. The
+    // engine's immutable `read_property` (used by internal `for-of`/spread and
+    // `String()` coercion) bypasses the proxy get trap and forwards to the
+    // target, so these must live HERE (not on the proxy wrapper). Symbol keys
+    // (`@@sym:`) are non-enumerable, so they never leak into Object.keys/for-in.
+    // Each rebuilds from the LIVE token set on every call.
+    let mut target_map = cv_js::OrderedMap::new();
+    // `Object.prototype.toString.call(classList)` reads this directly →
+    // "[object DOMTokenList]" (DOM §7.1).
+    target_map.insert(
+        "@@sym:Symbol.toStringTag".into(),
+        Value::str("DOMTokenList".to_string()),
+    );
+    {
+        let tokens_it = tokens.clone();
+        target_map.insert(
+            "@@sym:Symbol.iterator".into(),
+            native_fn("[Symbol.iterator]", move |_| {
+                let items: Vec<Value> = tokens_it().into_iter().map(Value::str).collect();
+                Ok(cv_js::interp::build_value_iterator(items))
+            }),
+        );
+        let get_raw_tp = get_raw.clone();
+        target_map.insert(
+            "@@sym:Symbol.toPrimitive".into(),
+            native_fn("[Symbol.toPrimitive]", move |_| {
+                Ok(Value::str(get_raw_tp().unwrap_or_default()))
+            }),
+        );
+    }
+
+    let mut proxy_map = cv_js::OrderedMap::new();
+    proxy_map.insert("_isProxy".into(), Value::Bool(true));
+    proxy_map.insert("_isDOMTokenList".into(), Value::Bool(true));
+    // Also on the wrapper: `Object.prototype.toString.call(classList)` reads the
+    // toStringTag off the RECEIVER object directly (not via the target/trap).
+    proxy_map.insert(
+        "@@sym:Symbol.toStringTag".into(),
+        Value::str("DOMTokenList".to_string()),
+    );
+    proxy_map.insert(
+        "_target".into(),
+        Value::Object(Rc::new(RefCell::new(target_map))),
+    );
+    proxy_map.insert(
+        "_handler".into(),
+        Value::Object(Rc::new(RefCell::new(handler))),
+    );
+    Value::Object(Rc::new(RefCell::new(proxy_map)))
 }
 
 /// Build a live `NamedNodeMap` (`el.attributes`, WHATWG DOM §4.9.1) over an
@@ -45566,15 +46039,12 @@ fn make_new_element_js_with_canvas_registry(
                 map.insert("id".into(), cv_js::Value::str(value));
             }
             "class" => {
-                let parts: Vec<String> = value.split_whitespace().map(|s| s.to_string()).collect();
-                *classes_for_set.borrow_mut() = parts;
-                drop(map);
-                sync_class_name(
-                    &obj_for_set,
-                    &attrs_for_set,
-                    &attrs_obj_for_set,
-                    &classes_for_set,
-                );
+                // Store the LITERAL attribute value verbatim (classList.value /
+                // toString must return it unchanged, dups + whitespace and all);
+                // `attrs`/`attrs_obj` already hold the literal `value` from above.
+                // The parsed ordered set drives classList's token operations.
+                map.insert("className".into(), cv_js::Value::str(value.clone()));
+                *classes_for_set.borrow_mut() = ordered_set_parse(&value);
                 return Ok(cv_js::Value::Undefined);
             }
             "width" if tag_for_set == "canvas" => {
@@ -45689,13 +46159,13 @@ fn make_new_element_js_with_canvas_registry(
                 .insert("id".into(), cv_js::Value::str(String::new()));
         }
         if lower == "class" {
+            // The attribute was already removed from `attrs`/`attrs_obj` above,
+            // so `getAttribute("class")` now returns null (NOT "") — don't
+            // re-insert via sync_class_name. Just clear the derived state.
             classes_for_remove.borrow_mut().clear();
-            sync_class_name(
-                &obj_for_remove,
-                &attrs_for_remove,
-                &attrs_obj_for_remove,
-                &classes_for_remove,
-            );
+            obj_for_remove
+                .borrow_mut()
+                .insert("className".into(), cv_js::Value::str(String::new()));
         }
         Ok(cv_js::Value::Undefined)
     });
@@ -45729,129 +46199,55 @@ fn make_new_element_js_with_canvas_registry(
         Ok(cv_js::Value::Bool(make_present))
     });
 
-    let obj_for_add = obj.clone();
-    let attrs_for_add = attrs.clone();
-    let attrs_obj_for_add = attrs_obj.clone();
-    let classes_for_add = class_names.clone();
-    let add_class = cv_js::native_fn("add", move |args| {
-        let mut classes = classes_for_add.borrow_mut();
-        for arg in args {
-            let name = arg.to_display_string();
-            if !name.is_empty() && !classes.contains(&name) {
-                classes.push(name);
-            }
-        }
-        drop(classes);
-        sync_class_name(
-            &obj_for_add,
-            &attrs_for_add,
-            &attrs_obj_for_add,
-            &classes_for_add,
-        );
-        Ok(cv_js::Value::Undefined)
-    });
-
-    let obj_for_remove_class = obj.clone();
-    let attrs_for_remove_class = attrs.clone();
-    let attrs_obj_for_remove_class = attrs_obj.clone();
-    let classes_for_remove_class = class_names.clone();
-    let remove_class = cv_js::native_fn("remove", move |args| {
-        let mut classes = classes_for_remove_class.borrow_mut();
-        for arg in args {
-            let name = arg.to_display_string();
-            classes.retain(|c| c != &name);
-        }
-        drop(classes);
-        sync_class_name(
-            &obj_for_remove_class,
-            &attrs_for_remove_class,
-            &attrs_obj_for_remove_class,
-            &classes_for_remove_class,
-        );
-        Ok(cv_js::Value::Undefined)
-    });
-
-    let obj_for_toggle_class = obj.clone();
-    let attrs_for_toggle_class = attrs.clone();
-    let attrs_obj_for_toggle_class = attrs_obj.clone();
-    let classes_for_toggle_class = class_names.clone();
-    let toggle_class = cv_js::native_fn("toggle", move |args| {
-        let name = args
-            .first()
-            .map(|v| v.to_display_string())
-            .unwrap_or_default();
-        let force = args.get(1).map(|v| v.to_bool());
-        if name.is_empty() {
-            return Ok(cv_js::Value::Bool(false));
-        }
-        let mut classes = classes_for_toggle_class.borrow_mut();
-        let has = classes.contains(&name);
-        let make_present = force.unwrap_or(!has);
-        if make_present {
-            if !has {
-                classes.push(name);
-            }
-        } else {
-            classes.retain(|c| c != &name);
-        }
-        drop(classes);
-        sync_class_name(
-            &obj_for_toggle_class,
-            &attrs_for_toggle_class,
-            &attrs_obj_for_toggle_class,
-            &classes_for_toggle_class,
-        );
-        Ok(cv_js::Value::Bool(make_present))
-    });
-
-    let classes_for_contains = class_names.clone();
-    let contains_class = cv_js::native_fn("contains", move |args| {
-        let name = args
-            .first()
-            .map(|v| v.to_display_string())
-            .unwrap_or_default();
-        Ok(cv_js::Value::Bool(
-            classes_for_contains.borrow().contains(&name),
-        ))
-    });
-
-    let obj_for_replace_class = obj.clone();
-    let attrs_for_replace_class = attrs.clone();
-    let attrs_obj_for_replace_class = attrs_obj.clone();
-    let classes_for_replace_class = class_names.clone();
-    let replace_class = cv_js::native_fn("replace", move |args| {
-        let old = args
-            .first()
-            .map(|v| v.to_display_string())
-            .unwrap_or_default();
-        let new_name = args
-            .get(1)
-            .map(|v| v.to_display_string())
-            .unwrap_or_default();
-        let mut classes = classes_for_replace_class.borrow_mut();
-        let mut changed = false;
-        if let Some(pos) = classes.iter().position(|c| c == &old) {
-            classes[pos] = new_name;
-            changed = true;
-        }
-        drop(classes);
-        if changed {
-            sync_class_name(
-                &obj_for_replace_class,
-                &attrs_for_replace_class,
-                &attrs_obj_for_replace_class,
-                &classes_for_replace_class,
+    // Full WHATWG DOMTokenList (DOM §7.1) for created elements. All state
+    // derives from the live `class` attribute; mutations re-serialize the
+    // ordered set back through the same attribute store (literal value, MO
+    // record, attributeChangedCallback) so getAttribute("class") stays in sync.
+    let class_list_set_raw: std::rc::Rc<dyn Fn(&str)> = {
+        let obj_set = obj.clone();
+        let attrs_set = attrs.clone();
+        let attrs_obj_set = attrs_obj.clone();
+        let attr_list_set = attr_list.clone();
+        let classes_set = class_names.clone();
+        std::rc::Rc::new(move |new_value: &str| {
+            let mo_old = attrs_set.borrow().get("class").cloned();
+            let mo_target = cv_js::Value::Object(obj_set.clone());
+            emit_js_attribute_mutation(&mo_target, "class", None, mo_old.as_deref());
+            enqueue_attribute_changed_reaction(
+                &mo_target,
+                "class",
+                mo_old.as_deref(),
+                Some(new_value),
+                None,
             );
-        }
-        Ok(cv_js::Value::Bool(changed))
-    });
-
-    let mut class_list_map: HashMap<String, cv_js::Value> = HashMap::new();
-    class_list_map.insert("add".into(), add_class);
-    class_list_map.insert("remove".into(), remove_class);
-    class_list_map.insert("toggle".into(), toggle_class);
-    class_list_map.insert("contains".into(), contains_class);
-    class_list_map.insert("replace".into(), replace_class);
+            attrs_set
+                .borrow_mut()
+                .insert("class".to_string(), new_value.to_string());
+            attrs_obj_set
+                .borrow_mut()
+                .insert("class".to_string(), cv_js::Value::str(new_value.to_string()));
+            {
+                let mut list = attr_list_set.borrow_mut();
+                if let Some(e) =
+                    list.iter_mut().find(|e| e.namespace.is_none() && e.local_name == "class")
+                {
+                    e.value = new_value.to_string();
+                } else {
+                    list.push(AttrEntry::plain("class", new_value));
+                }
+            }
+            *classes_set.borrow_mut() = ordered_set_parse(new_value);
+            obj_set
+                .borrow_mut()
+                .insert("className".into(), cv_js::Value::str(new_value.to_string()));
+        })
+    };
+    let class_list = {
+        let attrs_get = attrs.clone();
+        let get_raw: std::rc::Rc<dyn Fn() -> Option<String>> =
+            std::rc::Rc::new(move || attrs_get.borrow().get("class").cloned());
+        make_dom_token_list_js(get_raw, class_list_set_raw.clone())
+    };
 
     // insertAdjacentElement / insertAdjacentText / insertAdjacentHTML +
     // outerHTML setter for CREATED elements (document.createElement /
@@ -46644,10 +47040,20 @@ fn make_new_element_js_with_canvas_registry(
                 .insert("shadowRoot".into(), cv_js::Value::Null);
         }
         let mut map = obj.borrow_mut();
-        map.insert(
-            "classList".into(),
-            cv_js::Value::Object(Rc::new(RefCell::new(class_list_map))),
-        );
+        // `classList` is [SameObject, PutForwards=value] (DOM §4.9): the getter
+        // returns the one cached DOMTokenList proxy; `e.classList = "x"` forwards
+        // to `.value = "x"` (it does NOT replace the property).
+        {
+            let cl_get = class_list.clone();
+            let getter = cv_js::native_fn("get classList", move |_| Ok(cl_get.clone()));
+            let set_raw = class_list_set_raw.clone();
+            let setter = cv_js::native_fn("set classList", move |a| {
+                let v = a.first().map(|x| x.to_display_string()).unwrap_or_default();
+                set_raw(&v);
+                Ok(cv_js::Value::Undefined)
+            });
+            map.insert("classList".into(), tb_js_accessor(getter, setter));
+        }
         // Self-contained listener registry on each ad-hoc node (returned
         // by document.createElement / cloneNode etc.) so addEventListener
         // + dispatchEvent actually round-trip without needing a path
@@ -47539,9 +47945,7 @@ fn install_dom_api(
                 );
                 // Keep classList in sync when the class attribute is changed.
                 if name.eq_ignore_ascii_case("class") {
-                    let parts: Vec<String> =
-                        value.split_whitespace().map(|s| s.to_string()).collect();
-                    *cur_classes_set.borrow_mut() = parts;
+                    *cur_classes_set.borrow_mut() = ordered_set_parse(&value);
                 }
                 attr_writes_set
                     .borrow_mut()
@@ -47665,125 +48069,67 @@ fn install_dom_api(
                 Ok(cv_js::Value::Bool(make_present))
             });
 
-            // classList API — add / remove / toggle / contains.
-            // Reuse the same Rc<RefCell> that setAttribute captures so that
-            // setAttribute('class', …) keeps classList in sync automatically.
-            let cur_classes = cur_classes_for_set.clone();
-            let path_cl = rec.path.clone();
-            let attr_writes_cl = attr_writes.clone();
-            let push_class_attr_write = |classes: &std::rc::Rc<std::cell::RefCell<Vec<String>>>,
-                                         path: &Vec<usize>,
-                                         writes: &std::rc::Rc<
-                std::cell::RefCell<Vec<(Vec<usize>, String, String)>>,
-            >| {
-                let joined = classes.borrow().join(" ");
-                let mut w = writes.borrow_mut();
-                w.retain(|(p, n, _)| !(p == path && n == "class"));
-                w.push((path.clone(), "class".to_string(), joined));
+            // Full WHATWG DOMTokenList (DOM §7.1). State derives from the live
+            // `class` attribute (the attr_writes log most-recent-wins, else the
+            // parse-time snapshot); mutations push a single class write (literal
+            // serialized ordered set) and emit a MutationRecord, so it stays in
+            // sync with getAttribute("class")/setAttribute.
+            let class_list = {
+                let path_cl = rec.path.clone();
+                let writes_get = attr_writes.clone();
+                let orig_get = rec.original_attrs.clone();
+                let path_get = path_cl.clone();
+                let get_raw: std::rc::Rc<dyn Fn() -> Option<String>> =
+                    std::rc::Rc::new(move || {
+                        for (p, n, v) in writes_get.borrow().iter().rev() {
+                            if p == &path_get && n.eq_ignore_ascii_case("class") {
+                                return if v == "\x01" { None } else { Some(v.clone()) };
+                            }
+                        }
+                        orig_get.get("class").cloned()
+                    });
+
+                let writes_set = attr_writes.clone();
+                let cur_classes_setraw = cur_classes_for_set.clone();
+                let js_setraw = rec.js.clone();
+                let orig_setraw = rec.original_attrs.clone();
+                let path_set = path_cl.clone();
+                let set_raw: std::rc::Rc<dyn Fn(&str)> = std::rc::Rc::new(move |new_value: &str| {
+                    // oldValue for the MutationRecord = prior class write, else original.
+                    let mo_old = {
+                        let w = writes_set.borrow();
+                        w.iter()
+                            .rev()
+                            .find(|(p, n, _)| p == &path_set && n.eq_ignore_ascii_case("class"))
+                            .map(|(_, _, v)| v.clone())
+                            .filter(|v| v != "\x01")
+                            .or_else(|| orig_setraw.get("class").cloned())
+                    };
+                    emit_js_attribute_mutation(&js_setraw, "class", None, mo_old.as_deref());
+                    enqueue_attribute_changed_reaction(
+                        &js_setraw,
+                        "class",
+                        mo_old.as_deref(),
+                        Some(new_value),
+                        None,
+                    );
+                    *cur_classes_setraw.borrow_mut() = ordered_set_parse(new_value);
+                    let mut w = writes_set.borrow_mut();
+                    w.retain(|(p, n, _)| !(p == &path_set && n.eq_ignore_ascii_case("class")));
+                    w.push((path_set.clone(), "class".to_string(), new_value.to_string()));
+                });
+                let proxy = make_dom_token_list_js(get_raw, set_raw.clone());
+                // [SameObject, PutForwards=value]: getter returns the cached
+                // proxy; `e.classList = "x"` forwards to `.value = "x"`.
+                let cl_get = proxy.clone();
+                let getter = cv_js::native_fn("get classList", move |_| Ok(cl_get.clone()));
+                let setter = cv_js::native_fn("set classList", move |a| {
+                    let v = a.first().map(|x| x.to_display_string()).unwrap_or_default();
+                    set_raw(&v);
+                    Ok(cv_js::Value::Undefined)
+                });
+                tb_js_accessor(getter, setter)
             };
-
-            let c_add = cur_classes.clone();
-            let p_add = path_cl.clone();
-            let w_add = attr_writes_cl.clone();
-            let push_for_add = push_class_attr_write;
-            let add = cv_js::native_fn("add", move |args| {
-                let mut cs = c_add.borrow_mut();
-                for arg in args {
-                    let name = arg.to_display_string();
-                    if !name.is_empty() && !cs.contains(&name) {
-                        cs.push(name);
-                    }
-                }
-                drop(cs);
-                push_for_add(&c_add, &p_add, &w_add);
-                Ok(cv_js::Value::Undefined)
-            });
-
-            let c_rm = cur_classes.clone();
-            let p_rm = path_cl.clone();
-            let w_rm = attr_writes_cl.clone();
-            let push_for_rm = push_class_attr_write;
-            let remove_cls = cv_js::native_fn("remove", move |args| {
-                let mut cs = c_rm.borrow_mut();
-                for arg in args {
-                    let name = arg.to_display_string();
-                    cs.retain(|c| c != &name);
-                }
-                drop(cs);
-                push_for_rm(&c_rm, &p_rm, &w_rm);
-                Ok(cv_js::Value::Undefined)
-            });
-
-            let c_tg = cur_classes.clone();
-            let p_tg = path_cl.clone();
-            let w_tg = attr_writes_cl.clone();
-            let push_for_tg = push_class_attr_write;
-            let toggle = cv_js::native_fn("toggle", move |args| {
-                let name = args
-                    .first()
-                    .map(|v| v.to_display_string())
-                    .unwrap_or_default();
-                if name.is_empty() {
-                    return Ok(cv_js::Value::Bool(false));
-                }
-                let mut cs = c_tg.borrow_mut();
-                let now_present = if cs.contains(&name) {
-                    cs.retain(|c| c != &name);
-                    false
-                } else {
-                    cs.push(name);
-                    true
-                };
-                drop(cs);
-                push_for_tg(&c_tg, &p_tg, &w_tg);
-                Ok(cv_js::Value::Bool(now_present))
-            });
-
-            let c_has = cur_classes.clone();
-            let contains_cls = cv_js::native_fn("contains", move |args| {
-                let name = args
-                    .first()
-                    .map(|v| v.to_display_string())
-                    .unwrap_or_default();
-                Ok(cv_js::Value::Bool(c_has.borrow().contains(&name)))
-            });
-
-            let mut cl_map: cv_js::OrderedMap<String, cv_js::Value> = cv_js::OrderedMap::new();
-            cl_map.insert("add".into(), add);
-            cl_map.insert("remove".into(), remove_cls);
-            cl_map.insert("toggle".into(), toggle);
-            cl_map.insert("contains".into(), contains_cls);
-
-            // classList.replace(old, new) — swap one class for another
-            // if present; returns true on success.
-            let c_repl = cur_classes.clone();
-            let p_repl = path_cl.clone();
-            let w_repl = attr_writes_cl.clone();
-            let push_for_repl = push_class_attr_write;
-            let replace_cls = cv_js::native_fn("replace", move |args| {
-                let old = args
-                    .first()
-                    .map(|v| v.to_display_string())
-                    .unwrap_or_default();
-                let new_c = args
-                    .get(1)
-                    .map(|v| v.to_display_string())
-                    .unwrap_or_default();
-                let mut cs = c_repl.borrow_mut();
-                let mut changed = false;
-                if let Some(pos) = cs.iter().position(|c| c == &old) {
-                    cs[pos] = new_c;
-                    changed = true;
-                }
-                drop(cs);
-                if changed {
-                    push_for_repl(&c_repl, &p_repl, &w_repl);
-                }
-                Ok(cv_js::Value::Bool(changed))
-            });
-            cl_map.insert("replace".into(), replace_cls);
-            let class_list =
-                cv_js::Value::Object(std::rc::Rc::new(std::cell::RefCell::new(cl_map)));
 
             // addEventListener: capture (path, event_name, callback, options).
             let listeners_for_add = table.borrow().event_listeners.clone();
@@ -73934,6 +74280,137 @@ var el = document.getElementById('el');
             "getAttribute('class') must include 'baz' after classList.add, got {:?}",
             ga
         );
+    }
+
+    // WHATWG DOMTokenList (DOM §7.1): length/item/value/toString reflect the
+    // ordered set + literal attribute; supports() throws; indexed access works.
+    #[test]
+    fn dom_token_list_length_item_value() {
+        let doc = cv_html::parse("<!doctype html><html><body></body></html>");
+        let mut runtime = LiveInterp::new(&doc, "https://example.com/");
+        runtime
+            .interp
+            .run(
+                "var el = document.createElement('div'); \
+                 el.setAttribute('class', '   a  a b '); \
+                 window.__len = el.classList.length; \
+                 window.__item0 = el.classList.item(0); \
+                 window.__item1 = el.classList.item(1); \
+                 window.__item2 = String(el.classList.item(2)); \
+                 window.__idx0 = el.classList[0]; \
+                 window.__value = el.classList.value; \
+                 window.__ts = el.classList.toString();",
+            )
+            .expect("dom token list run");
+        // Ordered set dedups: {a, b} → length 2.
+        assert_eq!(window_str(&runtime, "__len"), "2");
+        assert_eq!(window_str(&runtime, "__item0"), "a");
+        assert_eq!(window_str(&runtime, "__item1"), "b");
+        assert_eq!(window_str(&runtime, "__item2"), "null");
+        assert_eq!(window_str(&runtime, "__idx0"), "a");
+        // value/toString return the LITERAL attribute (whitespace + dups kept).
+        assert_eq!(window_str(&runtime, "__value"), "   a  a b ");
+        assert_eq!(window_str(&runtime, "__ts"), "   a  a b ");
+    }
+
+    // add/remove/toggle re-serialize the ordered set into the literal attribute;
+    // toggle(force) is a no-op when already in the wanted state.
+    #[test]
+    fn dom_token_list_add_remove_toggle_replace() {
+        let doc = cv_html::parse("<!doctype html><html><body></body></html>");
+        let mut runtime = LiveInterp::new(&doc, "https://example.com/");
+        runtime
+            .interp
+            .run(
+                "var el = document.createElement('div'); \
+                 el.setAttribute('class', 'a a a  b'); \
+                 el.classList.add('a');      window.__after_noop_add = el.getAttribute('class'); \
+                 el.classList.add('c');      window.__after_add = el.getAttribute('class'); \
+                 el.classList.remove('a');   window.__after_remove = el.getAttribute('class'); \
+                 var r = el.classList.toggle('z'); window.__toggle_on = r + ':' + el.getAttribute('class'); \
+                 var r2 = el.classList.replace('z','c'); window.__replace = r2 + ':' + el.getAttribute('class');",
+            )
+            .expect("mutate run");
+        // add('a') still runs update steps → re-serialized ordered set "a b".
+        assert_eq!(window_str(&runtime, "__after_noop_add"), "a b");
+        assert_eq!(window_str(&runtime, "__after_add"), "a b c");
+        assert_eq!(window_str(&runtime, "__after_remove"), "b c");
+        // toggle('z') with no force adds it → true, class "b c z".
+        assert_eq!(window_str(&runtime, "__toggle_on"), "true:b c z");
+        // replace('z','c'): z present, c present → {b,c,z} ⇒ first of (z|c) is c
+        // at idx1, drop the rest → "b c". returns true.
+        assert_eq!(window_str(&runtime, "__replace"), "true:b c");
+    }
+
+    // Empty token → SyntaxError; whitespace token → InvalidCharacterError
+    // (DOMTokenList validation steps). supports() throws TypeError.
+    #[test]
+    fn dom_token_list_validation_and_supports_throw() {
+        let doc = cv_html::parse("<!doctype html><html><body></body></html>");
+        let mut runtime = LiveInterp::new(&doc, "https://example.com/");
+        runtime
+            .interp
+            .run(
+                "var el = document.createElement('div'); \
+                 function nm(f){ try { f(); return 'no-throw'; } catch(e){ return e.name; } } \
+                 window.__empty = nm(function(){ el.classList.add(''); }); \
+                 window.__ws = nm(function(){ el.classList.add('a b'); }); \
+                 window.__supports = nm(function(){ el.classList.supports('a'); });",
+            )
+            .expect("validation run");
+        assert_eq!(window_str(&runtime, "__empty"), "SyntaxError");
+        assert_eq!(window_str(&runtime, "__ws"), "InvalidCharacterError");
+        assert_eq!(window_str(&runtime, "__supports"), "TypeError");
+    }
+
+    // classList is iterable (for-of / spread) and forEach works; the
+    // [PutForwards=value] setter forwards `el.classList = "x"` to `.value`.
+    #[test]
+    fn dom_token_list_iteration_and_putforwards() {
+        let doc = cv_html::parse("<!doctype html><html><body></body></html>");
+        let mut runtime = LiveInterp::new(&doc, "https://example.com/");
+        runtime
+            .interp
+            .run(
+                "var el = document.createElement('div'); \
+                 el.setAttribute('class', 'a b c'); \
+                 var out = []; for (var t of el.classList) out.push(t); \
+                 window.__forof = out.join(','); \
+                 window.__spread = [...el.classList].join('|'); \
+                 var fe = []; el.classList.forEach(function(v){ fe.push(v); }); \
+                 window.__foreach = fe.join(','); \
+                 el.classList = 'x y'; window.__putforwards = el.getAttribute('class');",
+            )
+            .expect("iter run");
+        assert_eq!(window_str(&runtime, "__forof"), "a,b,c");
+        assert_eq!(window_str(&runtime, "__spread"), "a|b|c");
+        assert_eq!(window_str(&runtime, "__foreach"), "a,b,c");
+        // PutForwards: assigning the string forwards to value, does NOT replace.
+        assert_eq!(window_str(&runtime, "__putforwards"), "x y");
+    }
+
+    // Regression: a `var` declared ONLY inside a nested block must hoist to the
+    // enclosing FUNCTION scope (ECMA-262 VarDeclaredNames). The VM tier dropped
+    // these (declared them in the transient block scope), causing a spurious
+    // ReferenceError on a later read — which blocked ~700 WPT classlist subtests.
+    #[test]
+    fn var_hoists_out_of_nested_block_in_vm_tier() {
+        let doc = cv_html::parse("<!doctype html><html><body></body></html>");
+        let mut runtime = LiveInterp::new(&doc, "https://example.com/");
+        runtime
+            .interp
+            .run(
+                "function f1(){ if (true) { var x = 5; } return x; } \
+                 function f2(){ { var y = 7; } return y; } \
+                 function f3(){ for (var i = 0; i < 1; i++) { var z = 9; } return z + ':' + i; } \
+                 function f4(){ var got; for (var k in {a:1}) { var seen = k; } return seen; } \
+                 window.__f1 = f1(); window.__f2 = f2(); window.__f3 = f3(); window.__f4 = f4();",
+            )
+            .expect("var hoist run");
+        assert_eq!(window_str(&runtime, "__f1"), "5", "var in if hoists");
+        assert_eq!(window_str(&runtime, "__f2"), "7", "var in bare block hoists");
+        assert_eq!(window_str(&runtime, "__f3"), "9:1", "var in for-body hoists");
+        assert_eq!(window_str(&runtime, "__f4"), "a", "var in for-in body hoists");
     }
 
     // setAttribute('data-x', '') must be retrievable as "" (not null).

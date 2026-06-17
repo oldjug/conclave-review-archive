@@ -1166,6 +1166,88 @@ pub fn run_closure(
     )
 }
 
+/// Collect every `var`-declared name reachable from `stmts` WITHOUT descending
+/// into nested function bodies — the VM-tier mirror of `interp::collect_var_names`
+/// (ECMA-262 VarDeclaredNames). `var`, `for (var …)`, and `for (var … in/of …)`
+/// bindings hoist to the enclosing FUNCTION scope, crossing block/if/loop/try/
+/// switch boundaries but never a function boundary. `let`/`const` are excluded.
+fn bc_collect_var_names(stmts: &[Stmt], out: &mut Vec<String>) {
+    for s in stmts {
+        bc_collect_var_names_stmt(s, out);
+    }
+}
+
+fn bc_collect_var_names_stmt(s: &Stmt, out: &mut Vec<String>) {
+    use crate::ast::VarKind;
+    match s {
+        Stmt::VarDecl {
+            kind: VarKind::Var,
+            decls,
+        } => {
+            for d in decls {
+                out.push(d.name.clone());
+            }
+        }
+        Stmt::VarDecl { .. } => {}
+        // A nested function has its own var scope — do not descend.
+        Stmt::FunctionDecl { .. } => {}
+        Stmt::Block(b) => bc_collect_var_names(b, out),
+        Stmt::If { cons, alt, .. } => {
+            bc_collect_var_names_stmt(cons, out);
+            if let Some(a) = alt {
+                bc_collect_var_names_stmt(a, out);
+            }
+        }
+        Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => {
+            bc_collect_var_names_stmt(body, out)
+        }
+        Stmt::For { init, body, .. } => {
+            if let Some(ForInit::VarDecl {
+                kind: VarKind::Var,
+                decls,
+            }) = init
+            {
+                for d in decls {
+                    out.push(d.name.clone());
+                }
+            }
+            bc_collect_var_names_stmt(body, out);
+        }
+        Stmt::ForIn {
+            kind, name, body, ..
+        }
+        | Stmt::ForOf {
+            kind, name, body, ..
+        } => {
+            if matches!(kind, Some(VarKind::Var)) {
+                out.push(name.clone());
+            }
+            bc_collect_var_names_stmt(body, out);
+        }
+        Stmt::Try {
+            block,
+            catch_block,
+            finally_block,
+            ..
+        } => {
+            bc_collect_var_names(block, out);
+            if let Some(cb) = catch_block {
+                bc_collect_var_names(cb, out);
+            }
+            if let Some(fb) = finally_block {
+                bc_collect_var_names(fb, out);
+            }
+        }
+        Stmt::Switch { cases, .. } => {
+            for c in cases {
+                bc_collect_var_names(&c.body, out);
+            }
+        }
+        Stmt::Labeled { body, .. } => bc_collect_var_names_stmt(body, out),
+        _ => {}
+    }
+}
+
 fn compile_function(
     name: &str,
     params: &[String],
@@ -1245,6 +1327,24 @@ fn compile_function(
                 if c.lookup(name).is_none() {
                     c.declare(name);
                 }
+            }
+        }
+        // PRE-DECLARE every `var`-hoisted name (ECMA-262 VarDeclaredNames),
+        // including ones nested inside blocks / if / loops / try / switch. A
+        // `var x` only inside a block must hoist to a FUNCTION-scope slot, so a
+        // later read (`return x` after the block) resolves to it. Without this,
+        // `compile_stmt` declared the `var` in the transient block scope (popped
+        // when the block ends) and the read fell through to a global load →
+        // spurious ReferenceError. The top scope is `scopes[0]` (params live
+        // here too); a param of the same name already occupies the slot, so
+        // `lookup` short-circuits and we don't clobber it.
+        let mut hoisted: Vec<String> = Vec::new();
+        bc_collect_var_names(body, &mut hoisted);
+        for n in hoisted {
+            if c.lookup(&n).is_none() {
+                let r = c.alloc_reg();
+                c.scopes[0].insert(n, r);
+                c.local_regs.insert(r);
             }
         }
     }
@@ -1672,7 +1772,8 @@ impl<'a> FnCompiler<'a> {
                 let _ = self.compile_expr(e)?;
                 Ok(())
             }
-            Stmt::VarDecl { kind: _, decls } => {
+            Stmt::VarDecl { kind, decls } => {
+                let is_var = matches!(kind, crate::ast::VarKind::Var);
                 for VarDeclarator { name, init } in decls {
                     if self.is_script {
                         // The global binding was already created (undefined) at
@@ -1695,7 +1796,20 @@ impl<'a> FnCompiler<'a> {
                             });
                         }
                     } else {
-                        let slot = self.declare(name);
+                        // `var` was pre-declared into the FUNCTION-scope slot
+                        // (scopes[0]) at function entry, so resolve to that slot
+                        // here instead of creating a fresh, block-local shadow —
+                        // this is what makes a block-nested `var x` visible after
+                        // the block. `let`/`const` ARE block-scoped, so they
+                        // declare in the current (block) scope.
+                        let slot = if is_var {
+                            match self.lookup(name) {
+                                Some(s) => s,
+                                None => self.declare(name),
+                            }
+                        } else {
+                            self.declare(name)
+                        };
                         if let Some(init) = init {
                             // `var f = function(){ … f … }` / `var f = () => … f …`:
                             // the slot is declared above so the function body CAN
@@ -1729,7 +1843,12 @@ impl<'a> FnCompiler<'a> {
                                 }
                                 self.free_reg(src); // init temp consumed (no-op if local)
                             }
-                        } else {
+                        } else if !is_var {
+                            // `let`/`const x;` initializes to undefined here. A
+                            // bare `var x;` is a NO-OP — the pre-declared slot is
+                            // already undefined and may hold a value assigned
+                            // earlier in the same scope (the `x = 7; var x;`
+                            // shape), which must NOT be clobbered.
                             self.emit(Op::LoadUndef { dst: slot });
                         }
                     }
@@ -1889,7 +2008,8 @@ impl<'a> FnCompiler<'a> {
                 let mut script_forinit_globals: Vec<(String, Reg)> = Vec::new();
                 if let Some(init) = init {
                     match init {
-                        ForInit::VarDecl { kind: _, decls } => {
+                        ForInit::VarDecl { kind, decls } => {
+                            let forinit_is_var = matches!(kind, crate::ast::VarKind::Var);
                             for VarDeclarator { name, init } in decls {
                                 // SCRIPT FRAME: reuse the SAME register for a name
                                 // that already owns a for-init sync slot (sibling
@@ -1915,6 +2035,23 @@ impl<'a> FnCompiler<'a> {
                                         r
                                     } else {
                                         self.declare(name)
+                                    }
+                                } else if forinit_is_var {
+                                    // Non-script `for (var i …)`: bind the loop's
+                                    // (pushed) scope name to the pre-declared
+                                    // FUNCTION-scope slot so reads after the loop
+                                    // resolve to it (the `var` hoists out of the
+                                    // for-statement). Fall back to a fresh declare
+                                    // if (defensively) not pre-declared.
+                                    match self.lookup(name) {
+                                        Some(r) => {
+                                            self.scopes
+                                                .last_mut()
+                                                .unwrap()
+                                                .insert(name.clone(), r);
+                                            r
+                                        }
+                                        None => self.declare(name),
                                     }
                                 } else {
                                     self.declare(name)
@@ -2055,11 +2192,12 @@ impl<'a> FnCompiler<'a> {
                 Ok(())
             }
             Stmt::ForIn {
-                kind: _,
+                kind,
                 name,
                 source,
                 body,
             } => {
+                let forin_is_var = matches!(kind, Some(crate::ast::VarKind::Var));
                 // Lower to: keys = enum_keys(source); for (let i = 0;
                 // i < keys.length; i++) { name = keys[i]; <body> }
                 self.scopes.push(HashMap::new());
@@ -2100,7 +2238,19 @@ impl<'a> FnCompiler<'a> {
                     cond: cond_r,
                     target: 0,
                 });
-                let name_slot = self.declare(name);
+                // A `for (var k in …)` binds the FUNCTION-scope pre-declared slot
+                // (so `k` survives after the loop); `let`/`const` are block-local.
+                let name_slot = if forin_is_var {
+                    match self.lookup(name) {
+                        Some(r) => {
+                            self.scopes.last_mut().unwrap().insert(name.clone(), r);
+                            r
+                        }
+                        None => self.declare(name),
+                    }
+                } else {
+                    self.declare(name)
+                };
                 self.emit(Op::GetIdx {
                     dst: name_slot,
                     obj: keys_r,
@@ -2142,11 +2292,12 @@ impl<'a> FnCompiler<'a> {
             }
             Stmt::ForOf {
                 is_await: _,
-                kind: _,
+                kind,
                 name,
                 source,
                 body,
             } => {
+                let forof_is_var = matches!(kind, Some(crate::ast::VarKind::Var));
                 // for (let name of source) body
                 //
                 // Lazy iterator protocol — ECMA-262 §14.7.5.5:
@@ -2230,7 +2381,19 @@ impl<'a> FnCompiler<'a> {
                 });
 
                 // name = step.value
-                let name_slot = self.declare(name);
+                // `for (var x of …)` binds the FUNCTION-scope pre-declared slot
+                // so `x` survives after the loop; `let`/`const` are block-local.
+                let name_slot = if forof_is_var {
+                    match self.lookup(name) {
+                        Some(r) => {
+                            self.scopes.last_mut().unwrap().insert(name.clone(), r);
+                            r
+                        }
+                        None => self.declare(name),
+                    }
+                } else {
+                    self.declare(name)
+                };
                 self.emit(Op::GetProp {
                     dst:   name_slot,
                     obj:   step_r,
