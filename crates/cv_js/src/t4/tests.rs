@@ -147,6 +147,7 @@ mod windows_engagement {
             ],
             ic: std::cell::RefCell::new(Vec::new()),
             feedback: std::cell::RefCell::new(Vec::new()),
+            strict: false,
         };
         let g = BcFunction {
             name: "g".into(),
@@ -161,6 +162,7 @@ mod windows_engagement {
             ],
             ic: std::cell::RefCell::new(Vec::new()),
             feedback: std::cell::RefCell::new(Vec::new()),
+            strict: false,
         };
         let m = Module { fns: vec![f, g], script_forinit_syncs: Vec::new() };
         crate::t4::reset_inline_compile_count();
@@ -358,6 +360,7 @@ fn t4_inliner_produces_callfree_fused_body_with_resume_map() {
         ],
         ic: std::cell::RefCell::new(Vec::new()),
         feedback: std::cell::RefCell::new(Vec::new()),
+        strict: false,
     };
     let g = BcFunction {
         name: "g".into(),
@@ -372,6 +375,7 @@ fn t4_inliner_produces_callfree_fused_body_with_resume_map() {
         ],
         ic: std::cell::RefCell::new(Vec::new()),
         feedback: std::cell::RefCell::new(Vec::new()),
+        strict: false,
     };
     let g_code_len = g.code.len();
     let m = Module { fns: vec![f, g], script_forinit_syncs: Vec::new() };
@@ -414,6 +418,7 @@ fn t4_inliner_declines_un_inlinable_callee() {
             ],
             ic: std::cell::RefCell::new(Vec::new()),
             feedback: std::cell::RefCell::new(Vec::new()),
+            strict: false,
         };
         let g = BcFunction {
             name: "g".into(),
@@ -424,6 +429,7 @@ fn t4_inliner_declines_un_inlinable_callee() {
             code: callee_code,
             ic: std::cell::RefCell::new(Vec::new()),
             feedback: std::cell::RefCell::new(Vec::new()),
+            strict: false,
         };
         Module { fns: vec![f, g], script_forinit_syncs: Vec::new() }
     };

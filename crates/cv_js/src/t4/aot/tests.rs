@@ -34,6 +34,7 @@ fn sample_fn(name: &str) -> BcFunction {
         ],
         ic: std::cell::RefCell::new(Vec::new()),
         feedback: std::cell::RefCell::new(Vec::new()),
+        strict: false,
     }
 }
 

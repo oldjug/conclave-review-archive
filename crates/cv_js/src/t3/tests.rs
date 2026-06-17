@@ -17,6 +17,7 @@ fn mkfn(n_params: u8, n_regs: u16, consts: Vec<Value>, code: Vec<Op>) -> BcFunct
         code,
         ic: std::cell::RefCell::new(Vec::new()),
         feedback: std::cell::RefCell::new(Vec::new()),
+        strict: false,
     }
 }
 

@@ -34670,117 +34670,123 @@ mod gengc_oracle {
         Value::Object(Rc::new(RefCell::new(m)))
     }
 
+    /// Read the `id`/`name` slot off a fake element Value.
+    fn el_attr(v: &Value, key: &str) -> String {
+        match v {
+            Value::Object(o) => o
+                .borrow()
+                .get(key)
+                .map(|x| x.to_display_string())
+                .unwrap_or_default(),
+            _ => String::new(),
+        }
+    }
+
     /// WHATWG DOM §4.2.10.2 / WebIDL §3.9 — an HTMLCollection is a LIVE legacy
-    /// platform object: indexed + named getters, length, item/namedItem,
-    /// @@iterator, exotic ownKeys/getOwnPropertyNames/hasOwnProperty, and `in`.
+    /// platform object: indexed + named getters, length, item/namedItem, exotic
+    /// ownKeys/getOwnPropertyNames/[[GetOwnProperty]]/[[HasProperty]] +
+    /// hasOwnProperty, and live re-query. Exercised at the HOST-primitive level
+    /// (the load-bearing functions the property machinery routes through);
+    /// end-to-end JS surfacing is gated by the WPT dom/collections suite.
     #[test]
     fn legacy_collection_indexed_named_iterator_ownkeys_live() {
         let mut i = Interp::new();
         i.install_basic_globals();
-        // A LIVE backing the test can mutate (push a 4th element mid-run) to
-        // prove the collection re-queries on each access.
+        // A LIVE backing the test can mutate (push a 4th element) to prove the
+        // collection re-queries on EVERY access.
         let backing: Rc<RefCell<Vec<Value>>> = Rc::new(RefCell::new(vec![
             fake_el("foo", ""),
             fake_el("", "bar"),
             fake_el("baz", ""),
         ]));
         let b_for_supplier = backing.clone();
-        let coll = make_legacy_collection(
-            move || b_for_supplier.borrow().clone(),
-            "HTMLCollection",
-        );
-        i.define_global("coll", coll);
+        let coll =
+            make_legacy_collection(move || b_for_supplier.borrow().clone(), "HTMLCollection");
+        assert!(super::is_legacy_collection(&coll));
+        let c = super::legacy_coll_of(&coll).expect("registry lookup");
 
-        // length + indexed getter + item().
-        assert_eq!(i.run("coll.length").unwrap().to_number(), 3.0);
+        // length + indexed getter (item) — out-of-range → None.
+        assert_eq!((c.supplier)().len(), 3);
+        assert_eq!(el_attr(&super::legacy_coll_item(&c, 0).unwrap(), "id"), "foo");
+        assert_eq!(el_attr(&super::legacy_coll_item(&c, 2).unwrap(), "id"), "baz");
+        assert!(super::legacy_coll_item(&c, 9).is_none());
+
+        // Named getter: id wins, then name (HTML-namespace). namedItem.
+        assert_eq!(el_attr(&super::legacy_named_item(&c, "foo"), "id"), "foo");
+        assert_eq!(el_attr(&super::legacy_named_item(&c, "bar"), "name"), "bar");
+        assert!(matches!(super::legacy_named_item(&c, "nope"), Value::Null));
+        // Supported names are in TREE ORDER (each element's id, then name),
+        // deduped: foo(id), bar(name), baz(id).
         assert_eq!(
-            i.run("coll[0].id").unwrap().to_display_string(),
-            "foo"
+            super::legacy_supported_names(&c),
+            vec!["foo".to_string(), "bar".to_string(), "baz".to_string()]
+        );
+
+        // [[HasProperty]] (`in`): indices + supported names true, others false.
+        assert!(i.has_property_trapped(&coll, "0").unwrap());
+        assert!(i.has_property_trapped(&coll, "foo").unwrap());
+        assert!(!i.has_property_trapped(&coll, "9").unwrap());
+        assert!(!i.has_property_trapped(&coll, "nope").unwrap());
+        // length/item are inherited (prototype) → also present.
+        assert!(i.has_property_trapped(&coll, "length").unwrap());
+        assert!(i.has_property_trapped(&coll, "item").unwrap());
+
+        // hasOwnProperty: indices + names are own; out-of-range is not.
+        assert!(super::value_has_own(&coll, "0"));
+        assert!(super::value_has_own(&coll, "foo"));
+        assert!(!super::value_has_own(&coll, "9"));
+
+        // getOwnPropertyNames (full set): indices FIRST, then supported names
+        // (WebIDL §3.9.7); for-in / Object.keys (enumerable subset): indices ONLY
+        // (names are [LegacyUnenumerableNamedProperties]).
+        assert_eq!(
+            super::legacy_own_keys(&coll, &c, true),
+            vec!["0", "1", "2", "foo", "bar", "baz"]
         );
         assert_eq!(
-            i.run("coll.item(2).id").unwrap().to_display_string(),
-            "baz"
-        );
-        assert!(matches!(i.run("coll[9]").unwrap(), Value::Undefined));
-
-        // Named getter (id then name) + namedItem.
-        assert_eq!(
-            i.run("coll['bar'].name").unwrap().to_display_string(),
-            "bar"
-        );
-        assert_eq!(
-            i.run("coll.namedItem('baz').id").unwrap().to_display_string(),
-            "baz"
+            super::legacy_own_keys(&coll, &c, false),
+            vec!["0", "1", "2"]
         );
 
-        // `in` (HasProperty): indices + supported names true, others false.
-        assert!(i.run("0 in coll").unwrap().to_bool());
-        assert!(i.run("'foo' in coll").unwrap().to_bool());
-        assert!(!i.run("9 in coll").unwrap().to_bool());
-        assert!(!i.run("'nope' in coll").unwrap().to_bool());
+        // [[GetOwnProperty]]: an index descriptor is enumerable; a named
+        // descriptor is non-enumerable; both configurable, non-writable.
+        let d0 = super::legacy_own_descriptor(&coll, &c, "0").expect("index desc");
+        assert!(i.read_property(&d0, "enumerable").to_bool());
+        assert!(!i.read_property(&d0, "writable").to_bool());
+        let dn = super::legacy_own_descriptor(&coll, &c, "foo").expect("name desc");
+        assert!(!i.read_property(&dn, "enumerable").to_bool());
+        assert!(i.read_property(&dn, "configurable").to_bool());
 
-        // hasOwnProperty agrees: indices + names are own; out-of-range is not.
-        assert!(i.run("coll.hasOwnProperty(0)").unwrap().to_bool());
-        assert!(i.run("coll.hasOwnProperty('foo')").unwrap().to_bool());
-        assert!(!i.run("coll.hasOwnProperty(9)").unwrap().to_bool());
-
-        // getOwnPropertyNames: indices FIRST, then supported names (WebIDL §3.9.7).
-        assert_eq!(
-            i.run("Object.getOwnPropertyNames(coll).join(',')")
-                .unwrap()
-                .to_display_string(),
-            "0,1,2,foo,bar,baz"
-        );
-
-        // for-in enumerates the ENUMERABLE keys = indices only (names are
-        // [LegacyUnenumerableNamedProperties]).
-        assert_eq!(
-            i.run("(function(){var r=[];for(var k in coll){if(coll.hasOwnProperty(k))r.push(k);}return r.join(',');})()")
-                .unwrap()
-                .to_display_string(),
-            "0,1,2"
-        );
-
-        // @@iterator visits the elements in order.
-        assert_eq!(
-            i.run("Array.from(coll).map(function(e){return e.id||e.name;}).join(',')")
-                .unwrap()
-                .to_display_string(),
-            "foo,bar,baz"
-        );
-
-        // LIVE: push a 4th element into the backing → length + getters update
-        // with no re-construction of the collection.
+        // LIVE: push a 4th element → length + getters + ownKeys update with NO
+        // re-construction of the collection (re-query on access).
         backing.borrow_mut().push(fake_el("qux", ""));
-        assert_eq!(i.run("coll.length").unwrap().to_number(), 4.0);
+        assert_eq!((c.supplier)().len(), 4);
+        assert_eq!(el_attr(&super::legacy_coll_item(&c, 3).unwrap(), "id"), "qux");
+        assert!(super::value_has_own(&coll, "3"));
+        assert!(i.has_property_trapped(&coll, "qux").unwrap());
         assert_eq!(
-            i.run("coll[3].id").unwrap().to_display_string(),
-            "qux"
+            super::legacy_own_keys(&coll, &c, true),
+            vec!["0", "1", "2", "3", "foo", "bar", "baz", "qux"]
         );
-        assert!(i.run("'qux' in coll").unwrap().to_bool());
     }
 
-    /// A NodeList has NO named getter (WHATWG DOM §4.2.10.1): `nl['foo']` is
-    /// undefined even when an element's id is "foo", and supported names never
-    /// appear in getOwnPropertyNames.
+    /// A NodeList has NO named getter (WHATWG DOM §4.2.10.1): a name never
+    /// resolves and supported names are empty / absent from getOwnPropertyNames.
     #[test]
     fn legacy_nodelist_has_no_named_getter() {
         let mut i = Interp::new();
         i.install_basic_globals();
-        let nl = make_legacy_collection(
-            || vec![fake_el("foo", ""), fake_el("", "bar")],
-            "NodeList",
-        );
-        i.define_global("nl", nl);
-        assert_eq!(i.run("nl.length").unwrap().to_number(), 2.0);
-        assert_eq!(i.run("nl[0].id").unwrap().to_display_string(), "foo");
-        assert!(matches!(i.run("nl['foo']").unwrap(), Value::Undefined));
-        assert!(!i.run("'foo' in nl").unwrap().to_bool());
-        assert_eq!(
-            i.run("Object.getOwnPropertyNames(nl).join(',')")
-                .unwrap()
-                .to_display_string(),
-            "0,1"
-        );
+        let nl =
+            make_legacy_collection(|| vec![fake_el("foo", ""), fake_el("", "bar")], "NodeList");
+        let c = super::legacy_coll_of(&nl).expect("registry lookup");
+        // Indexed getter works; named getter does not.
+        assert_eq!(el_attr(&super::legacy_coll_item(&c, 0).unwrap(), "id"), "foo");
+        assert!(matches!(super::legacy_named_item(&c, "foo"), Value::Null));
+        assert!(super::legacy_supported_names(&c).is_empty());
+        assert!(i.has_property_trapped(&nl, "0").unwrap());
+        assert!(!i.has_property_trapped(&nl, "foo").unwrap());
+        // No supported names → getOwnPropertyNames is indices only.
+        assert_eq!(super::legacy_own_keys(&nl, &c, true), vec!["0", "1"]);
+        let _ = i;
     }
 }
