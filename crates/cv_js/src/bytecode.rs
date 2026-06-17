@@ -10703,10 +10703,35 @@ fn property_store(obj: &Value, key: &str, value: Value) {
                     // [LegacyNullToEmptyString] DOMString coercion (mirrors the
                     // tree-walk path): null → "", else ToString.
                     let coerced = crate::interp::coerce_chardata_value(&value);
-                    let mut b = o.borrow_mut();
-                    b.insert("data".into(), coerced.clone());
-                    b.insert("nodeValue".into(), coerced.clone());
-                    b.insert("textContent".into(), coerced);
+                    // §4.5 "replace data" range-adjusting (mirrors tree-walk):
+                    // capture old/new UTF-16 lengths around the overwrite. Only
+                    // when a host hook is installed (zero cost otherwise).
+                    let lens = if crate::interp::chardata_replace_hook_registered() {
+                        let old_len = {
+                            let b = o.borrow();
+                            match b.get("data").or_else(|| b.get("nodeValue")).or_else(|| b.get("textContent")) {
+                                Some(Value::String(s)) => s.encode_utf16().count(),
+                                Some(other) => other.to_display_string().encode_utf16().count(),
+                                None => 0,
+                            }
+                        };
+                        let new_len = match &coerced {
+                            Value::String(s) => s.encode_utf16().count(),
+                            other => other.to_display_string().encode_utf16().count(),
+                        };
+                        Some((old_len, new_len))
+                    } else {
+                        None
+                    };
+                    {
+                        let mut b = o.borrow_mut();
+                        b.insert("data".into(), coerced.clone());
+                        b.insert("nodeValue".into(), coerced.clone());
+                        b.insert("textContent".into(), coerced);
+                    }
+                    if let Some((old_len, new_len)) = lens {
+                        crate::interp::run_chardata_replace_hook(o, old_len, new_len);
+                    }
                     return;
                 }
             }

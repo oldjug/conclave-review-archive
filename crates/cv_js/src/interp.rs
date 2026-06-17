@@ -2115,6 +2115,58 @@ impl Drop for ForceEligibleGuard {
 
 type ElementTextContentHook = std::rc::Rc<dyn Fn(&Rc<RefCell<HashMap<String, Value>>>, &Value)>;
 
+/// Host hook for the WHATWG DOM §4.5 "replace data" range-adjusting steps that
+/// must run when a CharacterData node's `data`/`nodeValue`/`textContent` slot is
+/// REASSIGNED via a plain property write (`textNode.data = '…'`). cv_js performs
+/// the alias-slot store itself (it owns the slot layout) but cannot reach the
+/// host's live-Range registry, so after the store it calls this hook with the
+/// node, the OLD UTF-16 length, and the NEW UTF-16 length. The host runs
+/// `adjust_ranges_replace_data(node, 0, old_len, new_len)` (a full-data replace
+/// is offset 0, count old_len). No-op in pure cv_js tests (no hook registered).
+type CharDataReplaceHook =
+    std::rc::Rc<dyn Fn(&Rc<RefCell<HashMap<String, Value>>>, usize, usize)>;
+
+thread_local! {
+    static CHARDATA_REPLACE_HOOK: RefCell<Option<CharDataReplaceHook>> =
+        const { RefCell::new(None) };
+}
+
+/// Register the host CharacterData replace-data range-adjusting hook.
+pub fn set_chardata_replace_hook(f: CharDataReplaceHook) {
+    CHARDATA_REPLACE_HOOK.with(|h| *h.borrow_mut() = Some(f));
+}
+
+/// Invoke the CharacterData replace-data hook if registered (see
+/// CHARDATA_REPLACE_HOOK). `old_len`/`new_len` are UTF-16 code-unit lengths.
+pub fn run_chardata_replace_hook(
+    o: &Rc<RefCell<HashMap<String, Value>>>,
+    old_len: usize,
+    new_len: usize,
+) {
+    if let Some(hook) = CHARDATA_REPLACE_HOOK.with(|h| h.borrow().clone()) {
+        hook(o, old_len, new_len);
+    }
+}
+
+/// Cheap check: is a CharacterData replace-data hook installed? The property
+/// stores gate the (small) old/new UTF-16 length computation on this so a build
+/// with no host hook (pure cv_js tests) pays nothing per `data`/`nodeValue`/
+/// `textContent` write.
+#[inline]
+pub fn chardata_replace_hook_registered() -> bool {
+    CHARDATA_REPLACE_HOOK.with(|h| h.borrow().is_some())
+}
+
+/// UTF-16 code-unit length of a CharacterData node's current `data` slot (or 0).
+fn chardata_slot_utf16_len(o: &Rc<RefCell<HashMap<String, Value>>>) -> usize {
+    let b = o.borrow();
+    match b.get("data").or_else(|| b.get("nodeValue")).or_else(|| b.get("textContent")) {
+        Some(Value::String(s)) => s.encode_utf16().count(),
+        Some(other) => other.to_display_string().encode_utf16().count(),
+        None => 0,
+    }
+}
+
 thread_local! {
     /// Host hook for the WHATWG DOM §4.9 `Node.textContent` SETTER on an ELEMENT
     /// (nodeType 1). cv_js stores element properties as plain slots, so a write
@@ -22187,12 +22239,32 @@ impl Interp {
                         // `null`/number left the slots non-string and failed the
                         // CharacterData-data WPT assertions.
                         let coerced = coerce_chardata_value(&value);
+                        // §4.5 "replace data" range-adjusting: capture old/new
+                        // UTF-16 lengths around the full-data overwrite (offset 0,
+                        // count = old_len) so the host can adjust live Range
+                        // boundaries that point into this node. Only computed when
+                        // a host hook is installed (zero cost otherwise).
+                        let lens = if chardata_replace_hook_registered() {
+                            let old_len = chardata_slot_utf16_len(o);
+                            let new_len = match &coerced {
+                                Value::String(s) => s.encode_utf16().count(),
+                                other => other.to_display_string().encode_utf16().count(),
+                            };
+                            Some((old_len, new_len))
+                        } else {
+                            None
+                        };
                         // B4 write barrier: an old object gaining a young child.
                         gen_gc_write_barrier(Rc::as_ptr(o) as *const () as usize, &coerced);
-                        let mut b = o.borrow_mut();
-                        b.insert("data".into(), coerced.clone());
-                        b.insert("nodeValue".into(), coerced.clone());
-                        b.insert("textContent".into(), coerced);
+                        {
+                            let mut b = o.borrow_mut();
+                            b.insert("data".into(), coerced.clone());
+                            b.insert("nodeValue".into(), coerced.clone());
+                            b.insert("textContent".into(), coerced);
+                        }
+                        if let Some((old_len, new_len)) = lens {
+                            run_chardata_replace_hook(o, old_len, new_len);
+                        }
                         return;
                     }
                 }
