@@ -4597,6 +4597,17 @@ pub fn enumerable_string_keys_with_chain(v: &Value) -> Vec<String> {
             out.push(k);
         }
     };
+    // Legacy platform object (HTMLCollection / NodeList): its ENUMERABLE own
+    // keys are the array indices (+ enumerable expandos), NOT the supported
+    // names (HTMLCollection has [LegacyUnenumerableNamedProperties]). These are
+    // computed, not stored slots, so `for (k in coll)` would otherwise miss them
+    // (WebIDL §3.9.7 [[OwnPropertyKeys]] filtered to enumerable). Emit them
+    // FIRST (indices in ascending order, per spec), before the internal slots.
+    if let Some(coll) = legacy_coll_of(v) {
+        for k in legacy_own_keys(v, &coll, false) {
+            push(k, &mut seen, &mut out);
+        }
+    }
     // Own keys first (preserves the same order Object.keys produces).
     for k in enumerable_string_keys(v) {
         push(k, &mut seen, &mut out);
