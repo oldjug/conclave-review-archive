@@ -128,25 +128,35 @@ pub fn tokenize(src: &str) -> Vec<CssToken> {
             }
             b'#' => {
                 i += 1;
-                // CSS allows hashes like `#336699` whose body starts with
-                // a digit (hex color). `consume_ident_chars` rejects
-                // digit-leading bodies for safety, so we accept any run
-                // of hex-color-shape bytes too.
-                let body_start = i;
-                let mut had_digit = false;
+                // CSS Syntax §4.3.1: a `#` followed by a name code point or a
+                // valid escape produces a <hash-token> whose value is the result
+                // of "consume a name" (§4.3.11). This decodes CSS escapes
+                // (`#\30 nextIsWhiteSpace` → id "0nextIsWhiteSpace", `#zero\0` →
+                // id "zero\u{FFFD}") AND accepts digit-leading bodies (hex colors
+                // like `#336699`). Name code points are ident bytes (alnum / _ /
+                // - / non-ASCII); a backslash that is a valid escape is consumed
+                // via consume_escape.
+                let mut name = String::new();
                 while i < bytes.len() {
                     let b = bytes[i];
-                    if b.is_ascii_alphanumeric() || b == b'-' || b == b'_' {
-                        if b.is_ascii_digit() {
-                            had_digit = true;
+                    if is_valid_escape(bytes, i) {
+                        if let Some(ch) = consume_escape(bytes, &mut i) {
+                            name.push(ch);
+                            continue;
                         }
-                        i += 1;
+                        break;
+                    }
+                    if is_ident_byte(b) {
+                        if b.is_ascii() {
+                            name.push(b as char);
+                            i += 1;
+                        } else {
+                            name.push(decode_one(bytes, &mut i));
+                        }
                     } else {
                         break;
                     }
                 }
-                let name = String::from_utf8(bytes[body_start..i].to_vec()).unwrap_or_default();
-                let _ = had_digit;
                 out.push(CssToken::Hash(name));
             }
             b'@' => {
@@ -381,6 +391,13 @@ fn consume_escape(bytes: &[u8], i: &mut usize) -> Option<char> {
     if digits > 0 {
         if *i < bytes.len() && matches!(bytes[*i], b' ' | b'\t' | b'\n' | b'\r' | 0x0C) {
             *i += 1;
+        }
+        // css-syntax §4.3.7: if the code point is zero, a surrogate, or greater
+        // than the maximum allowed code point, return U+FFFD REPLACEMENT
+        // CHARACTER. (char::from_u32 already rejects surrogates / out-of-range,
+        // but accepts 0, so guard zero explicitly.)
+        if value == 0 {
+            return Some('\u{FFFD}');
         }
         return char::from_u32(value).or(Some('\u{FFFD}'));
     }
