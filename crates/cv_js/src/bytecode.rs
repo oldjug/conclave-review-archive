@@ -1025,6 +1025,27 @@ pub fn compile_single_function_arrow(
     ))
 }
 
+/// True if any function in the module writes to a captured upvalue (`StoreUp`).
+/// The VM's closures snapshot upvalues BY VALUE at `MakeClosure` time, so such a
+/// write never propagates back to the binding the enclosing scope (or a sibling
+/// closure) observes. The tree-walk tier captures by reference and is correct, so
+/// the per-SCRIPT bytecode path declines a module with any upvalue write and runs
+/// it tree-walk instead.
+///
+/// This is exactly the bug the WPT event tests expose: a `test(function(){ var
+/// called=false; el.addEventListener('x', function(){ called=true; });
+/// el.dispatchEvent(e); assert_true(called); })` — the inner listener's
+/// `called=true` is a `StoreUp` into its by-value snapshot, so on the VM the
+/// outer `called` stayed false. Declining the script to tree-walk fixes it
+/// without the (large) cell-based-upvalue rewrite. `New`/classes/etc. are NOT
+/// declined here (the script frame handles them) — only the write-back hazard.
+pub fn module_has_upvalue_writes(module: &Module) -> bool {
+    module
+        .fns
+        .iter()
+        .any(|f| f.code.iter().any(|op| matches!(op, Op::StoreUp { .. })))
+}
+
 /// Whether a per-function caller can safely run this module on the VM. Declines
 /// (returns false) when it would misbehave vs the tree-walk:
 /// - `StoreUp`: mutates a captured binding — the VM's by-value upvalues can't

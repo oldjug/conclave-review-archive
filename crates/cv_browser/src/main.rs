@@ -16721,6 +16721,21 @@ impl LiveInterp {
         // and persists for next run. DEFAULT-OFF → byte-identical to compile_program.
         match cv_js::code_cache::compile_program_cached(src) {
             Ok(module) => {
+                // CLOSURE WRITE-BACK CORRECTNESS: the VM snapshots upvalues by
+                // value, so a nested closure that mutates a captured binding
+                // (`StoreUp`) can't propagate the write back to the enclosing
+                // scope. That silently breaks the universal
+                //   var called=false; el.addEventListener('x',()=>{called=true});
+                //   el.dispatchEvent(e); assert(called)
+                // pattern (and any deferred-mutation callback). Decline such a
+                // script to the tree-walk tier (captures by reference, correct).
+                // Cheap one-pass op scan; the tree-walker is the proven fallback.
+                if cv_js::bytecode::module_has_upvalue_writes(&module) {
+                    if std::env::var("CV_BCLOG").is_ok() {
+                        cv_js::diag_log(&format!("[BC-FALLBACK][{source}] upvalue write (StoreUp)"));
+                    }
+                    return false;
+                }
                 if script_log {
                     let snippet: String = src.chars().take(90).collect();
                     eprintln!("[BC START][{source}] {} bytes :: {}", src.len(), snippet.replace('\n', " "));
@@ -19452,6 +19467,371 @@ fn build_event_object(
     me.borrow_mut()
         .insert("stopImmediatePropagation".into(), stop_immediate);
     cv_js::Value::Object(me)
+}
+
+/// Which Event interface a constructed/`createEvent`'d event belongs to — picks
+/// the right prototype (for `instanceof` / `Object.getPrototypeOf`) and whether
+/// `detail` + `initCustomEvent` are present.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EventKind {
+    Event,
+    CustomEvent,
+    UiEvent,
+}
+
+/// The shared per-interface `Event`/`CustomEvent`/`UIEvent` prototype objects +
+/// their constructor globals, created ONCE so every constructed event links to
+/// the SAME prototype Rc (the identity `instanceof Event` and
+/// `Object.getPrototypeOf(ev) === Event.prototype` assert against). Stored in a
+/// thread-local because the engine is single-threaded per page and many call
+/// sites (the constructors, `document.createEvent`, the dispatcher) all need the
+/// same protos without threading them through every signature.
+thread_local! {
+    static EVENT_PROTOS: std::cell::RefCell<Option<EventProtos>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[derive(Clone)]
+struct EventProtos {
+    event: cv_js::Value,
+    custom: cv_js::Value,
+    ui: cv_js::Value,
+}
+
+/// The WHATWG DOM §2.2 Event phase constants. Stamped on both the interface
+/// object and every instance (per WebIDL, [Constant]s appear on the interface,
+/// its prototype, AND — via the prototype chain — instances).
+fn insert_event_phase_constants(m: &mut cv_js::OrderedMap<String, cv_js::Value>) {
+    m.insert("NONE".into(), cv_js::Value::Number(0.0));
+    m.insert("CAPTURING_PHASE".into(), cv_js::Value::Number(1.0));
+    m.insert("AT_TARGET".into(), cv_js::Value::Number(2.0));
+    m.insert("BUBBLING_PHASE".into(), cv_js::Value::Number(3.0));
+}
+
+/// Lazily build (once) and return the shared Event/CustomEvent/UIEvent prototype
+/// objects. The CustomEvent + UIEvent protos chain to the Event proto (WebIDL
+/// inheritance) so `customEvent instanceof Event` is true.
+fn event_protos() -> EventProtos {
+    EVENT_PROTOS.with(|cell| {
+        if let Some(p) = cell.borrow().as_ref() {
+            return p.clone();
+        }
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        use cv_js::OrderedMap as HashMap;
+        let mk_proto = |parent: Option<&cv_js::Value>| -> cv_js::Value {
+            let mut m: HashMap<String, cv_js::Value> = HashMap::new();
+            // Phase constants are reachable through the prototype chain.
+            insert_event_phase_constants(&mut m);
+            if let Some(p) = parent {
+                m.insert(cv_js::PROTO_KEY.into(), p.clone());
+            }
+            cv_js::Value::Object(Rc::new(RefCell::new(m)))
+        };
+        let event = mk_proto(None);
+        let custom = mk_proto(Some(&event));
+        let ui = mk_proto(Some(&event));
+        let protos = EventProtos { event, custom, ui };
+        *cell.borrow_mut() = Some(protos.clone());
+        protos
+    })
+}
+
+/// Build a fully-shaped, dispatchable, prototype-linked Event value per WHATWG
+/// DOM §2.2 (Event) / §2.4 (CustomEvent) + UI Events.
+///
+/// Used by the `Event`/`CustomEvent`/`UIEvent` global constructors AND by
+/// `document.createEvent(...)`. The returned object:
+///   * links `[[Prototype]]` to the right shared interface prototype, so
+///     `e instanceof Event` and `Object.getPrototypeOf(e) === Event.prototype`;
+///   * carries every Event member: `type` / `target` / `currentTarget` /
+///     `eventPhase` / `bubbles` / `cancelable` / `composed` / `defaultPrevented`
+///     / `timeStamp` / `isTrusted` (+ `detail` for CustomEvent; UIEvent extras);
+///   * uses the CANONICAL dispatch flag names (`cancelBubble`,
+///     `\u{1}stopImmediate`) so it propagates correctly through the SAME
+///     `dispatch_event_to_path` the engine fires real events through — NOT a
+///     dead stub;
+///   * exposes `preventDefault` / `stopPropagation` / `stopImmediatePropagation`
+///     / `composedPath` / `initEvent` (+ `initCustomEvent` for CustomEvent),
+///     each mutating THIS instance.
+///
+/// `bubbles`/`cancelable`/`composed` default to FALSE (spec) and are overridden
+/// only by the init dict — NOT type-based (that legacy heuristic is for
+/// engine-synthesised trusted events, not author-constructed ones).
+/// `initialized` is false for the `createEvent` path (an uninitialized event the
+/// author must `initEvent`/`initCustomEvent` before dispatch).
+fn build_event_value(
+    event_type: &str,
+    init: Option<&cv_js::Value>,
+    kind: EventKind,
+    initialized: bool,
+) -> cv_js::Value {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use cv_js::OrderedMap as HashMap;
+    let protos = event_protos();
+    let proto = match kind {
+        EventKind::Event => protos.event.clone(),
+        EventKind::CustomEvent => protos.custom.clone(),
+        EventKind::UiEvent => protos.ui.clone(),
+    };
+    let mut m: HashMap<String, cv_js::Value> = HashMap::new();
+    m.insert(cv_js::PROTO_KEY.into(), proto);
+    m.insert("type".into(), cv_js::Value::str(event_type.to_string()));
+    m.insert("target".into(), cv_js::Value::Null);
+    m.insert("srcElement".into(), cv_js::Value::Null);
+    m.insert("currentTarget".into(), cv_js::Value::Null);
+    m.insert("eventPhase".into(), cv_js::Value::Number(0.0)); // NONE until dispatched
+    m.insert("bubbles".into(), cv_js::Value::Bool(false));
+    m.insert("cancelable".into(), cv_js::Value::Bool(false));
+    m.insert("composed".into(), cv_js::Value::Bool(false));
+    m.insert("defaultPrevented".into(), cv_js::Value::Bool(false));
+    m.insert("returnValue".into(), cv_js::Value::Bool(true));
+    m.insert("cancelBubble".into(), cv_js::Value::Bool(false));
+    m.insert("isTrusted".into(), cv_js::Value::Bool(false));
+    // `\u{1}initialized` is the WHATWG "initialized flag": preventDefault and the
+    // legacy `initEvent` short-circuit when an event is mid-dispatch / not yet
+    // initialized. Hidden from JS via the \u{1} prefix.
+    m.insert("\u{1}initialized".into(), cv_js::Value::Bool(initialized));
+    m.insert(
+        "timeStamp".into(),
+        cv_js::Value::Number(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs_f64() * 1000.0)
+                .unwrap_or(0.0),
+        ),
+    );
+    if matches!(kind, EventKind::CustomEvent) {
+        m.insert("detail".into(), cv_js::Value::Null);
+    }
+    if matches!(kind, EventKind::UiEvent) {
+        m.insert("view".into(), cv_js::Value::Null);
+        m.insert("detail".into(), cv_js::Value::Number(0.0));
+    }
+    // Phase constants ALSO live as own props on the instance so `"NONE" in e`
+    // and `e.NONE` work even where prototype-chain const lookup is bypassed.
+    insert_event_phase_constants(&mut m);
+    // Apply the init dictionary (constructor path). Spec: only the recognised
+    // members override defaults; `detail` is CustomEvent/UIEvent-only.
+    if let Some(cv_js::Value::Object(o)) = init {
+        let dict = o.borrow();
+        for k in ["bubbles", "cancelable", "composed"] {
+            if let Some(v) = dict.get(k) {
+                m.insert(k.into(), cv_js::Value::Bool(v.to_bool()));
+            }
+        }
+        if matches!(kind, EventKind::CustomEvent | EventKind::UiEvent) {
+            if let Some(v) = dict.get("detail") {
+                m.insert("detail".into(), v.clone());
+            }
+        }
+        if matches!(kind, EventKind::UiEvent) {
+            if let Some(v) = dict.get("view") {
+                m.insert("view".into(), v.clone());
+            }
+        }
+    }
+
+    let me: Rc<RefCell<HashMap<String, cv_js::Value>>> = Rc::new(RefCell::new(m));
+
+    // --- methods, each mutating THIS instance ---------------------------------
+    let pd = me.clone();
+    let prevent_default = cv_js::native_fn("preventDefault", move |_| {
+        // WHATWG §2.2: preventDefault sets the canceled flag ONLY if cancelable
+        // and the listener is not passive. (Passive neutralisation happens in the
+        // dispatcher.) returnValue mirrors defaultPrevented (inverted) per the
+        // legacy attribute.
+        let mut g = pd.borrow_mut();
+        if matches!(g.get("cancelable"), Some(cv_js::Value::Bool(true))) {
+            g.insert("defaultPrevented".into(), cv_js::Value::Bool(true));
+            g.insert("returnValue".into(), cv_js::Value::Bool(false));
+        }
+        Ok(cv_js::Value::Undefined)
+    });
+    let sp = me.clone();
+    let stop_propagation = cv_js::native_fn("stopPropagation", move |_| {
+        sp.borrow_mut()
+            .insert("cancelBubble".into(), cv_js::Value::Bool(true));
+        Ok(cv_js::Value::Undefined)
+    });
+    let si = me.clone();
+    let stop_immediate = cv_js::native_fn("stopImmediatePropagation", move |_| {
+        let mut g = si.borrow_mut();
+        g.insert("cancelBubble".into(), cv_js::Value::Bool(true));
+        g.insert("\u{1}stopImmediate".into(), cv_js::Value::Bool(true));
+        Ok(cv_js::Value::Undefined)
+    });
+    let cp = me.clone();
+    let composed_path = cv_js::native_fn("composedPath", move |_| {
+        // WHATWG §2.2 composedPath(): returns the event's path. Outside an active
+        // dispatch the path is empty; during dispatch the dispatcher records the
+        // touched targets on `\u{1}composedPath`. Return a COPY so callers can't
+        // mutate our internal record.
+        let g = cp.borrow();
+        match g.get("\u{1}composedPath") {
+            Some(cv_js::Value::Array(a)) => {
+                Ok(cv_js::Value::Array(Rc::new(RefCell::new(a.borrow().clone()))))
+            }
+            _ => Ok(cv_js::Value::Array(Rc::new(RefCell::new(Vec::new())))),
+        }
+    });
+    // initEvent(type, bubbles=false, cancelable=false) — legacy DOM Level 2.
+    let ie = me.clone();
+    let init_event = cv_js::native_fn_n("initEvent", 1, move |args| {
+        // WebIDL: `type` is a required argument — `initEvent()` with no args is a
+        // TypeError (the WPT "First parameter to initEvent should be mandatory"
+        // subtest asserts this).
+        if args.is_empty() {
+            return Err(cv_js::JsError::Throw(make_type_error_value(
+                "Failed to execute 'initEvent': 1 argument required, but only 0 present.",
+            )));
+        }
+        // WHATWG §2.2: initEvent is a no-op while the event is being dispatched
+        // (eventPhase !== NONE). Otherwise it RESETS the event: clears the stop /
+        // canceled flags and re-stamps type/bubbles/cancelable.
+        let mut g = ie.borrow_mut();
+        let dispatching = !matches!(g.get("eventPhase"), Some(cv_js::Value::Number(n)) if *n == 0.0);
+        if dispatching {
+            return Ok(cv_js::Value::Undefined);
+        }
+        let ty = args.first().map(|v| v.to_display_string()).unwrap_or_default();
+        let bubbles = args.get(1).map(|v| v.to_bool()).unwrap_or(false);
+        let cancelable = args.get(2).map(|v| v.to_bool()).unwrap_or(false);
+        g.insert("\u{1}initialized".into(), cv_js::Value::Bool(true));
+        g.insert("\u{1}stopImmediate".into(), cv_js::Value::Bool(false));
+        g.insert("cancelBubble".into(), cv_js::Value::Bool(false));
+        g.insert("defaultPrevented".into(), cv_js::Value::Bool(false));
+        g.insert("returnValue".into(), cv_js::Value::Bool(true));
+        g.insert("type".into(), cv_js::Value::str(ty));
+        g.insert("bubbles".into(), cv_js::Value::Bool(bubbles));
+        g.insert("cancelable".into(), cv_js::Value::Bool(cancelable));
+        Ok(cv_js::Value::Undefined)
+    });
+    {
+        let mut g = me.borrow_mut();
+        g.insert("preventDefault".into(), prevent_default);
+        g.insert("stopPropagation".into(), stop_propagation);
+        g.insert("stopImmediatePropagation".into(), stop_immediate);
+        g.insert("composedPath".into(), composed_path);
+        g.insert("initEvent".into(), init_event);
+    }
+    if matches!(kind, EventKind::CustomEvent) {
+        // initCustomEvent(type, bubbles, cancelable, detail) — legacy CustomEvent.
+        let ice = me.clone();
+        let init_custom = cv_js::native_fn_n("initCustomEvent", 1, move |args| {
+            // WebIDL: `type` is a required argument — calling with zero args is a
+            // TypeError (the WPT test asserts this).
+            if args.is_empty() {
+                return Err(cv_js::JsError::Throw(make_type_error_value(
+                    "Failed to execute 'initCustomEvent': 1 argument required, but only 0 present.",
+                )));
+            }
+            let mut g = ice.borrow_mut();
+            let dispatching =
+                !matches!(g.get("eventPhase"), Some(cv_js::Value::Number(n)) if *n == 0.0);
+            if dispatching {
+                return Ok(cv_js::Value::Undefined);
+            }
+            let ty = args[0].to_display_string();
+            let bubbles = args.get(1).map(|v| v.to_bool()).unwrap_or(false);
+            let cancelable = args.get(2).map(|v| v.to_bool()).unwrap_or(false);
+            let detail = args.get(3).cloned().unwrap_or(cv_js::Value::Null);
+            g.insert("\u{1}initialized".into(), cv_js::Value::Bool(true));
+            g.insert("\u{1}stopImmediate".into(), cv_js::Value::Bool(false));
+            g.insert("cancelBubble".into(), cv_js::Value::Bool(false));
+            g.insert("defaultPrevented".into(), cv_js::Value::Bool(false));
+            g.insert("type".into(), cv_js::Value::str(ty));
+            g.insert("bubbles".into(), cv_js::Value::Bool(bubbles));
+            g.insert("cancelable".into(), cv_js::Value::Bool(cancelable));
+            g.insert("detail".into(), detail);
+            Ok(cv_js::Value::Undefined)
+        });
+        me.borrow_mut()
+            .insert("initCustomEvent".into(), init_custom);
+    }
+    cv_js::Value::Object(me)
+}
+
+/// Install the `Event` / `CustomEvent` / `UIEvent` interface globals + their
+/// `document.createEvent` factory shapes. Each interface object is an Object
+/// (not a bare NativeFunction) carrying `_construct` (so `new X()` works),
+/// `_call` (so `X(...)` without `new` throws-or-constructs like the engine's
+/// other interface objects), `.prototype` (the shared proto from `event_protos`,
+/// linked so `instanceof` + `getPrototypeOf` resolve), `.constructor`/`.name`,
+/// and the eventPhase [Constant]s. WHATWG DOM §2.2/§2.4 + UI Events.
+fn install_event_interface_globals(interp: &cv_js::Interp) {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use cv_js::OrderedMap as HashMap;
+    let protos = event_protos();
+
+    // Helper: build one interface global for `kind` named `name` with shared
+    // `proto`. The ctor requires a `type` arg (WebIDL) → zero-arg `new Event()`
+    // is a TypeError, which the WPT constructor tests assert.
+    let make_iface = |name: &'static str, kind: EventKind, proto: cv_js::Value| -> cv_js::Value {
+        let ctor = cv_js::native_ctor(name, 1, move |_interp, args| {
+            if args.is_empty() {
+                return Err(cv_js::JsError::Throw(make_type_error_value(&format!(
+                    "Failed to construct '{name}': 1 argument required, but only 0 present."
+                ))));
+            }
+            let ty = args[0].to_display_string();
+            Ok(build_event_value(&ty, args.get(1), kind, true))
+        });
+        let iface: Rc<RefCell<HashMap<String, cv_js::Value>>> =
+            Rc::new(RefCell::new(HashMap::new()));
+        {
+            let mut m = iface.borrow_mut();
+            m.insert("_construct".into(), ctor.clone());
+            m.insert("_call".into(), ctor);
+            m.insert("prototype".into(), proto.clone());
+            m.insert("name".into(), cv_js::Value::String(name.into()));
+            m.insert("length".into(), cv_js::Value::Number(1.0));
+            insert_event_phase_constants(&mut m);
+        }
+        let iface_val = cv_js::Value::Object(iface);
+        // Back-link prototype.constructor → interface object.
+        if let cv_js::Value::Object(p) = &proto {
+            p.borrow_mut()
+                .insert("constructor".into(), iface_val.clone());
+        }
+        iface_val
+    };
+
+    let event_iface = make_iface("Event", EventKind::Event, protos.event.clone());
+    let custom_iface = make_iface("CustomEvent", EventKind::CustomEvent, protos.custom.clone());
+    let ui_iface = make_iface("UIEvent", EventKind::UiEvent, protos.ui.clone());
+    interp.define_global("Event", event_iface);
+    interp.define_global("CustomEvent", custom_iface);
+    interp.define_global("UIEvent", ui_iface);
+}
+
+/// `document.createEvent(interface)` — WHATWG DOM §4.5.1. Returns an
+/// UNINITIALIZED event of the requested legacy interface; the author must call
+/// `event.initEvent(...)` (or `initCustomEvent(...)`) before dispatch. The set of
+/// accepted interface strings is the spec's case-insensitive legacy list; an
+/// unknown one throws a `NotSupportedError` DOMException.
+fn document_create_event(arg: Option<&cv_js::Value>) -> Result<cv_js::Value, cv_js::JsError> {
+    let iface = arg.map(|v| v.to_display_string()).unwrap_or_default();
+    let lower = iface.to_ascii_lowercase();
+    let kind = match lower.as_str() {
+        // WHATWG DOM §4.5.1 createEvent map (legacy aliases included).
+        "event" | "events" | "htmlevents" | "svgevents" => EventKind::Event,
+        "customevent" => EventKind::CustomEvent,
+        "uievent" | "uievents" => EventKind::UiEvent,
+        _ => {
+            return Err(cv_js::JsError::Throw(make_dom_exception(
+                "NotSupportedError",
+                9,
+                &format!(
+                    "Failed to execute 'createEvent' on 'Document': The provided event type ('{iface}') is invalid."
+                ),
+            )));
+        }
+    };
+    // The created event's type is the empty string until initEvent is called.
+    Ok(build_event_value("", None, kind, false))
 }
 
 struct Mutations {
@@ -27022,6 +27402,14 @@ fn install_minimal_dom_with_url(interp: &cv_js::Interp, initial_title: String, p
     let mut doc_map: HashMap<String, cv_js::Value> = HashMap::new();
     doc_map.insert("title".into(), cv_js::Value::str(initial_title.clone()));
     doc_map.insert("URL".into(), cv_js::Value::str(page_url.to_string()));
+    // document.createEvent("Event"|"CustomEvent"|"UIEvent"|legacy aliases) —
+    // WHATWG DOM §4.5.1. Present on the minimal-DOM document too (the full
+    // install_dom_api also wires it on the live document); this keeps createEvent
+    // available even when only the minimal DOM is installed.
+    doc_map.insert(
+        "createEvent".into(),
+        cv_js::native_fn("createEvent", |args| document_create_event(args.first())),
+    );
     let document = cv_js::Value::Object(Rc::new(RefCell::new(doc_map)));
 
     let mut location_map: HashMap<String, cv_js::Value> = HashMap::new();
@@ -30070,16 +30458,29 @@ fn install_minimal_dom_with_url(interp: &cv_js::Interp, initial_title: String, p
                     .filter(|(n, _)| n == &name)
                     .map(|(_, cb)| cb.clone())
                     .collect();
-                // Respect stopImmediatePropagation by re-reading the
-                // event object's flag after each call.
-                let stopped_key = "_stopImmediate";
+                // Respect stopImmediatePropagation by re-reading the event's
+                // canonical internal flag after each call. (Events built by
+                // `build_event_value` use the `\u{1}stopImmediate` sentinel that the
+                // engine's other dispatch paths share; the legacy `_stopImmediate`
+                // is checked too for any older event shape.)
                 for cb in to_fire {
                     let _ = interp.call_value_with_this(cb, self_val.clone(), vec![ev.clone()]);
                     if let cv_js::Value::Object(o) = &ev {
-                        if matches!(o.borrow().get(stopped_key), Some(cv_js::Value::Bool(true))) {
+                        let m = o.borrow();
+                        let stopped =
+                            matches!(m.get("\u{1}stopImmediate"), Some(cv_js::Value::Bool(true)))
+                                || matches!(m.get("_stopImmediate"), Some(cv_js::Value::Bool(true)));
+                        if stopped {
                             break;
                         }
                     }
+                }
+                // WHATWG §2.9 step 14: reset currentTarget to null + eventPhase to
+                // NONE once dispatch completes.
+                if let cv_js::Value::Object(o) = &ev {
+                    let mut m = o.borrow_mut();
+                    m.insert("currentTarget".into(), cv_js::Value::Null);
+                    m.insert("eventPhase".into(), cv_js::Value::Number(0.0));
                 }
                 // dispatchEvent returns !defaultPrevented per DOM §2.10.
                 let default_prevented = matches!(&ev, cv_js::Value::Object(o)
@@ -30091,90 +30492,16 @@ fn install_minimal_dom_with_url(interp: &cv_js::Interp, initial_title: String, p
     });
     interp.define_global("EventTarget", eventtarget_ctor);
 
-    // Event constructor — `new Event('click', {bubbles: true})`.
-    // The returned object owns its own Rc<RefCell<HashMap>>; the
-    // preventDefault / stopPropagation / stopImmediatePropagation
-    // closures capture a clone of that Rc so they can flip flags on
-    // the actual event object the listener received.
-    let event_ctor = cv_js::native_ctor_pure("Event", 0, |args| {
-        use std::cell::RefCell;
-        use std::rc::Rc;
-        use cv_js::OrderedMap as HashMap;
-        let type_str = args
-            .first()
-            .map(|v| v.to_display_string())
-            .unwrap_or_default();
-        let obj: Rc<RefCell<HashMap<String, cv_js::Value>>> = Rc::new(RefCell::new(HashMap::new()));
-        {
-            let mut m = obj.borrow_mut();
-            m.insert("type".into(), cv_js::Value::str(type_str.clone()));
-            // Default bubbles/cancelable by event-type when no init dict is given.
-            // This matches the browser behaviour for untrusted events constructed
-            // with just a type string (e.g. `new Event('click')`).
-            m.insert("bubbles".into(), cv_js::Value::Bool(event_type_bubbles(&type_str)));
-            m.insert("cancelable".into(), cv_js::Value::Bool(event_type_cancelable(&type_str)));
-            m.insert("composed".into(), cv_js::Value::Bool(false));
-            m.insert("defaultPrevented".into(), cv_js::Value::Bool(false));
-            m.insert("_stopProp".into(), cv_js::Value::Bool(false));
-            m.insert("_stopImmediate".into(), cv_js::Value::Bool(false));
-            m.insert("timeStamp".into(), cv_js::Value::Number(0.0));
-            m.insert("isTrusted".into(), cv_js::Value::Bool(false));
-            m.insert("eventPhase".into(), cv_js::Value::Number(0.0));
-            m.insert("target".into(), cv_js::Value::Null);
-            m.insert("currentTarget".into(), cv_js::Value::Null);
-            // CustomEvent.detail — pulled below from init.detail.
-            m.insert("detail".into(), cv_js::Value::Null);
-            // Pull bubbles/cancelable/composed/detail out of the init dict
-            // if one was provided — init values override the type-based defaults.
-            if let Some(cv_js::Value::Object(o)) = args.get(1) {
-                let init = o.borrow();
-                for k in ["bubbles", "cancelable", "composed", "detail"] {
-                    if let Some(v) = init.get(k) {
-                        m.insert(k.into(), v.clone());
-                    }
-                }
-            }
-        }
-        let pd = obj.clone();
-        let prevent_default = cv_js::native_fn("preventDefault", move |_| {
-            // preventDefault only takes effect if cancelable is true,
-            // mirroring DOM §2.10.
-            let mut m = pd.borrow_mut();
-            let cancelable = matches!(m.get("cancelable"), Some(cv_js::Value::Bool(true)));
-            if cancelable {
-                m.insert("defaultPrevented".into(), cv_js::Value::Bool(true));
-            }
-            Ok(cv_js::Value::Undefined)
-        });
-        let sp = obj.clone();
-        let stop_propagation = cv_js::native_fn("stopPropagation", move |_| {
-            sp.borrow_mut()
-                .insert("_stopProp".into(), cv_js::Value::Bool(true));
-            Ok(cv_js::Value::Undefined)
-        });
-        let si = obj.clone();
-        let stop_immediate = cv_js::native_fn("stopImmediatePropagation", move |_| {
-            let mut m = si.borrow_mut();
-            m.insert("_stopProp".into(), cv_js::Value::Bool(true));
-            m.insert("_stopImmediate".into(), cv_js::Value::Bool(true));
-            Ok(cv_js::Value::Undefined)
-        });
-        let cp = obj.clone();
-        let composed_path = cv_js::native_fn("composedPath", move |_| {
-            let _ = &cp;
-            Ok(cv_js::Value::Array(Rc::new(RefCell::new(Vec::new()))))
-        });
-        {
-            let mut m = obj.borrow_mut();
-            m.insert("preventDefault".into(), prevent_default);
-            m.insert("stopPropagation".into(), stop_propagation);
-            m.insert("stopImmediatePropagation".into(), stop_immediate);
-            m.insert("composedPath".into(), composed_path);
-        }
-        Ok(cv_js::Value::Object(obj))
-    });
-    interp.define_global("Event", event_ctor.clone());
-    interp.define_global("CustomEvent", event_ctor);
+    // Event / CustomEvent / UIEvent constructors + interface globals (WHATWG DOM
+    // §2.2/§2.4 + UI Events). Each interface object is an Object carrying
+    // `_construct`/`_call`, the shared `.prototype`, the four eventPhase
+    // [Constant]s, and a `constructor` back-link on the prototype — so:
+    //   * `new Event(type, init)` makes a fully-shaped, DISPATCHABLE event
+    //     (canonical cancelBubble / \u{1}stopImmediate flags, real propagation),
+    //   * `e instanceof Event` / `Object.getPrototypeOf(e) === Event.prototype`
+    //     hold (several WPT tests assert exactly this),
+    //   * `Event.AT_TARGET === 2` etc. work on the interface AND on instances.
+    install_event_interface_globals(interp);
 
     // WHATWG `Headers` / `Request` / `Response` constructors — the shared,
     // real implementation (full header API + body methods), identical to the
@@ -50248,6 +50575,13 @@ fn install_dom_api(
         m.insert("createTextNode".into(), create_text_node);
         m.insert("createComment".into(), create_comment);
         m.insert("createDocumentFragment".into(), create_document_fragment);
+        // document.createEvent("Event"|"CustomEvent"|"UIEvent"|legacy aliases) —
+        // WHATWG DOM §4.5.1. Returns an uninitialized, prototype-linked event the
+        // author initializes via initEvent/initCustomEvent before dispatch.
+        m.insert(
+            "createEvent".into(),
+            cv_js::native_fn("createEvent", |args| document_create_event(args.first())),
+        );
         m.insert("createRange".into(), create_range);
         m.insert("createTreeWalker".into(), create_tree_walker);
         m.insert("createNodeIterator".into(), create_node_iterator);
@@ -64178,6 +64512,140 @@ mod tests {
         assert!(
             out.iter().any(|l| l.trim() == "1"),
             "expected one listener to fire, got: {out:?}"
+        );
+    }
+
+    /// Helper: run JS against a minimal-DOM interp, return the console lines.
+    fn run_min_dom_js(js: &str) -> Vec<String> {
+        let mut interp = cv_js::Interp::new();
+        interp.install_math();
+        interp.install_json();
+        interp.install_basic_globals();
+        install_minimal_dom_with_url(&interp, String::new(), "about:blank");
+        let _ = interp.run(js);
+        std::mem::take(&mut interp.output)
+    }
+
+    #[test]
+    fn event_interface_instanceof_and_prototype_identity() {
+        // WHATWG DOM §2.2: `new Event(...)` is an Event whose [[Prototype]] is
+        // Event.prototype; CustomEvent inherits from Event.
+        let out = run_min_dom_js(
+            r#"
+            var e = new Event('x');
+            var ce = new CustomEvent('y', {detail: 7});
+            console.log([
+              e instanceof Event,
+              Object.getPrototypeOf(e) === Event.prototype,
+              ce instanceof CustomEvent,
+              ce instanceof Event,
+              ce.detail === 7
+            ].join(','));
+            "#,
+        );
+        assert!(
+            out.iter().any(|l| l.trim() == "true,true,true,true,true"),
+            "instanceof/prototype/detail identity failed: {out:?}"
+        );
+    }
+
+    #[test]
+    fn event_phase_constants_on_interface_and_instance() {
+        // WebIDL [Constant]s NONE/CAPTURING_PHASE/AT_TARGET/BUBBLING_PHASE appear
+        // on the interface object AND (via the prototype chain + own props) on
+        // instances and the created event.
+        let out = run_min_dom_js(
+            r#"
+            var e = document.createEvent('Event');
+            console.log([
+              Event.NONE, Event.CAPTURING_PHASE, Event.AT_TARGET, Event.BUBBLING_PHASE,
+              e.NONE, e.CAPTURING_PHASE, e.AT_TARGET, e.BUBBLING_PHASE
+            ].join(','));
+            "#,
+        );
+        assert!(
+            out.iter().any(|l| l.trim() == "0,1,2,3,0,1,2,3"),
+            "event phase constants wrong: {out:?}"
+        );
+    }
+
+    #[test]
+    fn document_create_event_and_init_custom_event() {
+        // document.createEvent("CustomEvent") → uninitialized; initCustomEvent
+        // stamps type/bubbles/cancelable/detail (WHATWG DOM §4.5.1 + legacy
+        // CustomEvent init). Zero-arg initCustomEvent is a TypeError.
+        let out = run_min_dom_js(
+            r#"
+            var e = document.createEvent('CustomEvent');
+            var threw = false;
+            try { e.initCustomEvent(); } catch (err) { threw = (err instanceof TypeError); }
+            e.initCustomEvent('foo', true, true, {a:1});
+            console.log([threw, e.type, e.bubbles, e.cancelable, e.detail.a, e instanceof CustomEvent].join(','));
+            "#,
+        );
+        assert!(
+            out.iter().any(|l| l.trim() == "true,foo,true,true,1,true"),
+            "createEvent/initCustomEvent failed: {out:?}"
+        );
+    }
+
+    #[test]
+    fn event_constructor_defaults_and_init_dict() {
+        // Spec: bubbles/cancelable/composed default to FALSE; init dict overrides.
+        let out = run_min_dom_js(
+            r#"
+            var d = new Event('click');                     // no dict → all false
+            var w = new Event('click', {bubbles:true, cancelable:true, composed:true});
+            console.log([
+              d.bubbles, d.cancelable, d.composed,
+              w.bubbles, w.cancelable, w.composed,
+              d.defaultPrevented, d.isTrusted, d.type
+            ].join(','));
+            "#,
+        );
+        assert!(
+            out.iter()
+                .any(|l| l.trim() == "false,false,false,true,true,true,false,false,click"),
+            "Event constructor defaults/init-dict wrong: {out:?}"
+        );
+    }
+
+    #[test]
+    fn create_event_unknown_interface_throws_notsupported() {
+        let out = run_min_dom_js(
+            r#"
+            var name = "";
+            try { document.createEvent('Bogus'); }
+            catch (e) { name = e.name; }
+            console.log(name);
+            "#,
+        );
+        assert!(
+            out.iter().any(|l| l.trim() == "NotSupportedError"),
+            "createEvent('Bogus') should throw NotSupportedError: {out:?}"
+        );
+    }
+
+    #[test]
+    fn created_element_dispatch_fires_listener_with_closure_writeback() {
+        // The closure write-back regression: a listener that flips an outer-scope
+        // `called` must propagate the write (the bytecode VM declines such scripts
+        // to the tree-walk tier). Uses the full LiveInterp path (real
+        // document.createElement) so the created-element dispatchEvent fires.
+        let out = run_and_read(
+            "<html><body></body></html>",
+            "globalThis.__r = (function(){\
+                var t = document.createElement('div');\
+                var called = false;\
+                t.addEventListener('x', function(){ called = true; });\
+                var ok = t.dispatchEvent(new Event('x'));\
+                return called + ',' + ok;\
+             })();",
+            "globalThis.__r",
+        );
+        assert_eq!(
+            out, "true,true",
+            "created-element dispatch + closure write-back failed: {out}"
         );
     }
 

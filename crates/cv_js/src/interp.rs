@@ -15729,6 +15729,17 @@ impl Interp {
             Ok(m) => m,
             Err(_) => return None,
         };
+        // ── CLOSURE WRITE-BACK DECLINE ───────────────────────────────────────
+        // The VM snapshots upvalues by value, so a nested closure that mutates a
+        // captured binding (`StoreUp`) — e.g. the universal
+        //   var called=false; el.addEventListener('x',()=>{called=true});
+        //   el.dispatchEvent(e); assert(called)
+        // pattern — can't propagate the write back, diverging from the tree-walk.
+        // Decline to the tree-walk tier (captures by reference, correct). Never
+        // the numeric counted-loop bench shape, so the measured speedup stands.
+        if crate::bytecode::module_has_upvalue_writes(&module) {
+            return None;
+        }
         // ── STAGE 2 — VM-LEVEL LEAF INLINING (V8 JSInlining-shaped; gated
         // `CV_INLINE_LEAF`, DEFAULT ON). Splice every monomorphic numeric-leaf
         // `CallFn` in the script body (slot 0) inline so the hot loop's per-iteration
