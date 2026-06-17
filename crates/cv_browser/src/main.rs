@@ -27456,6 +27456,332 @@ fn make_dom_exception_like(name: &str, message: &str) -> cv_js::Value {
     cv_js::Value::Object(Rc::new(RefCell::new(e)))
 }
 
+/// The shared, chained prototype objects for the DOM interface hierarchy.
+/// Returned by [`build_dom_interface_objects`] so later setup (EventTarget /
+/// Document / AbortSignal constructors, element instances) can link their
+/// `.prototype` to the SAME object the interface global exposes — keeping
+/// `Object.getPrototypeOf(x) === Iface.prototype` and `x instanceof Iface`
+/// internally consistent (WebIDL §3.7 "interface prototype object").
+struct DomProtos {
+    event_target: std::rc::Rc<std::cell::RefCell<cv_js::OrderedMap<String, cv_js::Value>>>,
+    node: std::rc::Rc<std::cell::RefCell<cv_js::OrderedMap<String, cv_js::Value>>>,
+    element: std::rc::Rc<std::cell::RefCell<cv_js::OrderedMap<String, cv_js::Value>>>,
+    html_element: std::rc::Rc<std::cell::RefCell<cv_js::OrderedMap<String, cv_js::Value>>>,
+    character_data: std::rc::Rc<std::cell::RefCell<cv_js::OrderedMap<String, cv_js::Value>>>,
+    document: std::rc::Rc<std::cell::RefCell<cv_js::OrderedMap<String, cv_js::Value>>>,
+    document_fragment: std::rc::Rc<std::cell::RefCell<cv_js::OrderedMap<String, cv_js::Value>>>,
+    text: std::rc::Rc<std::cell::RefCell<cv_js::OrderedMap<String, cv_js::Value>>>,
+    comment: std::rc::Rc<std::cell::RefCell<cv_js::OrderedMap<String, cv_js::Value>>>,
+    abort_signal: std::rc::Rc<std::cell::RefCell<cv_js::OrderedMap<String, cv_js::Value>>>,
+}
+
+/// WHATWG DOM §4.4: the 12 `Node.<CONST>` node-type values plus the
+/// `Node.DOCUMENT_POSITION_*` bitmask constants. Returned as (name, value)
+/// pairs so they can be stamped onto BOTH the interface object and the
+/// interface prototype object (WebIDL §3.7.3 — a [Constant] is an own property
+/// of both), and onto Node instances (they inherit via the prototype chain).
+fn node_interface_constants() -> Vec<(&'static str, f64)> {
+    vec![
+        ("ELEMENT_NODE", 1.0),
+        ("ATTRIBUTE_NODE", 2.0),
+        ("TEXT_NODE", 3.0),
+        ("CDATA_SECTION_NODE", 4.0),
+        ("ENTITY_REFERENCE_NODE", 5.0),
+        ("ENTITY_NODE", 6.0),
+        ("PROCESSING_INSTRUCTION_NODE", 7.0),
+        ("COMMENT_NODE", 8.0),
+        ("DOCUMENT_NODE", 9.0),
+        ("DOCUMENT_TYPE_NODE", 10.0),
+        ("DOCUMENT_FRAGMENT_NODE", 11.0),
+        ("NOTATION_NODE", 12.0),
+        ("DOCUMENT_POSITION_DISCONNECTED", 0x01 as f64),
+        ("DOCUMENT_POSITION_PRECEDING", 0x02 as f64),
+        ("DOCUMENT_POSITION_FOLLOWING", 0x04 as f64),
+        ("DOCUMENT_POSITION_CONTAINS", 0x08 as f64),
+        ("DOCUMENT_POSITION_CONTAINED_BY", 0x10 as f64),
+        ("DOCUMENT_POSITION_IMPLEMENTATION_SPECIFIC", 0x20 as f64),
+    ]
+}
+
+/// WHATWG DOM §6.3 (NodeFilter): the `SHOW_*` whatToShow bitmask + the three
+/// `FILTER_*` acceptNode return values. [Constant]s of the NodeFilter callback
+/// interface object.
+fn node_filter_constants() -> Vec<(&'static str, f64)> {
+    vec![
+        ("FILTER_ACCEPT", 1.0),
+        ("FILTER_REJECT", 2.0),
+        ("FILTER_SKIP", 3.0),
+        ("SHOW_ALL", 0xFFFF_FFFFu32 as f64),
+        ("SHOW_ELEMENT", 0x1 as f64),
+        ("SHOW_ATTRIBUTE", 0x2 as f64),
+        ("SHOW_TEXT", 0x4 as f64),
+        ("SHOW_CDATA_SECTION", 0x8 as f64),
+        ("SHOW_ENTITY_REFERENCE", 0x10 as f64),
+        ("SHOW_ENTITY", 0x20 as f64),
+        ("SHOW_PROCESSING_INSTRUCTION", 0x40 as f64),
+        ("SHOW_COMMENT", 0x80 as f64),
+        ("SHOW_DOCUMENT", 0x100 as f64),
+        ("SHOW_DOCUMENT_TYPE", 0x200 as f64),
+        ("SHOW_DOCUMENT_FRAGMENT", 0x400 as f64),
+        ("SHOW_NOTATION", 0x800 as f64),
+    ]
+}
+
+/// Allocate an empty interface prototype object.
+fn new_proto_obj() -> std::rc::Rc<std::cell::RefCell<cv_js::OrderedMap<String, cv_js::Value>>> {
+    std::rc::Rc::new(std::cell::RefCell::new(cv_js::OrderedMap::new()))
+}
+
+/// Link `child.[[Prototype]]` → `parent` via the engine's `PROTO_KEY` slot so
+/// `Object.getPrototypeOf(child) === parent` and the inherited-property /
+/// `instanceof` chain walks resolve (WebIDL §3.7.4 — the interface prototype
+/// object's [[Prototype]] is the inherited interface's prototype object).
+fn link_proto(
+    child: &std::rc::Rc<std::cell::RefCell<cv_js::OrderedMap<String, cv_js::Value>>>,
+    parent: &std::rc::Rc<std::cell::RefCell<cv_js::OrderedMap<String, cv_js::Value>>>,
+) {
+    child
+        .borrow_mut()
+        .insert(cv_js::PROTO_KEY.into(), cv_js::Value::Object(parent.clone()));
+}
+
+/// Build a WebIDL interface object (WebIDL §3.7) for a DOM interface that has
+/// NO `[Constructor]` (e.g. `Node`, `Element`, `Document`): a callable object
+/// carrying `_construct`/`_call` that BOTH throw "Illegal constructor"
+/// (`new Element()` / `Element()` is a TypeError per WebIDL §3.7.1/§3.7.2),
+/// plus `name`/`length`/`prototype`, with `prototype.constructor` back-linked.
+fn make_iface_no_ctor(
+    name: &'static str,
+    proto: &std::rc::Rc<std::cell::RefCell<cv_js::OrderedMap<String, cv_js::Value>>>,
+) -> cv_js::Value {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use cv_js::OrderedMap as HashMap;
+    let mut m: HashMap<String, cv_js::Value> = HashMap::new();
+    let illegal = move |_args: Vec<cv_js::Value>| -> Result<cv_js::Value, cv_js::JsError> {
+        Err(cv_js::JsError::Throw(make_type_error_value(&format!(
+            "Illegal constructor: {name}"
+        ))))
+    };
+    m.insert("_construct".into(), cv_js::native_fn(name, illegal.clone()));
+    m.insert("_call".into(), cv_js::native_fn(name, illegal));
+    m.insert("prototype".into(), cv_js::Value::Object(proto.clone()));
+    m.insert("name".into(), cv_js::Value::str(name.to_string()));
+    m.insert("length".into(), cv_js::Value::Number(0.0));
+    let iface = cv_js::Value::Object(Rc::new(RefCell::new(m)));
+    proto
+        .borrow_mut()
+        .insert("constructor".into(), iface.clone());
+    iface
+}
+
+/// Build a WebIDL interface object whose `[[Construct]]` runs `ctor`. The
+/// returned object carries `_construct`/`_call`, `prototype` (with
+/// `constructor` back-link), `name`, `length`. Used by interfaces that DO have
+/// a `[Constructor]` (`Comment`, `Text`, `Document`, `DocumentFragment`,
+/// `AbortController`).
+fn make_iface_with_ctor(
+    name: &'static str,
+    length: u32,
+    proto: &std::rc::Rc<std::cell::RefCell<cv_js::OrderedMap<String, cv_js::Value>>>,
+    ctor: cv_js::Value,
+) -> cv_js::Value {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use cv_js::OrderedMap as HashMap;
+    let mut m: HashMap<String, cv_js::Value> = HashMap::new();
+    m.insert("_construct".into(), ctor.clone());
+    m.insert("_call".into(), ctor);
+    m.insert("prototype".into(), cv_js::Value::Object(proto.clone()));
+    m.insert("name".into(), cv_js::Value::str(name.to_string()));
+    m.insert("length".into(), cv_js::Value::Number(length as f64));
+    let iface = cv_js::Value::Object(Rc::new(RefCell::new(m)));
+    proto
+        .borrow_mut()
+        .insert("constructor".into(), iface.clone());
+    iface
+}
+
+/// Install the full DOM interface-object graph (WebIDL §3.7 + WHATWG DOM):
+/// every interface (`Node`, `Element`, `HTMLElement`, `Document`, `Text`, …)
+/// is exposed as a real global constructor object with a `.prototype` whose
+/// `[[Prototype]]` chain mirrors WebIDL inheritance
+/// (`HTMLElement.prototype` → `Element.prototype` → `Node.prototype` →
+/// `EventTarget.prototype`), so `x instanceof Iface`,
+/// `Object.getPrototypeOf(el) === Element.prototype`, patching
+/// `Element.prototype.foo`, and the `*.prototype.__proto__` identity tests all
+/// hold. `Node`/`NodeFilter` [Constant]s are stamped on the interface object,
+/// the prototype, AND instances inherit them through the chain.
+///
+/// Returns the shared prototype handles so the rest of `install_minimal_dom`
+/// can keep instances (`document`, created elements, the AbortController
+/// signal) consistent with these interface objects.
+fn install_dom_interface_objects(interp: &cv_js::Interp) -> DomProtos {
+    // ---- 1. Allocate the prototype objects and chain them per WebIDL. ----
+    let event_target = new_proto_obj();
+    let node = new_proto_obj();
+    let element = new_proto_obj();
+    let html_element = new_proto_obj();
+    let svg_element = new_proto_obj();
+    let character_data = new_proto_obj();
+    let text = new_proto_obj();
+    let cdata = new_proto_obj();
+    let comment = new_proto_obj();
+    let processing_instruction = new_proto_obj();
+    let document = new_proto_obj();
+    let xml_document = new_proto_obj();
+    let document_fragment = new_proto_obj();
+    let document_type = new_proto_obj();
+    let attr = new_proto_obj();
+    let abort_signal = new_proto_obj();
+
+    // Inheritance edges (child → parent). EventTarget.prototype's [[Prototype]]
+    // is left as the default Object.prototype (the engine resolves it).
+    link_proto(&node, &event_target);
+    link_proto(&abort_signal, &event_target);
+    link_proto(&element, &node);
+    link_proto(&character_data, &node);
+    link_proto(&document, &node);
+    link_proto(&document_fragment, &node);
+    link_proto(&document_type, &node);
+    link_proto(&attr, &node);
+    link_proto(&html_element, &element);
+    link_proto(&svg_element, &element);
+    link_proto(&text, &character_data);
+    link_proto(&comment, &character_data);
+    link_proto(&processing_instruction, &character_data);
+    link_proto(&cdata, &text);
+    link_proto(&xml_document, &document);
+
+    // Per-tag HTMLElement subtypes (HTMLDivElement, …) chain off HTMLElement.
+    let html_subtypes: &[&'static str] = &[
+        "HTMLCanvasElement",
+        "HTMLDivElement",
+        "HTMLSpanElement",
+        "HTMLImageElement",
+        "HTMLInputElement",
+        "HTMLButtonElement",
+        "HTMLAnchorElement",
+        "HTMLScriptElement",
+        "HTMLStyleElement",
+        "HTMLBodyElement",
+        "HTMLHeadElement",
+        "HTMLHtmlElement",
+        "HTMLParagraphElement",
+        "HTMLUListElement",
+        "HTMLLIElement",
+        "HTMLTableElement",
+        "HTMLFormElement",
+        "HTMLSelectElement",
+        "HTMLOptionElement",
+        "HTMLTextAreaElement",
+        "HTMLLabelElement",
+        "HTMLTemplateElement",
+        "HTMLFrameSetElement",
+        "HTMLUnknownElement",
+    ];
+
+    // ---- 2. Stamp Node [Constant]s on the Node interface object AND the
+    //         Node prototype object (instances inherit via the chain). ----
+    for (k, v) in node_interface_constants() {
+        node.borrow_mut().insert(k.into(), cv_js::Value::Number(v));
+    }
+
+    // ---- 3. Build + register the no-constructor interface objects. ----
+    // (Document/Text/Comment/DocumentFragment get real constructors in their
+    // own group; here we register Node/Element/etc. and re-register the four
+    // constructable ones too so a referencing test never hits ReferenceError
+    // even if the constructor group runs later.)
+    let node_iface = make_iface_no_ctor("Node", &node);
+    // Node [Constant]s are also own properties of the interface object.
+    if let cv_js::Value::Object(o) = &node_iface {
+        let mut m = o.borrow_mut();
+        for (k, v) in node_interface_constants() {
+            m.insert(k.into(), cv_js::Value::Number(v));
+        }
+    }
+    interp.define_global("Node", node_iface);
+
+    // EventTarget DOES have a `[Constructor]` (WHATWG DOM §2.7) — its interface
+    // object is built later (it wraps the real listener-bearing constructor) and
+    // its `.prototype` is `event_target` (returned in DomProtos). We do NOT
+    // register it here so the constructable version wins.
+    interp.define_global("Element", make_iface_no_ctor("Element", &element));
+    interp.define_global("HTMLElement", make_iface_no_ctor("HTMLElement", &html_element));
+    interp.define_global("SVGElement", make_iface_no_ctor("SVGElement", &svg_element));
+    interp.define_global("CharacterData", make_iface_no_ctor("CharacterData", &character_data));
+    interp.define_global("CDATASection", make_iface_no_ctor("CDATASection", &cdata));
+    interp.define_global(
+        "ProcessingInstruction",
+        make_iface_no_ctor("ProcessingInstruction", &processing_instruction),
+    );
+    interp.define_global("XMLDocument", make_iface_no_ctor("XMLDocument", &xml_document));
+    interp.define_global("DocumentType", make_iface_no_ctor("DocumentType", &document_type));
+    interp.define_global("Attr", make_iface_no_ctor("Attr", &attr));
+    // Document / Text / Comment / DocumentFragment are registered here as
+    // no-ctor interface objects so their globals + prototype chain exist; the
+    // constructable-interface group later UPGRADES them in place (re-uses the
+    // SAME prototype objects) so `new Document()` / `new Text()` etc. work.
+    interp.define_global("Document", make_iface_no_ctor("Document", &document));
+    interp.define_global("Text", make_iface_no_ctor("Text", &text));
+    interp.define_global("Comment", make_iface_no_ctor("Comment", &comment));
+    interp.define_global(
+        "DocumentFragment",
+        make_iface_no_ctor("DocumentFragment", &document_fragment),
+    );
+
+    for &name in html_subtypes {
+        let p = new_proto_obj();
+        link_proto(&p, &html_element);
+        interp.define_global(name, make_iface_no_ctor(name, &p));
+    }
+
+    // ---- 4. Standalone interface objects (inherit Object.prototype). ----
+    // NodeFilter (WHATWG DOM §6.3) is a callback interface whose interface
+    // object carries the SHOW_*/FILTER_* [Constant]s; NodeIterator/TreeWalker/
+    // Range/NamedNodeMap/DOMTokenList/DOMStringMap/DOMImplementation are plain
+    // interface objects so `x instanceof Iface` + `Iface.prototype` resolve.
+    for name in [
+        "NodeIterator",
+        "TreeWalker",
+        "Range",
+        "AbstractRange",
+        "StaticRange",
+        "NamedNodeMap",
+        "DOMTokenList",
+        "DOMStringMap",
+        "DOMImplementation",
+    ] {
+        let p = new_proto_obj();
+        interp.define_global(name, make_iface_no_ctor(name, &p));
+    }
+    {
+        let nf_proto = new_proto_obj();
+        let nf_iface = make_iface_no_ctor("NodeFilter", &nf_proto);
+        // SHOW_*/FILTER_* on the interface object AND its prototype.
+        for (k, v) in node_filter_constants() {
+            if let cv_js::Value::Object(o) = &nf_iface {
+                o.borrow_mut().insert(k.into(), cv_js::Value::Number(v));
+            }
+            nf_proto.borrow_mut().insert(k.into(), cv_js::Value::Number(v));
+        }
+        interp.define_global("NodeFilter", nf_iface);
+    }
+
+    DomProtos {
+        event_target,
+        node,
+        element,
+        html_element,
+        character_data,
+        document,
+        document_fragment,
+        text,
+        comment,
+        abort_signal,
+    }
+}
+
 fn install_minimal_dom_with_url(interp: &cv_js::Interp, initial_title: String, page_url: &str) {
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -29071,39 +29397,24 @@ fn install_minimal_dom_with_url(interp: &cv_js::Interp, initial_title: String, p
     interp.define_global("crypto", crypto);
     interp.define_global("performance", performance);
 
-    // DOM interface constructors (`HTMLCanvasElement`, `HTMLElement`, `Node`, …).
-    // Libraries gate on `x instanceof HTMLCanvasElement` and patch
-    // `HTMLElement.prototype`; without the globals those references throw
-    // `ReferenceError`. `instanceof` matches our tag-keyed elements by tag name
-    // (see `is_instance_of`). Each carries an own `prototype` object so
-    // prototype patching works.
-    for name in [
-        "EventTarget",
-        "Node",
-        "Element",
-        "HTMLElement",
-        "HTMLCanvasElement",
-        "HTMLDivElement",
-        "HTMLSpanElement",
-        "HTMLImageElement",
-        "HTMLInputElement",
-        "HTMLButtonElement",
-        "HTMLAnchorElement",
-        "HTMLScriptElement",
-        "HTMLStyleElement",
-        "HTMLBodyElement",
-        "HTMLDocument",
-        "SVGElement",
-        "CanvasRenderingContext2D",
-    ] {
-        let ctor = cv_js::native_fn(name, |_| Ok(cv_js::Value::Undefined));
-        if let cv_js::Value::NativeFunction(n) = &ctor {
-            n.props.borrow_mut().insert(
-                "prototype".into(),
-                cv_js::Value::Object(Rc::new(RefCell::new(HashMap::new()))),
-            );
-        }
-        interp.define_global(name, ctor);
+    // DOM interface objects (`Node`, `Element`, `HTMLElement`, `Document`, …)
+    // as real WebIDL interface objects with constants + a correctly chained
+    // prototype hierarchy. Returns the shared prototype handles so the rest of
+    // this function keeps `document`/elements/AbortSignal consistent with them.
+    // Replaces the former "weak" loop that exposed empty no-op functions.
+    let dom_protos = install_dom_interface_objects(interp);
+
+    // HTMLDocument (legacy alias for the HTML document interface) chains off
+    // Document.prototype; CanvasRenderingContext2D is a standalone interface.
+    {
+        let html_doc_proto = new_proto_obj();
+        link_proto(&html_doc_proto, &dom_protos.document);
+        interp.define_global("HTMLDocument", make_iface_no_ctor("HTMLDocument", &html_doc_proto));
+        let crc2d_proto = new_proto_obj();
+        interp.define_global(
+            "CanvasRenderingContext2D",
+            make_iface_no_ctor("CanvasRenderingContext2D", &crc2d_proto),
+        );
     }
 
     // Observer constructors (MutationObserver, IntersectionObserver,
@@ -30455,7 +30766,8 @@ fn install_minimal_dom_with_url(interp: &cv_js::Interp, initial_title: String, p
     // their own dispatchers expect the constructor to exist and
     // .addEventListener/.removeEventListener/.dispatchEvent to be
     // present.
-    let eventtarget_ctor = cv_js::native_ctor_pure("EventTarget", 0, |_args| {
+    let et_proto_for_ctor = dom_protos.event_target.clone();
+    let eventtarget_ctor = cv_js::native_ctor_pure("EventTarget", 0, move |_args| {
         use std::cell::RefCell;
         use std::rc::Rc;
         use cv_js::OrderedMap as HashMap;
@@ -30464,6 +30776,13 @@ fn install_minimal_dom_with_url(interp: &cv_js::Interp, initial_title: String, p
         // capture it and stamp event.target = this EventTarget object.
         let obj: Rc<RefCell<HashMap<String, cv_js::Value>>> =
             Rc::new(RefCell::new(HashMap::new()));
+        // WebIDL §3.7.4: a platform object's [[Prototype]] is its interface
+        // prototype object, so `new EventTarget() instanceof EventTarget` and
+        // `Object.getPrototypeOf(et) === EventTarget.prototype` hold.
+        obj.borrow_mut().insert(
+            cv_js::PROTO_KEY.into(),
+            cv_js::Value::Object(et_proto_for_ctor.clone()),
+        );
         let l_add = listeners.clone();
         obj.borrow_mut().insert(
             "addEventListener".into(),
@@ -30558,7 +30877,15 @@ fn install_minimal_dom_with_url(interp: &cv_js::Interp, initial_title: String, p
         );
         Ok(cv_js::Value::Object(obj))
     });
-    interp.define_global("EventTarget", eventtarget_ctor);
+    // Wrap the constructable EventTarget as a proper WebIDL interface object
+    // (object carrying `_construct`/`_call`/`prototype`/`name`/`length`) whose
+    // `.prototype` is the shared `event_target` proto. So `new EventTarget()`
+    // constructs, `EventTarget.prototype` is the chain root for Node, and
+    // `et instanceof EventTarget` holds.
+    interp.define_global(
+        "EventTarget",
+        make_iface_with_ctor("EventTarget", 0, &dom_protos.event_target, eventtarget_ctor),
+    );
 
     // Event / CustomEvent / UIEvent constructors + interface globals (WHATWG DOM
     // §2.2/§2.4 + UI Events). Each interface object is an Object carrying
@@ -64612,6 +64939,132 @@ mod tests {
         install_minimal_dom_with_url(&interp, String::new(), "about:blank");
         let _ = interp.run(js);
         std::mem::take(&mut interp.output)
+    }
+
+    /// Evaluate an expression against a minimal-DOM interp and return its
+    /// completion value's display string (last expression wins). Used by the
+    /// DOM interface-object tests below.
+    fn eval_min_dom(expr: &str) -> String {
+        let mut interp = cv_js::Interp::new();
+        interp.install_math();
+        interp.install_json();
+        interp.install_basic_globals();
+        install_minimal_dom_with_url(&interp, String::new(), "about:blank");
+        interp
+            .run_completion_value(expr)
+            .map(|v| v.to_display_string())
+            .unwrap_or_else(|e| format!("THROW: {e:?}"))
+    }
+
+    #[test]
+    fn dom_node_interface_constants_on_object_and_prototype() {
+        // WHATWG DOM §4.4 / WebIDL §3.7.3 — node-type [Constant]s exist on the
+        // interface object AND the prototype object.
+        assert_eq!(eval_min_dom("Node.ELEMENT_NODE"), "1");
+        assert_eq!(eval_min_dom("Node.TEXT_NODE"), "3");
+        assert_eq!(eval_min_dom("Node.DOCUMENT_NODE"), "9");
+        assert_eq!(eval_min_dom("Node.DOCUMENT_FRAGMENT_NODE"), "11");
+        assert_eq!(eval_min_dom("Node.prototype.ELEMENT_NODE"), "1");
+        assert_eq!(eval_min_dom("Node.prototype.COMMENT_NODE"), "8");
+        assert_eq!(
+            eval_min_dom("Node.DOCUMENT_POSITION_DISCONNECTED"),
+            "1"
+        );
+        assert_eq!(eval_min_dom("Node.DOCUMENT_POSITION_CONTAINED_BY"), "16");
+        assert_eq!(
+            eval_min_dom("Node.DOCUMENT_POSITION_IMPLEMENTATION_SPECIFIC"),
+            "32"
+        );
+    }
+
+    #[test]
+    fn dom_node_filter_constants() {
+        // WHATWG DOM §6.3 — SHOW_*/FILTER_* on the NodeFilter interface object.
+        assert_eq!(eval_min_dom("NodeFilter.SHOW_ALL"), "4294967295");
+        assert_eq!(eval_min_dom("NodeFilter.SHOW_ELEMENT"), "1");
+        assert_eq!(eval_min_dom("NodeFilter.SHOW_TEXT"), "4");
+        assert_eq!(eval_min_dom("NodeFilter.SHOW_COMMENT"), "128");
+        assert_eq!(eval_min_dom("NodeFilter.FILTER_ACCEPT"), "1");
+        assert_eq!(eval_min_dom("NodeFilter.FILTER_REJECT"), "2");
+        assert_eq!(eval_min_dom("NodeFilter.FILTER_SKIP"), "3");
+    }
+
+    #[test]
+    fn dom_interface_prototype_chain_per_webidl() {
+        // WebIDL §3.7.4 — the interface prototype object's [[Prototype]] is the
+        // inherited interface's prototype object.
+        assert_eq!(
+            eval_min_dom("Object.getPrototypeOf(HTMLElement.prototype) === Element.prototype"),
+            "true"
+        );
+        assert_eq!(
+            eval_min_dom("Object.getPrototypeOf(Element.prototype) === Node.prototype"),
+            "true"
+        );
+        assert_eq!(
+            eval_min_dom("Object.getPrototypeOf(Node.prototype) === EventTarget.prototype"),
+            "true"
+        );
+        assert_eq!(
+            eval_min_dom("Object.getPrototypeOf(Text.prototype) === CharacterData.prototype"),
+            "true"
+        );
+        assert_eq!(
+            eval_min_dom("Object.getPrototypeOf(CharacterData.prototype) === Node.prototype"),
+            "true"
+        );
+        assert_eq!(
+            eval_min_dom("Object.getPrototypeOf(Document.prototype) === Node.prototype"),
+            "true"
+        );
+        // constructor back-links.
+        assert_eq!(
+            eval_min_dom("Element.prototype.constructor === Element"),
+            "true"
+        );
+        assert_eq!(
+            eval_min_dom("Node.prototype.constructor === Node"),
+            "true"
+        );
+    }
+
+    #[test]
+    fn dom_interface_objects_no_ctor_throw_illegal() {
+        // WebIDL §3.7.1/§3.7.2 — `new Element()` / `Element()` is a TypeError
+        // (interface has no [Constructor]).
+        assert!(eval_min_dom("(function(){ try { new Element(); return 'no-throw'; } catch(e){ return e instanceof TypeError ? 'typeerror' : 'other'; } })()") == "typeerror");
+        assert!(eval_min_dom("(function(){ try { new Node(); return 'no-throw'; } catch(e){ return e instanceof TypeError ? 'typeerror' : 'other'; } })()") == "typeerror");
+    }
+
+    #[test]
+    fn dom_event_target_constructs_and_instanceof() {
+        // WHATWG DOM §2.7 — EventTarget has a [Constructor].
+        assert_eq!(
+            eval_min_dom("(new EventTarget()) instanceof EventTarget"),
+            "true"
+        );
+        assert_eq!(
+            eval_min_dom("Object.getPrototypeOf(new EventTarget()) === EventTarget.prototype"),
+            "true"
+        );
+    }
+
+    #[test]
+    fn dom_interface_globals_all_exist() {
+        // The big-unblock surface: each interface global is defined (not a
+        // ReferenceError). `typeof` returns "object" for the interface objects
+        // (which are Value::Object wrappers) and never "undefined".
+        for name in [
+            "Node", "Element", "HTMLElement", "CharacterData", "Text", "Comment",
+            "CDATASection", "ProcessingInstruction", "Document", "XMLDocument",
+            "DocumentFragment", "DocumentType", "Attr", "DOMImplementation",
+            "EventTarget", "NodeList", "HTMLCollection", "NamedNodeMap",
+            "DOMTokenList", "DOMStringMap", "NodeFilter", "NodeIterator",
+            "TreeWalker", "Range", "AbortController", "AbortSignal",
+        ] {
+            let got = eval_min_dom(&format!("typeof {name}"));
+            assert_ne!(got, "undefined", "interface global {name} must exist");
+        }
     }
 
     #[test]
