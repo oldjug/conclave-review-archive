@@ -26078,6 +26078,7 @@ fn build_domparser_document(html: &str) -> cv_js::Value {
     let mut doc_map: HashMap<String, cv_js::Value> = HashMap::new();
     doc_map.insert("nodeType".into(), cv_js::Value::Number(9.0));
     doc_map.insert("contentType".into(), cv_js::Value::String("text/html".into()));
+    install_event_handler_idl_defaults(&mut doc_map);
     doc_map.insert("body".into(), body_js);
     doc_map.insert("head".into(), head_js);
     doc_map.insert("documentElement".into(), html_js);
@@ -27791,6 +27792,7 @@ fn install_minimal_dom_with_url(interp: &cv_js::Interp, initial_title: String, p
     let mut doc_map: HashMap<String, cv_js::Value> = HashMap::new();
     doc_map.insert("title".into(), cv_js::Value::str(initial_title.clone()));
     doc_map.insert("URL".into(), cv_js::Value::str(page_url.to_string()));
+    install_event_handler_idl_defaults(&mut doc_map);
     // document.createEvent("Event"|"CustomEvent"|"UIEvent"|legacy aliases) —
     // WHATWG DOM §4.5.1. Present on the minimal-DOM document too (the full
     // install_dom_api also wires it on the live document); this keeps createEvent
@@ -39928,6 +39930,11 @@ fn walk_for_table(
         let inner_text = collect_inner_text(node);
 
         let mut el_map: HashMap<String, cv_js::Value> = HashMap::new();
+        // Event-handler IDL attributes default to null (HTML "event handler IDL
+        // attributes") so `el.onclick === null` initially and the assign-then-
+        // dispatch idiom works through dispatch_to_path. Authored on<type>
+        // content attributes (below) overwrite the null with the compiled handler.
+        install_event_handler_idl_defaults(&mut el_map);
         // Mirror the stable node id from the doc node into the JS object so a
         // mutation can resolve this element by identity (roadmap #3).
         if let Some(a) = attrs.iter().find(|a| a.name == NODE_ID_ATTR) {
@@ -44872,6 +44879,38 @@ fn make_comment_node_js(text: &str) -> cv_js::Value {
     cv_js::Value::Object(Rc::new(RefCell::new(m)))
 }
 
+/// The common event-handler IDL attribute names (HTML "GlobalEventHandlers" +
+/// the Body/FrameSet WindowEventHandlers set). Per the HTML event-handler IDL
+/// rules, each is a reflecting property that is `null` when no handler is set
+/// (NOT undefined); assigning a function installs it (and the event dispatch
+/// invokes it — see `dispatch_to_path`'s on-handler read). We stamp them as
+/// `null` defaults on element/document instances so `el.onclick === null`
+/// initially and feature-detect / read-before-write code never sees undefined.
+const EVENT_HANDLER_IDL_ATTRS: &[&str] = &[
+    "onabort", "onblur", "oncancel", "oncanplay", "oncanplaythrough", "onchange",
+    "onclick", "onclose", "oncontextmenu", "oncuechange", "ondblclick", "ondrag",
+    "ondragend", "ondragenter", "ondragleave", "ondragover", "ondragstart",
+    "ondrop", "ondurationchange", "onemptied", "onended", "onerror", "onfocus",
+    "onformdata", "oninput", "oninvalid", "onkeydown", "onkeypress", "onkeyup",
+    "onload", "onloadeddata", "onloadedmetadata", "onloadstart", "onmousedown",
+    "onmouseenter", "onmouseleave", "onmousemove", "onmouseout", "onmouseover",
+    "onmouseup", "onwheel", "onpause", "onplay", "onplaying", "onprogress",
+    "onratechange", "onreset", "onresize", "onscroll", "onseeked", "onseeking",
+    "onselect", "onstalled", "onsubmit", "onsuspend", "ontimeupdate", "ontoggle",
+    "onvolumechange", "onwaiting", "onpointerdown", "onpointermove", "onpointerup",
+    "onpointercancel", "onpointerover", "onpointerout", "onpointerenter",
+    "onpointerleave", "onanimationstart", "onanimationend", "onanimationiteration",
+    "ontransitionend", "onbeforeinput",
+];
+
+/// Stamp the event-handler IDL attributes (`onclick`, `onload`, …) as `null`
+/// defaults on a node's backing map, so `node.onclick === null` initially.
+fn install_event_handler_idl_defaults(m: &mut cv_js::OrderedMap<String, cv_js::Value>) {
+    for &name in EVENT_HANDLER_IDL_ATTRS {
+        m.entry(name.to_string()).or_insert(cv_js::Value::Null);
+    }
+}
+
 /// Map an HTML local name (lowercased) to its specific HTML*Element interface
 /// name (HTML §4 element interface table); unknown elements map to
 /// `HTMLUnknownElement` (WHATWG HTML — "elements in the HTML namespace whose
@@ -47311,6 +47350,10 @@ fn make_new_element_js_with_canvas_registry(
         _ => {}
     }
     m.insert("style".into(), make_style_declaration());
+    // Event-handler IDL attributes default to null (HTML "event handler IDL
+    // attributes"): `el.onclick === null` until assigned; dispatch_to_path reads
+    // a callable `on<type>` and invokes it during target+bubble.
+    install_event_handler_idl_defaults(&mut m);
     let attrs_obj: Rc<RefCell<HashMap<String, cv_js::Value>>> =
         Rc::new(RefCell::new(HashMap::new()));
     m.insert("_attrs".into(), cv_js::Value::Object(attrs_obj.clone()));
@@ -65759,6 +65802,44 @@ mod tests {
         assert_eq!(
             eval_min_dom("(function(){ var c=new AbortController(); c.signal.throwIfAborted(); return 'ok'; })()"),
             "ok"
+        );
+    }
+
+    #[test]
+    fn dom_event_handler_idl_attrs_default_null_and_dispatch() {
+        // HTML "event handler IDL attributes": `el.onclick` is null until set,
+        // and assigning a function makes the event dispatch it.
+        let html = "<!doctype html><html><body><button id=\"b\">x</button>\
+                    <script>\
+                      var b = document.getElementById('b');\
+                      window.__onclick_initial = (b.onclick === null);\
+                      window.__fired = 0;\
+                      b.onclick = function(){ window.__fired++; };\
+                      window.__onclick_is_fn = (typeof b.onclick === 'function');\
+                      b.dispatchEvent(new Event('click'));\
+                    </script></body></html>";
+        let cfg = cv_layout::LayoutConfig::default();
+        let (runtime, _d, _s, _p) =
+            build_runtime_and_first_paint(html, "https://example.com/", &cfg, "")
+                .expect("render ok");
+        assert!(
+            matches!(
+                runtime.interp.get_global("__onclick_initial"),
+                Some(cv_js::Value::Bool(true))
+            ),
+            "el.onclick must be null initially"
+        );
+        assert!(
+            matches!(
+                runtime.interp.get_global("__onclick_is_fn"),
+                Some(cv_js::Value::Bool(true))
+            ),
+            "assigned onclick reads back as a function"
+        );
+        assert_eq!(
+            runtime.interp.get_global("__fired").map(|v| v.to_number()),
+            Some(1.0),
+            "dispatching click invokes the onclick handler once"
         );
     }
 
