@@ -26112,6 +26112,8 @@ fn build_domparser_document(html: &str) -> cv_js::Value {
 
     let mut doc_map: HashMap<String, cv_js::Value> = HashMap::new();
     doc_map.insert("nodeType".into(), cv_js::Value::Number(9.0));
+    // WHATWG DOM §4.4: a Document's nodeValue is null.
+    doc_map.insert("nodeValue".into(), cv_js::Value::Null);
     doc_map.insert("contentType".into(), cv_js::Value::String("text/html".into()));
     install_event_handler_idl_defaults(&mut doc_map);
     doc_map.insert("body".into(), body_js);
@@ -40102,6 +40104,10 @@ fn walk_for_table(
         // dispatch idiom works through dispatch_to_path. Authored on<type>
         // content attributes (below) overwrite the null with the compiled handler.
         install_event_handler_idl_defaults(&mut el_map);
+        // WHATWG DOM §4.4: an Element's nodeValue is null (only CharacterData /
+        // Attr / PI nodes have a non-null nodeValue). Stamp it so
+        // `element.nodeValue === null` rather than undefined.
+        el_map.entry("nodeValue".into()).or_insert(cv_js::Value::Null);
         // Mirror the stable node id from the doc node into the JS object so a
         // mutation can resolve this element by identity (roadmap #3).
         if let Some(a) = attrs.iter().find(|a| a.name == NODE_ID_ATTR) {
@@ -44929,14 +44935,21 @@ fn js_node_is_element(v: &cv_js::Value) -> bool {
     js_node_type(v) == 1
 }
 
-/// The `data` (character data) of a Text/Comment node as a Rust String.
+/// The `data` (character data) of a Text/Comment node as a Rust String. Slots
+/// holding an explicit `null` (e.g. an element's nodeValue is null per §4.4) are
+/// treated as absent so a non-CharacterData node never stringifies to "null".
 fn js_chardata(v: &cv_js::Value) -> String {
     if let cv_js::Value::Object(o) = v {
         let b = o.borrow();
-        return b
-            .get("data")
-            .or_else(|| b.get("nodeValue"))
-            .or_else(|| b.get("textContent"))
+        let pick = |key: &str| -> Option<&cv_js::Value> {
+            match b.get(key) {
+                Some(cv_js::Value::Null) | None => None,
+                some => some,
+            }
+        };
+        return pick("data")
+            .or_else(|| pick("nodeValue"))
+            .or_else(|| pick("textContent"))
             .map(|x| x.to_display_string())
             .unwrap_or_default();
     }
@@ -48444,6 +48457,8 @@ fn make_document_fragment_js(pending: &PendingDomMutations) -> cv_js::Value {
         cv_js::Value::String("#document-fragment".into()),
     );
     m.insert("nodeType".into(), cv_js::Value::Number(11.0));
+    // WHATWG DOM §4.4: a DocumentFragment's nodeValue is null.
+    m.insert("nodeValue".into(), cv_js::Value::Null);
     m.insert("isConnected".into(), cv_js::Value::Bool(false));
     let nested: Rc<RefCell<Vec<cv_js::Value>>> = Rc::new(RefCell::new(Vec::new()));
     m.insert("_children".into(), cv_js::Value::Array(nested.clone()));
@@ -49968,6 +49983,8 @@ fn make_new_element_js_with_canvas_registry(
         cv_js::Value::str(HTML_NAMESPACE.to_string()),
     );
     m.insert("nodeType".into(), cv_js::Value::Number(1.0));
+    // WHATWG DOM §4.4: an Element's nodeValue is null.
+    m.insert("nodeValue".into(), cv_js::Value::Null);
     m.insert("isConnected".into(), cv_js::Value::Bool(false));
     m.insert("textContent".into(), cv_js::Value::str(String::new()));
     m.insert("innerHTML".into(), cv_js::Value::str(String::new()));
