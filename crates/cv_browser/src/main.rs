@@ -39046,23 +39046,16 @@ fn walk_for_table(
         el_map.insert("style".into(), make_style_declaration());
 
         // `element.dataset` — read-only snapshot of `data-*` attributes.
-        // Keys are camelCased per HTML spec (`data-foo-bar` → `fooBar`).
+        // Keys are camelCased per HTML spec (`data-foo-bar` → `fooBar`), with the
+        // edge cases handled by `dataset_attr_to_prop` (a trailing `-`, or a `-`
+        // not followed by an ASCII lowercase letter, is KEPT verbatim).
         let mut dataset_map: HashMap<String, cv_js::Value> = HashMap::new();
         for a in attrs.iter() {
             if let Some(rest) = a.name.strip_prefix("data-") {
-                let mut camel = String::with_capacity(rest.len());
-                let mut upper_next = false;
-                for c in rest.chars() {
-                    if c == '-' {
-                        upper_next = true;
-                    } else if upper_next {
-                        camel.push(c.to_ascii_uppercase());
-                        upper_next = false;
-                    } else {
-                        camel.push(c);
-                    }
-                }
-                dataset_map.insert(camel, cv_js::Value::str(a.value.clone()));
+                dataset_map.insert(
+                    dataset_attr_to_prop(rest),
+                    cv_js::Value::str(a.value.clone()),
+                );
             }
         }
         el_map.insert(
@@ -40580,6 +40573,29 @@ const XML_NAMESPACE: &str = "http://www.w3.org/XML/1998/namespace";
 /// The XMLNS namespace (https://infra.spec.whatwg.org/#xmlns-namespace).
 const XMLNS_NAMESPACE: &str = "http://www.w3.org/2000/xmlns/";
 
+/// HTML "name to IDL attribute name" for `dataset` (https://html.spec.whatwg.org/
+/// #concept-domstringmap-pairs): given the part AFTER the `data-` prefix, replace
+/// each `-` that is IMMEDIATELY FOLLOWED BY an ASCII lowercase letter (a–z) with
+/// that letter uppercased (dropping the `-`); EVERY OTHER character — including a
+/// trailing `-` or a `-` followed by a digit/uppercase — is kept verbatim. So
+/// `data-foo-bar` → `fooBar`, `data-` → "", `data-id-` → "id-".
+fn dataset_attr_to_prop(rest: &str) -> String {
+    let chars: Vec<char> = rest.chars().collect();
+    let mut out = String::with_capacity(rest.len());
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '-' && i + 1 < chars.len() && chars[i + 1].is_ascii_lowercase() {
+            out.push(chars[i + 1].to_ascii_uppercase());
+            i += 2;
+        } else {
+            out.push(c);
+            i += 1;
+        }
+    }
+    out
+}
+
 /// Read an element JS object's namespace, returning `None` for the null
 /// namespace (which we treat as the HTML namespace for parse-time elements that
 /// never set `namespaceURI`). `null`/`undefined`/absent → None.
@@ -41656,8 +41672,75 @@ fn make_named_node_map_js(list: AttrList, owner_element: cv_js::Value) -> cv_js:
         })
     };
 
+    // ownKeys trap — WebIDL §3.9.7 [[OwnPropertyKeys]] for NamedNodeMap (a legacy
+    // platform object): the array INDEX property names (0…length-1) in ascending
+    // order FIRST, then the supported property names (each attribute's qualified
+    // name, in list order, deduped). So `Object.getOwnPropertyNames(el.attributes)`
+    // == ['0','1',…,'id','class',…] (WHATWG DOM §4.9.1 NamedNodeMap).
+    let own_keys_trap = {
+        let list = list.clone();
+        native_fn("ownKeys", move |_args| {
+            let snapshot = list.borrow().clone();
+            let mut keys: Vec<Value> = Vec::new();
+            for i in 0..snapshot.len() {
+                keys.push(Value::str(i.to_string()));
+            }
+            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for e in snapshot.iter() {
+                if seen.insert(e.qualified_name.clone()) {
+                    keys.push(Value::str(e.qualified_name.clone()));
+                }
+            }
+            Ok(Value::Array(Rc::new(RefCell::new(keys))))
+        })
+    };
+    // getOwnPropertyDescriptor trap — report indices + supported names as own
+    // properties so getOwnPropertyNames/hasOwnProperty agree with ownKeys. Index
+    // descriptors are enumerable; named descriptors are non-enumerable
+    // ([LegacyUnenumerableNamedProperties]); both configurable, non-writable.
+    let gopd_trap = {
+        let list = list.clone();
+        let owner = owner_element.clone();
+        native_fn("getOwnPropertyDescriptor", move |args| {
+            let key = args
+                .get(1)
+                .map(|v| v.to_display_string())
+                .unwrap_or_default();
+            let snapshot = list.borrow().clone();
+            let make_desc = |value: Value, enumerable: bool| -> Value {
+                let mut d: cv_js::OrderedMap<String, Value> = cv_js::OrderedMap::new();
+                d.insert("value".into(), value);
+                d.insert("writable".into(), Value::Bool(false));
+                d.insert("enumerable".into(), Value::Bool(enumerable));
+                d.insert("configurable".into(), Value::Bool(true));
+                Value::Object(Rc::new(RefCell::new(d)))
+            };
+            if let Ok(i) = key.parse::<usize>() {
+                if i < snapshot.len() {
+                    let attr = make_attr_node_js(
+                        snapshot[i].clone(),
+                        Some(list.clone()),
+                        Some(owner.clone()),
+                    );
+                    return Ok(make_desc(attr, true));
+                }
+                return Ok(Value::Undefined);
+            }
+            if let Some(e) = snapshot
+                .iter()
+                .find(|e| e.qualified_name == key || e.qualified_name.eq_ignore_ascii_case(&key))
+            {
+                let attr = make_attr_node_js(e.clone(), Some(list.clone()), Some(owner.clone()));
+                return Ok(make_desc(attr, false));
+            }
+            Ok(Value::Undefined)
+        })
+    };
+
     let mut handler = cv_js::OrderedMap::new();
     handler.insert("get".into(), get_trap);
+    handler.insert("ownKeys".into(), own_keys_trap);
+    handler.insert("getOwnPropertyDescriptor".into(), gopd_trap);
 
     let mut proxy_map = cv_js::OrderedMap::new();
     proxy_map.insert("_isProxy".into(), Value::Bool(true));
@@ -47309,20 +47392,7 @@ fn make_new_element_js_with_canvas_registry(
             }
             // Build the target snapshot from attrs for initial enumeration.
             fn data_attr_to_camel_new(attr: &str) -> Option<String> {
-                let rest = attr.strip_prefix("data-")?;
-                let mut camel = String::with_capacity(rest.len());
-                let mut upper_next = false;
-                for c in rest.chars() {
-                    if c == '-' {
-                        upper_next = true;
-                    } else if upper_next {
-                        camel.push(c.to_ascii_uppercase());
-                        upper_next = false;
-                    } else {
-                        camel.push(c);
-                    }
-                }
-                Some(camel)
+                attr.strip_prefix("data-").map(dataset_attr_to_prop)
             }
             let mut target_map: HashMap<String, cv_js::Value> = HashMap::new();
             for (k, v) in attrs.borrow().iter() {
@@ -49520,8 +49590,10 @@ fn install_dom_api(
                 use cv_js::OrderedMap as HashMap;
 
                 let aw_ds = attr_writes.clone();
+                let aw_keys_ds = attr_writes.clone();
                 let orig_ds: cv_js::OrderedMap<String, String> = rec.original_attrs.clone();
                 let path_ds = rec.path.clone();
+                let path_keys_ds = rec.path.clone();
 
                 // camelCase → data-kebab-case (HTML spec §2.9.3).
                 fn camel_to_data_attr(camel: &str) -> String {
@@ -49538,20 +49610,7 @@ fn install_dom_api(
                 }
                 // data-kebab-case → camelCase (for ownKeys enumeration).
                 fn data_attr_to_camel(attr: &str) -> Option<String> {
-                    let rest = attr.strip_prefix("data-")?;
-                    let mut camel = String::with_capacity(rest.len());
-                    let mut upper_next = false;
-                    for c in rest.chars() {
-                        if c == '-' {
-                            upper_next = true;
-                        } else if upper_next {
-                            camel.push(c.to_ascii_uppercase());
-                            upper_next = false;
-                        } else {
-                            camel.push(c);
-                        }
-                    }
-                    Some(camel)
+                    attr.strip_prefix("data-").map(dataset_attr_to_prop)
                 }
 
                 // Build a target object seeded from the static HTML attrs
@@ -49637,10 +49696,57 @@ fn install_dom_api(
                     Ok(cv_js::Value::Bool(true))
                 });
 
+                // ownKeys trap — the LIVE set of dataset property names (HTML
+                // §2.3.10 DOMStringMap supported property names): every `data-*`
+                // content attribute mapped to its IDL name, in source order, with
+                // runtime setAttribute/removeAttribute (the attr-writes queue)
+                // and `dataset.x = …` applied so getOwnPropertyNames reflects
+                // mutations (domstringmap-supported-property-names.html).
+                let aw_keys = aw_keys_ds;
+                let orig_keys = orig_ds.clone();
+                let path_keys = path_keys_ds;
+                let own_keys_trap = cv_js::native_fn("dataset_ownKeys", move |_args| {
+                    let mut names: Vec<String> = Vec::new();
+                    let mut present: std::collections::HashSet<String> =
+                        std::collections::HashSet::new();
+                    // Static parse-time data-* attributes (source order).
+                    for k in orig_keys.keys() {
+                        if let Some(rest) = k.strip_prefix("data-") {
+                            let prop = dataset_attr_to_prop(rest);
+                            if present.insert(prop.clone()) {
+                                names.push(prop);
+                            }
+                        }
+                    }
+                    // Apply runtime writes: a `\x01` value REMOVES the key;
+                    // anything else ADDS it (if not already present).
+                    for (p, n, v) in aw_keys.borrow().iter() {
+                        let nl = n.to_ascii_lowercase();
+                        let Some(rest) = nl.strip_prefix("data-") else {
+                            continue;
+                        };
+                        if p != &path_keys {
+                            continue;
+                        }
+                        let prop = dataset_attr_to_prop(rest);
+                        if v == "\x01" {
+                            if present.remove(&prop) {
+                                names.retain(|x| x != &prop);
+                            }
+                        } else if present.insert(prop.clone()) {
+                            names.push(prop);
+                        }
+                    }
+                    let keys: Vec<cv_js::Value> =
+                        names.into_iter().map(cv_js::Value::str).collect();
+                    Ok(cv_js::Value::Array(Rc::new(RefCell::new(keys))))
+                });
+
                 let mut handler_map: HashMap<String, cv_js::Value> = HashMap::new();
                 handler_map.insert("get".into(), get_trap);
                 handler_map.insert("set".into(), set_trap);
                 handler_map.insert("deleteProperty".into(), del_trap);
+                handler_map.insert("ownKeys".into(), own_keys_trap);
                 let handler = cv_js::Value::Object(Rc::new(RefCell::new(handler_map)));
 
                 let mut proxy_map: HashMap<String, cv_js::Value> = HashMap::new();
