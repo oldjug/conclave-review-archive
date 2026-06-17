@@ -5,6 +5,13 @@
 A from-scratch, Windows-native web browser. **Not** a fork of Chromium,
 WebKit, Gecko, or Servo — and it pulls in **zero third-party crates**.
 
+Conclave is privacy-first: no telemetry, no advertising business model, no data
+selling. Because every layer is built in house, that is a guarantee rather than a
+setting you have to trust.
+
+- **Website:** https://conclave.studio
+- **Follow development:** https://x.com/ConclaveStudio
+
 The application icon (`assets/conclave.ico`, multi-resolution 16–256px) is
 embedded into the window at runtime and shown in the title bar, Alt-Tab, and
 taskbar.
@@ -101,3 +108,13 @@ feature) before launching:
   `CV_RETAINED_ORACLE` — internal correctness oracles.
 - `CV_T2_STATS`, `CV_LAYOUT_STATS`, `CV_BLOOM_STATS` — counters/stats.
 - `CV_JS_TIME_BUDGET_MS` — per-task JS wall-clock watchdog (default 8000ms).
+
+## License
+
+Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) for the
+full text.
+
+## About
+
+Conclave is an independent web browser built by the team at HyveChain Ltd. It is a
+standalone privacy product, not a blockchain or crypto application.
