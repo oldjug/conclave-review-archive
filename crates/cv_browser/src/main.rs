@@ -44891,6 +44891,62 @@ fn make_comment_node_js(text: &str) -> cv_js::Value {
     cv_js::Value::Object(Rc::new(RefCell::new(m)))
 }
 
+/// A live-document CharacterData node (CDATASection nodeType 4 / ProcessingInstruction
+/// nodeType 7) whose `[[Prototype]]` is linked at runtime to the supplied interface
+/// prototype (so `n instanceof CDATASection` / `instanceof ProcessingInstruction`
+/// and the CharacterData→Node chain hold). For a ProcessingInstruction the
+/// `target` attribute (WHATWG DOM §4.12 — "the PI's target") and `nodeName`
+/// (== target) are stamped; CDATASection's nodeName is "#cdata-section"
+/// (WHATWG DOM §4.13 — CDATASection extends Text). `data` is the verbatim string.
+fn make_chardata_node_with_iface(
+    node_type: f64,
+    node_name: &str,
+    target: Option<&str>,
+    data: &str,
+    proto: Option<std::rc::Rc<std::cell::RefCell<cv_js::OrderedMap<String, cv_js::Value>>>>,
+    owner_document: cv_js::Value,
+) -> cv_js::Value {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use cv_js::OrderedMap as HashMap;
+    let mut m: HashMap<String, cv_js::Value> = HashMap::new();
+    if let Some(p) = &proto {
+        m.insert(cv_js::PROTO_KEY.into(), cv_js::Value::Object(p.clone()));
+    }
+    m.insert("nodeName".into(), cv_js::Value::str(node_name.to_string()));
+    m.insert("nodeType".into(), cv_js::Value::Number(node_type));
+    m.insert("nodeValue".into(), cv_js::Value::str(data.to_string()));
+    m.insert("textContent".into(), cv_js::Value::str(data.to_string()));
+    m.insert("data".into(), cv_js::Value::str(data.to_string()));
+    if let Some(t) = target {
+        m.insert("target".into(), cv_js::Value::str(t.to_string()));
+    }
+    m.insert("ownerDocument".into(), owner_document);
+    // cloneNode (deep flag is irrelevant for a leaf CharacterData node — DOM §4.4
+    // "clone a node": a CharacterData clone copies `data`).
+    let (nt, nn, tgt, d, p) = (
+        node_type,
+        node_name.to_string(),
+        target.map(|s| s.to_string()),
+        data.to_string(),
+        proto.clone(),
+    );
+    let clone_node = cv_js::native_fn("cloneNode", move |_args| {
+        Ok(make_chardata_node_with_iface(
+            nt,
+            &nn,
+            tgt.as_deref(),
+            &d,
+            p.clone(),
+            cv_js::Value::Null,
+        ))
+    });
+    m.insert("cloneNode".into(), clone_node);
+    install_chardata_methods(&mut m);
+    install_child_node_mixin(&mut m);
+    cv_js::Value::Object(Rc::new(RefCell::new(m)))
+}
+
 /// The common event-handler IDL attribute names (HTML "GlobalEventHandlers" +
 /// the Body/FrameSet WindowEventHandlers set). Per the HTML event-handler IDL
 /// rules, each is a reflecting property that is `null` when no handler is set
@@ -45219,6 +45275,91 @@ fn make_blank_document(
     doc_rc
         .borrow_mut()
         .insert("createDocumentFragment".into(), create_fragment);
+
+    // createCDATASection(data) — WHATWG DOM §4.5. On a NON-HTML (XML) document
+    // step 1's "NotSupportedError" does NOT apply, so CDATA creation succeeds.
+    // Step 2: if data contains "]]>", throw InvalidCharacterError. The node is a
+    // CDATASection (nodeType 4, nodeName "#cdata-section", CharacterData/Text
+    // subclass, §4.13) whose [[Prototype]] is CDATASection.prototype.
+    // `new Document()` produces an XML document, so this is the working path that
+    // dom/common.js setupRangeTests() depends on.
+    let owner_for_cdata = doc_val.clone();
+    let is_html_cdata = is_html;
+    let create_cdata = cv_js::native_fn_with_interp("createCDATASection", move |interp, args| {
+        if is_html_cdata {
+            return Err(cv_js::JsError::Throw(make_dom_exception(
+                "NotSupportedError",
+                9,
+                "createCDATASection is not supported on HTML documents",
+            )));
+        }
+        let data = match args.first() {
+            Some(v) => interp.js_to_string(v),
+            None => String::new(),
+        };
+        if data.contains("]]>") {
+            return Err(cv_js::JsError::Throw(make_dom_exception(
+                "InvalidCharacterError",
+                5,
+                "CDATA section data must not contain ']]>'",
+            )));
+        }
+        let proto = iface_proto(interp, "CDATASection");
+        Ok(make_chardata_node_with_iface(
+            4.0,
+            "#cdata-section",
+            None,
+            &data,
+            proto,
+            owner_for_cdata.clone(),
+        ))
+    });
+    doc_rc
+        .borrow_mut()
+        .insert("createCDATASection".into(), create_cdata);
+
+    // createProcessingInstruction(target, data) — WHATWG DOM §4.5. Allowed on
+    // both HTML and XML documents. Validate target is a Name (InvalidCharacterError)
+    // and data has no "?>" (InvalidCharacterError). PI node: nodeType 7,
+    // nodeName == target, CharacterData with `target`+`data` (§4.12), [[Prototype]]
+    // ProcessingInstruction.prototype.
+    let owner_for_pi = doc_val.clone();
+    let create_pi = cv_js::native_fn_with_interp("createProcessingInstruction", move |interp, args| {
+        let target = match args.first() {
+            Some(v) => interp.js_to_string(v),
+            None => String::new(),
+        };
+        let data = match args.get(1) {
+            Some(v) => interp.js_to_string(v),
+            None => String::new(),
+        };
+        if !is_valid_xml_name(&target) {
+            return Err(cv_js::JsError::Throw(make_dom_exception(
+                "InvalidCharacterError",
+                5,
+                &format!("'{target}' is not a valid processing instruction target"),
+            )));
+        }
+        if data.contains("?>") {
+            return Err(cv_js::JsError::Throw(make_dom_exception(
+                "InvalidCharacterError",
+                5,
+                "processing instruction data must not contain '?>'",
+            )));
+        }
+        let proto = iface_proto(interp, "ProcessingInstruction");
+        Ok(make_chardata_node_with_iface(
+            7.0,
+            &target,
+            Some(&target),
+            &data,
+            proto,
+            owner_for_pi.clone(),
+        ))
+    });
+    doc_rc
+        .borrow_mut()
+        .insert("createProcessingInstruction".into(), create_pi);
 
     doc_val
 }
@@ -49537,6 +49678,72 @@ fn install_dom_api(
             .unwrap_or_default();
         Ok(make_comment_node_js(&data))
     });
+
+    // document.createCDATASection(data) — WHATWG DOM §4.5
+    // (https://dom.spec.whatwg.org/#dom-document-createcdatasection):
+    //   1. If this is an HTML document, then throw a "NotSupportedError".
+    //   2. If data contains the string "]]>", throw an "InvalidCharacterError".
+    //   3. Return a new CDATASection node with its data set to data and node
+    //      document set to this.
+    // The live `document` is always an HTML document, so this ALWAYS throws
+    // NotSupportedError here (the working path is `new Document()` — XML — in
+    // make_blank_document). We still implement the full algorithm rather than a
+    // bare throw so the InvalidCharacterError branch is correct if reached.
+    let create_cdata = cv_js::native_fn("createCDATASection", move |_args| {
+        // The live document is an HTML document → step 1 (NotSupportedError)
+        // always applies before the data check, so this unconditionally throws.
+        Err(cv_js::JsError::Throw(make_dom_exception(
+            "NotSupportedError",
+            9,
+            "createCDATASection is not supported on HTML documents",
+        )))
+    });
+
+    // document.createProcessingInstruction(target, data) — WHATWG DOM §4.5
+    // (https://dom.spec.whatwg.org/#dom-document-createprocessinginstruction):
+    //   1. If target does not match the Name production, throw an
+    //      "InvalidCharacterError".
+    //   2. If data contains the string "?>", throw an "InvalidCharacterError".
+    //   3. Return a new ProcessingInstruction node, with target set to target,
+    //      data set to data, and node document set to this.
+    // PIs ARE allowed in HTML documents (unlike CDATASection). The node's
+    // [[Prototype]] is ProcessingInstruction.prototype so `instanceof
+    // ProcessingInstruction`/`instanceof Node` hold (§4.12).
+    let create_pi = cv_js::native_fn_with_interp("createProcessingInstruction", move |interp, args| {
+        let target = match args.first() {
+            Some(v) => interp.js_to_string(v),
+            None => String::new(),
+        };
+        let data = match args.get(1) {
+            Some(v) => interp.js_to_string(v),
+            None => String::new(),
+        };
+        if !is_valid_xml_name(&target) {
+            return Err(cv_js::JsError::Throw(make_dom_exception(
+                "InvalidCharacterError",
+                5,
+                &format!("'{target}' is not a valid processing instruction target"),
+            )));
+        }
+        if data.contains("?>") {
+            return Err(cv_js::JsError::Throw(make_dom_exception(
+                "InvalidCharacterError",
+                5,
+                "processing instruction data must not contain '?>'",
+            )));
+        }
+        let owner = interp.get_global("document").unwrap_or(cv_js::Value::Null);
+        let proto = iface_proto(interp, "ProcessingInstruction");
+        Ok(make_chardata_node_with_iface(
+            7.0,
+            &target,
+            Some(&target),
+            &data,
+            proto,
+            owner,
+        ))
+    });
+
     // document.createAttribute(localName) — WHATWG DOM §4.5
     // (https://dom.spec.whatwg.org/#dom-document-createattribute). For an HTML
     // document the localName is lowercased; the Attr has a null namespace/prefix
@@ -51491,6 +51698,8 @@ fn install_dom_api(
         m.insert("createAttributeNS".into(), create_attribute_ns);
         m.insert("createTextNode".into(), create_text_node);
         m.insert("createComment".into(), create_comment);
+        m.insert("createCDATASection".into(), create_cdata);
+        m.insert("createProcessingInstruction".into(), create_pi);
         m.insert("createDocumentFragment".into(), create_document_fragment);
         // document.createEvent("Event"|"CustomEvent"|"UIEvent"|legacy aliases) —
         // WHATWG DOM §4.5.1. Returns an uninitialized, prototype-linked event the
@@ -51607,11 +51816,27 @@ fn install_dom_api(
                     ]))),
                 );
             }
-            let newdoc =
-                cv_js::Value::Object(DocRc::new(DocRefCell::new(cv_js::OrderedMap::new())));
+            // Build the new HTML document on make_blank_document(is_html=true) so
+            // it inherits the FULL node-creation surface — createTextNode /
+            // createComment / createProcessingInstruction / createDocumentFragment
+            // / createElementNS / createCDATASection (throws NotSupportedError on
+            // an HTML doc, per §4.5) — instead of carrying only an ad-hoc
+            // createElement. (WHATWG DOM §4.5.1 createHTMLDocument: the result is a
+            // real Document; common.js's foreignDoc relies on createTextNode etc.)
+            let newdoc = make_blank_document(
+                doc_proto.clone().unwrap_or_else(new_proto_obj),
+                iface_proto(interp, "Element").unwrap_or_else(new_proto_obj),
+                iface_proto(interp, "Text").unwrap_or_else(new_proto_obj),
+                iface_proto(interp, "Comment").unwrap_or_else(new_proto_obj),
+                iface_proto(interp, "DocumentFragment").unwrap_or_else(new_proto_obj),
+                true,
+            );
             let pending_ce = pending_impl.clone();
             let canvas_ce = canvas_impl.clone();
             let newdoc_for_ce = newdoc.clone();
+            // Override createElement with the canvas-registry-aware factory (so
+            // <canvas>.getContext works in the detached document); this SHADOWS
+            // the make_blank_document createElement for this HTML doc.
             let ce = cv_js::native_fn("createElement", move |a| {
                 let tag = a.first().map(|v| v.to_display_string()).unwrap_or_default();
                 let el =
