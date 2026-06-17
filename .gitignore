@@ -17,6 +17,7 @@ Cargo.lock.bak
 conformance/tmp/
 
 # internal planning / analysis notes (not part of the browser source)
+/*_PLAN.md
 /MASTER_DESIGN_BEAT_CHROME.md
 /ENGINE_VS_CHROME_AUDIT.md
 /CHROME_PARITY_ROADMAP.md
