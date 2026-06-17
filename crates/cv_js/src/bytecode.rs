@@ -4179,15 +4179,14 @@ fn run_callfn_p6(jf: &crate::jit::JitFunction, args: &[Value]) -> Value {
 // inlinable callee is spliced; any non-inlinable call, or a callee with the wrong
 // arity, is LEFT AS A `CallFn` (the VM runs it the Stage-1 way) — never wrong, just
 // not inlined. A caller with no inlinable call returns `None` (the module runs
-// un-inlined). Gated behind `CV_INLINE_LEAF` (default OFF) so the default build is
-// byte-identical to Stage 1.
+// un-inlined). Gated behind `CV_INLINE_LEAF` (DEFAULT ON; CV_INLINE_LEAF=0 to disable).
 // ══════════════════════════════════════════════════════════════════════════
 
-/// STAGE-2 gate (`CV_INLINE_LEAF`, DEFAULT OFF). When enabled (and the top-level VM
+/// STAGE-2 gate (`CV_INLINE_LEAF`, DEFAULT ON). When enabled (and the top-level VM
 /// is engaged), the top-level script module's slot-0 body has every monomorphic
 /// numeric-leaf `CallFn` spliced inline before it runs on the VM, so the hot loop's
-/// per-iteration call disappears. Default OFF until soak: the default build is
-/// byte-identical to Stage 1. Cached (env read once per thread); a programmatic
+/// per-iteration call disappears. DEFAULT ON (flipped 2026-06-16, fuzzer-clean);
+/// `CV_INLINE_LEAF=0` disables. Cached (env read once per thread); a programmatic
 /// override (`InlineLeafGuard`) takes precedence so tests/benches drive both states
 /// in one process without the per-thread cache pinning the first read.
 pub fn inline_leaf_enabled() -> bool {

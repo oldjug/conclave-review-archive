@@ -1967,7 +1967,7 @@ fn bc_per_fn_enabled() -> bool {
     })
 }
 
-/// TOP-LEVEL VM gate (`CV_TOPLEVEL_VM`, DEFAULT OFF). When enabled, eligible hot
+/// TOP-LEVEL VM gate (`CV_TOPLEVEL_VM`, DEFAULT ON). When enabled, eligible hot
 /// top-level script bodies are compiled to a bytecode Module and run on the
 /// register VM instead of the tree-walker (V8/Ignition runs ALL code — including
 /// top-level — on bytecode; the tree-walker re-walks the loop AST + string-keyed
@@ -15692,7 +15692,7 @@ impl Interp {
         result
     }
 
-    /// TOP-LEVEL VM seam (gated by `CV_TOPLEVEL_VM`, DEFAULT OFF). Compile the
+    /// TOP-LEVEL VM seam (gated by `CV_TOPLEVEL_VM`, DEFAULT ON). Compile the
     /// whole top-level script body to a bytecode `Module` and run it on the
     /// register VM (the SAME path a wrapped function already takes — measured ~5x
     /// faster than tree-walking the identical loop), returning the script's
@@ -15730,7 +15730,7 @@ impl Interp {
             Err(_) => return None,
         };
         // ── STAGE 2 — VM-LEVEL LEAF INLINING (V8 JSInlining-shaped; gated
-        // `CV_INLINE_LEAF`, DEFAULT OFF). Splice every monomorphic numeric-leaf
+        // `CV_INLINE_LEAF`, DEFAULT ON). Splice every monomorphic numeric-leaf
         // `CallFn` in the script body (slot 0) inline so the hot loop's per-iteration
         // `f(i)`/`work(n)` call disappears and the callee's arithmetic runs inline on
         // the VM. The transform is byte-identical to the un-inlined VM (the callee is
@@ -34653,6 +34653,134 @@ mod gengc_oracle {
         assert!(
             tripped,
             "watchdog must trip the runaway through the call op; got err={raw:?} msg={thrown_msg:?}"
+        );
+    }
+
+    /// Build a fake "element" Value carrying `id`/`name`/`nodeType` slots, the
+    /// shape the legacy-collection named getter inspects.
+    fn fake_el(id: &str, name: &str) -> Value {
+        let mut m: HashMap<String, Value> = HashMap::new();
+        m.insert("nodeType".into(), Value::Number(1.0));
+        if !id.is_empty() {
+            m.insert("id".into(), Value::str(id.to_string()));
+        }
+        if !name.is_empty() {
+            m.insert("name".into(), Value::str(name.to_string()));
+        }
+        Value::Object(Rc::new(RefCell::new(m)))
+    }
+
+    /// WHATWG DOM §4.2.10.2 / WebIDL §3.9 — an HTMLCollection is a LIVE legacy
+    /// platform object: indexed + named getters, length, item/namedItem,
+    /// @@iterator, exotic ownKeys/getOwnPropertyNames/hasOwnProperty, and `in`.
+    #[test]
+    fn legacy_collection_indexed_named_iterator_ownkeys_live() {
+        let mut i = Interp::new();
+        i.install_basic_globals();
+        // A LIVE backing the test can mutate (push a 4th element mid-run) to
+        // prove the collection re-queries on each access.
+        let backing: Rc<RefCell<Vec<Value>>> = Rc::new(RefCell::new(vec![
+            fake_el("foo", ""),
+            fake_el("", "bar"),
+            fake_el("baz", ""),
+        ]));
+        let b_for_supplier = backing.clone();
+        let coll = make_legacy_collection(
+            move || b_for_supplier.borrow().clone(),
+            "HTMLCollection",
+        );
+        i.define_global("coll", coll);
+
+        // length + indexed getter + item().
+        assert_eq!(i.run("coll.length").unwrap().to_number(), 3.0);
+        assert_eq!(
+            i.run("coll[0].id").unwrap().to_display_string(),
+            "foo"
+        );
+        assert_eq!(
+            i.run("coll.item(2).id").unwrap().to_display_string(),
+            "baz"
+        );
+        assert!(matches!(i.run("coll[9]").unwrap(), Value::Undefined));
+
+        // Named getter (id then name) + namedItem.
+        assert_eq!(
+            i.run("coll['bar'].name").unwrap().to_display_string(),
+            "bar"
+        );
+        assert_eq!(
+            i.run("coll.namedItem('baz').id").unwrap().to_display_string(),
+            "baz"
+        );
+
+        // `in` (HasProperty): indices + supported names true, others false.
+        assert!(i.run("0 in coll").unwrap().to_bool());
+        assert!(i.run("'foo' in coll").unwrap().to_bool());
+        assert!(!i.run("9 in coll").unwrap().to_bool());
+        assert!(!i.run("'nope' in coll").unwrap().to_bool());
+
+        // hasOwnProperty agrees: indices + names are own; out-of-range is not.
+        assert!(i.run("coll.hasOwnProperty(0)").unwrap().to_bool());
+        assert!(i.run("coll.hasOwnProperty('foo')").unwrap().to_bool());
+        assert!(!i.run("coll.hasOwnProperty(9)").unwrap().to_bool());
+
+        // getOwnPropertyNames: indices FIRST, then supported names (WebIDL §3.9.7).
+        assert_eq!(
+            i.run("Object.getOwnPropertyNames(coll).join(',')")
+                .unwrap()
+                .to_display_string(),
+            "0,1,2,foo,bar,baz"
+        );
+
+        // for-in enumerates the ENUMERABLE keys = indices only (names are
+        // [LegacyUnenumerableNamedProperties]).
+        assert_eq!(
+            i.run("(function(){var r=[];for(var k in coll){if(coll.hasOwnProperty(k))r.push(k);}return r.join(',');})()")
+                .unwrap()
+                .to_display_string(),
+            "0,1,2"
+        );
+
+        // @@iterator visits the elements in order.
+        assert_eq!(
+            i.run("Array.from(coll).map(function(e){return e.id||e.name;}).join(',')")
+                .unwrap()
+                .to_display_string(),
+            "foo,bar,baz"
+        );
+
+        // LIVE: push a 4th element into the backing → length + getters update
+        // with no re-construction of the collection.
+        backing.borrow_mut().push(fake_el("qux", ""));
+        assert_eq!(i.run("coll.length").unwrap().to_number(), 4.0);
+        assert_eq!(
+            i.run("coll[3].id").unwrap().to_display_string(),
+            "qux"
+        );
+        assert!(i.run("'qux' in coll").unwrap().to_bool());
+    }
+
+    /// A NodeList has NO named getter (WHATWG DOM §4.2.10.1): `nl['foo']` is
+    /// undefined even when an element's id is "foo", and supported names never
+    /// appear in getOwnPropertyNames.
+    #[test]
+    fn legacy_nodelist_has_no_named_getter() {
+        let mut i = Interp::new();
+        i.install_basic_globals();
+        let nl = make_legacy_collection(
+            || vec![fake_el("foo", ""), fake_el("", "bar")],
+            "NodeList",
+        );
+        i.define_global("nl", nl);
+        assert_eq!(i.run("nl.length").unwrap().to_number(), 2.0);
+        assert_eq!(i.run("nl[0].id").unwrap().to_display_string(), "foo");
+        assert!(matches!(i.run("nl['foo']").unwrap(), Value::Undefined));
+        assert!(!i.run("'foo' in nl").unwrap().to_bool());
+        assert_eq!(
+            i.run("Object.getOwnPropertyNames(nl).join(',')")
+                .unwrap()
+                .to_display_string(),
+            "0,1"
         );
     }
 }
