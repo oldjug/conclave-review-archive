@@ -27463,6 +27463,27 @@ fn make_dom_exception_like(name: &str, message: &str) -> cv_js::Value {
 /// `.prototype` to the SAME object the interface global exposes — keeping
 /// `Object.getPrototypeOf(x) === Iface.prototype` and `x instanceof Iface`
 /// internally consistent (WebIDL §3.7 "interface prototype object").
+/// Thread-local stash of the DOM interface PROTOTYPE objects keyed by interface
+/// name ("Element", "Text", "Comment", "CDATASection", "ProcessingInstruction",
+/// "DocumentType", "DocumentFragment", "Document", "Attr", "Node"). Populated by
+/// `install_dom_interface_objects`. Lets the proto-LESS legacy node factories
+/// (`make_text_node_js`/`make_comment_node_js`/`make_doctype_node_js`/
+/// `make_new_element_js*`/`make_document_fragment_js`), which are plain
+/// `native_fn`s with no `interp` handle, link each instance's `[[Prototype]]` to
+/// the right interface prototype so the universal Node.prototype methods
+/// (isEqualNode/contains/compareDocumentPosition/…) are inherited uniformly.
+type ProtoRc = std::rc::Rc<std::cell::RefCell<cv_js::OrderedMap<String, cv_js::Value>>>;
+thread_local! {
+    static DOM_NODE_PROTOS: std::cell::RefCell<std::collections::HashMap<&'static str, ProtoRc>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Fetch a stashed DOM interface prototype by interface name (see
+/// `DOM_NODE_PROTOS`). `None` before `install_dom_interface_objects` ran.
+fn node_proto(name: &str) -> Option<ProtoRc> {
+    DOM_NODE_PROTOS.with(|m| m.borrow().get(name).cloned())
+}
+
 struct DomProtos {
     event_target: std::rc::Rc<std::cell::RefCell<cv_js::OrderedMap<String, cv_js::Value>>>,
     node: std::rc::Rc<std::cell::RefCell<cv_js::OrderedMap<String, cv_js::Value>>>,
@@ -27689,6 +27710,15 @@ fn install_dom_interface_objects(interp: &cv_js::Interp) -> DomProtos {
         node.borrow_mut().insert(k.into(), cv_js::Value::Number(v));
     }
 
+    // ---- 2b. Populate Node.prototype with the universal `this`-generic Node
+    //          methods (WHATWG DOM §4.4). All node instances inherit them via
+    //          the chain; own-prop method bags on parsed/createElement nodes
+    //          still win (own-prop resolves before the proto walk), so this is
+    //          purely additive — it makes the previously-omitted methods on the
+    //          constructor-made node kinds (new Document/Comment/Text,
+    //          createHTMLDocument, createDocument) callable for the first time. ----
+    install_node_prototype_methods(&node);
+
     // ---- 3. Build + register the no-constructor interface objects. ----
     // (Document/Text/Comment/DocumentFragment get real constructors in their
     // own group; here we register Node/Element/etc. and re-register the four
@@ -27736,6 +27766,12 @@ fn install_dom_interface_objects(interp: &cv_js::Interp) -> DomProtos {
         let p = new_proto_obj();
         link_proto(&p, &html_element);
         interp.define_global(name, make_iface_no_ctor(name, &p));
+        // Stash so createElement can link the tag-specific element interface
+        // prototype (HTMLDivElement.prototype etc.) — `el.constructor` resolves
+        // and the universal Node methods still inherit up the chain.
+        DOM_NODE_PROTOS.with(|m| {
+            m.borrow_mut().insert(name, p.clone());
+        });
     }
 
     // ---- 4. Standalone interface objects (inherit Object.prototype). ----
@@ -27769,6 +27805,24 @@ fn install_dom_interface_objects(interp: &cv_js::Interp) -> DomProtos {
         }
         interp.define_global("NodeFilter", nf_iface);
     }
+
+    // Stash the node-kind prototypes so the proto-less legacy factories can link
+    // instances to them (and thereby inherit the universal Node.prototype methods).
+    DOM_NODE_PROTOS.with(|m| {
+        let mut m = m.borrow_mut();
+        m.insert("Node", node.clone());
+        m.insert("Element", element.clone());
+        m.insert("HTMLElement", html_element.clone());
+        m.insert("CharacterData", character_data.clone());
+        m.insert("Text", text.clone());
+        m.insert("CDATASection", cdata.clone());
+        m.insert("Comment", comment.clone());
+        m.insert("ProcessingInstruction", processing_instruction.clone());
+        m.insert("Document", document.clone());
+        m.insert("DocumentFragment", document_fragment.clone());
+        m.insert("DocumentType", document_type.clone());
+        m.insert("Attr", attr.clone());
+    });
 
     DomProtos {
         event_target,
@@ -43598,6 +43652,748 @@ fn install_chardata_methods(m: &mut cv_js::OrderedMap<String, cv_js::Value>) {
     );
 }
 
+/// Read a node's `nodeName` (the qualified name for elements/PIs, "#text" etc.
+/// for the leaf kinds). Empty if absent.
+fn js_node_name_str(v: &cv_js::Value) -> String {
+    if let cv_js::Value::Object(o) = v {
+        if let Some(x) = o.borrow().get("nodeName") {
+            return x.to_display_string();
+        }
+    }
+    String::new()
+}
+
+/// Read a string-valued own property (or "" if missing/non-string-ish).
+fn js_node_str_prop(v: &cv_js::Value, key: &str) -> Option<String> {
+    if let cv_js::Value::Object(o) = v {
+        match o.borrow().get(key) {
+            Some(cv_js::Value::String(s)) => return Some(s.to_string()),
+            Some(cv_js::Value::Null) | None => return None,
+            Some(other) => return Some(other.to_display_string()),
+        }
+    }
+    None
+}
+
+/// WHATWG DOM §4.4 "equals" — the per-node structural comparison `isEqualNode`
+/// is defined over (recursively for the whole subtree). Two nodes are equal when
+/// they have the same nodeType and the per-type data matches and their children
+/// are pairwise equal in order.
+fn js_nodes_equal(a: &cv_js::Value, b: &cv_js::Value) -> bool {
+    let ta = js_node_type(a);
+    let tb = js_node_type(b);
+    if ta != tb {
+        return false;
+    }
+    match ta {
+        // DocumentType (§4.7): name, publicId, systemId.
+        10 => {
+            js_node_str_prop(a, "name") == js_node_str_prop(b, "name")
+                && js_node_str_prop(a, "publicId") == js_node_str_prop(b, "publicId")
+                && js_node_str_prop(a, "systemId") == js_node_str_prop(b, "systemId")
+        }
+        // Element (§4.9): namespace, namespace prefix, local name, and the
+        // attribute list as an UNORDERED set (each attr's ns/local/value match).
+        1 => {
+            if js_node_str_prop(a, "namespaceURI") != js_node_str_prop(b, "namespaceURI")
+                || js_node_str_prop(a, "prefix") != js_node_str_prop(b, "prefix")
+                || js_node_str_prop(a, "localName") != js_node_str_prop(b, "localName")
+            {
+                return false;
+            }
+            let (cv_js::Value::Object(oa), cv_js::Value::Object(ob)) = (a, b) else {
+                return false;
+            };
+            let aa = live_attr_snapshot(oa);
+            let ab = live_attr_snapshot(ob);
+            if aa.len() != ab.len() {
+                return false;
+            }
+            for (k, v) in aa.iter() {
+                if ab.get(k).map(|x| x.as_str()) != Some(v.as_str()) {
+                    return false;
+                }
+            }
+            js_children_equal(a, b)
+        }
+        // ProcessingInstruction (§4.12): target + data.
+        7 => {
+            js_node_str_prop(a, "target") == js_node_str_prop(b, "target")
+                && js_chardata(a) == js_chardata(b)
+        }
+        // Text / CDATASection / Comment: data.
+        3 | 4 | 8 => js_chardata(a) == js_chardata(b),
+        // Document / DocumentFragment / others: just the children.
+        _ => js_children_equal(a, b),
+    }
+}
+
+/// Children of `a` and `b` are pairwise `isEqualNode` in order (and equal count).
+fn js_children_equal(a: &cv_js::Value, b: &cv_js::Value) -> bool {
+    let ca = js_node_children(a);
+    let cb = js_node_children(b);
+    if ca.len() != cb.len() {
+        return false;
+    }
+    ca.iter().zip(cb.iter()).all(|(x, y)| js_nodes_equal(x, y))
+}
+
+/// True if `other` is `node` or a descendant of `node` (WHATWG DOM §4.4
+/// "inclusive descendant"), walking the live child tree.
+fn js_is_inclusive_descendant(node: &cv_js::Value, other: &cv_js::Value) -> bool {
+    if cv_js::Value::strict_eq(node, other) {
+        return true;
+    }
+    js_node_children(node)
+        .iter()
+        .any(|c| js_is_inclusive_descendant(c, other))
+}
+
+/// WHATWG DOM §4.4 compareDocumentPosition(other) bitmask. Returns the
+/// DOCUMENT_POSITION_* flags describing `other`'s position relative to `this`.
+fn js_compare_document_position(this: &cv_js::Value, other: &cv_js::Value) -> f64 {
+    const DISCONNECTED: u32 = 0x01;
+    const PRECEDING: u32 = 0x02;
+    const FOLLOWING: u32 = 0x04;
+    const CONTAINS: u32 = 0x08;
+    const CONTAINED_BY: u32 = 0x10;
+    const IMPLEMENTATION_SPECIFIC: u32 = 0x20;
+
+    if cv_js::Value::strict_eq(this, other) {
+        return 0.0;
+    }
+    // Inclusive-ancestor chains, nearest-first (index 0 == the node itself).
+    fn chain(n: &cv_js::Value) -> Vec<cv_js::Value> {
+        let mut out = vec![n.clone()];
+        let mut cur = n.clone();
+        let mut guard = 0;
+        while let Some(p) = js_node_parent(&cur) {
+            out.push(p.clone());
+            cur = p;
+            guard += 1;
+            if guard > 4096 {
+                break;
+            }
+        }
+        out
+    }
+    let a_chain = chain(this); // this' ancestors
+    let b_chain = chain(other); // other's ancestors
+
+    // Different roots → disconnected (with the stable implementation-specific
+    // ordering bit, per spec, picking a consistent PRECEDING/FOLLOWING).
+    let a_root = a_chain.last().cloned().unwrap_or_else(|| this.clone());
+    let b_root = b_chain.last().cloned().unwrap_or_else(|| other.clone());
+    if !cv_js::Value::strict_eq(&a_root, &b_root) {
+        // Stable order by pointer identity so repeated calls agree.
+        let preceding = js_object_identity(other).unwrap_or(0)
+            < js_object_identity(this).unwrap_or(0);
+        let dir = if preceding { PRECEDING } else { FOLLOWING };
+        return f64::from(DISCONNECTED | IMPLEMENTATION_SPECIFIC | dir);
+    }
+
+    // other contains this (other is an ancestor of this) → CONTAINS + PRECEDING.
+    if b_chain
+        .iter()
+        .skip(1)
+        .any(|n| cv_js::Value::strict_eq(n, this))
+    {
+        return f64::from(CONTAINS | PRECEDING);
+    }
+    // this contains other → CONTAINED_BY + FOLLOWING.
+    if a_chain
+        .iter()
+        .skip(1)
+        .any(|n| cv_js::Value::strict_eq(n, other))
+    {
+        return f64::from(CONTAINED_BY | FOLLOWING);
+    }
+
+    // Neither contains the other: find the nearest common ancestor and compare
+    // the indices of the two divergent children (tree order).
+    // Build set of this' ancestors for membership test.
+    let mut order = FOLLOWING;
+    'outer: for (i, an) in a_chain.iter().enumerate() {
+        for (j, bn) in b_chain.iter().enumerate() {
+            if cv_js::Value::strict_eq(an, bn) {
+                // Common ancestor `an`/`bn`. The child of it on this' side is
+                // a_chain[i-1]; on other's side b_chain[j-1].
+                let a_child = if i == 0 { this.clone() } else { a_chain[i - 1].clone() };
+                let b_child = if j == 0 { other.clone() } else { b_chain[j - 1].clone() };
+                let kids = js_node_children(an);
+                let ia = kids
+                    .iter()
+                    .position(|c| cv_js::Value::strict_eq(c, &a_child));
+                let ib = kids
+                    .iter()
+                    .position(|c| cv_js::Value::strict_eq(c, &b_child));
+                if let (Some(ia), Some(ib)) = (ia, ib) {
+                    order = if ib < ia { PRECEDING } else { FOLLOWING };
+                }
+                break 'outer;
+            }
+        }
+    }
+    f64::from(order)
+}
+
+/// WHATWG DOM §4.4 "locate a namespace" — `lookupNamespaceURI(prefix)` for an
+/// element walks the element + its `xmlns`/`xmlns:prefix` attributes then up the
+/// ancestor chain. Returns None if no namespace is found.
+fn js_locate_namespace(node: &cv_js::Value, prefix: Option<&str>) -> Option<String> {
+    let mut cur = node.clone();
+    let mut guard = 0;
+    loop {
+        if js_node_type(&cur) == 1 {
+            // 1. If the element's namespace is non-null and its prefix == prefix,
+            //    return the namespace.
+            let el_prefix = js_node_str_prop(&cur, "prefix");
+            let el_ns = js_node_str_prop(&cur, "namespaceURI");
+            if let Some(ns) = &el_ns {
+                if el_prefix.as_deref() == prefix && !ns.is_empty() {
+                    return Some(ns.clone());
+                }
+            }
+            // 2. Inspect xmlns attributes.
+            if let cv_js::Value::Object(o) = &cur {
+                let attrs = live_attr_snapshot(o);
+                match prefix {
+                    Some(p) => {
+                        if let Some(v) = attrs.get(&format!("xmlns:{p}")) {
+                            return if v.is_empty() { None } else { Some(v.clone()) };
+                        }
+                    }
+                    None => {
+                        if let Some(v) = attrs.get("xmlns") {
+                            return if v.is_empty() { None } else { Some(v.clone()) };
+                        }
+                    }
+                }
+            }
+        }
+        guard += 1;
+        if guard > 4096 {
+            return None;
+        }
+        match js_node_parent(&cur) {
+            Some(p) if js_node_type(&p) != 9 => cur = p, // stop at document
+            _ => return None,
+        }
+    }
+}
+
+/// WHATWG DOM §4.4 "locate a namespace prefix" — `lookupPrefix(namespace)`.
+fn js_locate_prefix(node: &cv_js::Value, namespace: &str) -> Option<String> {
+    if namespace.is_empty() {
+        return None;
+    }
+    let mut cur = node.clone();
+    let mut guard = 0;
+    loop {
+        if js_node_type(&cur) == 1 {
+            if js_node_str_prop(&cur, "namespaceURI").as_deref() == Some(namespace) {
+                if let Some(p) = js_node_str_prop(&cur, "prefix") {
+                    if !p.is_empty() {
+                        return Some(p);
+                    }
+                }
+            }
+            if let cv_js::Value::Object(o) = &cur {
+                let attrs = live_attr_snapshot(o);
+                for (k, v) in attrs.iter() {
+                    if v == namespace {
+                        if let Some(p) = k.strip_prefix("xmlns:") {
+                            return Some(p.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        guard += 1;
+        if guard > 4096 {
+            return None;
+        }
+        match js_node_parent(&cur) {
+            Some(p) => cur = p,
+            None => return None,
+        }
+    }
+}
+
+/// Ensure a node-like object has a `_children` array, returning it. Used by the
+/// generic Node-mutation prototype methods so a constructor-made document /
+/// element that started life childless can still host appendChild.
+fn ensure_children_array(
+    parent: &cv_js::Value,
+) -> Option<std::rc::Rc<std::cell::RefCell<Vec<cv_js::Value>>>> {
+    if let Some(c) = get_children_snapshot(parent) {
+        return Some(c);
+    }
+    let cv_js::Value::Object(obj) = parent else {
+        return None;
+    };
+    let arr: std::rc::Rc<std::cell::RefCell<Vec<cv_js::Value>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let mut m = obj.borrow_mut();
+    m.insert("_children".into(), cv_js::Value::Array(arr.clone()));
+    // Don't clobber a live `childNodes` collection if one exists; mirror only
+    // when absent so firstChild/childNodes reflect the new array.
+    if !m.contains_key("childNodes") {
+        m.insert("childNodes".into(), cv_js::Value::Array(arr.clone()));
+    }
+    Some(arr)
+}
+
+/// Detach `child` from whatever parent currently holds it (any node type),
+/// keeping the live `_parent`/children snapshots consistent. Mirror of the
+/// element-only `detach_element_snapshot_observed` for the generic path.
+fn generic_detach(child: &cv_js::Value) {
+    if is_element_js_value(child) {
+        detach_element_snapshot_observed(child);
+        return;
+    }
+    if let Some(parent) = js_node_parent(child) {
+        if let Some(kids) = get_children_snapshot(&parent) {
+            kids.borrow_mut()
+                .retain(|c| !cv_js::Value::strict_eq(c, child));
+        }
+    }
+    set_parent_snapshot(child, cv_js::Value::Null);
+}
+
+/// WHATWG DOM §4.4 "ensure pre-insertion validity" (the cycle-prevention part):
+/// inserting `node` into `parent` is invalid (HierarchyRequestError) if `node`
+/// is an INCLUSIVE ANCESTOR of `parent` — i.e. `parent` is `node` itself or a
+/// descendant of `node`. Without this guard, `el.appendChild(el)` or
+/// `el.appendChild(el.ancestor)` builds a cyclic `_children` graph that makes the
+/// recursive connectivity/text-content walks loop forever (stack overflow). The
+/// Range-mutations tests deliberately exercise these cases and expect the throw.
+fn pre_insert_would_cycle(parent: &cv_js::Value, node: &cv_js::Value) -> bool {
+    // node is an inclusive ancestor of parent. Two independent checks (the live
+    // `_parent` ancestor chain can be incomplete/lazy, so we ALSO walk node's
+    // descendant child graph, which is authoritative for cycle creation):
+    //   (a) walk parent's ancestor chain (incl. parent) looking for node;
+    //   (b) walk node's descendant subtree (incl. node) looking for parent.
+    // Either hit ⇒ inserting node into parent would form a cycle.
+    if cv_js::Value::strict_eq(parent, node) {
+        return true;
+    }
+    // (a) ancestor walk from parent.
+    let mut cur = Some(parent.clone());
+    let mut guard = 0;
+    while let Some(n) = cur {
+        if cv_js::Value::strict_eq(&n, node) {
+            return true;
+        }
+        guard += 1;
+        if guard > 65536 {
+            return true; // already cyclic — refuse
+        }
+        cur = js_node_parent(&n);
+    }
+    // (b) descendant walk from node (bounded DFS over `_children`).
+    fn descendant_contains(node: &cv_js::Value, target: &cv_js::Value, depth: usize) -> bool {
+        if depth > 8192 {
+            return true; // already cyclic — refuse
+        }
+        for c in js_node_children(node) {
+            if cv_js::Value::strict_eq(&c, target) {
+                return true;
+            }
+            if descendant_contains(&c, target, depth + 1) {
+                return true;
+            }
+        }
+        false
+    }
+    descendant_contains(node, parent, 0)
+}
+
+/// A HierarchyRequestError DOMException (code 3) — WHATWG DOM pre-insertion.
+fn hierarchy_request_error(msg: &str) -> cv_js::JsError {
+    cv_js::JsError::Throw(make_dom_exception("HierarchyRequestError", 3, msg))
+}
+
+/// Install the universal `this`-generic Node interface methods (WHATWG DOM §4.4
+/// Node) on `Node.prototype`. Every node instance — parsed, createElement, and
+/// the constructor-made (`new Document()`/`new Comment()`/createHTMLDocument/
+/// createDocument) nodes — inherits these via the [[Prototype]] chain
+/// (`read_property_inner` resolves them at the proto-walk step, AFTER own props,
+/// so the existing per-element own-prop method bags still win where present and
+/// no parsed-element behavior changes). The receiver is recovered with
+/// `current_native_this()` (the mixin idiom), so a single shared closure serves
+/// all instances. Methods that are genuinely missing on the constructor-made
+/// node kinds (appendChild/insertBefore/removeChild/replaceChild/contains/
+/// hasChildNodes/getRootNode/isEqualNode/isSameNode/compareDocumentPosition/
+/// normalize/lookup*) become callable here for the first time.
+///
+/// IMPORTANT (regression guard): only METHOD names are stamped — never a
+/// tree-traversal key (firstChild/childNodes/parentNode/…) or a node-type
+/// constant, which the engine computes live AHEAD of the proto walk.
+fn install_node_prototype_methods(
+    proto: &std::rc::Rc<std::cell::RefCell<cv_js::OrderedMap<String, cv_js::Value>>>,
+) {
+    use cv_js::{native_fn_with_interp, Value};
+    let mut m = proto.borrow_mut();
+
+    // appendChild(node) — §4.4: pre-insert `node` into `this` before null.
+    m.insert(
+        "appendChild".into(),
+        native_fn_with_interp("appendChild", |_i, args| {
+            let me = cv_js::current_native_this();
+            let Some(child) = args.first().cloned() else {
+                return Ok(Value::Null);
+            };
+            // §4.4 ensure pre-insertion validity: reject inserting an inclusive
+            // ancestor (would create a cycle) → HierarchyRequestError.
+            if matches!(child, Value::Object(_)) && pre_insert_would_cycle(&me, &child) {
+                return Err(hierarchy_request_error(
+                    "appendChild: the new child is an ancestor of the parent",
+                ));
+            }
+            // A DocumentFragment is replaced by its children on insertion (§4.4).
+            let nodes = if js_node_type(&child) == 11 {
+                let kids = js_node_children(&child);
+                if let Some(c) = get_children_snapshot(&child) {
+                    c.borrow_mut().clear();
+                }
+                kids
+            } else {
+                vec![child.clone()]
+            };
+            let Some(kids) = ensure_children_array(&me) else {
+                return Ok(child);
+            };
+            for n in &nodes {
+                generic_detach(n);
+            }
+            {
+                let mut k = kids.borrow_mut();
+                k.extend(nodes.iter().cloned());
+            }
+            for n in &nodes {
+                set_parent_snapshot(n, me.clone());
+            }
+            Ok(child)
+        }),
+    );
+
+    // insertBefore(node, child) — §4.4 pre-insert before `child` (null == append).
+    m.insert(
+        "insertBefore".into(),
+        native_fn_with_interp("insertBefore", |_i, args| {
+            let me = cv_js::current_native_this();
+            let Some(node) = args.first().cloned() else {
+                return Ok(Value::Null);
+            };
+            let ref_child = args.get(1).cloned().unwrap_or(Value::Null);
+            if matches!(node, Value::Object(_)) && pre_insert_would_cycle(&me, &node) {
+                return Err(hierarchy_request_error(
+                    "insertBefore: the new child is an ancestor of the parent",
+                ));
+            }
+            let nodes = if js_node_type(&node) == 11 {
+                let kids = js_node_children(&node);
+                if let Some(c) = get_children_snapshot(&node) {
+                    c.borrow_mut().clear();
+                }
+                kids
+            } else {
+                vec![node.clone()]
+            };
+            let Some(kids) = ensure_children_array(&me) else {
+                return Ok(node);
+            };
+            // Locate the insertion index (before ref_child; append if null/absent).
+            let at = if matches!(ref_child, Value::Null | Value::Undefined) {
+                kids.borrow().len()
+            } else {
+                kids.borrow()
+                    .iter()
+                    .position(|c| cv_js::Value::strict_eq(c, &ref_child))
+                    .unwrap_or_else(|| kids.borrow().len())
+            };
+            for n in &nodes {
+                generic_detach(n);
+            }
+            {
+                let mut k = kids.borrow_mut();
+                let at = at.min(k.len());
+                k.splice(at..at, nodes.iter().cloned());
+            }
+            for n in &nodes {
+                set_parent_snapshot(n, me.clone());
+            }
+            Ok(node)
+        }),
+    );
+
+    // removeChild(child) — §4.4: if child's parent is not `this`, NotFoundError;
+    // else remove and return it.
+    m.insert(
+        "removeChild".into(),
+        native_fn_with_interp("removeChild", |_i, args| {
+            let me = cv_js::current_native_this();
+            let Some(child) = args.first().cloned() else {
+                return Err(cv_js::JsError::Throw(make_dom_exception(
+                    "NotFoundError",
+                    8,
+                    "removeChild requires a node argument",
+                )));
+            };
+            let Some(kids) = get_children_snapshot(&me) else {
+                return Err(cv_js::JsError::Throw(make_dom_exception(
+                    "NotFoundError",
+                    8,
+                    "node to remove is not a child of this node",
+                )));
+            };
+            let pos = kids
+                .borrow()
+                .iter()
+                .position(|c| cv_js::Value::strict_eq(c, &child));
+            match pos {
+                Some(i) => {
+                    kids.borrow_mut().remove(i);
+                    set_parent_snapshot(&child, Value::Null);
+                    Ok(child)
+                }
+                None => Err(cv_js::JsError::Throw(make_dom_exception(
+                    "NotFoundError",
+                    8,
+                    "node to remove is not a child of this node",
+                ))),
+            }
+        }),
+    );
+
+    // replaceChild(node, child) — §4.4: replace `child` with `node`, return child.
+    m.insert(
+        "replaceChild".into(),
+        native_fn_with_interp("replaceChild", |_i, args| {
+            let me = cv_js::current_native_this();
+            let node = args.first().cloned().unwrap_or(Value::Null);
+            let child = args.get(1).cloned().unwrap_or(Value::Null);
+            // §4.4 replace: reject if `node` is an inclusive ancestor of `me`
+            // (cycle). `child` itself is excluded from the ancestor walk since it
+            // is being removed, but pre_insert_would_cycle walks me's ancestors
+            // which never includes me's own child.
+            if matches!(node, Value::Object(_)) && pre_insert_would_cycle(&me, &node) {
+                return Err(hierarchy_request_error(
+                    "replaceChild: the new child is an ancestor of the parent",
+                ));
+            }
+            let Some(kids) = get_children_snapshot(&me) else {
+                return Err(cv_js::JsError::Throw(make_dom_exception(
+                    "NotFoundError",
+                    8,
+                    "node to replace is not a child of this node",
+                )));
+            };
+            let pos = kids
+                .borrow()
+                .iter()
+                .position(|c| cv_js::Value::strict_eq(c, &child));
+            let Some(i) = pos else {
+                return Err(cv_js::JsError::Throw(make_dom_exception(
+                    "NotFoundError",
+                    8,
+                    "node to replace is not a child of this node",
+                )));
+            };
+            let nodes = if js_node_type(&node) == 11 {
+                let k = js_node_children(&node);
+                if let Some(c) = get_children_snapshot(&node) {
+                    c.borrow_mut().clear();
+                }
+                k
+            } else {
+                vec![node.clone()]
+            };
+            for n in &nodes {
+                generic_detach(n);
+            }
+            {
+                let mut k = kids.borrow_mut();
+                let i = i.min(k.len().saturating_sub(1));
+                k.splice(i..i + 1, nodes.iter().cloned());
+            }
+            set_parent_snapshot(&child, Value::Null);
+            for n in &nodes {
+                set_parent_snapshot(n, me.clone());
+            }
+            Ok(child)
+        }),
+    );
+
+    // hasChildNodes() — §4.4.
+    m.insert(
+        "hasChildNodes".into(),
+        native_fn_with_interp("hasChildNodes", |_i, _args| {
+            let me = cv_js::current_native_this();
+            Ok(Value::Bool(!js_node_children(&me).is_empty()))
+        }),
+    );
+
+    // contains(other) — §4.4: true iff `other` is an inclusive descendant of
+    // `this`. `null` → false.
+    m.insert(
+        "contains".into(),
+        native_fn_with_interp("contains", |_i, args| {
+            let me = cv_js::current_native_this();
+            match args.first() {
+                Some(o @ Value::Object(_)) => {
+                    Ok(Value::Bool(js_is_inclusive_descendant(&me, o)))
+                }
+                _ => Ok(Value::Bool(false)),
+            }
+        }),
+    );
+
+    // getRootNode(options?) — §4.4: the topmost ancestor (shadow-including root
+    // collapses to the same in this engine — no shadow trees).
+    m.insert(
+        "getRootNode".into(),
+        native_fn_with_interp("getRootNode", |_i, _args| {
+            let me = cv_js::current_native_this();
+            Ok(js_node_root(&me))
+        }),
+    );
+
+    // isSameNode(other) — §4.4: identity (===). isEqualNode(other) — §4.4: the
+    // structural subtree comparison.
+    m.insert(
+        "isSameNode".into(),
+        native_fn_with_interp("isSameNode", |_i, args| {
+            let me = cv_js::current_native_this();
+            let other = args.first().cloned().unwrap_or(Value::Null);
+            Ok(Value::Bool(cv_js::Value::strict_eq(&me, &other)))
+        }),
+    );
+    m.insert(
+        "isEqualNode".into(),
+        native_fn_with_interp("isEqualNode", |_i, args| {
+            let me = cv_js::current_native_this();
+            match args.first() {
+                Some(o @ Value::Object(_)) => Ok(Value::Bool(js_nodes_equal(&me, o))),
+                _ => Ok(Value::Bool(false)),
+            }
+        }),
+    );
+
+    // compareDocumentPosition(other) — §4.4 bitmask.
+    m.insert(
+        "compareDocumentPosition".into(),
+        native_fn_with_interp("compareDocumentPosition", |_i, args| {
+            let me = cv_js::current_native_this();
+            let Some(other @ Value::Object(_)) = args.first() else {
+                return Ok(Value::Number(0.0));
+            };
+            Ok(Value::Number(js_compare_document_position(&me, other)))
+        }),
+    );
+
+    // normalize() — §4.4: remove empty exclusive Text nodes and merge contiguous
+    // ones throughout the subtree. (Live Range boundary adjustment is not modeled
+    // here; the dom/ranges normalize cases that assert range movement remain
+    // honest FAILs rather than fake passes — see report.)
+    m.insert(
+        "normalize".into(),
+        native_fn_with_interp("normalize", |_i, _args| {
+            let me = cv_js::current_native_this();
+            fn normalize_subtree(node: &Value) {
+                let Some(kids) = get_children_snapshot(node) else {
+                    return;
+                };
+                // First recurse into element children.
+                let snapshot: Vec<Value> = kids.borrow().clone();
+                for c in &snapshot {
+                    if js_node_type(c) == 1 {
+                        normalize_subtree(c);
+                    }
+                }
+                // Merge/drop contiguous Text nodes (type 3 only; CDATA/Comment
+                // are not merged).
+                let mut new_kids: Vec<Value> = Vec::new();
+                for c in kids.borrow().iter() {
+                    if js_node_type(c) == 3 {
+                        let data = js_chardata(c);
+                        if data.is_empty() {
+                            set_parent_snapshot(c, Value::Null);
+                            continue; // drop empty exclusive Text node
+                        }
+                        if let Some(prev) = new_kids.last() {
+                            if js_node_type(prev) == 3 {
+                                // Append c's data onto prev, drop c.
+                                let merged = format!("{}{}", js_chardata(prev), data);
+                                if let Value::Object(po) = prev {
+                                    chardata_set_all(po, merged);
+                                }
+                                set_parent_snapshot(c, Value::Null);
+                                continue;
+                            }
+                        }
+                    }
+                    new_kids.push(c.clone());
+                }
+                *kids.borrow_mut() = new_kids;
+            }
+            normalize_subtree(&me);
+            Ok(Value::Undefined)
+        }),
+    );
+
+    // lookupNamespaceURI(prefix) / lookupPrefix(namespace) / isDefaultNamespace
+    // (namespace) — §4.4 namespace algorithms.
+    m.insert(
+        "lookupNamespaceURI".into(),
+        native_fn_with_interp("lookupNamespaceURI", |_i, args| {
+            let me = cv_js::current_native_this();
+            let prefix = match args.first() {
+                None | Some(Value::Null) | Some(Value::Undefined) => None,
+                Some(v) => {
+                    let s = v.to_display_string();
+                    if s.is_empty() { None } else { Some(s) }
+                }
+            };
+            match js_locate_namespace(&me, prefix.as_deref()) {
+                Some(ns) => Ok(Value::str(ns)),
+                None => Ok(Value::Null),
+            }
+        }),
+    );
+    m.insert(
+        "lookupPrefix".into(),
+        native_fn_with_interp("lookupPrefix", |_i, args| {
+            let me = cv_js::current_native_this();
+            let ns = match args.first() {
+                None | Some(Value::Null) | Some(Value::Undefined) => String::new(),
+                Some(v) => v.to_display_string(),
+            };
+            match js_locate_prefix(&me, &ns) {
+                Some(p) => Ok(Value::str(p)),
+                None => Ok(Value::Null),
+            }
+        }),
+    );
+    m.insert(
+        "isDefaultNamespace".into(),
+        native_fn_with_interp("isDefaultNamespace", |_i, args| {
+            let me = cv_js::current_native_this();
+            let ns = match args.first() {
+                None | Some(Value::Null) | Some(Value::Undefined) => None,
+                Some(v) => {
+                    let s = v.to_display_string();
+                    if s.is_empty() { None } else { Some(s) }
+                }
+            };
+            // §4.4: default namespace == lookupNamespaceURI(null).
+            let default = js_locate_namespace(&me, None);
+            Ok(Value::Bool(default.as_deref() == ns.as_deref()))
+        }),
+    );
+}
+
 // ============================================================================
 // Range / Selection / TreeWalker / NodeIterator  (WHATWG DOM §5 Ranges,
 // §6 Traversal; CSSOM View elementFromPoint; Selection API)
@@ -43731,11 +44527,21 @@ fn range_contained_text_nodes(
     out
 }
 
-/// The root of a node (the topmost ancestor reachable via parentNode).
+/// The root of a node (the topmost ancestor reachable via parentNode). Bounded
+/// depth guards against a cyclic `_parent` snapshot (a malformed move could make
+/// a node its own ancestor — never loop forever).
 fn js_node_root(node: &cv_js::Value) -> cv_js::Value {
     let mut cur = node.clone();
+    let mut guard = 0usize;
     while let Some(p) = js_node_parent(&cur) {
+        if cv_js::Value::strict_eq(&p, &cur) {
+            break;
+        }
         cur = p;
+        guard += 1;
+        if guard > 65536 {
+            break;
+        }
     }
     cur
 }
@@ -44849,6 +45655,11 @@ fn make_text_node_js(text: &str) -> cv_js::Value {
     use cv_js::OrderedMap as HashMap;
 
     let mut m: HashMap<String, cv_js::Value> = HashMap::new();
+    // Link [[Prototype]] to Text.prototype so the universal Node.prototype
+    // methods (isEqualNode/contains/compareDocumentPosition/…) are inherited.
+    if let Some(p) = node_proto("Text") {
+        m.insert(cv_js::PROTO_KEY.into(), cv_js::Value::Object(p));
+    }
     m.insert("nodeName".into(), cv_js::Value::String("#text".into()));
     m.insert("nodeType".into(), cv_js::Value::Number(3.0));
     m.insert("nodeValue".into(), cv_js::Value::str(text.to_string()));
@@ -44874,6 +45685,11 @@ fn make_comment_node_js(text: &str) -> cv_js::Value {
     use cv_js::OrderedMap as HashMap;
 
     let mut m: HashMap<String, cv_js::Value> = HashMap::new();
+    // Link [[Prototype]] to Comment.prototype (→ CharacterData → Node) so the
+    // universal Node.prototype methods are inherited.
+    if let Some(p) = node_proto("Comment") {
+        m.insert(cv_js::PROTO_KEY.into(), cv_js::Value::Object(p));
+    }
     m.insert("nodeName".into(), cv_js::Value::String("#comment".into()));
     m.insert("nodeType".into(), cv_js::Value::Number(8.0));
     m.insert("nodeValue".into(), cv_js::Value::str(text.to_string()));
@@ -45416,6 +46232,11 @@ fn make_doctype_node_js(
     use cv_js::OrderedMap as HashMap;
 
     let mut m: HashMap<String, cv_js::Value> = HashMap::new();
+    // Link [[Prototype]] to DocumentType.prototype (→ Node) so the universal
+    // Node.prototype methods (isEqualNode/compareDocumentPosition/…) inherit.
+    if let Some(p) = node_proto("DocumentType") {
+        m.insert(cv_js::PROTO_KEY.into(), cv_js::Value::Object(p));
+    }
     m.insert("nodeType".into(), cv_js::Value::Number(10.0));
     m.insert("nodeName".into(), cv_js::Value::str(name.to_string()));
     m.insert("name".into(), cv_js::Value::str(name.to_string()));
@@ -45537,6 +46358,16 @@ fn value_is_connected(value: &cv_js::Value) -> bool {
 }
 
 fn set_connected_snapshot(node: &cv_js::Value, connected: bool) {
+    // Bounded recursion: a malformed/cyclic `_children` graph (which the
+    // pre-insertion-validity guards now prevent, but defend in depth) must never
+    // overflow the stack — cap the subtree depth.
+    set_connected_snapshot_depth(node, connected, 0);
+}
+
+fn set_connected_snapshot_depth(node: &cv_js::Value, connected: bool, depth: usize) {
+    if depth > 8192 {
+        return;
+    }
     let cv_js::Value::Object(obj) = node else {
         return;
     };
@@ -45558,7 +46389,11 @@ fn set_connected_snapshot(node: &cv_js::Value, connected: bool) {
     if let Some(children) = get_children_snapshot(node) {
         let child_nodes = children.borrow().clone();
         for child in child_nodes {
-            set_connected_snapshot(&child, connected);
+            // Don't recurse into a self-referential child (would be infinite).
+            if cv_js::Value::strict_eq(&child, node) {
+                continue;
+            }
+            set_connected_snapshot_depth(&child, connected, depth + 1);
         }
     }
 }
@@ -45567,16 +46402,21 @@ fn set_parent_snapshot(child: &cv_js::Value, parent: cv_js::Value) {
     let cv_js::Value::Object(obj) = child else {
         return;
     };
-    let mut map = obj.borrow_mut();
-    // `_parent` is what the engine's dom_traverse reads FIRST for
-    // parentNode/nextSibling — keep it in sync, else a detached node's
-    // stale `_parent` makes `node.parentNode` still report the old parent.
-    map.insert("_parent".into(), parent.clone());
-    map.insert("parentNode".into(), parent.clone());
-    map.insert("parentElement".into(), parent);
-    let connected =
-        value_is_connected(&map.get("parentNode").cloned().unwrap_or(cv_js::Value::Null));
-    drop(map);
+    {
+        let mut map = obj.borrow_mut();
+        // `_parent` is what the engine's dom_traverse reads FIRST for
+        // parentNode/nextSibling — keep it in sync, else a detached node's
+        // stale `_parent` makes `node.parentNode` still report the old parent.
+        map.insert("_parent".into(), parent.clone());
+        map.insert("parentNode".into(), parent.clone());
+        map.insert("parentElement".into(), parent.clone());
+    }
+    // Compute connectivity from the PARENT AFTER dropping the child borrow.
+    // (Previously this read `value_is_connected(parent)` while the child borrow
+    // was still held — if parent and child are the same Rc, e.g. a degenerate
+    // self-append, that re-borrow panicked. RefCell discipline: never hold a
+    // borrow across a call that may touch the same cell — see insert_all_at.)
+    let connected = value_is_connected(&parent);
     set_connected_snapshot(child, connected);
 }
 
@@ -45939,6 +46779,11 @@ fn make_document_fragment_js(pending: &PendingDomMutations) -> cv_js::Value {
     use cv_js::OrderedMap as HashMap;
 
     let mut m: HashMap<String, cv_js::Value> = HashMap::new();
+    // Link [[Prototype]] to DocumentFragment.prototype (→ Node) so the universal
+    // Node.prototype methods are inherited.
+    if let Some(p) = node_proto("DocumentFragment") {
+        m.insert(cv_js::PROTO_KEY.into(), cv_js::Value::Object(p));
+    }
     m.insert("_isDocumentFragment".into(), cv_js::Value::Bool(true));
     m.insert(
         "nodeName".into(),
@@ -47433,6 +48278,19 @@ fn make_new_element_js_with_canvas_registry(
     // elements. (createElementNS overrides localName/tagName afterward.)
     let tag_lc = tag.to_ascii_lowercase();
     let mut m: HashMap<String, cv_js::Value> = HashMap::new();
+    // Link [[Prototype]] to the HTMLElement prototype (→ Element → Node →
+    // EventTarget) so the universal Node.prototype methods (isEqualNode/contains/
+    // compareDocumentPosition/getRootNode/normalize/lookup*) are inherited.
+    // Own-prop methods (appendChild/setAttribute/…) still shadow them, so this is
+    // purely additive for the previously-omitted methods (no behavior change for
+    // the parsed/createElement path). Prefer the tag-specific interface proto
+    // (HTMLDivElement etc.) when stashed; fall back to HTMLElement then Element.
+    if let Some(p) = node_proto(html_element_interface_for_tag(&tag_lc))
+        .or_else(|| node_proto("HTMLElement"))
+        .or_else(|| node_proto("Element"))
+    {
+        m.insert(cv_js::PROTO_KEY.into(), cv_js::Value::Object(p));
+    }
     // Stable node identity (roadmap #3) — assigned at creation so this element
     // can be resolved by id when its DOM mutations are applied later.
     m.insert(
@@ -47742,6 +48600,19 @@ fn make_new_element_js_with_canvas_registry(
     let obj_for_append_child_sync = obj.clone();
     let append_inner = cv_js::native_fn("appendChild", move |args| {
         if let Some(child) = args.first() {
+            // §4.4 ensure pre-insertion validity: reject inserting an inclusive
+            // ancestor of this element (cycle) → HierarchyRequestError. Without
+            // this, `el.appendChild(el)` / `el.appendChild(el.ancestor)` builds a
+            // cyclic child graph that overflows the recursive connectivity/text
+            // walks. (Range-mutations exercises these and expects the throw.)
+            let parent_for_check = cv_js::Value::Object(obj_for_append_child_sync.clone());
+            if matches!(child, cv_js::Value::Object(_))
+                && pre_insert_would_cycle(&parent_for_check, child)
+            {
+                return Err(hierarchy_request_error(
+                    "appendChild: the new child is an ancestor of the parent",
+                ));
+            }
             let nodes = normalize_single_dom_node(child);
             queue_injected_scripts_in_nodes(&nodes);
             // DOM spec §4.4.2 "insert" step: if the node is already in the
@@ -48759,6 +49630,101 @@ fn make_new_element_js_with_canvas_registry(
         map.insert("append".into(), append_variadic);
         map.insert("prepend".into(), prepend_variadic);
         map.insert("replaceChildren".into(), replace_children);
+        // Harden insertBefore/replaceChild with the §4.4 pre-insertion-validity
+        // cycle check (HierarchyRequestError if inserting an inclusive ancestor).
+        // These OVERRIDE the early closures defined before `obj` existed (the
+        // early ones can't see `self`); we re-install them here where `obj` is in
+        // scope. Without the check, `el.insertBefore(el.ancestor, ref)` builds a
+        // cyclic child graph that overflows the recursive connectivity walk.
+        {
+            let nested_ib = nested.clone();
+            let obj_ib = obj.clone();
+            map.insert(
+                "insertBefore".into(),
+                cv_js::native_fn("insertBefore", move |args| {
+                    let node = args.first().cloned().unwrap_or(cv_js::Value::Undefined);
+                    let reference = args.get(1).cloned().unwrap_or(cv_js::Value::Null);
+                    let parent = cv_js::Value::Object(obj_ib.clone());
+                    if matches!(node, cv_js::Value::Object(_))
+                        && pre_insert_would_cycle(&parent, &node)
+                    {
+                        return Err(hierarchy_request_error(
+                            "insertBefore: the new child is an ancestor of the parent",
+                        ));
+                    }
+                    let nodes = normalize_single_dom_node(&node);
+                    queue_injected_scripts_in_nodes(&nodes);
+                    for n in &nodes {
+                        detach_element_snapshot_observed(n);
+                    }
+                    let mut kids = nested_ib.borrow_mut();
+                    match &reference {
+                        cv_js::Value::Null | cv_js::Value::Undefined => {
+                            for n in &nodes {
+                                kids.push(n.clone());
+                            }
+                        }
+                        _ => {
+                            let ref_id = js_object_identity(&reference);
+                            if let Some(pos) = kids.iter().position(|k| {
+                                ref_id.is_some() && js_object_identity(k) == ref_id
+                            }) {
+                                for (i, n) in nodes.iter().enumerate() {
+                                    kids.insert(pos + i, n.clone());
+                                }
+                            } else {
+                                return Err(cv_js::JsError::Throw(
+                                    make_not_found_dom_exception(
+                                        "The node before which the new node is to be inserted is not a child of this node.",
+                                    ),
+                                ));
+                            }
+                        }
+                    }
+                    drop(kids);
+                    for n in &nodes {
+                        set_parent_snapshot(n, parent.clone());
+                    }
+                    Ok(node)
+                }),
+            );
+            let nested_rc = nested.clone();
+            let obj_rc = obj.clone();
+            map.insert(
+                "replaceChild".into(),
+                cv_js::native_fn("replaceChild", move |args| {
+                    let node = args.first().cloned().unwrap_or(cv_js::Value::Undefined);
+                    let child = args.get(1).cloned().unwrap_or(cv_js::Value::Undefined);
+                    let parent = cv_js::Value::Object(obj_rc.clone());
+                    if matches!(node, cv_js::Value::Object(_))
+                        && pre_insert_would_cycle(&parent, &node)
+                    {
+                        return Err(hierarchy_request_error(
+                            "replaceChild: the new child is an ancestor of the parent",
+                        ));
+                    }
+                    let child_id = js_object_identity(&child);
+                    if matches!(node, cv_js::Value::Object(_)) {
+                        detach_element_snapshot_observed(&node);
+                    }
+                    let mut kids = nested_rc.borrow_mut();
+                    if let Some(pos) = kids
+                        .iter()
+                        .position(|k| child_id.is_some() && js_object_identity(k) == child_id)
+                    {
+                        kids[pos] = node.clone();
+                        drop(kids);
+                        set_parent_snapshot(&child, cv_js::Value::Null);
+                        set_parent_snapshot(&node, parent.clone());
+                        Ok(child)
+                    } else {
+                        Err(cv_js::JsError::Throw(make_not_found_dom_exception(
+                            "The node to be replaced is not a child of this node.",
+                        )))
+                    }
+                }),
+            );
+        }
         map.insert("insertAdjacentElement".into(), insert_adjacent_element);
         map.insert("insertAdjacentText".into(), insert_adjacent_text);
         map.insert("insertAdjacentHTML".into(), insert_adjacent_html);
