@@ -43454,6 +43454,17 @@ fn install_child_node_mixin(m: &mut cv_js::OrderedMap<String, cv_js::Value>) {
         at: usize,
         nodes: &[Value],
     ) {
+        // §4.4 pre-insertion validity: never insert an inclusive ancestor of the
+        // parent (would create a cycle → infinite recursion in connectivity/text
+        // walks). Skip any such node rather than build a broken graph.
+        let safe: Vec<Value> = nodes
+            .iter()
+            .filter(|n| {
+                !(matches!(n, Value::Object(_)) && pre_insert_would_cycle(parent, n))
+            })
+            .cloned()
+            .collect();
+        let nodes = &safe[..];
         for n in nodes {
             detach_any(n);
         }
@@ -48652,6 +48663,16 @@ fn make_new_element_js_with_canvas_registry(
     let nested_for_append_sync = nested.clone();
     let obj_for_append_sync = obj.clone();
     let append_variadic = cv_js::native_fn("append", move |args| {
+        // §4.2.6 append → "pre-insert"ّs validity check: reject an inclusive
+        // ancestor (cycle) → HierarchyRequestError, BEFORE any mutation.
+        let parent_check = cv_js::Value::Object(obj_for_append_sync.clone());
+        for a in &args {
+            if matches!(a, cv_js::Value::Object(_)) && pre_insert_would_cycle(&parent_check, a) {
+                return Err(hierarchy_request_error(
+                    "append: a node is an ancestor of the parent",
+                ));
+            }
+        }
         let nodes = normalize_dom_nodes(&args);
         queue_injected_scripts_in_nodes(&nodes);
         // DOM spec: detach nodes that already have a parent before
@@ -48676,6 +48697,14 @@ fn make_new_element_js_with_canvas_registry(
     let nested_for_prepend_sync = nested.clone();
     let obj_for_prepend_sync = obj.clone();
     let prepend_variadic = cv_js::native_fn("prepend", move |args| {
+        let parent_check = cv_js::Value::Object(obj_for_prepend_sync.clone());
+        for a in &args {
+            if matches!(a, cv_js::Value::Object(_)) && pre_insert_would_cycle(&parent_check, a) {
+                return Err(hierarchy_request_error(
+                    "prepend: a node is an ancestor of the parent",
+                ));
+            }
+        }
         let mut nodes = normalize_dom_nodes(&args);
         queue_injected_scripts_in_nodes(&nodes);
         // DOM spec: detach nodes that already have a parent before inserting
@@ -48706,6 +48735,14 @@ fn make_new_element_js_with_canvas_registry(
     let nested_for_replace_children_sync = nested.clone();
     let obj_for_replace_children_sync = obj.clone();
     let replace_children = cv_js::native_fn("replaceChildren", move |args| {
+        let parent_check = cv_js::Value::Object(obj_for_replace_children_sync.clone());
+        for a in &args {
+            if matches!(a, cv_js::Value::Object(_)) && pre_insert_would_cycle(&parent_check, a) {
+                return Err(hierarchy_request_error(
+                    "replaceChildren: a node is an ancestor of the parent",
+                ));
+            }
+        }
         let nodes = normalize_dom_nodes(&args);
         queue_injected_scripts_in_nodes(&nodes);
         *nested_for_replace_children_sync.borrow_mut() = nodes;
