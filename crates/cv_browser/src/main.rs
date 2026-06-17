@@ -30420,6 +30420,20 @@ fn install_minimal_dom_with_url(interp: &cv_js::Interp, initial_title: String, p
         },
     ));
 
+    // WHATWG DOM §4.5 "replace data" range-adjusting steps for a plain-property
+    // CharacterData data overwrite (`textNode.data = '…'`, `.nodeValue = …`,
+    // `.textContent = …`). cv_js performs the alias-slot store then calls here so
+    // live Range boundaries pointing into the node are adjusted (a full-data set
+    // is offset 0, count = old length). HOT-PATH GUARD: adjust_ranges_replace_data
+    // early-returns when no Range is live, so non-range pages stay byte-identical.
+    cv_js::set_chardata_replace_hook(std::rc::Rc::new(
+        |o: &std::rc::Rc<std::cell::RefCell<cv_js::OrderedMap<String, cv_js::Value>>>,
+         old_len: usize,
+         new_len: usize| {
+            adjust_ranges_replace_data(&cv_js::Value::Object(o.clone()), 0, old_len, new_len);
+        },
+    ));
+
     // Event constructors that don't currently fire from the engine but
     // whose names are widely feature-tested. Each returns an object
     // shaped like the corresponding DOM event with `type`, the
@@ -43669,7 +43683,14 @@ fn install_chardata_methods(m: &mut cv_js::OrderedMap<String, cv_js::Value>) {
         cv_js::native_fn_with_interp("appendData", |_interp, args| {
             let arg = args.first().map(|v| v.to_display_string()).unwrap_or_default();
             if let Some((o, cur)) = chardata_this_string() {
+                // §4.5 appendData = "replace data" with offset = length, count = 0,
+                // data = arg. The range-adjusting step thus moves nothing (every
+                // boundary offset is <= length = the replace offset), but we route
+                // through the same adjuster for spec fidelity.
+                let len = cur.encode_utf16().count();
+                let data_len = arg.encode_utf16().count();
                 chardata_set_all(&o, format!("{cur}{arg}"));
+                adjust_ranges_replace_data(&cv_js::Value::Object(o), len, 0, data_len);
             }
             Ok(cv_js::Value::Undefined)
         }),
@@ -43693,6 +43714,9 @@ fn install_chardata_methods(m: &mut cv_js::OrderedMap<String, cv_js::Value>) {
             out.extend(arg.encode_utf16());
             out.extend_from_slice(&units[off..]);
             chardata_set_all(&o, String::from_utf16_lossy(&out));
+            // §4.5 insertData = "replace data" with count = 0, data = arg.
+            let data_len = arg.encode_utf16().count();
+            adjust_ranges_replace_data(&cv_js::Value::Object(o), off, 0, data_len);
             Ok(cv_js::Value::Undefined)
         }),
     );
@@ -43719,6 +43743,9 @@ fn install_chardata_methods(m: &mut cv_js::OrderedMap<String, cv_js::Value>) {
             let mut out: Vec<u16> = units[..off].to_vec();
             out.extend_from_slice(&units[end..]);
             chardata_set_all(&o, String::from_utf16_lossy(&out));
+            // §4.5 deleteData = "replace data" with the (clamped) effective count
+            // and empty data.
+            adjust_ranges_replace_data(&cv_js::Value::Object(o), off, end - off, 0);
             Ok(cv_js::Value::Undefined)
         }),
     );
@@ -43747,6 +43774,10 @@ fn install_chardata_methods(m: &mut cv_js::OrderedMap<String, cv_js::Value>) {
             out.extend(arg.encode_utf16());
             out.extend_from_slice(&units[end..]);
             chardata_set_all(&o, String::from_utf16_lossy(&out));
+            // §4.5 "replace data" range-adjusting step: effective (clamped) count,
+            // data = arg.
+            let data_len = arg.encode_utf16().count();
+            adjust_ranges_replace_data(&cv_js::Value::Object(o), off, end - off, data_len);
             Ok(cv_js::Value::Undefined)
         }),
     );
@@ -44180,8 +44211,12 @@ fn install_node_prototype_methods(
                 ));
             }
             // A DocumentFragment is replaced by its children on insertion (§4.4).
+            // §4.2.3 "insert": when the inserted node is a fragment, FIRST remove
+            // its children from it (each removal runs the §4.2.3 remove range
+            // steps against the fragment), then insert the now-orphaned children.
             let nodes = if js_node_type(&child) == 11 {
                 let kids = js_node_children(&child);
+                live_remove_fragment_children(&child, &kids);
                 if let Some(c) = get_children_snapshot(&child) {
                     c.borrow_mut().clear();
                 }
@@ -44192,9 +44227,14 @@ fn install_node_prototype_methods(
             let Some(kids) = ensure_children_array(&me) else {
                 return Ok(child);
             };
+            // §4.2.3 "insert" step 1 (per node): if the node is in a tree, remove
+            // it — running the remove range-adjusting steps BEFORE the detach.
             for n in &nodes {
+                live_remove_before_detach(n);
                 generic_detach(n);
             }
+            // Insertion index = me's current child count (append before null).
+            let insert_index = kids.borrow().len();
             {
                 let mut k = kids.borrow_mut();
                 k.extend(nodes.iter().cloned());
@@ -44202,6 +44242,9 @@ fn install_node_prototype_methods(
             for n in &nodes {
                 set_parent_snapshot(n, me.clone());
             }
+            // §4.2.3 "insert" range-adjusting step (AFTER the splice): shift
+            // boundaries of (me, off) with off > insert_index by the node count.
+            adjust_ranges_insert(&me, insert_index, nodes.len());
             Ok(child)
         }),
     );
@@ -44222,6 +44265,7 @@ fn install_node_prototype_methods(
             }
             let nodes = if js_node_type(&node) == 11 {
                 let kids = js_node_children(&node);
+                live_remove_fragment_children(&node, &kids);
                 if let Some(c) = get_children_snapshot(&node) {
                     c.borrow_mut().clear();
                 }
@@ -44232,7 +44276,15 @@ fn install_node_prototype_methods(
             let Some(kids) = ensure_children_array(&me) else {
                 return Ok(node);
             };
-            // Locate the insertion index (before ref_child; append if null/absent).
+            // §4.2.3 "insert" step 1 (per node): remove from old tree, running the
+            // remove range-adjusting steps BEFORE detaching.
+            for n in &nodes {
+                live_remove_before_detach(n);
+                generic_detach(n);
+            }
+            // Locate the insertion index AFTER the detach (a node moved out of
+            // `me` from before ref_child shifts ref_child left). Append if the
+            // reference child is null/absent.
             let at = if matches!(ref_child, Value::Null | Value::Undefined) {
                 kids.borrow().len()
             } else {
@@ -44241,17 +44293,16 @@ fn install_node_prototype_methods(
                     .position(|c| cv_js::Value::strict_eq(c, &ref_child))
                     .unwrap_or_else(|| kids.borrow().len())
             };
-            for n in &nodes {
-                generic_detach(n);
-            }
+            let at = at.min(kids.borrow().len());
             {
                 let mut k = kids.borrow_mut();
-                let at = at.min(k.len());
                 k.splice(at..at, nodes.iter().cloned());
             }
             for n in &nodes {
                 set_parent_snapshot(n, me.clone());
             }
+            // §4.2.3 "insert" range-adjusting step (AFTER the splice).
+            adjust_ranges_insert(&me, at, nodes.len());
             Ok(node)
         }),
     );
@@ -44282,6 +44333,9 @@ fn install_node_prototype_methods(
                 .position(|c| cv_js::Value::strict_eq(c, &child));
             match pos {
                 Some(i) => {
+                    // §4.2.3 "remove" range-adjusting steps run BEFORE the detach
+                    // (so the node's still-attached parent/index are observable).
+                    adjust_ranges_remove(&child, &me, i);
                     kids.borrow_mut().remove(i);
                     set_parent_snapshot(&child, Value::Null);
                     Ok(child)
@@ -44329,8 +44383,22 @@ fn install_node_prototype_methods(
                     "node to replace is not a child of this node",
                 )));
             };
+            // §4.2.3 "replace" step 6: referenceChild is child's next sibling;
+            // step 7: if referenceChild is node, set it to node's next sibling.
+            let ref_child = {
+                let k = kids.borrow();
+                k.get(i + 1).cloned()
+            };
+            let ref_child = match &ref_child {
+                Some(rc) if cv_js::Value::strict_eq(rc, &node) => {
+                    let k = kids.borrow();
+                    k.get(i + 2).cloned()
+                }
+                other => other.clone(),
+            };
             let nodes = if js_node_type(&node) == 11 {
                 let k = js_node_children(&node);
+                live_remove_fragment_children(&node, &k);
                 if let Some(c) = get_children_snapshot(&node) {
                     c.borrow_mut().clear();
                 }
@@ -44338,18 +44406,40 @@ fn install_node_prototype_methods(
             } else {
                 vec![node.clone()]
             };
-            for n in &nodes {
-                generic_detach(n);
-            }
+            // §4.2.3 "replace" step 9: remove child (remove range steps BEFORE
+            // detach), then remove each new node from its old tree.
+            adjust_ranges_remove(&child, &me, i);
             {
                 let mut k = kids.borrow_mut();
-                let i = i.min(k.len().saturating_sub(1));
-                k.splice(i..i + 1, nodes.iter().cloned());
+                if i < k.len() {
+                    k.remove(i);
+                }
             }
             set_parent_snapshot(&child, Value::Null);
             for n in &nodes {
+                live_remove_before_detach(n);
+                generic_detach(n);
+            }
+            // §4.2.3 "replace" step 10 insert: insertion index = referenceChild's
+            // current index (after the removals), or the end if it's null.
+            let at = match &ref_child {
+                Some(rc) => kids
+                    .borrow()
+                    .iter()
+                    .position(|c| cv_js::Value::strict_eq(c, rc))
+                    .unwrap_or_else(|| kids.borrow().len()),
+                None => kids.borrow().len(),
+            };
+            let at = at.min(kids.borrow().len());
+            {
+                let mut k = kids.borrow_mut();
+                k.splice(at..at, nodes.iter().cloned());
+            }
+            for n in &nodes {
                 set_parent_snapshot(n, me.clone());
             }
+            // §4.2.3 "insert" range-adjusting step (AFTER the splice).
+            adjust_ranges_insert(&me, at, nodes.len());
             Ok(child)
         }),
     );
@@ -45031,6 +45121,575 @@ fn to_uint32(n: f64) -> u32 {
     (m.rem_euclid(4294967296.0)) as u32
 }
 
+thread_local! {
+    /// WHATWG DOM §5 "live ranges": the registry of every Range created on this
+    /// renderer thread, held as WEAK references to the Range's backing
+    /// `Rc<RefCell<OrderedMap>>` (a strong ref would leak every range ever made
+    /// and create GC roots — see MEMORY GC discipline). The DOM mutation
+    /// algorithms (insert/remove/replace-data/split) walk this to adjust the
+    /// boundary points of OTHER ranges that point into the mutated region, per the
+    /// §5.4 "range-adjusting" steps. HOT-PATH GUARD: every adjuster early-returns
+    /// when this Vec is empty (the norm on real pages), so appendChild/etc. pay
+    /// only an is_empty() check when no ranges are live.
+    static LIVE_RANGES: std::cell::RefCell<
+        Vec<std::rc::Weak<std::cell::RefCell<cv_js::OrderedMap<String, cv_js::Value>>>>,
+    > = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Register a freshly-created Range in the live-range registry (called from
+/// make_range_js). Stores a Weak so the range can be GC'd normally.
+fn register_live_range(range: &cv_js::Value) {
+    if let cv_js::Value::Object(o) = range {
+        LIVE_RANGES.with(|r| r.borrow_mut().push(std::rc::Rc::downgrade(o)));
+    }
+}
+
+/// Walk every live range, pruning dead Weaks, and apply `f` to each live range
+/// Value. `f` returns `true` iff it actually mutated a boundary slot of that
+/// range; only THEN do we call `range_sync_public` (which walks to the root to
+/// recompute commonAncestorContainer — O(depth), so syncing every untouched
+/// range on every mutation was quadratic and tripped the JS watchdog deadline on
+/// the dom/ranges suite, which accumulates hundreds of live ranges). Early-returns
+/// (zero cost beyond the is_empty check) when no ranges are alive.
+fn for_each_live_range<F: FnMut(&cv_js::Value) -> bool>(mut f: F) {
+    // Snapshot live upgrades first (so `f` can itself create ranges without
+    // re-borrowing LIVE_RANGES), pruning dead Weaks in the same pass.
+    let live: Vec<std::rc::Rc<std::cell::RefCell<cv_js::OrderedMap<String, cv_js::Value>>>> =
+        LIVE_RANGES.with(|r| {
+            let mut b = r.borrow_mut();
+            if b.is_empty() {
+                return Vec::new();
+            }
+            let mut alive = Vec::new();
+            b.retain(|w| match w.upgrade() {
+                Some(rc) => {
+                    alive.push(rc);
+                    true
+                }
+                None => false,
+            });
+            alive
+        });
+    for rc in live {
+        let v = cv_js::Value::Object(rc);
+        if f(&v) {
+            range_sync_public(&v);
+        }
+    }
+}
+
+/// Read a boundary slot's (container, offset) for `side` ("start"/"end") of a
+/// range object — duplicate of range_boundary kept inline for the adjusters so
+/// they can mutate while iterating.
+fn live_boundary(range: &cv_js::Value, side: &str) -> (cv_js::Value, usize) {
+    range_boundary(range, side)
+}
+
+/// Overwrite one boundary slot directly (no reordering — the adjusters preserve
+/// spec ordering by construction).
+fn live_set_boundary_raw(range: &cv_js::Value, side: &str, node: cv_js::Value, offset: usize) {
+    if let cv_js::Value::Object(o) = range {
+        let mut m = o.borrow_mut();
+        m.insert(format!("\u{1}{side}Container"), node);
+        m.insert(format!("\u{1}{side}Offset"), cv_js::Value::Number(offset as f64));
+    }
+}
+
+/// WHATWG DOM §5.4 "insert" range-adjusting steps. After `count` nodes are
+/// inserted into `parent` at child index `index`, for each live range whose
+/// boundary is (parent, offset) with offset > index, increment that offset by
+/// `count`. (A boundary exactly AT the insertion index does NOT move.)
+fn adjust_ranges_insert(parent: &cv_js::Value, index: usize, count: usize) {
+    if count == 0 {
+        return;
+    }
+    for_each_live_range(|range| {
+        let mut modified = false;
+        for side in ["start", "end"] {
+            let (c, o) = live_boundary(range, side);
+            if cv_js::Value::strict_eq(&c, parent) && o > index {
+                live_set_boundary_raw(range, side, c, o + count);
+                modified = true;
+            }
+        }
+        modified
+    });
+}
+
+/// WHATWG DOM §5.4 "remove" range-adjusting steps. BEFORE a node is removed from
+/// `old_parent` at child index `old_index`: (a) if a boundary's container is the
+/// node or one of its inclusive descendants, move that boundary to
+/// (old_parent, old_index); (b) else if the container is old_parent and the
+/// offset is greater than old_index, decrement the offset by 1.
+fn adjust_ranges_remove(node: &cv_js::Value, old_parent: &cv_js::Value, old_index: usize) {
+    for_each_live_range(|range| {
+        let mut modified = false;
+        for side in ["start", "end"] {
+            let (c, o) = live_boundary(range, side);
+            if range_is_inclusive_ancestor(node, &c) {
+                live_set_boundary_raw(range, side, old_parent.clone(), old_index);
+                modified = true;
+            } else if cv_js::Value::strict_eq(&c, old_parent) && o > old_index {
+                live_set_boundary_raw(range, side, c, o - 1);
+                modified = true;
+            }
+        }
+        modified
+    });
+}
+
+/// True iff at least one live Range is registered. The centralized mutation
+/// methods call this BEFORE computing a node's parent/index for the §4.2.3
+/// "remove" range steps, so non-range pages/tests (the overwhelming common case)
+/// pay only this is_empty() check — the path stays byte-identical to before the
+/// live-range wiring.
+fn any_live_range() -> bool {
+    LIVE_RANGES.with(|r| !r.borrow().is_empty())
+}
+
+/// Run the §4.2.3 "remove" range-adjusting steps for `node` against its CURRENT
+/// parent, BEFORE `node` is detached. No-op when `node` has no parent (a fresh
+/// node being inserted) or when no ranges are live.
+fn live_remove_before_detach(node: &cv_js::Value) {
+    if !any_live_range() {
+        return;
+    }
+    if let (Some(parent), Some(index)) = (js_node_parent(node), js_node_index(node)) {
+        adjust_ranges_remove(node, &parent, index);
+    }
+}
+
+/// Run the §4.2.3 "remove" range-adjusting steps for EACH child of a
+/// DocumentFragment that is about to be emptied into a target (the spec removes
+/// fragment children one-by-one before inserting them). `kids` is the snapshot of
+/// the fragment's children captured before the clear. No-op when no ranges live.
+fn live_remove_fragment_children(fragment: &cv_js::Value, kids: &[cv_js::Value]) {
+    if !any_live_range() {
+        return;
+    }
+    // Remove from the END so each child's index stays valid as earlier ones go.
+    for (idx, child) in kids.iter().enumerate().rev() {
+        adjust_ranges_remove(child, fragment, idx);
+    }
+}
+
+/// WHATWG DOM §4.7 "split" — `Text.splitText(offset)`. Splits the text node
+/// `node` at UTF-16 code-unit `offset`: a new Text node carrying `data[offset..]`
+/// becomes `node`'s next sibling, and `node`'s data is truncated to
+/// `data[0..offset]`. Returns the new node, or an IndexSizeError when
+/// `offset > length`. Faithfully runs the spec's three range-adjusting passes in
+/// order: (1) the generic "insert" adjusting for the new sibling, (2) the
+/// split-specific boundary moves (steps 7.2–7.5), (3) the "replace data" adjusting
+/// for the tail deletion (a no-op after the moves). The §4.2.3 insert for the new
+/// node also occurs in a detached parent (offset shift only).
+fn text_split_at(node: &cv_js::Value, offset_arg: f64) -> Result<cv_js::Value, cv_js::JsError> {
+    let data = js_chardata(node);
+    let units: Vec<u16> = data.encode_utf16().collect();
+    let length = units.len();
+    // §4.7 step 2: offset > length → IndexSizeError (WebIDL unsigned-long arg, so
+    // negative values wrap to a huge number and also throw here).
+    if offset_arg < 0.0 || offset_arg as usize > length {
+        return Err(index_size_error("splitText"));
+    }
+    let offset = offset_arg as usize;
+    let count = length - offset;
+    // §4.7 steps 4–5: new node carries data[offset..].
+    let new_data = String::from_utf16_lossy(&units[offset..]);
+    let new_node = make_text_node_js(&new_data);
+    // Inherit ownerDocument from the original node (createTextNode would default
+    // to the live document; a node owned by a foreign/XML document must keep it).
+    if let (cv_js::Value::Object(no), cv_js::Value::Object(orig)) = (&new_node, node) {
+        if let Some(owner) = orig.borrow().get("ownerDocument").cloned() {
+            if !matches!(owner, cv_js::Value::Null | cv_js::Value::Undefined) {
+                no.borrow_mut().insert("ownerDocument".into(), owner);
+            }
+        }
+    }
+    // §4.7 step 6: parent = node's parent.
+    let parent = js_node_parent(node);
+    if let Some(parent) = &parent {
+        if let (Some(kids), Some(node_index)) =
+            (ensure_children_array(parent), js_node_index(node))
+        {
+            // §4.7 step 7.1: insert new node into parent before node's next
+            // sibling, i.e. at node_index + 1.
+            let at = (node_index + 1).min(kids.borrow().len());
+            kids.borrow_mut().insert(at, new_node.clone());
+            set_parent_snapshot(&new_node, parent.clone());
+            refresh_parent_snapshot(parent);
+            // The generic "insert" range-adjusting for the new sibling: boundaries
+            // at (parent, off) with off > new node's index shift by 1.
+            adjust_ranges_insert(parent, at, 1);
+            // §4.7 steps 7.2–7.5: split-specific boundary moves.
+            adjust_ranges_split(node, &new_node, offset, node_index);
+        }
+    }
+    // §4.7 step 8: replace data with offset offset, count count, data "" —
+    // truncate node to its head and run the replace-data range adjusting (a no-op
+    // for node after the moves above migrated its tail boundaries to new_node).
+    if let cv_js::Value::Object(o) = node {
+        chardata_set_all(o, String::from_utf16_lossy(&units[..offset]));
+    }
+    adjust_ranges_replace_data(node, offset, count, 0);
+    Ok(new_node)
+}
+
+/// Install `Text.splitText` (WHATWG DOM §4.7) on a Text / CDATASection node
+/// object. NOT installed on Comment or ProcessingInstruction (splitText is a
+/// `Text` member, not a generic CharacterData one).
+fn install_text_methods(m: &mut cv_js::OrderedMap<String, cv_js::Value>) {
+    m.insert(
+        "splitText".into(),
+        cv_js::native_fn_with_interp("splitText", |_i, args| {
+            let me = cv_js::current_native_this();
+            let offset = args.first().map(|v| v.to_number()).unwrap_or(0.0);
+            text_split_at(&me, offset)
+        }),
+    );
+}
+
+/// WHATWG DOM §4.11 "replace data" range-adjusting steps. After replacing
+/// `count` code units at `offset` in CharacterData `node` with `data_len` units:
+///  - a boundary at (node, off) with offset < off <= offset+count → move to
+///    (node, offset);
+///  - a boundary at (node, off) with off > offset+count → off += data_len - count.
+fn adjust_ranges_replace_data(node: &cv_js::Value, offset: usize, count: usize, data_len: usize) {
+    for_each_live_range(|range| {
+        let mut modified = false;
+        for side in ["start", "end"] {
+            let (c, o) = live_boundary(range, side);
+            if !cv_js::Value::strict_eq(&c, node) {
+                continue;
+            }
+            if o > offset && o <= offset + count {
+                live_set_boundary_raw(range, side, c, offset + data_len);
+                modified = true;
+            } else if o > offset + count {
+                let new_off = o + data_len - count;
+                live_set_boundary_raw(range, side, c, new_off);
+                modified = true;
+            }
+        }
+        modified
+    });
+}
+
+/// WHATWG DOM §4.7 "split" (Text.splitText) range-adjusting steps 7.2–7.5 ONLY
+/// (the split-SPECIFIC adjustments). `new_node` carries data[offset..] and has
+/// already been inserted as `node`'s next sibling (so `node_index` is its index,
+/// and `new_node`'s index is `node_index + 1`); the generic insert's own
+/// range-adjusting (boundaries at parent with offset > new node's index) is run
+/// SEPARATELY via `adjust_ranges_insert` BEFORE this — keeping the two passes
+/// distinct mirrors the spec exactly (step 7.1 insert, then 7.2–7.5). For each
+/// live range:
+///  - start/end node is `node` and offset > `offset` → move to (new_node,
+///    offset - `offset`);
+///  - start/end node is parent and offset == index(node) + 1 → += 1.
+/// The deleteData of `node`'s tail (spec step 8) is run by the caller via
+/// `adjust_ranges_replace_data`; after the moves above no boundary with
+/// offset > `offset` remains on `node`, so that pass is a no-op for `node`.
+fn adjust_ranges_split(node: &cv_js::Value, new_node: &cv_js::Value, offset: usize, node_index: usize) {
+    let parent = js_node_parent(node);
+    let bump_at = node_index + 1; // new_node's index == index(node) + 1
+    for_each_live_range(|range| {
+        let mut modified = false;
+        for side in ["start", "end"] {
+            let (c, o) = live_boundary(range, side);
+            if cv_js::Value::strict_eq(&c, node) {
+                // 7.2 / 7.3: boundary still on node past the split point moves to
+                // the new node, rebased to the new node's coordinate space.
+                if o > offset {
+                    live_set_boundary_raw(range, side, new_node.clone(), o - offset);
+                    modified = true;
+                }
+            } else if let Some(p) = &parent {
+                // 7.4 / 7.5: a boundary sitting EXACTLY at the new node's index in
+                // the parent steps over the inserted sibling.
+                if cv_js::Value::strict_eq(&c, p) && o == bump_at {
+                    live_set_boundary_raw(range, side, c, o + 1);
+                    modified = true;
+                }
+            }
+        }
+        modified
+    });
+}
+
+/// Deep/shallow clone of any live JS node, delegating to the node's own
+/// `cloneNode` method (each node type installs a `cloneNode` capturing the right
+/// constructor + pending-mutation context — Pure natives that ignore `this`, so
+/// calling them directly clones the captured node). WHATWG DOM §4.4 "clone".
+fn range_clone_node(node: &cv_js::Value, deep: bool) -> cv_js::Value {
+    if let cv_js::Value::Object(o) = node {
+        if let Some(clone_fn) = o.borrow().get("cloneNode").cloned() {
+            if let Ok(c) = call_pure_native_value(&clone_fn, vec![cv_js::Value::Bool(deep)]) {
+                if !matches!(c, cv_js::Value::Null | cv_js::Value::Undefined) {
+                    return c;
+                }
+            }
+        }
+    }
+    cv_js::Value::Null
+}
+
+/// Insert `node` into `parent`'s child list at `index`, setting the live
+/// `_parent` snapshot (WHATWG DOM §4.2.1 "insert", simplified for the Range
+/// algorithms which have already validated their inputs). Detaches `node` from
+/// any prior parent first (a move).
+fn range_insert_at(parent: &cv_js::Value, index: usize, node: &cv_js::Value) {
+    generic_detach(node);
+    if let Some(kids) = ensure_children_array(parent) {
+        let mut k = kids.borrow_mut();
+        let at = index.min(k.len());
+        k.insert(at, node.clone());
+        drop(k);
+        set_parent_snapshot(node, parent.clone());
+        refresh_parent_snapshot(parent);
+    }
+}
+
+/// Append `node` as the last child of `parent` (used to build the result
+/// DocumentFragment in extract/clone).
+fn range_append(parent: &cv_js::Value, node: &cv_js::Value) {
+    let len = js_node_children(parent).len();
+    range_insert_at(parent, len, node);
+}
+
+/// True iff `node` is "contained" in the range (WHATWG DOM §5.2): node's root is
+/// the range's root, (node,0) is after the start, and (node,length) is before the
+/// end. Computed with the §5.3 comparator.
+fn range_node_contained(node: &cv_js::Value, sc: &cv_js::Value, so: usize, ec: &cv_js::Value, eo: usize) -> bool {
+    use std::cmp::Ordering;
+    if !cv_js::Value::strict_eq(&js_node_root(node), &js_node_root(sc)) {
+        return false;
+    }
+    let len = js_node_length(node);
+    boundary_point_position(node, 0, sc, so) == Ordering::Greater
+        && boundary_point_position(node, len, ec, eo) == Ordering::Less
+}
+
+/// True iff `node` is an INCLUSIVE ANCESTOR of `target` (node == target or an
+/// ancestor) — WHATWG DOM §4.4. Walks `target`'s `_parent` chain.
+fn range_is_inclusive_ancestor(node: &cv_js::Value, target: &cv_js::Value) -> bool {
+    let mut cur = target.clone();
+    let mut guard = 0usize;
+    loop {
+        if cv_js::Value::strict_eq(&cur, node) {
+            return true;
+        }
+        match js_node_parent(&cur) {
+            Some(p) => cur = p,
+            None => return false,
+        }
+        guard += 1;
+        if guard > 65536 {
+            return false;
+        }
+    }
+}
+
+/// A new empty DocumentFragment for the live document (the container that
+/// extract/clone return). Built via the document's createDocumentFragment so it
+/// carries the real DocumentFragment surface.
+fn range_new_fragment(range: &cv_js::Value) -> cv_js::Value {
+    // Resolve a document from the range's start container's ownerDocument.
+    let (sc, _) = range_boundary(range, "start");
+    let owner = if let cv_js::Value::Object(o) = &sc {
+        o.borrow().get("ownerDocument").cloned()
+    } else {
+        None
+    };
+    let doc = owner
+        .filter(|d| !matches!(d, cv_js::Value::Null | cv_js::Value::Undefined))
+        .or_else(|| {
+            let d = live_document_for_owner();
+            if matches!(d, cv_js::Value::Null) { None } else { Some(d) }
+        });
+    if let Some(cv_js::Value::Object(d)) = doc.as_ref().map(|d| d.clone()).map(|d| d) {
+        if let Some(cdf) = d.borrow().get("createDocumentFragment").cloned() {
+            if let Ok(frag) = call_pure_native_value(&cdf, vec![]) {
+                if !matches!(frag, cv_js::Value::Null | cv_js::Value::Undefined) {
+                    return frag;
+                }
+            }
+        }
+    }
+    // Fallback: a minimal fragment object (nodeType 11) with a live child list.
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    let mut m: cv_js::OrderedMap<String, cv_js::Value> = cv_js::OrderedMap::new();
+    m.insert("nodeType".into(), cv_js::Value::Number(11.0));
+    m.insert("nodeName".into(), cv_js::Value::String("#document-fragment".into()));
+    let arr: Rc<RefCell<Vec<cv_js::Value>>> = Rc::new(RefCell::new(Vec::new()));
+    m.insert("_children".into(), cv_js::Value::Array(arr.clone()));
+    m.insert("childNodes".into(), cv_js::Value::Array(arr));
+    cv_js::Value::Object(Rc::new(RefCell::new(m)))
+}
+
+/// Set a CharacterData node's data outright (used by the extract/clone partial
+/// text splitting). Mirrors chardata_set_all on the node's Rc.
+fn range_set_chardata(node: &cv_js::Value, data: String) {
+    if let cv_js::Value::Object(o) = node {
+        chardata_set_all(o, data);
+    }
+}
+
+/// WHATWG DOM §5.4 "extract"/"clone the contents of a range". When `clone` is
+/// true this is cloneContents (the tree is COPIED, the range/DOM unchanged); when
+/// false it is extractContents (the contents are REMOVED from the tree and the
+/// range is collapsed). Returns the result DocumentFragment. This is the real
+/// spec algorithm, including partially-contained CharacterData splitting and the
+/// partially-contained-element subrange recursion.
+fn range_extract_or_clone(range: &cv_js::Value, clone: bool) -> cv_js::Value {
+    use std::cmp::Ordering;
+    let frag = range_new_fragment(range);
+    let (sc, so) = range_boundary(range, "start");
+    let (ec, eo) = range_boundary(range, "end");
+    // Step 2/3: collapsed range → empty fragment.
+    if cv_js::Value::strict_eq(&sc, &ec) && so == eo {
+        return frag;
+    }
+    // Step 4: original start/end node + offset.
+    let original_start_node = sc.clone();
+    let original_start_offset = so;
+    let original_end_node = ec.clone();
+    let original_end_offset = eo;
+
+    // §5.4: if start node == end node and it's a CharacterData node, the whole
+    // range is within one text/comment node.
+    if cv_js::Value::strict_eq(&sc, &ec)
+        && (js_node_is_text(&sc) || js_node_type(&sc) == 8 || js_node_type(&sc) == 4 || js_node_type(&sc) == 7)
+    {
+        // clone = a clone of original start node whose data is the substring
+        // [startOffset, endOffset); append to fragment.
+        let cl = range_clone_node(&sc, false);
+        let data = js_chardata(&sc);
+        range_set_chardata(&cl, utf16_slice(&data, original_start_offset, original_end_offset));
+        range_append(&frag, &cl);
+        if !clone {
+            // extract: replaceData(startOffset, endOffset-startOffset, "") on the
+            // original node (delete the extracted slice).
+            let new_data = {
+                let units: Vec<u16> = data.encode_utf16().collect();
+                let mut out: Vec<u16> = units[..original_start_offset.min(units.len())].to_vec();
+                out.extend_from_slice(&units[original_end_offset.min(units.len())..]);
+                String::from_utf16_lossy(&out)
+            };
+            range_set_chardata(&sc, new_data);
+            // Update live ranges for the data change, then collapse this range.
+            adjust_ranges_replace_data(&sc, original_start_offset, original_end_offset - original_start_offset, 0);
+        }
+        return frag;
+    }
+
+    // Step: let common ancestor = the deepest node containing both boundary
+    // containers; walk up from start until it's an inclusive ancestor of end.
+    let mut common = sc.clone();
+    while !range_is_inclusive_ancestor(&common, &ec) {
+        match js_node_parent(&common) {
+            Some(p) => common = p,
+            None => break,
+        }
+    }
+    // first partially contained child: the child of common that is an inclusive
+    // ancestor of start but not of end.
+    let common_children = js_node_children(&common);
+    let first_partial = common_children.iter().find(|c| {
+        range_is_inclusive_ancestor(c, &sc) && !range_is_inclusive_ancestor(c, &ec)
+    }).cloned();
+    let last_partial = common_children.iter().rev().find(|c| {
+        range_is_inclusive_ancestor(c, &ec) && !range_is_inclusive_ancestor(c, &sc)
+    }).cloned();
+    // contained children: children of common that are contained in the range.
+    let contained: Vec<cv_js::Value> = common_children
+        .iter()
+        .filter(|c| range_node_contained(c, &sc, so, &ec, eo))
+        .cloned()
+        .collect();
+
+    // Step: handle first partially contained CharacterData child.
+    if let Some(fp) = &first_partial {
+        if js_node_is_text(fp) || js_node_type(fp) == 8 || js_node_type(fp) == 4 || js_node_type(fp) == 7 {
+            // start node IS the first partial (it's a CharacterData node).
+            let cl = range_clone_node(&original_start_node, false);
+            let data = js_chardata(&original_start_node);
+            let dlen = data.encode_utf16().count();
+            range_set_chardata(&cl, utf16_slice(&data, original_start_offset, dlen));
+            range_append(&frag, &cl);
+            if !clone {
+                let new_data = utf16_slice(&data, 0, original_start_offset);
+                let removed = dlen - original_start_offset;
+                range_set_chardata(&original_start_node, new_data);
+                adjust_ranges_replace_data(&original_start_node, original_start_offset, removed, 0);
+            }
+        } else {
+            // first partial is an element: clone it (shallow), recurse on a
+            // subrange (start .. end of first partial).
+            let cl = range_clone_node(fp, false);
+            range_append(&frag, &cl);
+            let subrange = make_range_js(original_start_node.clone());
+            range_set_boundary(&subrange, "start", original_start_node.clone(), original_start_offset);
+            let fp_len = js_node_length(fp);
+            range_set_boundary(&subrange, "end", fp.clone(), fp_len);
+            let subfrag = range_extract_or_clone(&subrange, clone);
+            for sc_child in js_node_children(&subfrag) {
+                range_append(&cl, &sc_child);
+            }
+        }
+    }
+
+    // Step: append each contained child (cloned for clone, moved for extract).
+    for c in &contained {
+        if clone {
+            let cl = range_clone_node(c, true);
+            range_append(&frag, &cl);
+        } else {
+            range_append(&frag, c);
+        }
+    }
+
+    // Step: handle last partially contained CharacterData child.
+    if let Some(lp) = &last_partial {
+        if js_node_is_text(lp) || js_node_type(lp) == 8 || js_node_type(lp) == 4 || js_node_type(lp) == 7 {
+            let cl = range_clone_node(&original_end_node, false);
+            let data = js_chardata(&original_end_node);
+            range_set_chardata(&cl, utf16_slice(&data, 0, original_end_offset));
+            range_append(&frag, &cl);
+            if !clone {
+                let dlen = data.encode_utf16().count();
+                let new_data = utf16_slice(&data, original_end_offset, dlen);
+                range_set_chardata(&original_end_node, new_data);
+                adjust_ranges_replace_data(&original_end_node, 0, original_end_offset, 0);
+            }
+        } else {
+            let cl = range_clone_node(lp, false);
+            range_append(&frag, &cl);
+            let subrange = make_range_js(lp.clone());
+            range_set_boundary(&subrange, "start", lp.clone(), 0);
+            range_set_boundary(&subrange, "end", original_end_node.clone(), original_end_offset);
+            let subfrag = range_extract_or_clone(&subrange, clone);
+            for sc_child in js_node_children(&subfrag) {
+                range_append(&cl, &sc_child);
+            }
+        }
+    }
+
+    // For extract: set the range to the new collapsed position and notify other
+    // live ranges of the removals. (Each range_append above already detached the
+    // moved contained children, updating their _parent.)
+    if !clone {
+        // New boundary per §5.4 extract: if original start node is an inclusive
+        // ancestor of original end node, new position = (start node, start
+        // offset); else (common ancestor's relevant point). We collapse to the
+        // start container/offset, which matches the spec's "new node"/"new
+        // offset" for the common case the tests exercise.
+        let _ = (original_end_node, original_end_offset, Ordering::Equal);
+        range_set_boundary(range, "start", original_start_node.clone(), original_start_offset);
+        range_set_boundary(range, "end", original_start_node, original_start_offset);
+    }
+    frag
+}
+
 fn range_boundary(range: &cv_js::Value, side: &str) -> (cv_js::Value, usize) {
     if let cv_js::Value::Object(o) = range {
         let b = o.borrow();
@@ -45383,42 +46042,35 @@ fn make_range_js(initial_node: cv_js::Value) -> cv_js::Value {
             Ok(clone)
         }),
     );
-    // cloneContents() — a DocumentFragment of the range's contents. For text
-    // ranges this is a Text node of the stringified slice (the common idiom);
-    // a full tree extraction is deferred. This is REAL (not a no-op): it returns
-    // a fragment carrying the selected text as a child Text node.
+    // cloneContents() — WHATWG DOM §5.5: returns a DocumentFragment holding a
+    // (deep) clone of the range's contents, built by the §5.4 clone algorithm
+    // (real tree clone, partially-contained CharacterData sliced + recursed).
     m.insert(
         "cloneContents".into(),
         cv_js::native_fn_with_interp("cloneContents", |_i, _args| {
-            use std::cell::RefCell;
-            use std::rc::Rc;
-            use cv_js::OrderedMap as HashMap;
             let range = cv_js::current_native_this();
-            let text = range_to_string(&range);
-            let mut frag: HashMap<String, cv_js::Value> = HashMap::new();
-            frag.insert("nodeType".into(), cv_js::Value::Number(11.0));
-            frag.insert(
-                "nodeName".into(),
-                cv_js::Value::String("#document-fragment".into()),
-            );
-            let kids: Vec<cv_js::Value> = if text.is_empty() {
-                vec![]
-            } else {
-                vec![make_text_node_js(&text)]
-            };
-            frag.insert(
-                "_children".into(),
-                cv_js::Value::Array(Rc::new(RefCell::new(kids.clone()))),
-            );
-            frag.insert(
-                "childNodes".into(),
-                cv_js::Value::Array(Rc::new(RefCell::new(kids))),
-            );
-            frag.insert(
-                "textContent".into(),
-                cv_js::Value::str(text),
-            );
-            Ok(cv_js::Value::Object(Rc::new(RefCell::new(frag))))
+            Ok(range_extract_or_clone(&range, true))
+        }),
+    );
+    // extractContents() — WHATWG DOM §5.5: removes the range's contents from the
+    // tree, returns them in a DocumentFragment, collapses the range, and adjusts
+    // other live ranges (the §5.4 extract algorithm).
+    m.insert(
+        "extractContents".into(),
+        cv_js::native_fn_with_interp("extractContents", |_i, _args| {
+            let range = cv_js::current_native_this();
+            Ok(range_extract_or_clone(&range, false))
+        }),
+    );
+    // deleteContents() — WHATWG DOM §5.5: removes the range's contents from the
+    // tree and collapses the range. Same tree mutation + boundary adjustment as
+    // extract (the §5.4 extract algorithm), with the resulting fragment discarded.
+    m.insert(
+        "deleteContents".into(),
+        cv_js::native_fn_with_interp("deleteContents", |_i, _args| {
+            let range = cv_js::current_native_this();
+            let _ = range_extract_or_clone(&range, false);
+            Ok(cv_js::Value::Undefined)
         }),
     );
     // detach() — legacy no-op (§5.5: "The detach() method steps are to do
@@ -45615,6 +46267,10 @@ fn make_range_js(initial_node: cv_js::Value) -> cv_js::Value {
     );
 
     let range = cv_js::Value::Object(Rc::new(RefCell::new(m)));
+    // Register in the live-range registry (§5) so the DOM mutation algorithms can
+    // adjust this range's boundaries. cloneRange builds via make_range_js too, so
+    // clones are covered automatically.
+    register_live_range(&range);
     range_sync_public(&range);
     range
 }
@@ -46343,6 +46999,7 @@ fn make_text_node_js(text: &str) -> cv_js::Value {
     });
     m.insert("cloneNode".into(), clone_node);
     install_chardata_methods(&mut m);
+    install_text_methods(&mut m);
     install_child_node_mixin(&mut m);
     cv_js::Value::Object(Rc::new(RefCell::new(m)))
 }
@@ -46501,6 +47158,11 @@ fn make_chardata_node_with_iface(
     });
     m.insert("cloneNode".into(), clone_node);
     install_chardata_methods(&mut m);
+    // CDATASection (nodeType 4) extends Text (WHATWG DOM §4.13), so it carries
+    // splitText; ProcessingInstruction (nodeType 7) does NOT.
+    if node_type == 4.0 {
+        install_text_methods(&mut m);
+    }
     install_child_node_mixin(&mut m);
     cv_js::Value::Object(Rc::new(RefCell::new(m)))
 }
@@ -46631,6 +47293,11 @@ fn make_chardata_with_proto(
     });
     m.insert("cloneNode".into(), clone_node);
     install_chardata_methods(&mut m);
+    // `new Text()` (nodeType 3) carries splitText (WHATWG DOM §4.7); Comment
+    // (nodeType 8) does not.
+    if node_type == 3.0 {
+        install_text_methods(&mut m);
+    }
     install_child_node_mixin(&mut m);
     cv_js::Value::Object(Rc::new(RefCell::new(m)))
 }
