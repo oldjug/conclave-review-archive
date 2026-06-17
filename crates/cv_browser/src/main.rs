@@ -44943,14 +44943,16 @@ fn js_chardata(v: &cv_js::Value) -> String {
     String::new()
 }
 
-/// Length of a node per WHATWG DOM "node length" (§4.4): for a Text/Comment
-/// node it's the data length in UTF-16 code units; for any other node it's the
-/// number of children.
+/// Length of a node per WHATWG DOM "node length" (§4.4): for any CharacterData
+/// node (Text 3, CDATASection 4, ProcessingInstruction 7, Comment 8) it's the
+/// data length in UTF-16 code units; for a DocumentType it's 0; for any other
+/// node it's the number of children.
 fn js_node_length(v: &cv_js::Value) -> usize {
-    if js_node_is_text(v) || js_node_type(v) == 8 {
-        return js_chardata(v).encode_utf16().count();
+    match js_node_type(v) {
+        3 | 4 | 7 | 8 => js_chardata(v).encode_utf16().count(),
+        10 => 0, // DocumentType
+        _ => js_node_children(v).len(),
     }
-    js_node_children(v).len()
 }
 
 /// A node's child list (the canonical `_children` array, falling back to
@@ -45738,39 +45740,91 @@ fn range_sync_public(range: &cv_js::Value) {
     }
 }
 
-/// WHATWG §5.5 "set the start" / "set the end": write a boundary point. If this
-/// makes start come after end (same container, offset crossing), the spec
-/// collapses the OTHER boundary onto this one. We approximate the ordering check
-/// with the same-container offset comparison (the common case) plus a guard:
-/// setting start with no end yet seeds the end too.
+/// WHATWG DOM §5.5 setStart(node, offset)/setEnd(node, offset) preconditions:
+///   1. If node is a doctype, throw an "InvalidNodeTypeError" DOMException.
+///   2. If offset is greater than node's length, throw an "IndexSizeError".
+/// Shared by setStart and setEnd (they differ only in which boundary they set).
+fn range_check_boundary_node_offset(node: &cv_js::Value, offset: usize) -> Result<(), cv_js::JsError> {
+    // DocumentType is nodeType 10.
+    if js_node_type(node) == 10 {
+        return Err(cv_js::JsError::Throw(make_dom_exception(
+            "InvalidNodeTypeError",
+            24,
+            "setStart/setEnd: node is a DocumentType",
+        )));
+    }
+    if offset > js_node_length(node) {
+        return Err(cv_js::JsError::Throw(make_dom_exception(
+            "IndexSizeError",
+            1,
+            "setStart/setEnd: offset is greater than node's length",
+        )));
+    }
+    Ok(())
+}
+
+/// WHATWG DOM §5.5 "set the start" / "set the end" of a Range to (node, offset).
+///
+/// "Set the start" (to bp = (node, offset)):
+///   1. If range's root is not the same as node's root, or bp is after the
+///      range's end, set range's end to bp.
+///   2. Set range's start to bp.
+/// "Set the end" is symmetric: if root differs or bp is BEFORE the range's
+/// start, set range's start to bp first; then set range's end to bp.
+///
+/// The cross-root / tree-order comparison uses `boundary_point_position` (§5.3)
+/// when both points share a root, and `js_node_root` to detect the cross-root
+/// case (in which the OTHER end must always be collapsed onto the new point so
+/// the range never straddles two trees).
 fn range_set_boundary(range: &cv_js::Value, side: &str, node: cv_js::Value, offset: usize) {
-    if let cv_js::Value::Object(o) = range {
-        {
-            let mut m = o.borrow_mut();
-            m.insert(format!("\u{1}{side}Container"), node.clone());
+    let cv_js::Value::Object(o) = range else {
+        return;
+    };
+    // Read the CURRENT other boundary BEFORE writing, so the ordering test sees
+    // the pre-update state (the spec evaluates "the range's end/start" first).
+    let (other_c, other_o) = if side == "start" {
+        range_boundary(range, "end")
+    } else {
+        range_boundary(range, "start")
+    };
+
+    // Decide whether the other end must be collapsed onto the new point.
+    // Cross-root: the other boundary is unset (Null) or lives in a different
+    // tree than `node` — then the range can no longer span both, so collapse.
+    let collapse_other = if matches!(other_c, cv_js::Value::Null) {
+        true
+    } else {
+        let new_root = js_node_root(&node);
+        let other_root = js_node_root(&other_c);
+        if !cv_js::Value::strict_eq(&new_root, &other_root) {
+            true
+        } else {
+            // Same root: compare tree order via §5.3 position.
+            let pos = boundary_point_position(&node, offset, &other_c, other_o);
+            match side {
+                // set start: collapse end if new start is AFTER old end.
+                "start" => pos == std::cmp::Ordering::Greater,
+                // set end: collapse start if new end is BEFORE old start.
+                _ => pos == std::cmp::Ordering::Less,
+            }
+        }
+    };
+
+    {
+        let mut m = o.borrow_mut();
+        // Step "set range's start/end to bp".
+        m.insert(format!("\u{1}{side}Container"), node.clone());
+        m.insert(
+            format!("\u{1}{side}Offset"),
+            cv_js::Value::Number(offset as f64),
+        );
+        if collapse_other {
+            let other = if side == "start" { "end" } else { "start" };
+            m.insert(format!("\u{1}{other}Container"), node.clone());
             m.insert(
-                format!("\u{1}{side}Offset"),
+                format!("\u{1}{other}Offset"),
                 cv_js::Value::Number(offset as f64),
             );
-        }
-        // §5.5 steps 3-4: if the boundary points are now mis-ordered in the same
-        // container, collapse the other end onto the one just set.
-        let (sc, so) = range_boundary(range, "start");
-        let (ec, eo) = range_boundary(range, "end");
-        let same = cv_js::Value::strict_eq(&sc, &ec);
-        if same {
-            if side == "start" && so > eo {
-                let mut m = o.borrow_mut();
-                m.insert("\u{1}endContainer".into(), node.clone());
-                m.insert("\u{1}endOffset".into(), cv_js::Value::Number(offset as f64));
-            } else if side == "end" && eo < so {
-                let mut m = o.borrow_mut();
-                m.insert("\u{1}startContainer".into(), node.clone());
-                m.insert(
-                    "\u{1}startOffset".into(),
-                    cv_js::Value::Number(offset as f64),
-                );
-            }
         }
     }
     range_sync_public(range);
@@ -45913,7 +45967,8 @@ fn make_range_js(initial_node: cv_js::Value) -> cv_js::Value {
         cv_js::native_fn_with_interp("setStart", |_i, args| {
             let range = cv_js::current_native_this();
             let node = args.first().cloned().unwrap_or(cv_js::Value::Null);
-            let offset = args.get(1).map(|v| v.to_number() as usize).unwrap_or(0);
+            let offset = args.get(1).map(|v| to_uint32(v.to_number()) as usize).unwrap_or(0);
+            range_check_boundary_node_offset(&node, offset)?;
             range_set_boundary(&range, "start", node, offset);
             Ok(cv_js::Value::Undefined)
         }),
@@ -45923,7 +45978,8 @@ fn make_range_js(initial_node: cv_js::Value) -> cv_js::Value {
         cv_js::native_fn_with_interp("setEnd", |_i, args| {
             let range = cv_js::current_native_this();
             let node = args.first().cloned().unwrap_or(cv_js::Value::Null);
-            let offset = args.get(1).map(|v| v.to_number() as usize).unwrap_or(0);
+            let offset = args.get(1).map(|v| to_uint32(v.to_number()) as usize).unwrap_or(0);
+            range_check_boundary_node_offset(&node, offset)?;
             range_set_boundary(&range, "end", node, offset);
             Ok(cv_js::Value::Undefined)
         }),
