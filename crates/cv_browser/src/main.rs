@@ -27469,6 +27469,7 @@ struct DomProtos {
     html_element: std::rc::Rc<std::cell::RefCell<cv_js::OrderedMap<String, cv_js::Value>>>,
     character_data: std::rc::Rc<std::cell::RefCell<cv_js::OrderedMap<String, cv_js::Value>>>,
     document: std::rc::Rc<std::cell::RefCell<cv_js::OrderedMap<String, cv_js::Value>>>,
+    xml_document: std::rc::Rc<std::cell::RefCell<cv_js::OrderedMap<String, cv_js::Value>>>,
     document_fragment: std::rc::Rc<std::cell::RefCell<cv_js::OrderedMap<String, cv_js::Value>>>,
     text: std::rc::Rc<std::cell::RefCell<cv_js::OrderedMap<String, cv_js::Value>>>,
     comment: std::rc::Rc<std::cell::RefCell<cv_js::OrderedMap<String, cv_js::Value>>>,
@@ -27775,6 +27776,7 @@ fn install_dom_interface_objects(interp: &cv_js::Interp) -> DomProtos {
         html_element,
         character_data,
         document,
+        xml_document,
         document_fragment,
         text,
         comment,
@@ -29414,6 +29416,96 @@ fn install_minimal_dom_with_url(interp: &cv_js::Interp, initial_title: String, p
         interp.define_global(
             "CanvasRenderingContext2D",
             make_iface_no_ctor("CanvasRenderingContext2D", &crc2d_proto),
+        );
+    }
+
+    // ── Constructable node interfaces (WHATWG DOM): new Document(), new
+    // DocumentFragment(), new Comment(data), new Text(data) + their interface
+    // objects (UPGRADING the no-ctor versions Group 1 registered so they reuse
+    // the SAME prototype objects). new Comment/Text coerce their first arg via
+    // ToString and set ownerDocument = the live `document`. ──
+    {
+        let text_proto = dom_protos.text.clone();
+        let comment_proto = dom_protos.comment.clone();
+        let doc_proto = dom_protos.document.clone();
+        let frag_proto = dom_protos.document_fragment.clone();
+        let element_proto = dom_protos.element.clone();
+
+        // new Comment(data?) — WHATWG DOM §4.11 Comment(data = ""). WebIDL: an
+        // `optional DOMString = ""` argument uses the default when MISSING or
+        // explicitly `undefined`, so `new Comment(undefined).data === ""`.
+        let cproto = comment_proto.clone();
+        let comment_ctor = cv_js::native_ctor("Comment", 0, move |interp, args| {
+            let data = match args.first() {
+                None | Some(cv_js::Value::Undefined) => String::new(),
+                Some(v) => interp.js_to_string(v),
+            };
+            let owner = interp.get_global("document").unwrap_or(cv_js::Value::Null);
+            Ok(make_chardata_with_proto(
+                8.0,
+                "#comment",
+                &data,
+                cproto.clone(),
+                owner,
+            ))
+        });
+        interp.define_global(
+            "Comment",
+            make_iface_with_ctor("Comment", 0, &comment_proto, comment_ctor),
+        );
+
+        // new Text(data?) — WHATWG DOM §4.10 Text(data = ""). Same WebIDL
+        // optional-default rule as Comment (missing/undefined → "").
+        let tproto = text_proto.clone();
+        let text_ctor = cv_js::native_ctor("Text", 0, move |interp, args| {
+            let data = match args.first() {
+                None | Some(cv_js::Value::Undefined) => String::new(),
+                Some(v) => interp.js_to_string(v),
+            };
+            let owner = interp.get_global("document").unwrap_or(cv_js::Value::Null);
+            Ok(make_chardata_with_proto(
+                3.0,
+                "#text",
+                &data,
+                tproto.clone(),
+                owner,
+            ))
+        });
+        interp.define_global(
+            "Text",
+            make_iface_with_ctor("Text", 0, &text_proto, text_ctor),
+        );
+
+        // new DocumentFragment() — WHATWG DOM §4.7 DocumentFragment().
+        let fproto = frag_proto.clone();
+        let frag_ctor = cv_js::native_ctor("DocumentFragment", 0, move |interp, _args| {
+            let owner = interp.get_global("document").unwrap_or(cv_js::Value::Null);
+            Ok(make_document_fragment(fproto.clone(), owner))
+        });
+        interp.define_global(
+            "DocumentFragment",
+            make_iface_with_ctor("DocumentFragment", 0, &frag_proto, frag_ctor),
+        );
+
+        // new Document() — WHATWG DOM §4.5 Document(). A fresh XML document.
+        let dproto = doc_proto.clone();
+        let eproto = element_proto.clone();
+        let tproto2 = text_proto.clone();
+        let cproto2 = comment_proto.clone();
+        let fproto2 = frag_proto.clone();
+        let document_ctor = cv_js::native_ctor("Document", 0, move |_interp, _args| {
+            Ok(make_blank_document(
+                dproto.clone(),
+                eproto.clone(),
+                tproto2.clone(),
+                cproto2.clone(),
+                fproto2.clone(),
+                false,
+            ))
+        });
+        interp.define_global(
+            "Document",
+            make_iface_with_ctor("Document", 0, &doc_proto, document_ctor),
         );
     }
 
@@ -44763,6 +44855,344 @@ fn make_comment_node_js(text: &str) -> cv_js::Value {
     cv_js::Value::Object(Rc::new(RefCell::new(m)))
 }
 
+/// Map an HTML local name (lowercased) to its specific HTML*Element interface
+/// name (HTML §4 element interface table); unknown elements map to
+/// `HTMLUnknownElement` (WHATWG HTML — "elements in the HTML namespace whose
+/// local name is not defined"). Used so `createElementNS(xhtml, "a").constructor`
+/// === HTMLAnchorElement etc.
+fn html_element_interface_for_tag(local: &str) -> &'static str {
+    match local {
+        "a" => "HTMLAnchorElement",
+        "div" => "HTMLDivElement",
+        "span" => "HTMLSpanElement",
+        "img" => "HTMLImageElement",
+        "input" => "HTMLInputElement",
+        "button" => "HTMLButtonElement",
+        "script" => "HTMLScriptElement",
+        "style" => "HTMLStyleElement",
+        "body" => "HTMLBodyElement",
+        "head" => "HTMLHeadElement",
+        "html" => "HTMLHtmlElement",
+        "p" => "HTMLParagraphElement",
+        "ul" => "HTMLUListElement",
+        "li" => "HTMLLIElement",
+        "table" => "HTMLTableElement",
+        "form" => "HTMLFormElement",
+        "select" => "HTMLSelectElement",
+        "option" => "HTMLOptionElement",
+        "textarea" => "HTMLTextAreaElement",
+        "label" => "HTMLLabelElement",
+        "template" => "HTMLTemplateElement",
+        "frameset" => "HTMLFrameSetElement",
+        "canvas" => "HTMLCanvasElement",
+        // Known-but-unmodelled HTML elements still expose HTMLElement; only
+        // truly unknown local names get HTMLUnknownElement. We err toward
+        // HTMLElement for anything alphabetic (so `el instanceof HTMLElement`
+        // holds for e.g. <section>), reserving HTMLUnknownElement for names
+        // containing characters invalid in an element name.
+        _ if local.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') && !local.is_empty() => {
+            "HTMLElement"
+        }
+        _ => "HTMLUnknownElement",
+    }
+}
+
+/// The interface prototype object (`Iface.prototype`) of a DOM interface
+/// global, looked up at runtime. Returns `None` if the global isn't an
+/// interface object or has no object `prototype`. Lets host node factories
+/// stamp the right `[[Prototype]]` without threading proto handles through
+/// every call site.
+fn iface_proto(
+    interp: &cv_js::Interp,
+    name: &str,
+) -> Option<std::rc::Rc<std::cell::RefCell<cv_js::OrderedMap<String, cv_js::Value>>>> {
+    match interp.get_global(name) {
+        Some(cv_js::Value::Object(o)) => match o.borrow().get("prototype") {
+            Some(cv_js::Value::Object(p)) => Some(p.clone()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// A CharacterData node (Text nodeType 3 / Comment nodeType 8) built for the
+/// `new Text()` / `new Comment()` constructors (WHATWG DOM §4.6/§4.11). Unlike
+/// [`make_text_node_js`], it (1) links `[[Prototype]]` to the supplied interface
+/// prototype so `Object.getPrototypeOf(n) === Text.prototype` and the
+/// CharacterData→Node chain hold, and (2) stamps `ownerDocument` (the live
+/// `document`). `data` is the ALREADY-ToString'd argument (`new Comment(42)` →
+/// `"42"`, `new Comment(null)` → `"null"`, no arg → `""`).
+fn make_chardata_with_proto(
+    node_type: f64,
+    node_name: &'static str,
+    data: &str,
+    proto: std::rc::Rc<std::cell::RefCell<cv_js::OrderedMap<String, cv_js::Value>>>,
+    owner_document: cv_js::Value,
+) -> cv_js::Value {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use cv_js::OrderedMap as HashMap;
+    let mut m: HashMap<String, cv_js::Value> = HashMap::new();
+    m.insert(
+        cv_js::PROTO_KEY.into(),
+        cv_js::Value::Object(proto.clone()),
+    );
+    m.insert("nodeName".into(), cv_js::Value::String(node_name.into()));
+    m.insert("nodeType".into(), cv_js::Value::Number(node_type));
+    m.insert("nodeValue".into(), cv_js::Value::str(data.to_string()));
+    m.insert("textContent".into(), cv_js::Value::str(data.to_string()));
+    m.insert("data".into(), cv_js::Value::str(data.to_string()));
+    m.insert("ownerDocument".into(), owner_document);
+    let (nt, nn, d, p) = (node_type, node_name, data.to_string(), proto.clone());
+    let clone_node = cv_js::native_fn("cloneNode", move |_args| {
+        Ok(make_chardata_with_proto(nt, nn, &d, p.clone(), cv_js::Value::Null))
+    });
+    m.insert("cloneNode".into(), clone_node);
+    install_chardata_methods(&mut m);
+    install_child_node_mixin(&mut m);
+    cv_js::Value::Object(Rc::new(RefCell::new(m)))
+}
+
+/// A fresh, empty Document for `new Document()` (WHATWG DOM §4.5 — an XML
+/// document with content type "application/xml") and for
+/// `DOMImplementation.createDocument`. Links `[[Prototype]]` to the supplied
+/// Document prototype, exposes the metadata + node-creation surface the WPT
+/// `Document-constructor` / `DOMImplementation-createDocument` tests assert.
+/// `is_html` selects the HTML-document content type / compatMode flavor.
+fn make_blank_document(
+    proto: std::rc::Rc<std::cell::RefCell<cv_js::OrderedMap<String, cv_js::Value>>>,
+    element_proto: std::rc::Rc<std::cell::RefCell<cv_js::OrderedMap<String, cv_js::Value>>>,
+    text_proto: std::rc::Rc<std::cell::RefCell<cv_js::OrderedMap<String, cv_js::Value>>>,
+    comment_proto: std::rc::Rc<std::cell::RefCell<cv_js::OrderedMap<String, cv_js::Value>>>,
+    fragment_proto: std::rc::Rc<std::cell::RefCell<cv_js::OrderedMap<String, cv_js::Value>>>,
+    is_html: bool,
+) -> cv_js::Value {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use cv_js::OrderedMap as HashMap;
+    let mut m: HashMap<String, cv_js::Value> = HashMap::new();
+    m.insert(cv_js::PROTO_KEY.into(), cv_js::Value::Object(proto));
+    m.insert("nodeType".into(), cv_js::Value::Number(9.0));
+    m.insert("nodeName".into(), cv_js::Value::String("#document".into()));
+    m.insert("nodeValue".into(), cv_js::Value::Null);
+    // WHATWG DOM §4.5: a `new Document()` is an XML document (content type
+    // "application/xml"); a `createHTMLDocument` document is "text/html".
+    m.insert(
+        "contentType".into(),
+        cv_js::Value::str(if is_html { "text/html" } else { "application/xml" }.to_string()),
+    );
+    m.insert(
+        "compatMode".into(),
+        cv_js::Value::String("CSS1Compat".into()),
+    );
+    m.insert("characterSet".into(), cv_js::Value::String("UTF-8".into()));
+    m.insert("charset".into(), cv_js::Value::String("UTF-8".into()));
+    m.insert("inputEncoding".into(), cv_js::Value::String("UTF-8".into()));
+    m.insert("URL".into(), cv_js::Value::String("about:blank".into()));
+    m.insert(
+        "documentURI".into(),
+        cv_js::Value::String("about:blank".into()),
+    );
+    // A document constructed in a null browsing context has no Location.
+    m.insert("location".into(), cv_js::Value::Null);
+    // Empty document: no children, no doctype, no document element.
+    m.insert("firstChild".into(), cv_js::Value::Null);
+    m.insert("lastChild".into(), cv_js::Value::Null);
+    m.insert("doctype".into(), cv_js::Value::Null);
+    m.insert("documentElement".into(), cv_js::Value::Null);
+    m.insert("body".into(), cv_js::Value::Null);
+    m.insert("head".into(), cv_js::Value::Null);
+    let empty_children: Rc<RefCell<Vec<cv_js::Value>>> = Rc::new(RefCell::new(Vec::new()));
+    m.insert(
+        "childNodes".into(),
+        cv_js::Value::Array(empty_children.clone()),
+    );
+    m.insert("_children".into(), cv_js::Value::Array(empty_children));
+    let doc_rc = Rc::new(RefCell::new(m));
+    let doc_val = cv_js::Value::Object(doc_rc.clone());
+
+    // createElement(localName): in a non-HTML document the local name is NOT
+    // lowercased (WHATWG DOM §4.5 — "if document is an HTML document, then set
+    // localName to its ASCII-lowercased value"); element.constructor === Element
+    // for an unknown/namespaceless element (its [[Prototype]] is Element.prototype).
+    let owner_for_ce = doc_val.clone();
+    let elproto_ce = element_proto.clone();
+    let is_html_ce = is_html;
+    let create_element = cv_js::native_fn("createElement", move |args| {
+        let name = args
+            .first()
+            .map(|v| v.to_display_string())
+            .unwrap_or_default();
+        let local = if is_html_ce {
+            name.to_ascii_lowercase()
+        } else {
+            name.clone()
+        };
+        let mut em: cv_js::OrderedMap<String, cv_js::Value> = cv_js::OrderedMap::new();
+        em.insert(
+            cv_js::PROTO_KEY.into(),
+            cv_js::Value::Object(elproto_ce.clone()),
+        );
+        em.insert("nodeType".into(), cv_js::Value::Number(1.0));
+        em.insert("localName".into(), cv_js::Value::str(local.clone()));
+        em.insert("tagName".into(), cv_js::Value::str(local.clone()));
+        em.insert("nodeName".into(), cv_js::Value::str(local.clone()));
+        em.insert(
+            "namespaceURI".into(),
+            cv_js::Value::str(HTML_NAMESPACE.to_string()),
+        );
+        em.insert("prefix".into(), cv_js::Value::Null);
+        em.insert("ownerDocument".into(), owner_for_ce.clone());
+        em.insert(
+            "_children".into(),
+            cv_js::Value::Array(Rc::new(RefCell::new(Vec::new()))),
+        );
+        Ok(cv_js::Value::Object(Rc::new(RefCell::new(em))))
+    });
+    doc_rc
+        .borrow_mut()
+        .insert("createElement".into(), create_element);
+
+    // createElementNS(namespace, qualifiedName) — WHATWG DOM §4.5. The created
+    // element's [[Prototype]] reflects the namespace+localName-derived interface
+    // (XHTML "a" → HTMLAnchorElement.prototype) so `el.constructor` resolves.
+    let owner_for_cens = doc_val.clone();
+    let elproto_cens = element_proto.clone();
+    let create_element_ns = cv_js::native_fn_with_interp(
+        "createElementNS",
+        move |interp, args| {
+            let namespace = match args.first() {
+                None | Some(cv_js::Value::Null) | Some(cv_js::Value::Undefined) => String::new(),
+                Some(v) => interp.js_to_string(v),
+            };
+            let qualified = args
+                .get(1)
+                .map(|v| v.to_display_string())
+                .unwrap_or_default();
+            let local = qualified.rsplit(':').next().unwrap_or(&qualified).to_string();
+            // For an XHTML element, link to the specific HTML*Element prototype
+            // (so `.constructor === HTMLAnchorElement`); otherwise Element.prototype.
+            let proto = if namespace == HTML_NAMESPACE {
+                let iface_name = html_element_interface_for_tag(&local.to_ascii_lowercase());
+                iface_proto(interp, iface_name).unwrap_or_else(|| elproto_cens.clone())
+            } else {
+                elproto_cens.clone()
+            };
+            let mut em: cv_js::OrderedMap<String, cv_js::Value> = cv_js::OrderedMap::new();
+            em.insert(cv_js::PROTO_KEY.into(), cv_js::Value::Object(proto));
+            em.insert("nodeType".into(), cv_js::Value::Number(1.0));
+            em.insert("localName".into(), cv_js::Value::str(local.clone()));
+            em.insert("tagName".into(), cv_js::Value::str(qualified.clone()));
+            em.insert("nodeName".into(), cv_js::Value::str(qualified.clone()));
+            em.insert(
+                "namespaceURI".into(),
+                if namespace.is_empty() {
+                    cv_js::Value::Null
+                } else {
+                    cv_js::Value::str(namespace.clone())
+                },
+            );
+            em.insert("prefix".into(), cv_js::Value::Null);
+            em.insert("ownerDocument".into(), owner_for_cens.clone());
+            em.insert(
+                "_children".into(),
+                cv_js::Value::Array(std::rc::Rc::new(std::cell::RefCell::new(Vec::new()))),
+            );
+            Ok(cv_js::Value::Object(std::rc::Rc::new(std::cell::RefCell::new(em))))
+        },
+    );
+    doc_rc
+        .borrow_mut()
+        .insert("createElementNS".into(), create_element_ns);
+
+    let owner_for_ctn = doc_val.clone();
+    let tproto = text_proto.clone();
+    let create_text_node = cv_js::native_fn_with_interp("createTextNode", move |interp, args| {
+        let data = match args.first() {
+            Some(v) => interp.js_to_string(v),
+            None => String::new(),
+        };
+        Ok(make_chardata_with_proto(
+            3.0,
+            "#text",
+            &data,
+            tproto.clone(),
+            owner_for_ctn.clone(),
+        ))
+    });
+    doc_rc
+        .borrow_mut()
+        .insert("createTextNode".into(), create_text_node);
+
+    let owner_for_cc = doc_val.clone();
+    let cproto = comment_proto.clone();
+    let create_comment = cv_js::native_fn_with_interp("createComment", move |interp, args| {
+        let data = match args.first() {
+            Some(v) => interp.js_to_string(v),
+            None => String::new(),
+        };
+        Ok(make_chardata_with_proto(
+            8.0,
+            "#comment",
+            &data,
+            cproto.clone(),
+            owner_for_cc.clone(),
+        ))
+    });
+    doc_rc
+        .borrow_mut()
+        .insert("createComment".into(), create_comment);
+
+    let fproto = fragment_proto.clone();
+    let owner_for_cdf = doc_val.clone();
+    let create_fragment = cv_js::native_fn("createDocumentFragment", move |_args| {
+        Ok(make_document_fragment(fproto.clone(), owner_for_cdf.clone()))
+    });
+    doc_rc
+        .borrow_mut()
+        .insert("createDocumentFragment".into(), create_fragment);
+
+    doc_val
+}
+
+/// A DocumentFragment node (nodeType 11; WHATWG DOM §4.7) for
+/// `new DocumentFragment()` / `document.createDocumentFragment()`. Links
+/// `[[Prototype]]` to the DocumentFragment prototype so instanceof Node +
+/// DocumentFragment hold.
+fn make_document_fragment(
+    proto: std::rc::Rc<std::cell::RefCell<cv_js::OrderedMap<String, cv_js::Value>>>,
+    owner_document: cv_js::Value,
+) -> cv_js::Value {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use cv_js::OrderedMap as HashMap;
+    let mut m: HashMap<String, cv_js::Value> = HashMap::new();
+    m.insert(cv_js::PROTO_KEY.into(), cv_js::Value::Object(proto));
+    m.insert("nodeType".into(), cv_js::Value::Number(11.0));
+    m.insert(
+        "nodeName".into(),
+        cv_js::Value::String("#document-fragment".into()),
+    );
+    m.insert("nodeValue".into(), cv_js::Value::Null);
+    m.insert("ownerDocument".into(), owner_document);
+    let children: Rc<RefCell<Vec<cv_js::Value>>> = Rc::new(RefCell::new(Vec::new()));
+    m.insert("childNodes".into(), cv_js::Value::Array(children.clone()));
+    m.insert("_children".into(), cv_js::Value::Array(children.clone()));
+    m.insert("firstChild".into(), cv_js::Value::Null);
+    m.insert("lastChild".into(), cv_js::Value::Null);
+    let kids = children.clone();
+    let append = cv_js::native_fn("appendChild", move |args| {
+        if let Some(child) = args.first() {
+            kids.borrow_mut().push(child.clone());
+            Ok(child.clone())
+        } else {
+            Ok(cv_js::Value::Undefined)
+        }
+    });
+    m.insert("appendChild".into(), append);
+    cv_js::Value::Object(Rc::new(RefCell::new(m)))
+}
+
 /// A DOM `DocumentType` node (nodeType 10; WHATWG DOM §4.7). Carries
 /// name/publicId/systemId, `ownerDocument`, and `nodeValue` === null. Used by
 /// `document.implementation.createDocumentType` and `doctype` reflection.
@@ -51071,11 +51501,14 @@ fn install_dom_api(
         // The owning document (Rc clone — cheap, doesn't conflict with the live
         // `m` borrow) for `createDocumentType().ownerDocument`.
         let owner_doc_for_impl = document.clone();
-        let create_html_document = cv_js::native_fn("createHTMLDocument", move |args| {
+        let create_html_document = cv_js::native_fn_with_interp("createHTMLDocument", move |interp, args| {
             let title = args
                 .first()
                 .map(|v| v.to_display_string())
                 .unwrap_or_default();
+            // Document.prototype so `createHTMLDocument(...) instanceof Document`
+            // and the Node chain hold (WHATWG DOM §4.5.1).
+            let doc_proto = iface_proto(interp, "Document");
             let mk = |tag: &str| {
                 make_new_element_js_with_canvas_registry(tag, &pending_impl, Some(&canvas_impl))
             };
@@ -51154,7 +51587,14 @@ fn install_dom_api(
             }
             if let cv_js::Value::Object(o) = &newdoc {
                 let mut dm = o.borrow_mut();
+                if let Some(p) = &doc_proto {
+                    dm.insert(cv_js::PROTO_KEY.into(), cv_js::Value::Object(p.clone()));
+                }
                 dm.insert("nodeType".into(), cv_js::Value::Number(9.0));
+                dm.insert("nodeName".into(), cv_js::Value::String("#document".into()));
+                dm.insert("contentType".into(), cv_js::Value::String("text/html".into()));
+                dm.insert("compatMode".into(), cv_js::Value::String("CSS1Compat".into()));
+                dm.insert("characterSet".into(), cv_js::Value::String("UTF-8".into()));
                 dm.insert("head".into(), head_el);
                 dm.insert("body".into(), body_el);
                 dm.insert("documentElement".into(), html_el);
@@ -51208,6 +51648,96 @@ fn install_dom_api(
                 "hasFeature".into(),
                 cv_js::native_fn("hasFeature", |_a| Ok(cv_js::Value::Bool(true))),
             );
+
+            // DOMImplementation.createDocument(namespace, qualifiedName, doctype)
+            // — WHATWG DOM §4.5.1. Returns an XMLDocument; if a qualifiedName is
+            // given it gets a document element of that name in `namespace`, and a
+            // supplied DocumentType becomes its doctype. The created document's
+            // [[Prototype]] is XMLDocument.prototype (→ Document → Node), so
+            // `doc instanceof XMLDocument` / `instanceof Document` hold.
+            let create_document = cv_js::native_fn_with_interp(
+                "createDocument",
+                move |interp, a| {
+                    // WebIDL §3.6.1: createDocument(namespace, qualifiedName,
+                    // optional doctype) has 2 REQUIRED args → calling with fewer
+                    // is a TypeError.
+                    if a.len() < 2 {
+                        return Err(cv_js::JsError::Throw(make_type_error_value(
+                            "Failed to execute 'createDocument' on 'DOMImplementation': 2 arguments required",
+                        )));
+                    }
+                    let namespace = match a.first() {
+                        None | Some(cv_js::Value::Null) | Some(cv_js::Value::Undefined) => {
+                            String::new()
+                        }
+                        Some(v) => interp.js_to_string(v),
+                    };
+                    let qualified = match a.get(1) {
+                        None | Some(cv_js::Value::Null) | Some(cv_js::Value::Undefined) => {
+                            String::new()
+                        }
+                        Some(v) => interp.js_to_string(v),
+                    };
+                    let doctype = a.get(2).cloned().unwrap_or(cv_js::Value::Null);
+                    let el_proto = iface_proto(interp, "Element").unwrap_or_else(new_proto_obj);
+                    let doc = make_blank_document(
+                        iface_proto(interp, "XMLDocument").unwrap_or_else(new_proto_obj),
+                        el_proto.clone(),
+                        iface_proto(interp, "Text").unwrap_or_else(new_proto_obj),
+                        iface_proto(interp, "Comment").unwrap_or_else(new_proto_obj),
+                        iface_proto(interp, "DocumentFragment").unwrap_or_else(new_proto_obj),
+                        false,
+                    );
+                    if let cv_js::Value::Object(o) = &doc {
+                        // An XML document created via createDocument has content
+                        // type "application/xml".
+                        o.borrow_mut().insert(
+                            "contentType".into(),
+                            cv_js::Value::String("application/xml".into()),
+                        );
+                        if !qualified.is_empty() {
+                            // Build the document element in `namespace`.
+                            let mut em: cv_js::OrderedMap<String, cv_js::Value> =
+                                cv_js::OrderedMap::new();
+                            em.insert(
+                                cv_js::PROTO_KEY.into(),
+                                cv_js::Value::Object(el_proto.clone()),
+                            );
+                            em.insert("nodeType".into(), cv_js::Value::Number(1.0));
+                            let local = qualified
+                                .rsplit(':')
+                                .next()
+                                .unwrap_or(&qualified)
+                                .to_string();
+                            em.insert("localName".into(), cv_js::Value::str(local));
+                            em.insert("tagName".into(), cv_js::Value::str(qualified.clone()));
+                            em.insert("nodeName".into(), cv_js::Value::str(qualified.clone()));
+                            em.insert(
+                                "namespaceURI".into(),
+                                if namespace.is_empty() {
+                                    cv_js::Value::Null
+                                } else {
+                                    cv_js::Value::str(namespace.clone())
+                                },
+                            );
+                            em.insert("ownerDocument".into(), doc.clone());
+                            let el = cv_js::Value::Object(std::rc::Rc::new(
+                                std::cell::RefCell::new(em),
+                            ));
+                            o.borrow_mut()
+                                .insert("documentElement".into(), el.clone());
+                            o.borrow_mut().insert("firstChild".into(), el.clone());
+                            o.borrow_mut().insert("lastChild".into(), el);
+                        }
+                        if matches!(&doctype, cv_js::Value::Object(_)) {
+                            o.borrow_mut().insert("doctype".into(), doctype);
+                        }
+                    }
+                    Ok(doc)
+                },
+            );
+            o.borrow_mut()
+                .insert("createDocument".into(), create_document);
         }
         m.insert("implementation".into(), impl_obj);
     }
@@ -65045,6 +65575,87 @@ mod tests {
         );
         assert_eq!(
             eval_min_dom("Object.getPrototypeOf(new EventTarget()) === EventTarget.prototype"),
+            "true"
+        );
+    }
+
+    #[test]
+    fn dom_comment_text_constructors() {
+        // WHATWG DOM §4.10/§4.11 + Comment-Text-constructor.js assertions.
+        assert_eq!(
+            eval_min_dom("Object.getPrototypeOf(new Comment()) === Comment.prototype"),
+            "true"
+        );
+        assert_eq!(
+            eval_min_dom("Object.getPrototypeOf(Object.getPrototypeOf(new Comment())) === CharacterData.prototype"),
+            "true"
+        );
+        assert_eq!(
+            eval_min_dom("(new Comment()) instanceof Node && (new Comment()) instanceof CharacterData && (new Comment()) instanceof Comment"),
+            "true"
+        );
+        // ToString coercion of the first arg (undefined→"", null→"null", 42→"42").
+        assert_eq!(eval_min_dom("new Comment().data"), "");
+        assert_eq!(eval_min_dom("new Comment(undefined).data"), "");
+        assert_eq!(eval_min_dom("new Comment(null).data"), "null");
+        assert_eq!(eval_min_dom("new Comment(42).data"), "42");
+        assert_eq!(eval_min_dom("new Comment('--\\x3e').nodeValue"), "-->");
+        assert_eq!(eval_min_dom("new Text('hi').data"), "hi");
+        assert_eq!(
+            eval_min_dom("(new Text()) instanceof Text && (new Text()) instanceof CharacterData"),
+            "true"
+        );
+        // ownerDocument is the live document.
+        assert_eq!(eval_min_dom("new Comment().ownerDocument === document"), "true");
+    }
+
+    #[test]
+    fn dom_new_document_interfaces_and_metadata() {
+        // WHATWG DOM §4.5 — `new Document()` is an XML document.
+        assert_eq!(
+            eval_min_dom("(new Document()) instanceof Node && (new Document()) instanceof Document"),
+            "true"
+        );
+        assert_eq!(
+            eval_min_dom("(new Document()) instanceof XMLDocument"),
+            "false"
+        );
+        assert_eq!(
+            eval_min_dom("Object.getPrototypeOf(new Document()) === Document.prototype"),
+            "true"
+        );
+        assert_eq!(eval_min_dom("new Document().firstChild"), "null");
+        assert_eq!(eval_min_dom("new Document().documentElement"), "null");
+        assert_eq!(eval_min_dom("new Document().doctype"), "null");
+        assert_eq!(eval_min_dom("new Document().URL"), "about:blank");
+        assert_eq!(eval_min_dom("new Document().compatMode"), "CSS1Compat");
+        assert_eq!(eval_min_dom("new Document().characterSet"), "UTF-8");
+        assert_eq!(eval_min_dom("new Document().contentType"), "application/xml");
+        // createElement in a non-HTML document preserves case.
+        assert_eq!(eval_min_dom("new Document().createElement('DIV').localName"), "DIV");
+        assert_eq!(
+            eval_min_dom("new Document().createElement('a').constructor === Element"),
+            "true"
+        );
+        // createElementNS resolves the specific HTML*Element interface.
+        assert_eq!(
+            eval_min_dom("new Document().createElementNS('http://www.w3.org/1999/xhtml','a').constructor === HTMLAnchorElement"),
+            "true"
+        );
+    }
+
+    #[test]
+    fn dom_new_document_fragment() {
+        // (The full DOMImplementation.createDocument surface is wired through
+        // install_dom_api on the page-build path and verified via the WPT runner;
+        // the minimal-DOM interp here covers the constructable interfaces.)
+        assert_eq!(
+            eval_min_dom("(new DocumentFragment()) instanceof DocumentFragment && (new DocumentFragment()) instanceof Node"),
+            "true"
+        );
+        assert_eq!(eval_min_dom("new DocumentFragment().nodeType"), "11");
+        assert_eq!(
+            eval_min_dom("Object.getPrototypeOf(new DocumentFragment()) === DocumentFragment.prototype"),
             "true"
         );
     }
