@@ -46344,15 +46344,38 @@ const NF_SKIP: f64 = 3.0;
 /// Does `node` pass `what_to_show` (a bitmask) for a TreeWalker/NodeIterator?
 /// Mirrors cv_dom::traversal::WhatToShow::matches over the JS node tree.
 fn node_matches_what_to_show(node: &cv_js::Value, what_to_show: u32) -> bool {
+    // WHATWG DOM §6.2 NodeFilter SHOW_* constants: the bit is 1 << (nodeType-1).
     let bit = match js_node_type(node) {
-        1 => 0x1,        // ELEMENT
-        3 | 4 => 0x4,    // TEXT / CDATA
-        8 => 0x80,       // COMMENT
-        9 => 0x100,      // DOCUMENT
-        11 => 0x400,     // DOCUMENT_FRAGMENT
+        1 => 0x1,    // ELEMENT
+        2 => 0x2,    // ATTRIBUTE
+        3 => 0x4,    // TEXT
+        4 => 0x8,    // CDATA_SECTION
+        7 => 0x40,   // PROCESSING_INSTRUCTION
+        8 => 0x80,   // COMMENT
+        9 => 0x100,  // DOCUMENT
+        10 => 0x200, // DOCUMENT_TYPE
+        11 => 0x400, // DOCUMENT_FRAGMENT
         _ => 0,
     };
     (what_to_show & bit) != 0
+}
+
+/// WHATWG DOM §6.2 "filter": the FULL verdict for a node in a TreeWalker/
+/// NodeIterator — first apply whatToShow (a non-matching node is FILTER_SKIP and
+/// the user filter is NOT called), then run the user NodeFilter. Returns
+/// FILTER_ACCEPT / FILTER_REJECT / FILTER_SKIP; a thrown filter exception
+/// propagates. This single entry point is what the traversal procedures use so
+/// the whatToShow gate and the callback can never get out of order.
+fn node_filter_verdict(
+    interp: &mut cv_js::Interp,
+    what_to_show: u32,
+    filter: &cv_js::Value,
+    node: &cv_js::Value,
+) -> Result<f64, cv_js::JsError> {
+    if !node_matches_what_to_show(node, what_to_show) {
+        return Ok(NF_SKIP);
+    }
+    run_node_filter(interp, filter, node)
 }
 
 /// Run a JS NodeFilter (an object with `acceptNode` or a bare function) against
@@ -46362,7 +46385,7 @@ fn run_node_filter(
     interp: &mut cv_js::Interp,
     filter: &cv_js::Value,
     node: &cv_js::Value,
-) -> f64 {
+) -> Result<f64, cv_js::JsError> {
     let callable = match filter {
         // A NodeFilter object: call its `acceptNode` method.
         cv_js::Value::Object(o) => o.borrow().get("acceptNode").cloned(),
@@ -46373,22 +46396,35 @@ fn run_node_filter(
         _ => None,
     };
     let Some(cb) = callable else {
-        return NF_ACCEPT;
+        return Ok(NF_ACCEPT);
     };
     if matches!(cb, cv_js::Value::Null | cv_js::Value::Undefined) {
-        return NF_ACCEPT;
+        return Ok(NF_ACCEPT);
     }
-    match interp.call_value(cb, vec![node.clone()]) {
-        Ok(v) => {
-            let n = v.to_number();
-            if n == NF_REJECT || n == NF_SKIP {
-                n
-            } else {
-                NF_ACCEPT
-            }
-        }
-        Err(_) => NF_ACCEPT,
+    // WHATWG DOM §6.2 "filter": call the user object's operation; the return
+    // value is converted to an `unsigned short`; ONLY 1 (FILTER_ACCEPT) and 2
+    // (FILTER_REJECT) are special — every OTHER value (including 0/false, 3,
+    // NaN, ...) is FILTER_SKIP. A thrown exception propagates to the caller
+    // (the traversal method re-throws it). The conversion is ToUint16.
+    let v = interp.call_value(cb, vec![node.clone()])?;
+    let n = to_uint16(v.to_number()) as f64;
+    Ok(if n == NF_ACCEPT {
+        NF_ACCEPT
+    } else if n == NF_REJECT {
+        NF_REJECT
+    } else {
+        NF_SKIP
+    })
+}
+
+/// ECMA-262 ToUint16 — the WebIDL `unsigned short` conversion applied to a
+/// NodeFilter callback's return value (§6.2). Non-finite → 0, else truncate and
+/// reduce modulo 2^16.
+fn to_uint16(n: f64) -> u16 {
+    if !n.is_finite() {
+        return 0;
     }
+    (n.trunc().rem_euclid(65536.0)) as u16
 }
 
 /// The last descendant of `node` (deepest, last-child chain) — used to compute
@@ -46449,6 +46485,122 @@ fn js_node_following(node: &cv_js::Value, root: &cv_js::Value) -> Option<cv_js::
     }
 }
 
+/// First (or last, if `last`) child of `node`, or None.
+fn js_node_edge_child(node: &cv_js::Value, last: bool) -> Option<cv_js::Value> {
+    let kids = js_node_children(node);
+    if last {
+        kids.into_iter().next_back()
+    } else {
+        kids.into_iter().next()
+    }
+}
+
+/// Next (or previous, if `back`) sibling of `node`, or None.
+fn js_node_sibling(node: &cv_js::Value, back: bool) -> Option<cv_js::Value> {
+    let (idx, parent) = (js_node_index(node)?, js_node_parent(node)?);
+    let siblings = js_node_children(&parent);
+    if back {
+        idx.checked_sub(1).and_then(|i| siblings.get(i).cloned())
+    } else {
+        siblings.get(idx + 1).cloned()
+    }
+}
+
+/// WHATWG DOM §6.1 "traverse children" — the shared algorithm behind
+/// TreeWalker.firstChild() (type=first) and lastChild() (type=last). Descends
+/// into FILTER_SKIP'd children, prunes FILTER_REJECT'd subtrees, and on a dead
+/// end walks back up to a sibling (never above the walker's current node).
+/// On success sets currentNode and returns the node; else returns Null and
+/// leaves currentNode unchanged. Filter exceptions propagate.
+fn tree_walker_traverse_children(
+    interp: &mut cv_js::Interp,
+    wo: &std::rc::Rc<std::cell::RefCell<cv_js::OrderedMap<String, cv_js::Value>>>,
+    what: u32,
+    filter: &cv_js::Value,
+    current: &cv_js::Value,
+    last: bool,
+) -> Result<cv_js::Value, cv_js::JsError> {
+    let Some(mut node) = js_node_edge_child(current, last) else {
+        return Ok(cv_js::Value::Null);
+    };
+    loop {
+        let result = node_filter_verdict(interp, what, filter, &node)?;
+        if result == NF_ACCEPT {
+            wo.borrow_mut().insert("currentNode".into(), node.clone());
+            return Ok(node);
+        }
+        // FILTER_SKIP: descend into this node's children (first/last).
+        if result == NF_SKIP {
+            if let Some(child) = js_node_edge_child(&node, last) {
+                node = child;
+                continue;
+            }
+        }
+        // FILTER_REJECT, or SKIP with no children: try a sibling, walking up to
+        // the parent (but never above `current`) when there is none.
+        loop {
+            if let Some(sib) = js_node_sibling(&node, last) {
+                node = sib;
+                break;
+            }
+            let Some(parent) = js_node_parent(&node) else {
+                return Ok(cv_js::Value::Null);
+            };
+            if cv_js::Value::strict_eq(&parent, current) {
+                return Ok(cv_js::Value::Null);
+            }
+            node = parent;
+        }
+    }
+}
+
+/// WHATWG DOM §6.1 "traverse siblings" — shared by TreeWalker.nextSibling()
+/// (back=false) and previousSibling() (back=true). On a SKIP'd sibling that has
+/// children, descends to that sibling's first/last child; on REJECT moves to the
+/// next sibling; on a dead end ascends to the parent (stopping at root / an
+/// ACCEPT parent). Filter exceptions propagate.
+fn tree_walker_traverse_siblings(
+    interp: &mut cv_js::Interp,
+    wo: &std::rc::Rc<std::cell::RefCell<cv_js::OrderedMap<String, cv_js::Value>>>,
+    root: &cv_js::Value,
+    what: u32,
+    filter: &cv_js::Value,
+    current: &cv_js::Value,
+    back: bool,
+) -> Result<cv_js::Value, cv_js::JsError> {
+    let mut node = current.clone();
+    if cv_js::Value::strict_eq(&node, root) {
+        return Ok(cv_js::Value::Null);
+    }
+    loop {
+        let mut sibling = js_node_sibling(&node, back);
+        while let Some(sib) = sibling {
+            node = sib;
+            let result = node_filter_verdict(interp, what, filter, &node)?;
+            if result == NF_ACCEPT {
+                wo.borrow_mut().insert("currentNode".into(), node.clone());
+                return Ok(node);
+            }
+            // If not REJECT, descend; else move to the next sibling.
+            sibling = if result != NF_REJECT {
+                js_node_edge_child(&node, back).or_else(|| js_node_sibling(&node, back))
+            } else {
+                js_node_sibling(&node, back)
+            };
+        }
+        let Some(parent) = js_node_parent(&node) else {
+            return Ok(cv_js::Value::Null);
+        };
+        node = parent;
+        if cv_js::Value::strict_eq(&node, root) {
+            return Ok(cv_js::Value::Null);
+        }
+        if node_filter_verdict(interp, what, filter, &node)? == NF_ACCEPT {
+            return Ok(cv_js::Value::Null);
+        }
+    }
+}
+
 /// Build a TreeWalker (WHATWG DOM §6.1) over the live JS DOM rooted at `root`.
 /// Implements `currentNode`, `nextNode`, `firstChild`, `lastChild`,
 /// `parentNode`, `nextSibling`, `previousSibling`, `previousNode`, honoring
@@ -46487,24 +46639,54 @@ fn make_tree_walker_js(root: cv_js::Value, what_to_show: u32, filter: cv_js::Val
                     b.get("currentNode").cloned().unwrap_or(cv_js::Value::Null),
                 )
             };
+            // WHATWG DOM §6.1 TreeWalker.nextNode(): pre-order, but a
+            // FILTER_REJECT prunes the whole subtree (descend only on ACCEPT or
+            // SKIP). `node` starts at current; we move to its first child unless
+            // it was REJECT'd (or had been the previous node), in which case we
+            // move to the following node skipping its descendants.
+            let mut node = current.clone();
+            let mut result = NF_SKIP; // so the first step descends from current
             loop {
-                let Some(next) = js_node_following(&current, &root) else {
+                // Descend on a non-REJECT verdict; otherwise step to a sibling /
+                // following node skipping this subtree.
+                while result != NF_REJECT {
+                    if let Some(child) = js_node_edge_child(&node, false) {
+                        node = child;
+                    } else {
+                        break;
+                    }
+                    result = node_filter_verdict(interp, what, &filter, &node)?;
+                    if result == NF_ACCEPT {
+                        wo.borrow_mut().insert("currentNode".into(), node.clone());
+                        return Ok(node);
+                    }
+                }
+                // No (more) children to descend: take the following node that is
+                // a sibling-or-ancestor's-sibling (subtree of `node` skipped).
+                let mut stepped: Option<cv_js::Value> = None;
+                let mut walk = node.clone();
+                loop {
+                    if cv_js::Value::strict_eq(&walk, &root) {
+                        break;
+                    }
+                    if let Some(sib) = js_node_sibling(&walk, false) {
+                        stepped = Some(sib);
+                        break;
+                    }
+                    match js_node_parent(&walk) {
+                        Some(p) => walk = p,
+                        None => break,
+                    }
+                }
+                let Some(next) = stepped else {
                     return Ok(cv_js::Value::Null);
                 };
-                current = next.clone();
-                if !node_matches_what_to_show(&next, what) {
-                    continue;
+                node = next;
+                result = node_filter_verdict(interp, what, &filter, &node)?;
+                if result == NF_ACCEPT {
+                    wo.borrow_mut().insert("currentNode".into(), node.clone());
+                    return Ok(node);
                 }
-                let verdict = run_node_filter(interp, &filter, &next);
-                if verdict == NF_ACCEPT {
-                    wo.borrow_mut().insert("currentNode".into(), next.clone());
-                    return Ok(next);
-                }
-                // REJECT and SKIP both continue in pre-order for nextNode
-                // (TreeWalker REJECT does NOT skip the subtree for next/previous
-                // *Node* the way it does for child navigation; the spec's
-                // traverse-children handles REJECT-prunes-subtree, but for
-                // nextNode/previousNode REJECT==SKIP).
             }
         }),
     );
@@ -46527,15 +46709,7 @@ fn make_tree_walker_js(root: cv_js::Value, what_to_show: u32, filter: cv_js::Val
                     b.get("currentNode").cloned().unwrap_or(cv_js::Value::Null),
                 )
             };
-            for child in js_node_children(&current) {
-                if node_matches_what_to_show(&child, what)
-                    && run_node_filter(interp, &filter, &child) == NF_ACCEPT
-                {
-                    wo.borrow_mut().insert("currentNode".into(), child.clone());
-                    return Ok(child);
-                }
-            }
-            Ok(cv_js::Value::Null)
+            tree_walker_traverse_children(interp, wo, what, &filter, &current, false)
         }),
     );
     // parentNode(): nearest ACCEPT ancestor (not past root).
@@ -46558,6 +46732,8 @@ fn make_tree_walker_js(root: cv_js::Value, what_to_show: u32, filter: cv_js::Val
                     b.get("currentNode").cloned().unwrap_or(cv_js::Value::Null),
                 )
             };
+            // §6.1 TreeWalker.parentNode(): walk up from currentNode; the first
+            // ancestor (not above root) that the filter ACCEPTs becomes current.
             let mut cur = current;
             loop {
                 if cv_js::Value::strict_eq(&cur, &root) {
@@ -46566,9 +46742,7 @@ fn make_tree_walker_js(root: cv_js::Value, what_to_show: u32, filter: cv_js::Val
                 let Some(p) = js_node_parent(&cur) else {
                     return Ok(cv_js::Value::Null);
                 };
-                if node_matches_what_to_show(&p, what)
-                    && run_node_filter(interp, &filter, &p) == NF_ACCEPT
-                {
+                if node_filter_verdict(interp, what, &filter, &p)? == NF_ACCEPT {
                     wo.borrow_mut().insert("currentNode".into(), p.clone());
                     return Ok(p);
                 }
@@ -46596,33 +46770,14 @@ fn make_tree_walker_js(root: cv_js::Value, what_to_show: u32, filter: cv_js::Val
                         b.get("currentNode").cloned().unwrap_or(cv_js::Value::Null),
                     )
                 };
-                let (Some(idx), Some(parent)) =
-                    (js_node_index(&current), js_node_parent(&current))
-                else {
-                    return Ok(cv_js::Value::Null);
-                };
-                let siblings = js_node_children(&parent);
-                let mut i = idx;
-                loop {
-                    let next_i = if forward {
-                        i.checked_add(1)
-                    } else {
-                        i.checked_sub(1)
-                    };
-                    let Some(ni) = next_i else {
-                        return Ok(cv_js::Value::Null);
-                    };
-                    let Some(sib) = siblings.get(ni) else {
-                        return Ok(cv_js::Value::Null);
-                    };
-                    i = ni;
-                    if node_matches_what_to_show(sib, what)
-                        && run_node_filter(interp, &filter, sib) == NF_ACCEPT
-                    {
-                        wo.borrow_mut().insert("currentNode".into(), sib.clone());
-                        return Ok(sib.clone());
-                    }
-                }
+                let root = wo
+                    .borrow()
+                    .get("root")
+                    .cloned()
+                    .unwrap_or(cv_js::Value::Null);
+                tree_walker_traverse_siblings(
+                    interp, wo, &root, what, &filter, &current, !forward,
+                )
             }),
         );
     }
@@ -46645,15 +46800,7 @@ fn make_tree_walker_js(root: cv_js::Value, what_to_show: u32, filter: cv_js::Val
                     b.get("currentNode").cloned().unwrap_or(cv_js::Value::Null),
                 )
             };
-            for child in js_node_children(&current).into_iter().rev() {
-                if node_matches_what_to_show(&child, what)
-                    && run_node_filter(interp, &filter, &child) == NF_ACCEPT
-                {
-                    wo.borrow_mut().insert("currentNode".into(), child.clone());
-                    return Ok(child);
-                }
-            }
-            Ok(cv_js::Value::Null)
+            tree_walker_traverse_children(interp, wo, what, &filter, &current, true)
         }),
     );
     // previousNode(): the previous ACCEPT node in pre-order from currentNode
@@ -46677,16 +46824,39 @@ fn make_tree_walker_js(root: cv_js::Value, what_to_show: u32, filter: cv_js::Val
                     b.get("currentNode").cloned().unwrap_or(cv_js::Value::Null),
                 )
             };
+            // §6.1 TreeWalker.previousNode(): for each previous sibling, descend
+            // to its DEEPEST non-REJECT last-descendant; a FILTER_REJECT prunes
+            // the subtree. If no sibling yields an ACCEPT, move up to the parent.
+            let mut node = current;
             loop {
-                let Some(prev) = js_node_preceding(&current, &root) else {
+                let mut sibling = js_node_sibling(&node, true);
+                while let Some(sib) = sibling {
+                    node = sib;
+                    let mut result = node_filter_verdict(interp, what, &filter, &node)?;
+                    // Descend into the last child while not REJECT'd and children exist.
+                    while result != NF_REJECT {
+                        let Some(child) = js_node_edge_child(&node, true) else {
+                            break;
+                        };
+                        node = child;
+                        result = node_filter_verdict(interp, what, &filter, &node)?;
+                    }
+                    if result == NF_ACCEPT {
+                        wo.borrow_mut().insert("currentNode".into(), node.clone());
+                        return Ok(node);
+                    }
+                    sibling = js_node_sibling(&node, true);
+                }
+                let Some(parent) = js_node_parent(&node) else {
                     return Ok(cv_js::Value::Null);
                 };
-                current = prev.clone();
-                if node_matches_what_to_show(&prev, what)
-                    && run_node_filter(interp, &filter, &prev) == NF_ACCEPT
-                {
-                    wo.borrow_mut().insert("currentNode".into(), prev.clone());
-                    return Ok(prev);
+                if cv_js::Value::strict_eq(&parent, &root) {
+                    return Ok(cv_js::Value::Null);
+                }
+                node = parent;
+                if node_filter_verdict(interp, what, &filter, &node)? == NF_ACCEPT {
+                    wo.borrow_mut().insert("currentNode".into(), node.clone());
+                    return Ok(node);
                 }
             }
         }),
@@ -46752,9 +46922,11 @@ fn make_node_iterator_js(
                 }
             };
             loop {
-                if node_matches_what_to_show(&candidate, what)
-                    && run_node_filter(interp, &filter, &candidate) == NF_ACCEPT
-                {
+                // §6.1 NodeIterator "traverse" (next): a node is yielded only on
+                // FILTER_ACCEPT; FILTER_REJECT and FILTER_SKIP both continue in
+                // pre-order (NodeIterators do not prune subtrees). Filter
+                // exceptions propagate out of next().
+                if node_filter_verdict(interp, what, &filter, &candidate)? == NF_ACCEPT {
                     let mut b = io.borrow_mut();
                     b.insert("referenceNode".into(), candidate.clone());
                     b.insert(
@@ -46805,9 +46977,9 @@ fn make_node_iterator_js(
                 }
             };
             loop {
-                if node_matches_what_to_show(&candidate, what)
-                    && run_node_filter(interp, &filter, &candidate) == NF_ACCEPT
-                {
+                // §6.1 NodeIterator "traverse" (previous): yield on
+                // FILTER_ACCEPT only; REJECT/SKIP continue backward in pre-order.
+                if node_filter_verdict(interp, what, &filter, &candidate)? == NF_ACCEPT {
                     let mut b = io.borrow_mut();
                     b.insert("referenceNode".into(), candidate.clone());
                     b.insert(
