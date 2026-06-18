@@ -20192,14 +20192,33 @@ fn install_event_interface_globals(interp: &cv_js::Interp) {
 /// `event.initEvent(...)` (or `initCustomEvent(...)`) before dispatch. The set of
 /// accepted interface strings is the spec's case-insensitive legacy list; an
 /// unknown one throws a `NotSupportedError` DOMException.
-fn document_create_event(arg: Option<&cv_js::Value>) -> Result<cv_js::Value, cv_js::JsError> {
+fn document_create_event(
+    interp: &cv_js::Interp,
+    arg: Option<&cv_js::Value>,
+) -> Result<cv_js::Value, cv_js::JsError> {
     let iface = arg.map(|v| v.to_display_string()).unwrap_or_default();
+    // WHATWG DOM §4.5.1 createEvent: the ASCII-case-insensitive legacy interface
+    // table maps the argument to the interface to construct. ASCII-only
+    // lowercasing is deliberate — the spec compares ASCII-case-insensitively, so
+    // "UİEvent"/"UıEvent" (U+0130/U+0131) must NOT match and throw. The created
+    // event is UNINITIALIZED (type = ""); the author calls initEvent/initCustomEvent.
     let lower = iface.to_ascii_lowercase();
-    let kind = match lower.as_str() {
-        // WHATWG DOM §4.5.1 createEvent map (legacy aliases included).
-        "event" | "events" | "htmlevents" | "svgevents" => EventKind::Event,
-        "customevent" => EventKind::CustomEvent,
-        "uievent" | "uievents" => EventKind::UiEvent,
+    let (kind, interface_name) = match lower.as_str() {
+        "event" | "events" | "htmlevents" | "svgevents" => (EventKind::Event, "Event"),
+        "customevent" => (EventKind::CustomEvent, "CustomEvent"),
+        "uievent" | "uievents" => (EventKind::UiEvent, "UIEvent"),
+        "beforeunloadevent" => (EventKind::Event, "BeforeUnloadEvent"),
+        "compositionevent" => (EventKind::Event, "CompositionEvent"),
+        "devicemotionevent" => (EventKind::Event, "DeviceMotionEvent"),
+        "deviceorientationevent" => (EventKind::Event, "DeviceOrientationEvent"),
+        "dragevent" => (EventKind::Event, "DragEvent"),
+        "focusevent" => (EventKind::Event, "FocusEvent"),
+        "hashchangeevent" => (EventKind::Event, "HashChangeEvent"),
+        "keyboardevent" => (EventKind::Event, "KeyboardEvent"),
+        "messageevent" => (EventKind::Event, "MessageEvent"),
+        "mouseevent" | "mouseevents" => (EventKind::Event, "MouseEvent"),
+        "storageevent" => (EventKind::Event, "StorageEvent"),
+        "textevent" => (EventKind::Event, "TextEvent"),
         _ => {
             return Err(cv_js::JsError::Throw(make_dom_exception(
                 "NotSupportedError",
@@ -20210,8 +20229,19 @@ fn document_create_event(arg: Option<&cv_js::Value>) -> Result<cv_js::Value, cv_
             )));
         }
     };
-    // The created event's type is the empty string until initEvent is called.
-    Ok(build_event_value("", None, kind, false))
+    let ev = build_event_value("", None, kind, false);
+    // Set the created event's [[Prototype]] to the named interface's prototype so
+    // `Object.getPrototypeOf(ev) === window[Iface].prototype` (the "alias"
+    // assertion). Read it through the interp's property reader — the SAME path the
+    // test uses (`window[Iface].prototype`) — so the object identity matches for
+    // both Object interface globals and lazily-prototyped native-function ones.
+    if let Some(iface_global) = interp.get_global(interface_name) {
+        let proto = interp.read_property(&iface_global, "prototype");
+        if let (cv_js::Value::Object(o), cv_js::Value::Object(_)) = (&ev, &proto) {
+            o.borrow_mut().insert(cv_js::PROTO_KEY.into(), proto);
+        }
+    }
+    Ok(ev)
 }
 
 struct Mutations {
@@ -28265,7 +28295,7 @@ fn install_minimal_dom_with_url(interp: &cv_js::Interp, initial_title: String, p
     // available even when only the minimal DOM is installed.
     doc_map.insert(
         "createEvent".into(),
-        cv_js::native_fn("createEvent", |args| document_create_event(args.first())),
+        cv_js::native_fn_with_interp("createEvent", |i, args| document_create_event(i, args.first())),
     );
     let document = cv_js::Value::Object(Rc::new(RefCell::new(doc_map)));
 
@@ -30850,6 +30880,32 @@ fn install_minimal_dom_with_url(interp: &cv_js::Interp, initial_title: String, p
     interp.define_global(
         "StorageEvent",
         make_event_ctor("StorageEvent", &[("bubbles", false), ("cancelable", false)]),
+    );
+    // Legacy event interfaces required by document.createEvent's alias table
+    // (WHATWG DOM §4.5.1) so `window[Iface].prototype` resolves. (A constructible
+    // shape is a follow-up; these satisfy createEvent + `Iface in window`.)
+    interp.define_global(
+        "DragEvent",
+        make_event_ctor("DragEvent", &[("bubbles", true), ("cancelable", true)]),
+    );
+    interp.define_global(
+        "MessageEvent",
+        make_event_ctor("MessageEvent", &[("bubbles", false), ("cancelable", false)]),
+    );
+    interp.define_global(
+        "TextEvent",
+        make_event_ctor("TextEvent", &[("bubbles", true), ("cancelable", true)]),
+    );
+    interp.define_global(
+        "DeviceMotionEvent",
+        make_event_ctor("DeviceMotionEvent", &[("bubbles", false), ("cancelable", false)]),
+    );
+    interp.define_global(
+        "DeviceOrientationEvent",
+        make_event_ctor(
+            "DeviceOrientationEvent",
+            &[("bubbles", false), ("cancelable", false)],
+        ),
     );
     interp.define_global(
         "PromiseRejectionEvent",
@@ -54860,7 +54916,7 @@ fn install_dom_api(
         // author initializes via initEvent/initCustomEvent before dispatch.
         m.insert(
             "createEvent".into(),
-            cv_js::native_fn("createEvent", |args| document_create_event(args.first())),
+            cv_js::native_fn_with_interp("createEvent", |i, args| document_create_event(i, args.first())),
         );
         m.insert("createRange".into(), create_range);
         m.insert("createTreeWalker".into(), create_tree_walker);
