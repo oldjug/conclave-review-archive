@@ -19585,23 +19585,38 @@ fn event_protos() -> EventProtos {
 /// engine-synthesised trusted events, not author-constructed ones).
 /// `initialized` is false for the `createEvent` path (an uninitialized event the
 /// author must `initEvent`/`initCustomEvent` before dispatch).
-fn build_event_value(
+fn populate_event_into(
+    me_target: &std::rc::Rc<std::cell::RefCell<cv_js::OrderedMap<String, cv_js::Value>>>,
     event_type: &str,
     init: Option<&cv_js::Value>,
     kind: EventKind,
     initialized: bool,
-) -> cv_js::Value {
+    set_proto: bool,
+) {
+    #[allow(unused_imports)]
     use std::cell::RefCell;
     use std::rc::Rc;
+    #[allow(unused_imports)]
     use cv_js::OrderedMap as HashMap;
-    let protos = event_protos();
-    let proto = match kind {
-        EventKind::Event => protos.event.clone(),
-        EventKind::CustomEvent => protos.custom.clone(),
-        EventKind::UiEvent => protos.ui.clone(),
+    // `set_proto`=true (the normal `build_event_value` path) links [[Prototype]]
+    // to the shared interface proto. `set_proto`=false is the `super(...)` path:
+    // the receiver `this` already carries the DERIVED class's prototype, so we
+    // populate the Event members onto it WITHOUT clobbering that chain.
+    let me = Rc::clone(me_target);
+    let proto = {
+        let protos = event_protos();
+        match kind {
+            EventKind::Event => protos.event.clone(),
+            EventKind::CustomEvent => protos.custom.clone(),
+            EventKind::UiEvent => protos.ui.clone(),
+        }
     };
-    let mut m: HashMap<String, cv_js::Value> = HashMap::new();
-    m.insert(cv_js::PROTO_KEY.into(), proto);
+    let mut m = me.borrow_mut();
+    if set_proto {
+        m.insert(cv_js::PROTO_KEY.into(), proto);
+    } else {
+        let _ = proto;
+    }
     m.insert("type".into(), cv_js::Value::str(event_type.to_string()));
     m.insert("target".into(), cv_js::Value::Null);
     m.insert("srcElement".into(), cv_js::Value::Null);
@@ -19658,7 +19673,7 @@ fn build_event_value(
         }
     }
 
-    let me: Rc<RefCell<HashMap<String, cv_js::Value>>> = Rc::new(RefCell::new(m));
+    drop(m);
 
     // --- methods, each mutating THIS instance ---------------------------------
     let pd = me.clone();
@@ -19810,6 +19825,19 @@ fn build_event_value(
         me.borrow_mut()
             .insert("initCustomEvent".into(), init_custom);
     }
+}
+
+/// Build a fresh, fully-shaped, prototype-linked Event value (the normal
+/// constructor / `document.createEvent` path). Thin wrapper over
+/// `populate_event_into` with a fresh backing object and `set_proto = true`.
+fn build_event_value(
+    event_type: &str,
+    init: Option<&cv_js::Value>,
+    kind: EventKind,
+    initialized: bool,
+) -> cv_js::Value {
+    let me = std::rc::Rc::new(std::cell::RefCell::new(cv_js::OrderedMap::new()));
+    populate_event_into(&me, event_type, init, kind, initialized, true);
     cv_js::Value::Object(me)
 }
 
@@ -19969,6 +19997,23 @@ fn install_event_interface_globals(interp: &cv_js::Interp) {
             m.insert("prototype".into(), proto.clone());
             m.insert("name".into(), cv_js::Value::String(name.into()));
             m.insert("length".into(), cv_js::Value::Number(1.0));
+            // `.call` so `class X extends Event { constructor(){ super(t, init) } }`
+            // works: super() desugars to `Event.call(this, t, init)`, which must
+            // populate the DERIVED receiver's Event members IN PLACE (its prototype
+            // is already X.prototype → Event.prototype). super() returns undefined.
+            m.insert(
+                "call".into(),
+                cv_js::native_fn("call", move |args| {
+                    if let Some(cv_js::Value::Object(target)) = args.first() {
+                        let ty = args
+                            .get(1)
+                            .map(|v| v.to_display_string())
+                            .unwrap_or_default();
+                        populate_event_into(target, &ty, args.get(2), kind, true, false);
+                    }
+                    Ok(cv_js::Value::Undefined)
+                }),
+            );
             insert_event_phase_constants(&mut m);
         }
         let iface_val = cv_js::Value::Object(iface);
@@ -20024,6 +20069,31 @@ fn install_event_interface_globals(interp: &cv_js::Interp) {
             m.insert("prototype".into(), proto.clone());
             m.insert("name".into(), cv_js::Value::String(name.into()));
             m.insert("length".into(), cv_js::Value::Number(1.0));
+            // `.call` for `class X extends MouseEvent { constructor(){ super(t,init) } }`:
+            // populate the derived receiver's UIEvent base + this subclass's own
+            // members in place (keeps the derived prototype). super() → undefined.
+            m.insert(
+                "call".into(),
+                cv_js::native_fn("call", move |args| {
+                    if let Some(cv_js::Value::Object(target)) = args.first() {
+                        let ty = args
+                            .get(1)
+                            .map(|v| v.to_display_string())
+                            .unwrap_or_default();
+                        let sub_init = args.get(2);
+                        populate_event_into(
+                            target,
+                            &ty,
+                            sub_init,
+                            EventKind::UiEvent,
+                            true,
+                            false,
+                        );
+                        apply_event_subclass_fields(target, sub_init, fields);
+                    }
+                    Ok(cv_js::Value::Undefined)
+                }),
+            );
             insert_event_phase_constants(&mut m);
         }
         let iface_val = cv_js::Value::Object(iface);
