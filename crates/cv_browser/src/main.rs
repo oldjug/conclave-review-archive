@@ -49096,6 +49096,159 @@ fn call_pure_native_value(
     Ok(cv_js::Value::Undefined)
 }
 
+/// The reflection category of an IDL attribute that mirrors a content attribute
+/// (WHATWG HTML "reflect"). Drives [`reflected_accessor`].
+#[derive(Clone, Copy)]
+enum ReflectKind {
+    /// DOMString: get = content value or ""; set = content := ToString(value).
+    Str,
+    /// boolean: get = content present; set true → content := ""; set false → remove.
+    Bool,
+    /// enumerated limited-to-known: get = canonical keyword for the state or "";
+    /// set = keyword match → canonical, "" → remove, else set as-is.
+    Enum(&'static [&'static str]),
+    /// signed long: get = parse-integer(content) or 0; set = content := ToInt32(value).
+    Long,
+}
+
+/// HTML "rules for parsing integers" (signed): skip leading ASCII whitespace, an
+/// optional sign, then ASCII digits. Returns None if no digits follow.
+fn parse_dom_integer(s: &str) -> Option<i64> {
+    let chars: Vec<char> = s.chars().collect();
+    let mut i = 0;
+    while i < chars.len() && chars[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    let mut neg = false;
+    if i < chars.len() && (chars[i] == '+' || chars[i] == '-') {
+        neg = chars[i] == '-';
+        i += 1;
+    }
+    let start = i;
+    let mut val: i64 = 0;
+    while i < chars.len() && chars[i].is_ascii_digit() {
+        val = val.saturating_mul(10).saturating_add((chars[i] as u8 - b'0') as i64);
+        i += 1;
+    }
+    if i == start {
+        return None;
+    }
+    Some(if neg { -val } else { val })
+}
+
+/// ECMAScript ToInt32 (the WebIDL `long` conversion): NaN/±Infinity → 0, else
+/// truncate toward zero and wrap to a signed 32-bit value.
+fn js_to_int32(n: f64) -> i64 {
+    if !n.is_finite() || n == 0.0 {
+        return 0;
+    }
+    let two32 = 4294967296.0_f64;
+    let mut m = n.trunc() % two32;
+    if m < 0.0 {
+        m += two32;
+    }
+    if m >= 2147483648.0 {
+        (m - two32) as i64
+    } else {
+        m as i64
+    }
+}
+
+/// Build a live get/set accessor that reflects a content attribute as an IDL
+/// property per the WHATWG reflection rules, reusing the element's OWN
+/// getAttribute/setAttribute/removeAttribute so the attribute store + render
+/// mutations stay consistent. (Object→string coercion uses `to_display_string`;
+/// the rare valueOf/toString-only operands need full ToString — deferred.)
+fn reflected_accessor(
+    content: &'static str,
+    kind: ReflectKind,
+    get_attr: cv_js::Value,
+    set_attr: cv_js::Value,
+    remove_attr: cv_js::Value,
+) -> cv_js::Value {
+    let ga = get_attr;
+    let getter = cv_js::native_fn("reflect:get", move |_args| {
+        let cur = call_pure_native_value(&ga, vec![cv_js::Value::str(content.to_string())])?;
+        let present = !matches!(cur, cv_js::Value::Null | cv_js::Value::Undefined);
+        Ok(match kind {
+            ReflectKind::Str => {
+                cv_js::Value::str(if present { cur.to_display_string() } else { String::new() })
+            }
+            ReflectKind::Bool => cv_js::Value::Bool(present),
+            ReflectKind::Enum(keywords) => {
+                let mut out = String::new();
+                if present {
+                    let cv = cur.to_display_string();
+                    if let Some(kw) = keywords.iter().find(|k| k.eq_ignore_ascii_case(&cv)) {
+                        out = (*kw).to_string();
+                    }
+                }
+                cv_js::Value::str(out)
+            }
+            ReflectKind::Long => {
+                let n = if present {
+                    parse_dom_integer(&cur.to_display_string()).unwrap_or(0)
+                } else {
+                    0
+                };
+                cv_js::Value::Number(n as f64)
+            }
+        })
+    });
+    let sa = set_attr;
+    let ra = remove_attr;
+    let setter = cv_js::native_fn("reflect:set", move |args| {
+        let v = args.first().cloned().unwrap_or(cv_js::Value::Undefined);
+        let set = |val: String| {
+            let _ = call_pure_native_value(
+                &sa,
+                vec![cv_js::Value::str(content.to_string()), cv_js::Value::str(val)],
+            );
+        };
+        let remove = || {
+            let _ = call_pure_native_value(&ra, vec![cv_js::Value::str(content.to_string())]);
+        };
+        match kind {
+            ReflectKind::Str => set(v.to_display_string()),
+            ReflectKind::Bool => {
+                if v.to_bool() {
+                    set(String::new());
+                } else {
+                    remove();
+                }
+            }
+            ReflectKind::Enum(keywords) => {
+                let s = v.to_display_string();
+                if let Some(kw) = keywords.iter().find(|k| k.eq_ignore_ascii_case(&s)) {
+                    set((*kw).to_string());
+                } else if s.is_empty() {
+                    remove();
+                } else {
+                    set(s);
+                }
+            }
+            ReflectKind::Long => set(js_to_int32(v.to_number()).to_string()),
+        }
+        Ok(cv_js::Value::Undefined)
+    });
+    tb_js_accessor(getter, setter)
+}
+
+/// The global reflected IDL attributes present on every HTML element (WHATWG HTML
+/// + the WPT reflection harness's per-element block). classList (tokenlist) is
+/// handled separately.
+// (className/classList are reflected separately — `className` has direct
+// string-slot readers in layout/serialization that an accessor would break.)
+const REFLECT_GLOBAL_ATTRS: &[(&str, &str, ReflectKind)] = &[
+    ("title", "title", ReflectKind::Str),
+    ("lang", "lang", ReflectKind::Str),
+    ("accessKey", "accesskey", ReflectKind::Str),
+    ("dir", "dir", ReflectKind::Enum(&["ltr", "rtl", "auto"])),
+    ("autofocus", "autofocus", ReflectKind::Bool),
+    ("hidden", "hidden", ReflectKind::Bool),
+    ("tabIndex", "tabindex", ReflectKind::Long),
+];
+
 fn call_pure_native_method(target: &cv_js::Value, name: &str, args: Vec<cv_js::Value>) {
     let method = if let cv_js::Value::Object(obj) = target {
         obj.borrow().get(name).cloned()
@@ -51990,6 +52143,22 @@ fn make_new_element_js_with_canvas_registry(
             "outerHTML".into(),
             tb_js_accessor(outer_html_getter, outer_html_setter),
         );
+        // Reflect the global IDL attributes (title/lang/dir/hidden/tabIndex/…)
+        // onto this element, each backed by its own get/set/removeAttribute so the
+        // attribute store + render path stay authoritative. Inserted into obj's
+        // map (overriding any early static slot) before the originals are moved in.
+        for &(idl, content, kind) in REFLECT_GLOBAL_ATTRS {
+            map.insert(
+                idl.to_string(),
+                reflected_accessor(
+                    content,
+                    kind,
+                    get_attribute.clone(),
+                    set_attribute.clone(),
+                    remove_attribute.clone(),
+                ),
+            );
+        }
         map.insert("setAttribute".into(), set_attribute);
         map.insert("getAttribute".into(), get_attribute);
         map.insert("hasAttribute".into(), has_attribute);
