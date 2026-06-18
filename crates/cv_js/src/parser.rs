@@ -1676,13 +1676,29 @@ impl Parser {
         let mut ctor_full_body: Vec<Stmt> = Vec::new();
         ctor_full_body.extend(field_inits);
         if ctor_body.is_empty() && superclass.is_some() {
+            // V8: a derived class with NO explicit constructor gets the
+            // synthesized `constructor(...args) { super(...args); }`. Forward via
+            // a REST PARAMETER (not the `arguments` object) so the generated
+            // forwarder runs on the bytecode VM — which supports `...rest` but
+            // has no `arguments` object (an `arguments` read there throws
+            // `ReferenceError: arguments is not defined`, breaking every
+            // `class X extends Y {}` with an implicit constructor). Only when
+            // there is no explicit constructor at all (ctor_params empty); an
+            // explicit empty-body `constructor(a, b) {}` keeps its declared
+            // arity and forwards the live `arguments` unchanged.
+            let forward_args: Expr = if ctor_params.is_empty() {
+                ctor_params.push("...\u{1}__args".to_string());
+                Expr::Identifier("\u{1}__args".to_string())
+            } else {
+                Expr::Identifier("arguments".to_string())
+            };
             ctor_full_body.push(Stmt::Expression(Expr::Call {
                 callee: Box::new(Expr::Member {
                     object: Box::new(Expr::Identifier("\u{1}__superclass__".to_string())),
                     property: Box::new(Expr::Identifier("apply".to_string())),
                     computed: false,
                 }),
-                args: vec![Expr::This, Expr::Identifier("arguments".to_string())],
+                args: vec![Expr::This, forward_args],
             }));
         }
         ctor_full_body.extend(ctor_body);
