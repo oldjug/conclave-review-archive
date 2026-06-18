@@ -51821,8 +51821,58 @@ fn make_new_element_js_with_canvas_registry(
         ))))
     });
 
+    // innerHTML — a LIVE accessor (HTML Standard §3.5). The getter serializes
+    // this element's children; the SETTER parses the fragment (the tokenizer
+    // decodes named + numeric character references via the full entities table)
+    // into child nodes and updates `_children` + the reflected `textContent`, so
+    // `el.innerHTML = "&amp;"; el.textContent === "&"` round-trips. Replaces the
+    // inert empty-string slot the created-element builder installed. (Created
+    // elements are NOT in the SSR `table.all`, so this never reaches the
+    // parse-time-element render path that reads `innerHTML` as a raw string.)
+    let obj_for_inner_get = obj.clone();
+    let inner_html_getter = cv_js::native_fn("get innerHTML", move |_args| {
+        let mut out = String::new();
+        if let Some(cv_js::Value::Array(kids)) = obj_for_inner_get.borrow().get("_children") {
+            for child in kids.borrow().iter() {
+                serialize_live_node_inner(child, &mut out);
+            }
+        }
+        Ok(cv_js::Value::str(out))
+    });
+    let obj_for_inner_set = obj.clone();
+    let nested_for_inner_set = nested.clone();
+    let pending_for_inner_set = pending.clone();
+    let inner_html_setter = cv_js::native_fn("set innerHTML", move |args| {
+        let html = args.first().map(|v| v.to_display_string()).unwrap_or_default();
+        let parsed = parse_html_fragment_to_nodes(&html);
+        let parent = cv_js::Value::Object(obj_for_inner_set.clone());
+        let mut new_children: Vec<cv_js::Value> = Vec::with_capacity(parsed.len());
+        let mut text = String::new();
+        for node in &parsed {
+            collect_text(node, &mut text);
+            let js = node_to_js_value(node, &pending_for_inner_set);
+            set_parent_snapshot(&js, parent.clone());
+            new_children.push(js);
+        }
+        queue_injected_scripts_in_nodes(&new_children);
+        // Mutate the EXISTING `_children` backing array in place (the
+        // appendChild/insertBefore/etc. closures captured this same Rc — replacing
+        // it with a new Rc would desync them).
+        *nested_for_inner_set.borrow_mut() = new_children;
+        // Reflect the decoded text so `el.textContent` matches (the created
+        // element keeps textContent as a slot, not a computed accessor).
+        obj_for_inner_set
+            .borrow_mut()
+            .insert("textContent".into(), cv_js::Value::str(text));
+        Ok(cv_js::Value::Undefined)
+    });
+
     {
         let mut map = obj.borrow_mut();
+        map.insert(
+            "innerHTML".into(),
+            tb_js_accessor(inner_html_getter, inner_html_setter),
+        );
         map.insert("attributes".into(), attributes_map);
         map.insert("setAttributeNS".into(), set_attribute_ns);
         map.insert("getAttributeNS".into(), get_attribute_ns);
@@ -52516,10 +52566,14 @@ fn js_value_to_nodes(js: &cv_js::Value) -> Vec<cv_html::Node> {
             });
         }
     }
-    let inner_html = m
-        .get("innerHTML")
-        .map(|v| v.to_display_string())
-        .unwrap_or_default();
+    // Only a RAW STRING innerHTML slot is reparsed here. Created elements now
+    // expose innerHTML as a live accessor that keeps `_children` authoritative —
+    // reading the accessor as a string would yield its function repr and clobber
+    // the real children, so fall through to the `_children` walk below.
+    let inner_html = match m.get("innerHTML") {
+        Some(cv_js::Value::String(s)) => s.to_string(),
+        _ => String::new(),
+    };
     let mut child_nodes: Vec<Node> = Vec::new();
     let mut derived_child_text = String::new();
     if let Some(cv_js::Value::Array(arr)) = m.get("_children") {
