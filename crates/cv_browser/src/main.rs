@@ -49249,6 +49249,10 @@ const REFLECT_GLOBAL_ATTRS: &[(&str, &str, ReflectKind)] = &[
     ("tabIndex", "tabindex", ReflectKind::Long),
 ];
 
+// Per-element reflected IDL attributes (string/boolean/long) generated from the
+// WPT reflection definitions — (tag, idlName, contentAttr, ReflectKind).
+include!("reflect_gen.rs");
+
 fn call_pure_native_method(target: &cv_js::Value, name: &str, args: Vec<cv_js::Value>) {
     let method = if let cv_js::Value::Object(obj) = target {
         obj.borrow().get(name).cloned()
@@ -52158,6 +52162,22 @@ fn make_new_element_js_with_canvas_registry(
                     remove_attribute.clone(),
                 ),
             );
+        }
+        // Element-specific reflected IDL attributes for THIS tag (a.target,
+        // img.alt, input.name, …). Same generic reflection, keyed by tag.
+        for &(t, idl, content, kind) in ELEMENT_REFLECT_ATTRS {
+            if t == tag_lc {
+                map.insert(
+                    idl.to_string(),
+                    reflected_accessor(
+                        content,
+                        kind,
+                        get_attribute.clone(),
+                        set_attribute.clone(),
+                        remove_attribute.clone(),
+                    ),
+                );
+            }
         }
         map.insert("setAttribute".into(), set_attribute);
         map.insert("getAttribute".into(), get_attribute);
