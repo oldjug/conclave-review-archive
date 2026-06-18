@@ -9440,17 +9440,24 @@ fn run_function_inner(
             Op::In { dst, lhs, rhs } => {
                 let key = regs[lhs as usize].to_display_string();
                 let recv = regs[rhs as usize].clone();
-                // Lenient on non-objects (return false rather than throwing) so
-                // a `typeof x==='object' && k in x` guard against null doesn't
-                // abort the VM run.
-                if is_proxy_val(&recv)
+                // Fast own-property check first — no host round-trip for the
+                // common `"ownKey" in obj` case.
+                let own_hit = matches!(&recv, Value::Object(o) if o.borrow().contains_key(&key));
+                if own_hit {
+                    regs[dst as usize] = Value::Bool(true);
+                } else if matches!(&recv, Value::Object(_))
+                    || is_proxy_val(&recv)
                     || crate::interp::is_legacy_collection(&recv)
                     || crate::interp::value_is_node_like(&recv)
                 {
-                    // Route a legacy platform object (HTMLCollection/NodeList), a
-                    // Proxy, and any DOM node through the host [[HasProperty]] so
-                    // the exotic index/name resolution, the live tree-traversal
-                    // accessors, and the nodeType CONSTANTS all resolve for `in`.
+                    // ECMA-262 [[HasProperty]] walks the WHOLE prototype chain
+                    // (so inherited methods/getters — `"method" in instance`,
+                    // `"fixedProp" in subclassInstance` — count), fires a Proxy
+                    // `has` trap, and resolves WebIDL legacy collection index/name
+                    // + live DOM node accessors. Route every object through the
+                    // single host [[HasProperty]] (`has_property_trapped`) so the
+                    // VM `in` matches the tree-walk tier exactly. (Own keys were
+                    // already handled above; this is the inherited/exotic case.)
                     let hook = globals.borrow().get("__tb_host_has").cloned();
                     if let Some(g @ Value::NativeFunction(_)) = hook {
                         match dispatch(g, Value::Undefined, vec![recv, Value::str(key)]) {
@@ -9458,9 +9465,12 @@ fn run_function_inner(
                             Err(e) => propagate!(e),
                         }
                     } else {
+                        // No host hook (bare VM): own-only fallback.
                         regs[dst as usize] = Value::Bool(has_property(&recv, &key));
                     }
                 } else {
+                    // Array/String/primitive: lenient (false, never throws) so a
+                    // `typeof x==='object' && k in x` null-guard doesn't abort.
                     regs[dst as usize] = Value::Bool(has_property(&recv, &key));
                 }
             }

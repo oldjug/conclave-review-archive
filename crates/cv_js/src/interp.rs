@@ -16981,42 +16981,17 @@ impl Interp {
                     return Ok(Value::Bool(is_instance_of(&l, &r)));
                 }
                 if *op == BinOp::In {
-                    // `key in obj`: is the string key present?
+                    // ECMA-262 §13.10.1 `in`: ToPropertyKey(left) then
+                    // [[HasProperty]](right), which walks the WHOLE prototype
+                    // chain (so inherited methods/getters count) and fires a
+                    // Proxy `has` trap / WebIDL legacy [[HasProperty]]. Delegate
+                    // to the single [[HasProperty]] implementation so the
+                    // tree-walk `in` matches the VM's `__tb_host_has` exactly —
+                    // previously this inline copy only checked OWN keys, so
+                    // `"method" in instance` / `"getter" in subclassInstance`
+                    // were false even though the members were inherited.
                     let key = l.to_display_string();
-                    // Proxy `has` trap fires on `in` (Vue 3 reactivity tracks
-                    // `key in state` this way).
-                    if let Some((target, handler)) = proxy_parts(&r) {
-                        if let Value::Object(h) = &handler {
-                            if let Some(trap) = h.borrow().get("has").cloned() {
-                                if self.is_callable(&trap) {
-                                    let res = self.call_value_with_this(
-                                        trap,
-                                        handler.clone(),
-                                        vec![target, Value::str(key)],
-                                    )?;
-                                    return Ok(Value::Bool(res.to_bool()));
-                                }
-                            }
-                        }
-                        // No `has` trap → [[HasProperty]] on the target.
-                        let present =
-                            matches!(&target, Value::Object(o) if o.borrow().contains_key(&key));
-                        return Ok(Value::Bool(present));
-                    }
-                    let present = match &r {
-                        Value::Object(o) => o.borrow().contains_key(&key),
-                        Value::Array(a) => {
-                            if let Ok(i) = key.parse::<usize>() {
-                                let arr = a.borrow();
-                                // A Hole means the index was deleted — `i in arr` → false.
-                                i < arr.len() && !matches!(arr[i], Value::Hole)
-                            } else {
-                                key == "length"
-                            }
-                        }
-                        _ => false,
-                    };
-                    return Ok(Value::Bool(present));
+                    return Ok(Value::Bool(self.has_property_trapped(&r, &key)?));
                 }
                 // ECMA-262 §13.15 `+`: ToPrimitive(default) both operands
                 // before deciding string-concat vs numeric-add. Without this,
@@ -19563,7 +19538,14 @@ impl Interp {
                     // are true.
                     true
                 } else {
-                    false
+                    // ECMA-262 §13.10.1 / §10.1.7 [[HasProperty]]: `key in obj`
+                    // is true if `key` is an OWN property OR any property reached
+                    // by walking the [[Prototype]] chain. Without this the `in`
+                    // operator only saw own data properties, so inherited methods
+                    // and getters (`"m" in instance`, `"fixedProp" in subclassed`
+                    // on the class prototype) reported false even though
+                    // `instance.m` / `instance.fixedProp` read correctly.
+                    self.proto_chain_has(obj, key)
                 }
             }
             Value::Array(a) => {
