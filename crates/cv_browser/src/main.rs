@@ -28773,10 +28773,8 @@ fn install_minimal_dom_with_url(interp: &cv_js::Interp, initial_title: String, p
     // Without a provider-shaped object some explorers build sparse connector
     // lists and later crash on `connector.getProvider()`. Keep this
     // disconnected but structurally compatible.
-    let (default_chain_id, default_net_version) = match Url::parse(page_url) {
-        Ok(url) if url.host.contains("hyvechain.com") => ("0x1ea7".to_string(), "7847".to_string()),
-        _ => ("0x1".to_string(), "1".to_string()),
-    };
+    // Disconnected provider: report Ethereum mainnet defaults for every site.
+    let (default_chain_id, default_net_version) = ("0x1".to_string(), "1".to_string());
     let wallet_chain_id = Rc::new(RefCell::new(default_chain_id));
     let wallet_net_version = Rc::new(RefCell::new(default_net_version));
     let wallet_accounts: Rc<RefCell<Vec<cv_js::Value>>> = Rc::new(RefCell::new(Vec::new()));

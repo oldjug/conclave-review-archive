@@ -48,3 +48,6 @@ keylog*.txt
 /tools/run_audit.ps1
 /tools/audit_sites.txt
 
+
+# brand/marketing assets (separate from the browser source)
+/assets/brand/
