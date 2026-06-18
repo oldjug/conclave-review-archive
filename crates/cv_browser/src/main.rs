@@ -55183,6 +55183,16 @@ fn install_dom_api(
                     em.insert("parentElement".into(), html_el.clone());
                 }
             }
+            // createHTMLDocument creates a document WITH a DocumentType("html"):
+            // expose it as `.doctype` so `foreignDoc.doctype` is a real node whose
+            // §4.4 Node methods (contains / compareDocumentPosition / cloneNode /
+            // …) are callable (inherited via DocumentType.prototype). We do NOT add
+            // it to the document's `_children` here: that changes
+            // foreignDoc.childNodes.length, which the dom/ranges test generator keys
+            // off and which cascades into hundreds of unrelated range subtests
+            // (a known trap); `.doctype` alone un-breaks Node-contains /
+            // Node-compareDocumentPosition for the foreign doctype receiver.
+            let foreign_doctype = make_doctype_node_js("html", "", "", newdoc.clone());
             if let cv_js::Value::Object(o) = &newdoc {
                 let mut dm = o.borrow_mut();
                 if let Some(p) = &doc_proto {
@@ -55193,6 +55203,7 @@ fn install_dom_api(
                 dm.insert("contentType".into(), cv_js::Value::String("text/html".into()));
                 dm.insert("compatMode".into(), cv_js::Value::String("CSS1Compat".into()));
                 dm.insert("characterSet".into(), cv_js::Value::String("UTF-8".into()));
+                dm.insert("doctype".into(), foreign_doctype);
                 dm.insert("head".into(), head_el);
                 dm.insert("body".into(), body_el);
                 dm.insert("documentElement".into(), html_el);
