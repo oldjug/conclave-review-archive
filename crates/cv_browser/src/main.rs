@@ -19496,6 +19496,12 @@ struct EventProtos {
     event: cv_js::Value,
     custom: cv_js::Value,
     ui: cv_js::Value,
+    mouse: cv_js::Value,
+    focus: cv_js::Value,
+    keyboard: cv_js::Value,
+    composition: cv_js::Value,
+    input: cv_js::Value,
+    wheel: cv_js::Value,
 }
 
 /// The WHATWG DOM §2.2 Event phase constants. Stamped on both the interface
@@ -19531,7 +19537,26 @@ fn event_protos() -> EventProtos {
         let event = mk_proto(None);
         let custom = mk_proto(Some(&event));
         let ui = mk_proto(Some(&event));
-        let protos = EventProtos { event, custom, ui };
+        // UI Events inheritance chains (WebIDL): MouseEvent/FocusEvent/
+        // KeyboardEvent/CompositionEvent/InputEvent → UIEvent → Event;
+        // WheelEvent → MouseEvent → UIEvent → Event.
+        let mouse = mk_proto(Some(&ui));
+        let focus = mk_proto(Some(&ui));
+        let keyboard = mk_proto(Some(&ui));
+        let composition = mk_proto(Some(&ui));
+        let input = mk_proto(Some(&ui));
+        let wheel = mk_proto(Some(&mouse));
+        let protos = EventProtos {
+            event,
+            custom,
+            ui,
+            mouse,
+            focus,
+            keyboard,
+            composition,
+            input,
+            wheel,
+        };
         *cell.borrow_mut() = Some(protos.clone());
         protos
     })
@@ -19849,6 +19874,63 @@ fn event_dispatch_end(ev: &cv_js::Value) {
     }
 }
 
+/// WebIDL: `UIEvent` (and its subclasses) `view` member must be a `Window?`.
+/// A primitive value (e.g. `new UIEvent("x", {view: 7})`) is a TypeError. We
+/// accept any object as a window-ish view (the WPT subclass test only rejects
+/// the primitive) and null/undefined.
+fn check_event_view_init(init: Option<&cv_js::Value>) -> Result<(), cv_js::JsError> {
+    if let Some(cv_js::Value::Object(o)) = init {
+        if let Some(v) = o.borrow().get("view") {
+            if !matches!(
+                v,
+                cv_js::Value::Null | cv_js::Value::Undefined | cv_js::Value::Object(_)
+            ) {
+                return Err(cv_js::JsError::Throw(make_type_error_value(
+                    "Failed to construct event: member 'view' is not a Window.",
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The WebIDL type of a typed-Event-subclass init member, used to default + coerce.
+#[derive(Clone, Copy)]
+enum EvField {
+    Bool,
+    Num,
+    Str,
+    Node,
+}
+
+/// Apply a typed Event subclass's OWN init members onto the instance map,
+/// defaulting per WebIDL (boolean→false, numeric→0, DOMString→"", nullable
+/// interface→null) and overriding from the init dict coerced to the member type.
+/// (Inherited Event/UIEvent members are already set by `build_event_value`.)
+fn apply_event_subclass_fields(
+    obj: &std::rc::Rc<std::cell::RefCell<cv_js::OrderedMap<String, cv_js::Value>>>,
+    init: Option<&cv_js::Value>,
+    fields: &[(&str, EvField)],
+) {
+    let dict = match init {
+        Some(cv_js::Value::Object(o)) => Some(o.borrow()),
+        _ => None,
+    };
+    let mut g = obj.borrow_mut();
+    for (name, kind) in fields {
+        let provided = dict.as_ref().and_then(|d| d.get(*name));
+        let val = match kind {
+            EvField::Bool => cv_js::Value::Bool(provided.map(|v| v.to_bool()).unwrap_or(false)),
+            EvField::Num => cv_js::Value::Number(provided.map(|v| v.to_number()).unwrap_or(0.0)),
+            EvField::Str => {
+                cv_js::Value::str(provided.map(|v| v.to_display_string()).unwrap_or_default())
+            }
+            EvField::Node => provided.cloned().unwrap_or(cv_js::Value::Null),
+        };
+        g.insert((*name).to_string(), val);
+    }
+}
+
 /// Install the `Event` / `CustomEvent` / `UIEvent` interface globals + their
 /// `document.createEvent` factory shapes. Each interface object is an Object
 /// (not a bare NativeFunction) carrying `_construct` (so `new X()` works),
@@ -19873,6 +19955,9 @@ fn install_event_interface_globals(interp: &cv_js::Interp) {
                 ))));
             }
             let ty = args[0].to_display_string();
+            if matches!(kind, EventKind::UiEvent) {
+                check_event_view_init(args.get(1))?;
+            }
             Ok(build_event_value(&ty, args.get(1), kind, true))
         });
         let iface: Rc<RefCell<HashMap<String, cv_js::Value>>> =
@@ -19901,6 +19986,135 @@ fn install_event_interface_globals(interp: &cv_js::Interp) {
     interp.define_global("Event", event_iface);
     interp.define_global("CustomEvent", custom_iface);
     interp.define_global("UIEvent", ui_iface);
+
+    // ── Typed UI-event subclasses (WHATWG UI Events) ──────────────────────────
+    // Each ctor builds a UIEvent base (Event + UIEvent members + the real
+    // dispatch surface + ui proto, via build_event_value), re-points
+    // [[Prototype]] to the subclass proto so `instanceof` holds up the whole
+    // chain, then applies the subclass's own typed init members. `view` gets the
+    // WebIDL `Window?`-type check.
+    let make_subclass = |name: &'static str,
+                         proto: cv_js::Value,
+                         fields: &'static [(&'static str, EvField)]|
+     -> cv_js::Value {
+        let proto_for_ctor = proto.clone();
+        let ctor = cv_js::native_ctor(name, 1, move |_i, args| {
+            if args.is_empty() {
+                return Err(cv_js::JsError::Throw(make_type_error_value(&format!(
+                    "Failed to construct '{name}': 1 argument required, but only 0 present."
+                ))));
+            }
+            let init = args.get(1);
+            check_event_view_init(init)?;
+            let ty = args[0].to_display_string();
+            let ev = build_event_value(&ty, init, EventKind::UiEvent, true);
+            if let cv_js::Value::Object(o) = &ev {
+                o.borrow_mut()
+                    .insert(cv_js::PROTO_KEY.into(), proto_for_ctor.clone());
+                apply_event_subclass_fields(o, init, fields);
+            }
+            Ok(ev)
+        });
+        let iface: Rc<RefCell<HashMap<String, cv_js::Value>>> =
+            Rc::new(RefCell::new(HashMap::new()));
+        {
+            let mut m = iface.borrow_mut();
+            m.insert("_construct".into(), ctor.clone());
+            m.insert("_call".into(), ctor);
+            m.insert("prototype".into(), proto.clone());
+            m.insert("name".into(), cv_js::Value::String(name.into()));
+            m.insert("length".into(), cv_js::Value::Number(1.0));
+            insert_event_phase_constants(&mut m);
+        }
+        let iface_val = cv_js::Value::Object(iface);
+        if let cv_js::Value::Object(p) = &proto {
+            p.borrow_mut().insert("constructor".into(), iface_val.clone());
+        }
+        iface_val
+    };
+
+    // Own init members per interface (inherited Event/UIEvent members come from
+    // build_event_value; WheelEvent additionally carries MouseEvent's members).
+    const MOUSE_FIELDS: &[(&str, EvField)] = &[
+        ("ctrlKey", EvField::Bool),
+        ("shiftKey", EvField::Bool),
+        ("altKey", EvField::Bool),
+        ("metaKey", EvField::Bool),
+        ("screenX", EvField::Num),
+        ("screenY", EvField::Num),
+        ("clientX", EvField::Num),
+        ("clientY", EvField::Num),
+        ("button", EvField::Num),
+        ("buttons", EvField::Num),
+        ("relatedTarget", EvField::Node),
+    ];
+    const WHEEL_FIELDS: &[(&str, EvField)] = &[
+        ("ctrlKey", EvField::Bool),
+        ("shiftKey", EvField::Bool),
+        ("altKey", EvField::Bool),
+        ("metaKey", EvField::Bool),
+        ("screenX", EvField::Num),
+        ("screenY", EvField::Num),
+        ("clientX", EvField::Num),
+        ("clientY", EvField::Num),
+        ("button", EvField::Num),
+        ("buttons", EvField::Num),
+        ("relatedTarget", EvField::Node),
+        ("deltaX", EvField::Num),
+        ("deltaY", EvField::Num),
+        ("deltaZ", EvField::Num),
+        ("deltaMode", EvField::Num),
+    ];
+    const KEYBOARD_FIELDS: &[(&str, EvField)] = &[
+        ("ctrlKey", EvField::Bool),
+        ("shiftKey", EvField::Bool),
+        ("altKey", EvField::Bool),
+        ("metaKey", EvField::Bool),
+        ("key", EvField::Str),
+        ("code", EvField::Str),
+        ("location", EvField::Num),
+        ("repeat", EvField::Bool),
+        ("isComposing", EvField::Bool),
+        ("charCode", EvField::Num),
+        ("keyCode", EvField::Num),
+        ("which", EvField::Num),
+    ];
+    const FOCUS_FIELDS: &[(&str, EvField)] = &[("relatedTarget", EvField::Node)];
+    const COMPOSITION_FIELDS: &[(&str, EvField)] = &[("data", EvField::Str)];
+    const INPUT_FIELDS: &[(&str, EvField)] = &[
+        ("data", EvField::Str),
+        ("inputType", EvField::Str),
+        ("isComposing", EvField::Bool),
+    ];
+
+    interp.define_global(
+        "MouseEvent",
+        make_subclass("MouseEvent", protos.mouse.clone(), MOUSE_FIELDS),
+    );
+    interp.define_global(
+        "FocusEvent",
+        make_subclass("FocusEvent", protos.focus.clone(), FOCUS_FIELDS),
+    );
+    interp.define_global(
+        "KeyboardEvent",
+        make_subclass("KeyboardEvent", protos.keyboard.clone(), KEYBOARD_FIELDS),
+    );
+    interp.define_global(
+        "WheelEvent",
+        make_subclass("WheelEvent", protos.wheel.clone(), WHEEL_FIELDS),
+    );
+    interp.define_global(
+        "CompositionEvent",
+        make_subclass(
+            "CompositionEvent",
+            protos.composition.clone(),
+            COMPOSITION_FIELDS,
+        ),
+    );
+    interp.define_global(
+        "InputEvent",
+        make_subclass("InputEvent", protos.input.clone(), INPUT_FIELDS),
+    );
 }
 
 /// `document.createEvent(interface)` — WHATWG DOM §4.5.1. Returns an
