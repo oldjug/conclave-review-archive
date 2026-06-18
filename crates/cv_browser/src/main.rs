@@ -3548,7 +3548,7 @@ fn run_js_files(cli: &Cli) -> Result<(), String> {
         );
     }
     let doc = cv_html::parse("<!doctype html><html><head></head><body></body></html>");
-    let mut runtime = LiveInterp::new(&doc, "https://explorer.hyvechain.com/");
+    let mut runtime = LiveInterp::new(&doc, "https://explorer.example.com/");
     for path in pos {
         let src = std::fs::read_to_string(path).map_err(|e| format!("read {path}: {e}"))?;
         eprintln!("=== running {path} ({} bytes) ===", src.len());
@@ -6026,7 +6026,7 @@ fn fetch_external_stylesheets(doc: &cv_html::Document, base_url: &str) -> Vec<cv
         Err(_) => return Vec::new(),
     };
     // Tight 2s budget per sheet so a wedged CDN can't block the page
-    // render. Without this hyvechain.com sat at 96s of CPU with no window
+    // render. Without this a marketing site sat at 96s of CPU with no window
     // because one of its four stylesheet fetches never returned.
     // Resolve hrefs in document order, filtered to fetchable schemes. Cap the
     // count so a page listing hundreds of sheets can't spawn a thread storm.
@@ -20474,7 +20474,7 @@ fn bake_layout_into_paint_inner(
             // element's (html) background paints over the ENTIRE canvas (the full
             // viewport/document), not just its box. If the root background is
             // empty (transparent), the BODY element's background is used instead.
-            // Without this, a non-white page (dark themes like hyvechain's
+            // Without this, a non-white page (dark themes like
             // rgb(10,10,15)) left the bitmap's default WHITE showing in any area
             // not covered by a box — e.g. a white strip down the left/side
             // margins. Clear the whole canvas to the propagated color up-front;
@@ -29905,7 +29905,7 @@ fn install_minimal_dom_with_url(interp: &cv_js::Interp, initial_title: String, p
                         // throws "cannot read property of undefined"
                         // — particularly counter-on-scroll widgets
                         // (every "count up when visible" widget on
-                        // marketing pages, the hyvechain stats being
+                        // marketing pages, a hero-stat count-up being
                         // one example).
                         let make_rect = || -> cv_js::Value {
                             let mut r: HashMap<String, cv_js::Value> = HashMap::new();
@@ -64160,7 +64160,7 @@ fn paint_box_offset_t(
                     // rings) that piled up to ~99% gold over the box's
                     // own dark background — the visible symptom was the
                     // orbit-node "gold square with dark inner square"
-                    // on hyvechain.com (and every glow-styled element on
+                    // on a crypto landing page (and every glow-styled element on
                     // the modern web). We now paint each ring as 4 thin
                     // 1px strips so each shadow pixel is painted at most
                     // once and the integrated profile actually matches
@@ -65170,7 +65170,7 @@ fn paint_box_offset_t(
     // landed UNDER its non-positioned siblings because both came out
     // to 0 and document order took over). Real symptom on Tailwind/
     // Next.js sites: the Connect Wallet menu rendering behind the
-    // dashboard cards on explorer.hyvechain.com.
+    // dashboard cards on a crypto-explorer dashboard.
     //
     // A child "is positioned" iff its `position` is anything other
     // than `Static` (CSS Positioned Layout §2). A stacking context
@@ -69877,7 +69877,7 @@ mod tests {
 
     #[test]
     fn dom_content_loaded_late_init_calls_external_global() {
-        // Reproduce mail.hyvechain.com's particle-init pattern: an external
+        // Reproduce a webmail SPA's particle-init pattern: an external
         // (non-defer) script defines a global, then a later inline script
         // registers a DOMContentLoaded listener that calls a local init fn IF
         // the global exists. The particle background never started, so verify
@@ -71577,8 +71577,8 @@ mod tests {
     }
 
     #[test]
-    fn hyvechain_hex_grid_data_uri_decodes_at_low_opacity() {
-        // EXACT data URI from hyvechain.com's style.css `.hex-grid`
+    fn hex_grid_data_uri_decodes_at_low_opacity() {
+        // EXACT data URI from a decorative `.hex-grid` background
         // rule. The SVG has fill-opacity=0.03 on the wrapping <g>;
         // when piped through `fetch_and_decode_image` it should
         // produce a 28x49 bitmap whose painted pixels have very low
@@ -71601,7 +71601,7 @@ mod tests {
         assert!(
             max_alpha <= 30,
             "data-URI SVG with fill-opacity=0.03 must produce alpha ≤ 30, got max_alpha={max_alpha} \
-             (full opacity would make hyvechain.com's body appear as a solid gold blob)"
+             (full opacity would make the page body appear as a solid gold blob)"
         );
         assert!(
             max_alpha > 0,
@@ -75197,19 +75197,19 @@ mod tests {
     fn runtime_url_resolution_uses_window_location_for_relative_fetches() {
         let interp = cv_js::Interp::new();
         interp.install_basic_globals();
-        install_minimal_dom_with_url(&interp, String::new(), "https://explorer.hyvechain.com/");
+        install_minimal_dom_with_url(&interp, String::new(), "https://explorer.example.com/");
 
         let abs = resolve_runtime_url(&interp, "/api/v2/stats").expect("relative URL resolves");
         assert_eq!(
             abs.to_string(),
-            "https://explorer.hyvechain.com/api/v2/stats"
+            "https://explorer.example.com/api/v2/stats"
         );
 
         let asset =
             resolve_runtime_url(&interp, "./_next/static/chunk.js").expect("asset URL resolves");
         assert_eq!(
             asset.to_string(),
-            "https://explorer.hyvechain.com/_next/static/chunk.js"
+            "https://explorer.example.com/_next/static/chunk.js"
         );
     }
 
@@ -78836,7 +78836,7 @@ var el = document.getElementById('el');
 
     // Isolate the NESTING: update() is defined inside animate(), which is invoked
     // from a callback — and update captures several outer locals (the exact
-    // hyvechain shape). Driven through native rAF.
+    // hero count-up shape). Driven through native rAF.
     #[test]
     fn raf_nested_closure_self_rearm_runs_many_frames() {
         let html = r#"<!doctype html><html><body></body></html>"#;
@@ -78857,7 +78857,7 @@ var el = document.getElementById('el');
               };
               requestAnimationFrame(update);
             }
-            (function(cb){ cb(7847); })(function(t){ animate(t); });
+            (function(cb){ cb(4242); })(function(t){ animate(t); });
         "#;
         let (mut runtime, _doc, _sheets, _paint) =
             build_runtime_and_first_paint(html, "https://example.com/", &cfg, extra)
@@ -78871,8 +78871,8 @@ var el = document.getElementById('el');
         assert_eq!(title, "20 err=", "nested self-re-arming rAF closure must run all 20 frames, got {title:?}");
     }
 
-    // ── hyvechain stat count-up (IntersectionObserver + rAF + performance.now) ──
-    // Reproduces the hyvechain.com hero-stat "0/0/0" bug end-to-end: a
+    // ── hero stat count-up (IntersectionObserver + rAF + performance.now) ──
+    // Reproduces a hero-stat "0/0/0" bug end-to-end: a
     // `[data-count]` span whose value is driven by an IntersectionObserver that,
     // on first intersection, runs a `requestAnimationFrame` count-up reading
     // `performance.now()`. We build the real runtime, fire the observer step
@@ -78882,9 +78882,9 @@ var el = document.getElementById('el');
     // 16ms window ticker — if the engine froze the rAF clock during a drain
     // burst, this catches it.
     #[test]
-    fn hyvechain_stat_count_up_reaches_target() {
+    fn hero_stat_count_up_reaches_target() {
         let html = r#"<!doctype html><html><body>
-            <span class="stat-value" data-count="7847">7,847</span>
+            <span class="stat-value" data-count="4242">4,242</span>
         </body></html>"#;
         let cfg = cv_layout::LayoutConfig {
             viewport_w: 1280.0,
@@ -78892,7 +78892,7 @@ var el = document.getElementById('el');
             measure_text_fn: Some(layout_text_measurer()),
             ..cv_layout::LayoutConfig::default()
         };
-        // The exact hyvechain count-up pattern (the `initCounters` path).
+        // The exact count-up pattern (the `initCounters` path).
         let extra = r#"
             (function(){
               var counters = document.querySelectorAll('[data-count]');
@@ -78947,20 +78947,20 @@ var el = document.getElementById('el');
         );
         let title = runtime.title_override().unwrap_or_default();
         assert_eq!(
-            title, "7,847",
-            "hyvechain count-up must reach its data-count target, got {title:?}"
+            title, "4,242",
+            "the count-up must reach its data-count target, got {title:?}"
         );
     }
 
     // The page's SECOND counter path: `initCounterScramble` / `scrambleToNumber`.
-    // VERBATIM from hyvechain.com/js/main.js — a named `function update()` (not a
+    // A real-world pattern — a named `function update()` (not a
     // var) that re-arms via requestAnimationFrame(update), scrambles random digits
     // for 60% of the duration then eases to the target. This is what actually
     // paints the hero "0/0/0" if it stalls. Driven exactly like the live ticker.
     #[test]
-    fn hyvechain_scramble_counter_reaches_target() {
+    fn scramble_counter_reaches_target() {
         let html = r#"<!doctype html><html><body>
-            <span class="stat-value counter-scramble" data-count="7847">7,847</span>
+            <span class="stat-value counter-scramble" data-count="4242">4,242</span>
         </body></html>"#;
         let cfg = cv_layout::LayoutConfig {
             viewport_w: 1280.0,
@@ -79041,8 +79041,8 @@ var el = document.getElementById('el');
         );
         let title = runtime.title_override().unwrap_or_default();
         assert_eq!(
-            title, "7,847",
-            "hyvechain scramble counter must reach target, got {title:?}"
+            title, "4,242",
+            "the scramble counter must reach target, got {title:?}"
         );
     }
 
@@ -79757,7 +79757,7 @@ var el = document.getElementById('el');
 
     // font-weight:900 must reach the LayoutBox as a NUMERIC weight (not collapse
     // to bold/700), and inline text inside the heading must INHERIT it. Covers
-    // the full cv_css→cv_layout→LayoutBox thread (hyvechain h1 Orbitron 900).
+    // the full cv_css→cv_layout→LayoutBox thread (a hero h1 in Orbitron 900).
     #[test]
     fn font_weight_900_threads_to_layout_box_and_inherits() {
         // Recursively find the max font_weight_num over all boxes that carry the
@@ -79893,7 +79893,7 @@ var el = document.getElementById('el');
     }
 
     // A `max-width` + `margin: 0 auto` container centers in a wide viewport even
-    // when a SECOND rule adds `width: 100%` (the hyvechain `.hero-container`
+    // when a SECOND rule adds `width: 100%` (a common `.hero-container`
     // idiom). CSS 2.2 §10.3.3: explicit width + both margins auto → centered.
     // Repro of the "content off to the left" bug on ultrawide displays.
     #[test]
@@ -79938,7 +79938,7 @@ var el = document.getElementById('el');
         );
     }
 
-    // The hyvechain hero EXACTLY: a flex SECTION whose child is a
+    // A hero section EXACTLY: a flex SECTION whose child is a
     // `max-width:1400 + margin:0 auto + width:100%` container. A flex item's
     // auto main-axis margins must absorb free space and CENTER it (Flexbox
     // §8.1) — this is the "content off to the left on ultrawide" bug.

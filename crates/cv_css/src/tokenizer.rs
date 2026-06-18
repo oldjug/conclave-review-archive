@@ -502,7 +502,7 @@ mod tests {
         // the tokenizer stored the raw 5 characters `\f135` and the
         // icon rendered as garbled text (the backslash in display
         // fonts often looks like a V at small sizes — every Font
-        // Awesome icon on hyvechain.com showed as "V###" garbage).
+        // Awesome icon on the affected site showed as "V###" garbage).
         let t = tokenize(r#"a{content:"\f135"}"#);
         let str_tok = t
             .into_iter()

@@ -3493,7 +3493,7 @@ fn intrinsic_content_width(b: &LayoutBox, container_w: f32, parent_font_size: f3
             // (max)` below under-sized any grid to a single column's width — e.g.
             // `grid-template-columns: 1.1fr 1fr` reported only max(hero, card),
             // which then shrank an ancestor flex item and cascaded into a crushed
-            // card + clipped tab labels (mail.hyvechain.com auth layout).
+            // card + clipped tab labels (a webmail SPA auth layout).
             if b.is_grid {
                 if let Some(w) = intrinsic_grid_max_width(b, container_w, child_parent_fs) {
                     return w;
@@ -7721,7 +7721,7 @@ mod tests {
     // Regression: layout must measure the post-`text-transform` glyphs
     // (what paint draws), not the raw source. Measuring lower-case "Block"
     // for an `uppercase` run under-sized the box and clipped "BLOCK" at
-    // paint (explorer.hyvechain.com Orbitron table headers).
+    // paint (a crypto-explorer's Orbitron table headers).
     #[test]
     fn text_transform_applied_before_measurement() {
         assert_eq!(
@@ -9342,7 +9342,7 @@ mod tests {
     fn flex_item_percent_width_fills_container() {
         // A `width:100%` flex item must fill the flex container — its flex base
         // size resolves the percentage against the container, NOT collapse to
-        // content width. Regression: real grid/flex cards (mail.hyvechain.com's
+        // content width. Regression: real grid/flex cards (a webmail SPA's
         // login card) were crushed to ~content width, clipping "SIGN IN"→"SI IN".
         let kid = block(
             "div",
@@ -9377,7 +9377,7 @@ mod tests {
         // of its column tracks, NOT the max of its items. Regression: a 2-column
         // grid nested in a centered flex container collapsed to one column's
         // width, crushing the auth card and clipping the tab labels
-        // ("SIGN IN"→"SI IN") once mail.hyvechain.com's JS flipped the container
+        // ("SIGN IN"→"SI IN") once the webmail SPA's JS flipped the container
         // to flex.
         let cell_a = block(
             "div",

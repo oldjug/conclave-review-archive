@@ -1144,7 +1144,7 @@ fn copy_nested_template(
 /// the main lexer's regex scan. Without this, a regex containing a quote inside a
 /// template hole — `` `${x.replace(/'/g, "")}` `` — was mis-read: the `'` started
 /// a "string" that ran to the next quote far downstream, swallowing the closing
-/// `}` and backtick and desyncing the entire parse (broke mail.hyvechain.com).
+/// `}` and backtick and desyncing the entire parse (broke a webmail SPA).
 fn copy_regex_literal(bytes: &[u8], i: &mut usize, s: &mut String, line: &mut u32, col: &mut u32) {
     s.push('/');
     *i += 1;

@@ -2609,7 +2609,7 @@ mod tests {
 
     #[test]
     fn fill_opacity_on_path_produces_low_alpha() {
-        // Mirrors hyvechain.com's hex-grid data-URI SVG: a single path
+        // Mirrors a decorative hex-grid data-URI SVG: a single path
         // with fill='#FFD700' fill-opacity='0.03'. After the walker
         // flattens the nested `<g>` groups, the path arrives at the
         // rasterizer with both attributes already on it. The output

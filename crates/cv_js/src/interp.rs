@@ -27378,7 +27378,7 @@ mod tests {
         // A regex literal containing a quote inside a template `${}` hole was
         // mis-lexed as a string that ran to the next quote far downstream,
         // swallowing the template's closing `}` and backtick and desyncing the
-        // ENTIRE rest of the script. This broke mail.hyvechain.com — its whole
+        // ENTIRE rest of the script. This broke a webmail SPA — its whole
         // DOMContentLoaded init (incl. the particle background) lived after this
         // exact construct and never registered. The following statement MUST run.
         let (_, out) = run("var photo = 'PIC';\
@@ -29005,7 +29005,7 @@ log(probe());
     // body (the rAF self-re-arm idiom: `var tick = function(){ ...; rAF(tick); }`).
     // The self-reference must resolve to the (now-assigned) function by BINDING,
     // not capture the hoisted `undefined` value at closure-creation time. This is
-    // the exact pattern hyvechain's stat count-up uses; capturing the stale
+    // the exact pattern a hero-stat count-up uses; capturing the stale
     // undefined made the 2nd invocation throw "not a function (undefined)".
     #[test]
     fn var_function_expr_self_reference_in_closure() {
@@ -29031,7 +29031,7 @@ log(probe());
 
     // Same self-re-arm, but the defining function is itself invoked through a
     // STORED callable (the IntersectionObserver→animate→update chain). Reproduces
-    // the boundary the real hyvechain count-up crosses.
+    // the boundary a real hero count-up crosses.
     #[test]
     fn var_function_self_reference_via_stored_callback() {
         let (_, out) = run(
@@ -29819,7 +29819,7 @@ log(probe());
         // field's bit length via `n.toString(2).length`; a base-10-only
         // toString corrupts every curve's modulus (e.g. an Ed25519
         // coordinate bound collapsing from 2^255 to 2^80). Regression for
-        // the explorer.hyvechain.com "valid coordinate" crypto failure.
+        // a crypto-explorer's "valid coordinate" crypto failure.
         let (_, out) = run("console.log((255n).toString(2)); \
              console.log((256n).toString(16)); \
              let p = 2n ** 255n - 19n; \

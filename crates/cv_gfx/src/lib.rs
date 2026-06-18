@@ -423,7 +423,7 @@ impl Bitmap {
     /// each other. The center pixels — which should have NO shadow
     /// because they're under the box's own background — accumulated
     /// N × low_alpha shadow color, ending up nearly opaque on dark
-    /// themes. Visible symptom on the explorer.hyvechain.com cards:
+    /// themes. Visible symptom on a crypto-explorer dashboard's cards:
     /// each rounded card had a gold tint inside its dark background.
     /// Painting just the ring's perimeter band keeps the shadow
     /// outside the box where it belongs.
