@@ -1667,17 +1667,11 @@ impl<'a> FnCompiler<'a> {
             self.emit(Op::LoadUp { dst, slot });
             return dst;
         }
-        if let Some(fn_idx) = self.fn_index.get(name).copied() {
-            let dst = self.alloc_reg();
-            let first_upvalue = self.next_reg;
-            self.emit(Op::MakeClosure {
-                dst,
-                fn_idx,
-                first_upvalue,
-                n_upvalues: 0,
-            });
-            return dst;
-        }
+        // Top-level module fn as a value: load its one STABLE global binding
+        // (bound by the script frame's GlobalDeclarationInstantiation), not a
+        // fresh per-read `MakeClosure` — see the matching note in the
+        // value-context `Expr::Identifier` arm. Falls through to the unchecked
+        // `LoadGlobal` so `typeof Foo` stays "function" and never throws.
         let k = self.add_const(Value::str(name.to_string()));
         let dst = self.alloc_reg();
         self.emit(Op::LoadGlobal { dst, name_k: k });
@@ -2952,22 +2946,20 @@ impl<'a> FnCompiler<'a> {
                     self.emit(Op::LoadUp { dst, slot });
                     return Ok(dst);
                 }
-                // Top-level module fn referenced as a value (e.g. used
-                // in `new Foo(...)` or passed as a callback). Wrap it
-                // as a zero-upvalue closure so it's first-class. The
-                // direct-call fast path in Expr::Call still uses CallFn
-                // because it short-circuits before reaching this branch.
-                if let Some(fn_idx) = self.fn_index.get(name).copied() {
-                    let dst = self.alloc_reg();
-                    let first_upvalue = self.next_reg;
-                    self.emit(Op::MakeClosure {
-                        dst,
-                        fn_idx,
-                        first_upvalue,
-                        n_upvalues: 0,
-                    });
-                    return Ok(dst);
-                }
+                // Top-level module fn referenced as a VALUE (e.g. `new Foo()`,
+                // `Foo.prototype`, or passed as a callback). It is NOT a fresh
+                // closure per read: the script frame binds every top-level
+                // `function`/`class` decl to a STABLE global via `StoreGlobal`
+                // (the GlobalDeclarationInstantiation block above), so a value
+                // read must LOAD that one binding — otherwise `F === F` is false
+                // and every `F.prototype` / `F.x = …` writeback lands on a
+                // throwaway closure (broke `new`/`instanceof`/`.prototype` for
+                // ALL user functions & classes in page scripts). Reading it as a
+                // global below (instead of re-emitting `MakeClosure`) gives the
+                // one shared identity, matching the tree-walk tier. The
+                // direct-call fast path in Expr::Call still uses `CallFn` (it
+                // short-circuits before this branch), so mutual recursion and
+                // call performance are unaffected.
                 let k = self.add_const(Value::str(name.clone()));
                 let dst = self.alloc_reg();
                 // VALUE-context read of an unresolved identifier: the checked
@@ -9747,6 +9739,23 @@ fn run_function_inner(
                 let ctor_val = regs[ctor as usize].clone();
                 let new_obj =
                     Value::Object(std::rc::Rc::new(std::cell::RefCell::new(HashMap::new())));
+                // ECMA-262 §10.2.2 [[Construct]] / OrdinaryCreateFromConstructor:
+                // link the fresh instance's [[Prototype]] to the constructor's
+                // `.prototype` BEFORE running the body, so `this instanceof F`,
+                // inherited methods (`F.prototype.m`), and
+                // `getPrototypeOf(new F()) === F.prototype` hold both inside the
+                // ctor and on the returned object. Uses the closure's ONE shared
+                // `.prototype` (same slot a value-read returns) — the bytecode VM
+                // used to leave the instance proto-less and "defer to the interp",
+                // which silently broke `new`/`instanceof` for every user
+                // function/class once the VM became the default execution tier.
+                if let Value::BcClosure(ref c) = ctor_val {
+                    let proto = crate::interp::bc_closure_prototype(c, &ctor_val);
+                    if let Value::Object(ref o) = new_obj {
+                        o.borrow_mut()
+                            .insert(crate::interp::PROTO_KEY.to_string(), proto);
+                    }
+                }
                 let mut call_args: Vec<Value> = Vec::with_capacity(n_args as usize);
                 for i in 0..n_args {
                     call_args.push(regs[first_arg as usize + i as usize].clone());
@@ -10840,6 +10849,22 @@ mod tests {
             std::cell::RefCell::new(HashMap::new());
         let mut refuse = refuse_with_interp;
         run_function(m, idx, args, &Value::Undefined, &empty, None, &mut refuse)
+    }
+
+    /// Run the SCRIPT frame (slot 0) first to instantiate the global environment
+    /// (GlobalDeclarationInstantiation binds every top-level `function` to a
+    /// stable global), THEN invoke top-level fn `idx` through that SAME env —
+    /// exactly how real execution works (the script always runs before any of
+    /// its top-level functions are called). Use this instead of `run_fn` when the
+    /// callee references a SIBLING top-level fn by name (e.g. `new Point()`),
+    /// since a top-level fn read resolves to its global binding, not a fresh
+    /// per-read closure.
+    fn run_fn_after_script(m: &Module, idx: usize, args: &[Value]) -> Result<Value, RuntimeError> {
+        let g: std::cell::RefCell<HashMap<String, Value>> =
+            std::cell::RefCell::new(HashMap::new());
+        let mut refuse = refuse_with_interp;
+        run_function(m, 0, &[], &Value::Undefined, &g, None, &mut refuse)?;
+        run_function(m, idx, args, &Value::Undefined, &g, None, &mut refuse)
     }
 
     // ════════════════════════════════════════════════════════════════════════
@@ -12820,8 +12845,9 @@ mod tests {
              function makePoint() { let p = new Point(3, 4); return p.x + p.y; }",
         )
         .unwrap();
-        // makePoint is fns[2] (script + Point + makePoint).
-        let r = run_fn(&m, 2, &[]).unwrap();
+        // makePoint is fns[2] (script + Point + makePoint). Instantiate globals
+        // first (binds `Point`) then call makePoint, as real execution does.
+        let r = run_fn_after_script(&m, 2, &[]).unwrap();
         assert!(matches!(r, Value::Number(n) if (n - 7.0).abs() < 1e-9));
     }
 
@@ -12977,7 +13003,9 @@ mod tests {
              function go() { let c = new Counter(10); c.inc = function () { this.n = this.n + 1; }; c.inc(); c.inc(); c.inc(); return c.n; }",
         )
         .unwrap();
-        let r = run_fn(&m, 2, &[]).unwrap();
+        // Instantiate globals first (binds `Counter`) then call go(), as real
+        // execution does.
+        let r = run_fn_after_script(&m, 2, &[]).unwrap();
         assert!(matches!(r, Value::Number(n) if (n - 13.0).abs() < 1e-9));
     }
 

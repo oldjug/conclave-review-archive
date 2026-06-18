@@ -956,6 +956,30 @@ pub struct BcClosure {
     pub module: Rc<crate::bytecode::Module>,
 }
 
+/// Lazily build + persist a VM closure constructor's `.prototype` object, byte
+/// -for-byte the SAME object the property reader's `"prototype"` arm produces
+/// (interp.rs Value::BcClosure case) — `{ constructor: F, __proto__:
+/// Object.prototype }` stored under `c.props["prototype"]`. Because both a
+/// value-read of `F.prototype` AND `new F()`'s instance proto-link resolve
+/// through this ONE slot, `Object.getPrototypeOf(new F()) === F.prototype`,
+/// `new F() instanceof F`, and `F.prototype.constructor === F` all hold, and any
+/// `F.prototype.m = …` method written before/after construction is visible on
+/// instances. `ctor_val` must be the `Value::BcClosure(c)` itself (used as the
+/// `constructor` back-reference).
+pub fn bc_closure_prototype(c: &Rc<BcClosure>, ctor_val: &Value) -> Value {
+    if let Some(p) = c.props.borrow().get("prototype") {
+        return p.clone();
+    }
+    let mut m: HashMap<String, Value> = HashMap::new();
+    m.insert("constructor".into(), ctor_val.clone());
+    m.insert(PROTO_KEY.into(), Value::Object(protos().object));
+    let proto = Value::Object(Rc::new(RefCell::new(m)));
+    c.props
+        .borrow_mut()
+        .insert("prototype".into(), proto.clone());
+    proto
+}
+
 // ---- Per-function bytecode execution (gated by CV_BYTECODE) ----
 // When enabled, the interp compiles individual user functions to the register
 // VM the first time it invokes them and runs them there on subsequent calls —
