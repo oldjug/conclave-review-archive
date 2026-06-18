@@ -49239,6 +49239,16 @@ fn reflected_accessor(
     tb_js_accessor(getter, setter)
 }
 
+/// IDL-attribute names whose reflecting accessor would shadow a property slot
+/// that the engine's OWN logic reads directly via `map.get(name)` (expecting a
+/// plain string/data value, not an accessor descriptor) — e.g. checkbox click
+/// toggling + script handling read `get("type")`. For these we keep the plain
+/// data slot (kept in sync by setAttribute's mirror) rather than an accessor, so
+/// internal readers see a string. (`id`/`className` aren't reflected here at all.)
+fn reflect_attr_has_direct_reader(idl: &str) -> bool {
+    matches!(idl, "type")
+}
+
 /// The global reflected IDL attributes present on every HTML element (WHATWG HTML
 /// + the WPT reflection harness's per-element block). classList (tokenlist) is
 /// handled separately.
@@ -51189,7 +51199,20 @@ fn make_new_element_js_with_canvas_registry(
             // returns the JS property name for each reflected attribute.
             other => {
                 if let Some(prop) = reflected_dom_property(other) {
-                    map.insert(prop.into(), cv_js::Value::str(value));
+                    // Do NOT clobber a live reflecting accessor: the IDL
+                    // reflection layer installs get/set accessors for most of
+                    // these, and the accessor's getter already reads this content
+                    // attribute. Overwriting the accessor slot with a plain string
+                    // would disable the SETTER on the next IDL write. Only mirror
+                    // into a plain data slot (the legacy convenience for the
+                    // attributes that have no accessor).
+                    let is_accessor = matches!(
+                        map.get(prop),
+                        Some(cv_js::Value::Object(o)) if o.borrow().contains_key(cv_js::ACCESSOR_GET)
+                    );
+                    if !is_accessor {
+                        map.insert(prop.into(), cv_js::Value::str(value));
+                    }
                 }
             }
         }
@@ -52157,6 +52180,9 @@ fn make_new_element_js_with_canvas_registry(
         // attribute store + render path stay authoritative. Inserted into obj's
         // map (overriding any early static slot) before the originals are moved in.
         for &(idl, content, kind) in REFLECT_GLOBAL_ATTRS {
+            if reflect_attr_has_direct_reader(idl) {
+                continue;
+            }
             map.insert(
                 idl.to_string(),
                 reflected_accessor(
@@ -52171,7 +52197,7 @@ fn make_new_element_js_with_canvas_registry(
         // Element-specific reflected IDL attributes for THIS tag (a.target,
         // img.alt, input.name, …). Same generic reflection, keyed by tag.
         for &(t, idl, content, kind) in ELEMENT_REFLECT_ATTRS {
-            if t == tag_lc {
+            if t == tag_lc && !reflect_attr_has_direct_reader(idl) {
                 map.insert(
                     idl.to_string(),
                     reflected_accessor(
