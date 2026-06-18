@@ -45842,6 +45842,24 @@ fn range_clone_node(node: &cv_js::Value, deep: bool) -> cv_js::Value {
     cv_js::Value::Null
 }
 
+/// Set `node`'s (and every descendant's) `ownerDocument` to `owner` — the WHATWG
+/// DOM §4.5 "adopt" / "import" set-node-document step. Bounded recursion over the
+/// live `_children` snapshot (a malformed cyclic snapshot can't loop forever).
+fn restamp_owner_document(node: &cv_js::Value, owner: &cv_js::Value) {
+    fn walk(n: &cv_js::Value, owner: &cv_js::Value, depth: usize) {
+        if depth > 8192 {
+            return;
+        }
+        if let cv_js::Value::Object(o) = n {
+            o.borrow_mut().insert("ownerDocument".into(), owner.clone());
+        }
+        for c in js_node_children(n) {
+            walk(&c, owner, depth + 1);
+        }
+    }
+    walk(node, owner, 0);
+}
+
 /// Insert `node` into `parent`'s child list at `index`, setting the live
 /// `_parent` snapshot (WHATWG DOM §4.2.1 "insert", simplified for the Range
 /// algorithms which have already validated their inputs). Detaches `node` from
@@ -54911,6 +54929,56 @@ fn install_dom_api(
         m.insert("createCDATASection".into(), create_cdata);
         m.insert("createProcessingInstruction".into(), create_pi);
         m.insert("createDocumentFragment".into(), create_document_fragment);
+        // document.importNode(node, deep) — WHATWG DOM §4.5: clone `node` into
+        // THIS document (the clone + its descendants get ownerDocument = this
+        // document); the source is unchanged. Importing a Document throws
+        // NotSupportedError; a non-Node argument is a TypeError.
+        m.insert(
+            "importNode".into(),
+            cv_js::native_fn("importNode", |args| {
+                let node = args.first().cloned().unwrap_or(cv_js::Value::Undefined);
+                if !matches!(node, cv_js::Value::Object(_)) {
+                    return Err(cv_js::JsError::Throw(make_type_error_value(
+                        "Failed to execute 'importNode' on 'Document': parameter 1 is not of type 'Node'.",
+                    )));
+                }
+                if js_node_type(&node) == 9 {
+                    return Err(cv_js::JsError::Throw(make_dom_exception(
+                        "NotSupportedError",
+                        9,
+                        "Failed to execute 'importNode' on 'Document': The node provided is a document, which may not be imported.",
+                    )));
+                }
+                let deep = args.get(1).map(|v| v.to_bool()).unwrap_or(false);
+                let clone = range_clone_node(&node, deep);
+                restamp_owner_document(&clone, &live_document_for_owner());
+                Ok(clone)
+            }),
+        );
+        // document.adoptNode(node) — WHATWG DOM §4.5: remove `node` from its
+        // current parent and set its (and its descendants') node document to THIS
+        // document, returning it. Adopting a Document throws NotSupportedError.
+        m.insert(
+            "adoptNode".into(),
+            cv_js::native_fn("adoptNode", |args| {
+                let node = args.first().cloned().unwrap_or(cv_js::Value::Undefined);
+                if !matches!(node, cv_js::Value::Object(_)) {
+                    return Err(cv_js::JsError::Throw(make_type_error_value(
+                        "Failed to execute 'adoptNode' on 'Document': parameter 1 is not of type 'Node'.",
+                    )));
+                }
+                if js_node_type(&node) == 9 {
+                    return Err(cv_js::JsError::Throw(make_dom_exception(
+                        "NotSupportedError",
+                        9,
+                        "Failed to execute 'adoptNode' on 'Document': The node provided is a document, which may not be adopted.",
+                    )));
+                }
+                generic_detach(&node);
+                restamp_owner_document(&node, &live_document_for_owner());
+                Ok(node)
+            }),
+        );
         // document.createEvent("Event"|"CustomEvent"|"UIEvent"|legacy aliases) —
         // WHATWG DOM §4.5.1. Returns an uninitialized, prototype-linked event the
         // author initializes via initEvent/initCustomEvent before dispatch.
