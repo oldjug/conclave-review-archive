@@ -49251,43 +49251,56 @@ fn reflected_accessor(
     // store the converted string, not "[object Object]".
     let setter = cv_js::native_fn_with_interp("reflect:set", move |interp, args| {
         let v = args.first().cloned().unwrap_or(cv_js::Value::Undefined);
-        let set = |val: String| {
-            let _ = call_pure_native_value(
-                &sa,
-                vec![cv_js::Value::str(content.to_string()), cv_js::Value::str(val)],
-            );
-        };
-        let remove = || {
-            let _ = call_pure_native_value(&ra, vec![cv_js::Value::str(content.to_string())]);
-        };
-        match kind {
-            ReflectKind::Str => set(interp.js_to_string(&v)),
+        // Decide the action first (computing any string via the interp's full
+        // ToString), THEN perform it — keeps borrows simple.
+        enum Act {
+            Set(String),
+            Remove,
+            Noop,
+        }
+        let act = match kind {
+            ReflectKind::Str => Act::Set(interp.js_to_string(&v)),
             ReflectKind::Bool => {
                 if v.to_bool() {
-                    set(String::new());
+                    Act::Set(String::new())
                 } else {
-                    remove();
+                    Act::Remove
                 }
             }
             ReflectKind::Enum(keywords, _, _) => {
                 let s = interp.js_to_string(&v);
                 if let Some(kw) = keywords.iter().find(|k| k.eq_ignore_ascii_case(&s)) {
-                    set((*kw).to_string());
+                    Act::Set((*kw).to_string())
                 } else if s.is_empty() {
-                    remove();
+                    Act::Remove
                 } else {
-                    set(s);
+                    Act::Set(s)
                 }
             }
-            ReflectKind::Long => set(js_to_int32(v.to_number()).to_string()),
-            ReflectKind::ULong => set(js_to_uint32(v.to_number()).to_string()),
+            ReflectKind::Long => Act::Set(js_to_int32(v.to_number()).to_string()),
+            ReflectKind::ULong => Act::Set(js_to_uint32(v.to_number()).to_string()),
             ReflectKind::Double => {
                 let n = v.to_number();
                 if n.is_finite() {
-                    // Shortest round-trippable decimal (Rust's f64 Display).
-                    set(n.to_string());
+                    Act::Set(n.to_string())
+                } else {
+                    Act::Noop
                 }
             }
+        };
+        // `sa`/`ra` are the Pure get/set/removeAttribute CORE closures (the
+        // value is already a String here), so invoke them directly.
+        match act {
+            Act::Set(val) => {
+                let _ = call_pure_native_value(
+                    &sa,
+                    vec![cv_js::Value::str(content.to_string()), cv_js::Value::str(val)],
+                );
+            }
+            Act::Remove => {
+                let _ = call_pure_native_value(&ra, vec![cv_js::Value::str(content.to_string())]);
+            }
+            Act::Noop => {}
         }
         Ok(cv_js::Value::Undefined)
     });
@@ -49921,7 +49934,7 @@ fn node_to_js_value(node: &cv_html::Node, pending: &PendingDomMutations) -> cv_j
             for attr in attrs {
                 call_pure_native_method(
                     &js,
-                    "setAttribute",
+                    "\u{1}setAttrCore",
                     vec![
                         cv_js::Value::str(attr.name.clone()),
                         cv_js::Value::str(attr.value.clone()),
@@ -50023,7 +50036,7 @@ fn clone_dom_js_value(
     for (name, value) in attrs {
         call_pure_native_method(
             &clone,
-            "setAttribute",
+            "\u{1}setAttrCore",
             vec![cv_js::Value::str(name), cv_js::Value::str(value)],
         );
     }
@@ -51171,6 +51184,9 @@ fn make_new_element_js_with_canvas_registry(
     let attr_list_for_set = attr_list.clone();
     let classes_for_set = class_names.clone();
     let tag_for_set = tag_lc.clone();
+    // Pure CORE: takes an already-stringified value. Internal Rust callers
+    // (node_to_js_value / cloneNode subtree builders) invoke this directly with
+    // string values; the JS-facing `setAttribute` wraps it with full ToString.
     let set_attribute = cv_js::native_fn("setAttribute", move |args| {
         let name = args
             .first()
@@ -52071,6 +52087,20 @@ fn make_new_element_js_with_canvas_registry(
     // inert empty-string slot the created-element builder installed. (Created
     // elements are NOT in the SSR `table.all`, so this never reaches the
     // parse-time-element render path that reads `innerHTML` as a raw string.)
+    // JS-facing setAttribute: WebIDL coerces the value to a DOMString via full
+    // ECMAScript ToString (invoking toString/valueOf), then defers to the Pure
+    // core — `setAttribute("x", {toString(){…}})` stores the converted string,
+    // not "[object Object]". (Internal Rust callers use the core directly via the
+    // hidden "\u{1}setAttrCore" key, since they already pass strings.)
+    let set_attribute_core_for_js = set_attribute.clone();
+    let set_attribute_js = cv_js::native_fn_with_interp("setAttribute", move |interp, args| {
+        let name = args.first().cloned().unwrap_or(cv_js::Value::Undefined);
+        let value = cv_js::Value::str(
+            args.get(1).map(|v| interp.js_to_string(v)).unwrap_or_default(),
+        );
+        call_pure_native_value(&set_attribute_core_for_js, vec![name, value])
+    });
+
     let obj_for_inner_get = obj.clone();
     let inner_html_getter = cv_js::native_fn("get innerHTML", move |_args| {
         let mut out = String::new();
@@ -52267,7 +52297,8 @@ fn make_new_element_js_with_canvas_registry(
                 );
             }
         }
-        map.insert("setAttribute".into(), set_attribute);
+        map.insert("setAttribute".into(), set_attribute_js);
+        map.insert("\u{1}setAttrCore".into(), set_attribute);
         map.insert("getAttribute".into(), get_attribute);
         map.insert("hasAttribute".into(), has_attribute);
         map.insert("removeAttribute".into(), remove_attribute);
