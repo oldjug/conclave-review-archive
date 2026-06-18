@@ -16,6 +16,12 @@ Cargo.lock.bak
 
 conformance/tmp/
 
+# build artifacts / packaged binaries (use GitHub Releases, not the repo tree)
+/dist/
+
+# conformance measurement reports (scratch outputs; curated fixtures in conformance/wpt/ are kept)
+/conformance/*.json
+
 # website (separate project, not part of the browser)
 /site/
 
