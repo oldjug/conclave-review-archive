@@ -49112,6 +49112,32 @@ enum ReflectKind {
     Enum(&'static [&'static str], &'static str, &'static str),
     /// signed long: get = parse-integer(content) or 0; set = content := ToInt32(value).
     Long,
+    /// unsigned long: get = parse-non-negative-integer(content) in [0,2147483647]
+    /// else 0; set = content := ToUint32(value).
+    ULong,
+    /// double: get = parse-floating-point(content) or 0.0; set = content := the
+    /// number (ToNumber), as a decimal string when finite.
+    Double,
+}
+
+/// HTML "rules for parsing non-negative integers": like [`parse_dom_integer`] but
+/// a negative result (or a leading '-') is invalid.
+fn parse_dom_nonneg(s: &str) -> Option<i64> {
+    parse_dom_integer(s).filter(|&n| n >= 0)
+}
+
+/// ECMAScript ToUint32 (the WebIDL `unsigned long` conversion): NaN/±Infinity → 0,
+/// else truncate toward zero and wrap to an unsigned 32-bit value.
+fn js_to_uint32(n: f64) -> u64 {
+    if !n.is_finite() || n == 0.0 {
+        return 0;
+    }
+    let two32 = 4294967296.0_f64;
+    let mut m = n.trunc() % two32;
+    if m < 0.0 {
+        m += two32;
+    }
+    m as u64
 }
 
 /// HTML "rules for parsing integers" (signed): skip leading ASCII whitespace, an
@@ -49198,6 +49224,24 @@ fn reflected_accessor(
                 };
                 cv_js::Value::Number(n as f64)
             }
+            ReflectKind::ULong => {
+                let n = if present {
+                    parse_dom_nonneg(&cur.to_display_string())
+                        .filter(|&n| n <= 2147483647)
+                        .unwrap_or(0)
+                } else {
+                    0
+                };
+                cv_js::Value::Number(n as f64)
+            }
+            ReflectKind::Double => {
+                let n = if present {
+                    cur.to_display_string().trim().parse::<f64>().ok().filter(|n| n.is_finite())
+                } else {
+                    None
+                };
+                cv_js::Value::Number(n.unwrap_or(0.0))
+            }
         })
     });
     let sa = set_attr;
@@ -49236,6 +49280,14 @@ fn reflected_accessor(
                 }
             }
             ReflectKind::Long => set(js_to_int32(v.to_number()).to_string()),
+            ReflectKind::ULong => set(js_to_uint32(v.to_number()).to_string()),
+            ReflectKind::Double => {
+                let n = v.to_number();
+                if n.is_finite() {
+                    // Shortest round-trippable decimal (Rust's f64 Display).
+                    set(n.to_string());
+                }
+            }
         }
         Ok(cv_js::Value::Undefined)
     });
@@ -49249,7 +49301,9 @@ fn reflected_accessor(
 /// data slot (kept in sync by setAttribute's mirror) rather than an accessor, so
 /// internal readers see a string. (`id`/`className` aren't reflected here at all.)
 fn reflect_attr_has_direct_reader(idl: &str) -> bool {
-    matches!(idl, "type")
+    // type: checkbox-click + script handling read get("type") as a string.
+    // width/height: canvas + image layout read them directly as numbers.
+    matches!(idl, "type" | "width" | "height")
 }
 
 /// The global reflected IDL attributes present on every HTML element (WHATWG HTML
