@@ -55277,6 +55277,15 @@ fn install_dom_api(
                 // matching the WPT reference getPosition in dom/common.js).
                 m.entry("nodeType".into())
                     .or_insert(cv_js::Value::Number(9.0));
+                // The §4.4 universal Node methods (contains / compareDocumentPosition
+                // / hasChildNodes / cloneNode / normalize / append / …) live on
+                // Document.prototype → Node.prototype. Link the live document into
+                // the prototype chain so they resolve on `document` itself (own
+                // props like createElement/getElementById/querySelector still win).
+                if let Some(dp) = node_proto("Document") {
+                    m.entry(cv_js::PROTO_KEY.into())
+                        .or_insert(cv_js::Value::Object(dp));
+                }
                 {
                     use std::cell::RefCell;
                     use std::rc::Rc;
@@ -55386,6 +55395,22 @@ fn install_dom_api(
                     "_children".into(),
                     cv_js::Value::Array(Rc::new(RefCell::new(child_vals))),
                 );
+                // Link the parse-time element into its per-tag interface prototype
+                // chain (mirrors createElement) so the universal Node/Element
+                // methods (§4.4: hasChildNodes / compareDocumentPosition /
+                // isEqualNode / normalize / lookupNamespaceURI / …) inherit.
+                // Parse-time elements previously carried NO [[Prototype]] and a
+                // hand-picked method bag that omitted these. The own-prop method
+                // bag still shadows, so this is purely additive.
+                if let Some(p) = node_proto(html_element_interface_for_tag(
+                    &rec.tag.to_ascii_lowercase(),
+                ))
+                .or_else(|| node_proto("HTMLElement"))
+                .or_else(|| node_proto("Element"))
+                {
+                    m.entry(cv_js::PROTO_KEY.into())
+                        .or_insert(cv_js::Value::Object(p));
+                }
             }
         }
     }
