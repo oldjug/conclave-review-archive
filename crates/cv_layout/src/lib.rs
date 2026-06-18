@@ -7796,7 +7796,7 @@ mod tests {
                     ..Style::default()
                 },
                 children: vec![
-                    text("HYVE"),
+                    text("ALPHA"),
                     StyledNode {
                         kind: StyledKind::Element {
                             tag: "span".to_string(),
@@ -7806,7 +7806,7 @@ mod tests {
                             font_size_px: Some(28.0),
                             ..Style::default()
                         },
-                        children: vec![text("CHAIN")],
+                        children: vec![text("BETA")],
                     },
                 ],
             }],
@@ -7815,13 +7815,13 @@ mod tests {
         let root = layout(&doc, &LayoutConfig::default());
         let outer = &root.children[0];
         assert_eq!(outer.children.len(), 2);
-        let hyve = &outer.children[0];
-        let chain_wrapper = &outer.children[1];
+        let alpha = &outer.children[0];
+        let beta_wrapper = &outer.children[1];
         assert!(
-            chain_wrapper.content.x > hyve.content.x + hyve.content.w - 1.0,
+            beta_wrapper.content.x > alpha.content.x + alpha.content.w - 1.0,
             "nested inline content should flow to the right, got x={} after {}",
-            chain_wrapper.content.x,
-            hyve.content.x + hyve.content.w
+            beta_wrapper.content.x,
+            alpha.content.x + alpha.content.w
         );
     }
 
@@ -8301,7 +8301,7 @@ mod tests {
                         font_weight_bold: Some(true),
                         ..Style::default()
                     },
-                    vec![text("HYVE")],
+                    vec![text("ALPHA")],
                 ),
                 block(
                     "span",
@@ -8311,7 +8311,7 @@ mod tests {
                         font_weight_bold: Some(true),
                         ..Style::default()
                     },
-                    vec![text("CHAIN")],
+                    vec![text("BETA")],
                 ),
             ],
         );

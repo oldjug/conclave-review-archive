@@ -58537,7 +58537,7 @@ fn lower_style(
         cs.backdrop_filters.iter().map(map_filter).collect();
     // `background-clip: text` together with a `background-image:
     // linear-gradient(...)` is the standard idiom for gradient-coloured
-    // wordmarks (HYVEMAIL, branded headings, etc.). Chrome/Skia paints the
+    // wordmarks (a branded wordmark, branded headings, etc.). Chrome/Skia paints the
     // element background normally then clips it to the union of the text
     // glyph outlines (`TextPainter::Paint` → `GraphicsContext::ClipPath`
     // in blink's text_painter.cc). We mirror that: carry the FULL N-stop
@@ -64659,7 +64659,7 @@ fn paint_box_offset_t(
             }
         } else if radius > 0 && (bt > 0 || br > 0 || bb > 0 || bl > 0) {
             // Rounded boxes must keep rounded border geometry even when authors
-            // tweak one side (HyveMail's orbital rings use a brighter/thicker
+            // tweak one side (an orbital-ring decoration uses a brighter/thicker
             // border-top as a highlight). Falling back to four rectangular side
             // strips turns circles into broken squares. Use the non-top side as
             // the base ring when present, then fall back to top.
@@ -77734,7 +77734,7 @@ mod tests {
     }
 
     #[test]
-    fn hyve_style_body_color_inherits_into_hero_title_text() {
+    fn themed_style_body_color_inherits_into_hero_title_text() {
         fn find_text<'a>(
             node: &'a cv_layout::StyledNode,
             needle: &str,
@@ -77781,7 +77781,7 @@ mod tests {
     }
 
     #[test]
-    fn hyve_style_button_gradient_survives_var_resolution() {
+    fn themed_style_button_gradient_survives_var_resolution() {
         fn find_tag<'a>(
             node: &'a cv_layout::StyledNode,
             tag_name: &str,
@@ -78057,7 +78057,7 @@ mod tests {
 
     #[test]
     fn ua_inline_spans_do_not_stack_vertically() {
-        let html = "<!doctype html><html><body><div id='brand'><span id='left'>HYVE</span><span id='right'>CHAIN</span></div></body></html>";
+        let html = "<!doctype html><html><body><div id='brand'><span id='left'>ALPHA</span><span id='right'>BETA</span></div></body></html>";
         let cfg = cv_layout::LayoutConfig::default();
         let (_runtime, doc, _sheets, paint) =
             build_runtime_and_first_paint(html, "https://example.com/", &cfg, "")

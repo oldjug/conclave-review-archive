@@ -566,7 +566,7 @@ mod tests {
 
     #[test]
     fn ident_consumes_tailwind_escaped_class_fragments() {
-        let t = tokenize(r#".md\:ml-\[250px\].border-hyve-border\/50{}"#);
+        let t = tokenize(r#".md\:ml-\[250px\].border-brand-border\/50{}"#);
         let v: Vec<_> = t
             .into_iter()
             .filter(|t| !matches!(t, CssToken::Whitespace | CssToken::Eof))
@@ -574,7 +574,7 @@ mod tests {
         assert!(matches!(v[0], CssToken::Delim('.')));
         assert!(matches!(v[1], CssToken::Ident(ref s) if s == "md:ml-[250px]"));
         assert!(matches!(v[2], CssToken::Delim('.')));
-        assert!(matches!(v[3], CssToken::Ident(ref s) if s == "border-hyve-border/50"));
+        assert!(matches!(v[3], CssToken::Ident(ref s) if s == "border-brand-border/50"));
     }
 
     #[test]
