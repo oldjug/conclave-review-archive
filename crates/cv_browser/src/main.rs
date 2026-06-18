@@ -55254,22 +55254,42 @@ fn install_dom_api(
                     Some(name) => make_doctype_node_js(name, "", "", document.clone()),
                     None => cv_js::Value::Null,
                 };
+                // The doctype is a CHILD of the Document (WHATWG DOM §4.7), so
+                // link its parent to the document node. (parentElement is null —
+                // the document is not an element.)
+                if let cv_js::Value::Object(dt) = &doctype_val {
+                    let mut dm = dt.borrow_mut();
+                    dm.insert("_parent".into(), document.clone());
+                    dm.insert("parentNode".into(), document.clone());
+                    dm.insert("parentElement".into(), cv_js::Value::Null);
+                }
                 let mut m = o.borrow_mut();
-                m.insert("doctype".into(), doctype_val);
+                m.insert("doctype".into(), doctype_val.clone());
                 m.insert("body".into(), body_js);
                 m.insert("head".into(), head_js);
                 m.insert("documentElement".into(), html_js.clone());
-                // Connect `document` into the live tree so `document.firstChild`
-                // / `document.childNodes` resolve to `<html>` — React's
-                // `hydrateRoot(document, …)` walks from the document node.
+                // Connect `document` into the live tree as the TREE ROOT: its
+                // children are [doctype?, <html>] in document order (WHATWG DOM
+                // §4.4 node length / §5.5 range root, and React's
+                // `hydrateRoot(document, …)` which walks from the document node).
+                // The <html> element's parent is wired to the document in the
+                // cross-link pass below (so its root() terminates at the document,
+                // matching the WPT reference getPosition in dom/common.js).
                 m.entry("nodeType".into())
                     .or_insert(cv_js::Value::Number(9.0));
-                if !matches!(html_js, cv_js::Value::Null) {
+                {
                     use std::cell::RefCell;
                     use std::rc::Rc;
+                    let mut kids: Vec<cv_js::Value> = Vec::new();
+                    if !matches!(doctype_val, cv_js::Value::Null) {
+                        kids.push(doctype_val);
+                    }
+                    if !matches!(html_js, cv_js::Value::Null) {
+                        kids.push(html_js.clone());
+                    }
                     m.insert(
                         "_children".into(),
-                        cv_js::Value::Array(Rc::new(RefCell::new(vec![html_js]))),
+                        cv_js::Value::Array(Rc::new(RefCell::new(kids))),
                     );
                 }
             }
@@ -55297,6 +55317,10 @@ fn install_dom_api(
             .iter()
             .map(|r| (r.path.clone(), r.js.clone()))
             .collect();
+        // The Document node is the parent of the documentElement (<html>), so the
+        // root() of every node in the page terminates at the document (WHATWG DOM
+        // §4.4) — matching the WPT reference. Fetched once for the root wiring.
+        let document_node = interp.get_global("document").unwrap_or(cv_js::Value::Null);
         for rec in t.all.iter() {
             // Build the FULL ordered child-node list straight from the parsed
             // tree — Element (nodeType 1), Text (3), AND Comment (8) — so
@@ -55338,11 +55362,15 @@ fn install_dom_api(
                     }
                 }
             }
-            let parent = if rec.path.is_empty() {
-                cv_js::Value::Null
+            // The documentElement (<html>, empty path) parents the DOCUMENT node:
+            // parentNode === document, but parentElement === null (the document is
+            // not an element). Every other element parents its containing element.
+            let (parent_node, parent_element) = if rec.path.is_empty() {
+                (document_node.clone(), cv_js::Value::Null)
             } else {
                 let pp = rec.path[..rec.path.len() - 1].to_vec();
-                by_path.get(&pp).cloned().unwrap_or(cv_js::Value::Null)
+                let p = by_path.get(&pp).cloned().unwrap_or(cv_js::Value::Null);
+                (p.clone(), p)
             };
             if let cv_js::Value::Object(o) = &rec.js {
                 let mut m = o.borrow_mut();
@@ -55350,9 +55378,9 @@ fn install_dom_api(
                 // firstElementChild) + `_parent` (parentNode/nextSibling/
                 // previousSibling). React's hydration walks
                 // `container.firstChild`→`.nextSibling` over THIS tree.
-                m.insert("_parent".into(), parent.clone());
-                m.insert("parentNode".into(), parent.clone());
-                m.insert("parentElement".into(), parent);
+                m.insert("_parent".into(), parent_node.clone());
+                m.insert("parentNode".into(), parent_node.clone());
+                m.insert("parentElement".into(), parent_element);
                 m.insert("isConnected".into(), cv_js::Value::Bool(true));
                 m.insert(
                     "_children".into(),
