@@ -48109,6 +48109,56 @@ fn make_blank_document(
         .borrow_mut()
         .insert("createElement".into(), create_element);
 
+    // createAttribute(localName) / createAttributeNS(namespace, qualifiedName) —
+    // WHATWG DOM §4.5: a standalone Attr with empty value + null owner element.
+    // The local name is ASCII-lowercased only for an HTML document; an invalid
+    // Name throws InvalidCharacterError. (Constructor-made documents — `new
+    // Document()`, createDocument, createHTMLDocument — lacked these entirely.)
+    let is_html_ca = is_html;
+    let create_attribute = cv_js::native_fn("createAttribute", move |args| {
+        let mut local = args
+            .first()
+            .map(|v| v.to_display_string())
+            .unwrap_or_default();
+        if !is_valid_xml_name(&local) {
+            return Err(cv_js::JsError::Throw(make_dom_exception(
+                "InvalidCharacterError",
+                5,
+                &format!("'{local}' is not a valid attribute name"),
+            )));
+        }
+        if is_html_ca {
+            local = local.to_ascii_lowercase();
+        }
+        let entry = AttrEntry {
+            namespace: None,
+            prefix: None,
+            local_name: local.clone(),
+            qualified_name: local,
+            value: String::new(),
+        };
+        Ok(make_attr_node_js(entry, None, None))
+    });
+    doc_rc
+        .borrow_mut()
+        .insert("createAttribute".into(), create_attribute);
+    let create_attribute_ns = cv_js::native_fn("createAttributeNS", move |args| {
+        let ns = ns_arg_to_option(args.first());
+        let qualified = args.get(1).map(|v| v.to_display_string()).unwrap_or_default();
+        let ext = validate_and_extract(ns, &qualified)?;
+        let entry = AttrEntry {
+            namespace: ext.namespace,
+            prefix: ext.prefix,
+            local_name: ext.local_name,
+            qualified_name: ext.qualified_name,
+            value: String::new(),
+        };
+        Ok(make_attr_node_js(entry, None, None))
+    });
+    doc_rc
+        .borrow_mut()
+        .insert("createAttributeNS".into(), create_attribute_ns);
+
     // createElementNS(namespace, qualifiedName) — WHATWG DOM §4.5. The created
     // element's [[Prototype]] reflects the namespace+localName-derived interface
     // (XHTML "a" → HTMLAnchorElement.prototype) so `el.constructor` resolves.
