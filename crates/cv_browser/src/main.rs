@@ -49104,9 +49104,12 @@ enum ReflectKind {
     Str,
     /// boolean: get = content present; set true → content := ""; set false → remove.
     Bool,
-    /// enumerated limited-to-known: get = canonical keyword for the state or "";
+    /// enumerated limited-to-known: get = canonical keyword for the current state
+    /// (present+match → that keyword; present+no-match → invalid-value default;
+    /// absent → missing-value default; each default is a canonical keyword or "");
     /// set = keyword match → canonical, "" → remove, else set as-is.
-    Enum(&'static [&'static str]),
+    /// `Enum(keywords, missing_default, invalid_default)`.
+    Enum(&'static [&'static str], &'static str, &'static str),
     /// signed long: get = parse-integer(content) or 0; set = content := ToInt32(value).
     Long,
 }
@@ -49175,14 +49178,16 @@ fn reflected_accessor(
                 cv_js::Value::str(if present { cur.to_display_string() } else { String::new() })
             }
             ReflectKind::Bool => cv_js::Value::Bool(present),
-            ReflectKind::Enum(keywords) => {
-                let mut out = String::new();
-                if present {
+            ReflectKind::Enum(keywords, missing, invalid) => {
+                let out = if present {
                     let cv = cur.to_display_string();
-                    if let Some(kw) = keywords.iter().find(|k| k.eq_ignore_ascii_case(&cv)) {
-                        out = (*kw).to_string();
+                    match keywords.iter().find(|k| k.eq_ignore_ascii_case(&cv)) {
+                        Some(kw) => (*kw).to_string(),
+                        None => invalid.to_string(),
                     }
-                }
+                } else {
+                    missing.to_string()
+                };
                 cv_js::Value::str(out)
             }
             ReflectKind::Long => {
@@ -49217,7 +49222,7 @@ fn reflected_accessor(
                     remove();
                 }
             }
-            ReflectKind::Enum(keywords) => {
+            ReflectKind::Enum(keywords, _, _) => {
                 let s = v.to_display_string();
                 if let Some(kw) = keywords.iter().find(|k| k.eq_ignore_ascii_case(&s)) {
                     set((*kw).to_string());
@@ -49243,7 +49248,7 @@ const REFLECT_GLOBAL_ATTRS: &[(&str, &str, ReflectKind)] = &[
     ("title", "title", ReflectKind::Str),
     ("lang", "lang", ReflectKind::Str),
     ("accessKey", "accesskey", ReflectKind::Str),
-    ("dir", "dir", ReflectKind::Enum(&["ltr", "rtl", "auto"])),
+    ("dir", "dir", ReflectKind::Enum(&["ltr", "rtl", "auto"], "", "")),
     ("autofocus", "autofocus", ReflectKind::Bool),
     ("hidden", "hidden", ReflectKind::Bool),
     ("tabIndex", "tabindex", ReflectKind::Long),
