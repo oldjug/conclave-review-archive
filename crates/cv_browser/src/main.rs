@@ -49202,7 +49202,10 @@ fn reflected_accessor(
     });
     let sa = set_attr;
     let ra = remove_attr;
-    let setter = cv_js::native_fn("reflect:set", move |args| {
+    // WithInterp so string/enum coercion runs the FULL ECMAScript ToString
+    // (invoking a value's toString/valueOf) — `el.title = {toString(){…}}` must
+    // store the converted string, not "[object Object]".
+    let setter = cv_js::native_fn_with_interp("reflect:set", move |interp, args| {
         let v = args.first().cloned().unwrap_or(cv_js::Value::Undefined);
         let set = |val: String| {
             let _ = call_pure_native_value(
@@ -49214,7 +49217,7 @@ fn reflected_accessor(
             let _ = call_pure_native_value(&ra, vec![cv_js::Value::str(content.to_string())]);
         };
         match kind {
-            ReflectKind::Str => set(v.to_display_string()),
+            ReflectKind::Str => set(interp.js_to_string(&v)),
             ReflectKind::Bool => {
                 if v.to_bool() {
                     set(String::new());
@@ -49223,7 +49226,7 @@ fn reflected_accessor(
                 }
             }
             ReflectKind::Enum(keywords, _, _) => {
-                let s = v.to_display_string();
+                let s = interp.js_to_string(&v);
                 if let Some(kw) = keywords.iter().find(|k| k.eq_ignore_ascii_case(&s)) {
                     set((*kw).to_string());
                 } else if s.is_empty() {
