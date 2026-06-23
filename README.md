@@ -5,7 +5,10 @@ This fork is preserved for technical review only.
 
 I am not building Profile NFT on this repository. Current review indicates the project contains partial browser-engine components, but the declared browser entrypoint is not wired as a usable application.
 
-Status: archived / review only.
+Status: archived / review only
+|
+
+
 # Conclave
 
 ![Conclave](assets/conclave-256.png)
